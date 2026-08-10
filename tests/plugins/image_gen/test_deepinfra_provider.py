@@ -85,7 +85,17 @@ async def test_generate_calls_openai_sdk_with_deepinfra_base_url(monkeypatch):
 
     fake_openai = MagicMock()
     fake_openai.AsyncOpenAI = _FakeClient
-    with patch.dict("sys.modules", {"openai": fake_openai}):
+
+    async def create_client(client_class, **kwargs):
+        return client_class(**kwargs)
+
+    with (
+        patch.dict("sys.modules", {"openai": fake_openai}),
+        patch(
+            "agent.ssl_verify._create_openai_sdk_client",
+            side_effect=create_client,
+        ),
+    ):
         result = await deepinfra_plugin.DeepInfraImageGenProvider().generate(
             prompt="a cat", aspect_ratio="square",
         )

@@ -299,3 +299,62 @@ async def _create_httpx_client(
         if cancellation is not None:
             raise cancellation from construction_error  # noqa: ASYNC104
         raise
+
+
+async def _create_openai_sdk_client(
+    client_class: Any,
+    /,
+    **kwargs: Any,
+) -> Any:
+    """Construct an OpenAI async client with its exact default HTTP settings."""
+    import httpx
+    from openai import _base_client
+
+    client_factory = getattr(_base_client, "AsyncHttpxClientWrapper", None)
+    limits = getattr(_base_client, "DEFAULT_CONNECTION_LIMITS", None)
+    timeout = getattr(_base_client, "DEFAULT_TIMEOUT", None)
+    if client_factory is None or not isinstance(limits, httpx.Limits):
+        raise RuntimeError(
+            "The installed OpenAI runtime does not expose its async HTTP "
+            "client defaults. Reinstall async-hermes-agent."
+        )
+    if not isinstance(timeout, httpx.Timeout):
+        raise RuntimeError(
+            "The installed OpenAI runtime does not expose its default timeout. "
+            "Reinstall async-hermes-agent."
+        )
+
+    base_url = kwargs.get("base_url")
+    if base_url is None:
+        base_url = os.environ.get("OPENAI_BASE_URL")
+    if base_url is None:
+        base_url = "https://api.openai.com/v1"
+
+    http_client = await _create_httpx_client(
+        _client_factory=client_factory,
+        base_url=base_url,
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=True,
+    )
+    try:
+        return client_class(http_client=http_client, **kwargs)
+    except BaseException as construction_error:
+        close_task = asyncio.create_task(
+            http_client.aclose(),
+            name="openai-http-client-construction-cleanup",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103
+                if close_task.cancelled():
+                    break  # noqa: ASYNC104 - owned cleanup reached a terminal state
+                if cancellation is None:
+                    cancellation = exc
+                continue  # noqa: ASYNC104 - finish closing the owned client
+        if cancellation is not None:
+            raise cancellation from construction_error  # noqa: ASYNC104
+        raise

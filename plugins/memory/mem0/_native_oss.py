@@ -118,6 +118,7 @@ class OpenAIEmbedding:
                 raise RuntimeError("Cannot use a closed OpenAIEmbedding")
 
             from openai import AsyncOpenAI
+            from agent.ssl_verify import _create_openai_sdk_client
 
             api_key = self.config.get("api_key") or os.getenv("OPENAI_API_KEY")
             legacy_base_url = os.getenv("OPENAI_API_BASE")
@@ -135,7 +136,11 @@ class OpenAIEmbedding:
                     DeprecationWarning,
                     stacklevel=2,
                 )
-            self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self._client = await _create_openai_sdk_client(
+                AsyncOpenAI,
+                api_key=api_key,
+                base_url=base_url,
+            )
             return self._client
 
     async def embed(
@@ -357,6 +362,7 @@ class OpenAILLM:
                 raise RuntimeError("Cannot use a closed OpenAILLM")
 
             from openai import AsyncOpenAI
+            from agent.ssl_verify import _create_openai_sdk_client
 
             openrouter_key = os.getenv("OPENROUTER_API_KEY")
             if openrouter_key:
@@ -373,7 +379,11 @@ class OpenAILLM:
                     or os.getenv("OPENAI_BASE_URL")
                     or "https://api.openai.com/v1"
                 )
-            self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self._client = await _create_openai_sdk_client(
+                AsyncOpenAI,
+                api_key=api_key,
+                base_url=base_url,
+            )
             return self._client
 
     @staticmethod

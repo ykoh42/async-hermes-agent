@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -44,10 +45,23 @@ def provider(monkeypatch):
     return openai_plugin.OpenAIImageGenProvider()
 
 
+@contextmanager
 def _patched_openai(fake_client: MagicMock):
     fake_openai = MagicMock()
     fake_openai.AsyncOpenAI.return_value = fake_client
-    return patch.dict("sys.modules", {"openai": fake_openai})
+
+    async def create_client(client_class, **kwargs):
+        return client_class(**kwargs)
+
+    with (
+        patch.dict("sys.modules", {"openai": fake_openai}),
+        patch.object(
+            openai_plugin,
+            "_create_openai_sdk_client",
+            side_effect=create_client,
+        ),
+    ):
+        yield
 
 
 def _fake_client(*, response) -> MagicMock:

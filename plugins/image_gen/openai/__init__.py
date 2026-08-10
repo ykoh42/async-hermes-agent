@@ -28,7 +28,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_scope import get_secret
-from agent.ssl_verify import _create_httpx_client
+from agent.ssl_verify import _create_httpx_client, _create_openai_sdk_client
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
@@ -298,7 +298,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
 
-            client = openai.AsyncOpenAI(api_key=api_key)
+            client = await _create_openai_sdk_client(
+                openai.AsyncOpenAI,
+                api_key=api_key,
+            )
             try:
                 response = await client.images.edit(
                     model=API_MODEL,
@@ -331,7 +334,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 "quality": meta["quality"],
             }
 
-            client = openai.AsyncOpenAI(api_key=api_key)
+            client = await _create_openai_sdk_client(
+                openai.AsyncOpenAI,
+                api_key=api_key,
+            )
             try:
                 response = await client.images.generate(**payload)
             except Exception as exc:

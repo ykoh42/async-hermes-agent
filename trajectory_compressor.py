@@ -984,6 +984,7 @@ class TrajectoryCompressor:
         self.tokenizer = None
         self._tokenizer_init_lock = asyncio.Lock()
         self._initialization_lock = asyncio.Lock()
+        self._client_init_lock = asyncio.Lock()
         self._summarizer_initialized = False
         self.client = None
         self.logger = logging.getLogger(__name__)
@@ -1073,20 +1074,25 @@ class TrajectoryCompressor:
         print(f"✅ Initialized summarizer client: {self.config.summarization_model}")
         print(f"   Max concurrent requests: {self.config.max_concurrent_requests}")
 
-    def _get_client(self):
+    async def _get_client(self):
         """Return an AsyncOpenAI client bound to the current event loop.
 
         Created lazily and reused for this compressor lifecycle.
         """
         if self.client is not None:
             return self.client
-        from openai import AsyncOpenAI
-        from agent.auxiliary_client import _to_openai_base_url
+        async with self._client_init_lock:
+            if self.client is not None:
+                return self.client
+            from openai import AsyncOpenAI
+            from agent.auxiliary_client import _to_openai_base_url
+            from agent.ssl_verify import _create_openai_sdk_client
 
-        self.client = AsyncOpenAI(
-            api_key=self._client_api_key,
-            base_url=_to_openai_base_url(self.config.base_url),
-        )
+            self.client = await _create_openai_sdk_client(
+                AsyncOpenAI,
+                api_key=self._client_api_key,
+                base_url=_to_openai_base_url(self.config.base_url),
+            )
         return self.client
 
     async def close(self) -> None:
@@ -1348,7 +1354,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     }
                     if summary_temperature is not None:
                         _create_kwargs["temperature"] = summary_temperature
-                    response = await self._get_client().chat.completions.create(**_create_kwargs)
+                    client = await self._get_client()
+                    response = await client.chat.completions.create(**_create_kwargs)
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)

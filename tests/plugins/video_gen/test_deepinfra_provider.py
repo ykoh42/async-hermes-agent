@@ -109,12 +109,25 @@ def _mock_url_download(captured: dict, raise_exc: Exception | None = None):
         yield
 
 
+@contextmanager
+def _mock_openai_client_builder():
+    async def create_client(client_class, **kwargs):
+        return client_class(**kwargs)
+
+    with patch(
+        "agent.ssl_verify._create_openai_sdk_client",
+        side_effect=create_client,
+    ):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_generate_text_to_video_downloads_url_and_saves_locally():
     """t2v happy path: SDK called with DeepInfra base_url + key; status
     'succeeded' + data[].url → bytes downloaded and saved to a local file."""
     captured: dict = {}
     with patch.dict("sys.modules", {"openai": _fake_openai_with_capture(captured)}), \
+            _mock_openai_client_builder(), \
             _mock_url_download(captured):
         result = await deepinfra_plugin.DeepInfraVideoGenProvider().generate(
             prompt="a red cube rotating", model="vendor/test-vid", duration=5,

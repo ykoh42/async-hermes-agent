@@ -246,7 +246,13 @@ class DeepInfraImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        from agent.ssl_verify import _create_openai_sdk_client
+
+        client = await _create_openai_sdk_client(
+            openai.AsyncOpenAI,
+            api_key=api_key,
+            base_url=base_url,
+        )
         try:
             response = await client.images.generate(
                 model=model_id,

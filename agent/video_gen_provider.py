@@ -519,7 +519,13 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
         if extra_body:
             call_kwargs["extra_body"] = extra_body
 
-        client = openai.AsyncOpenAI(api_key=self._api_key(), base_url=self._base_url())
+        from agent.ssl_verify import _create_openai_sdk_client
+
+        client = await _create_openai_sdk_client(
+            openai.AsyncOpenAI,
+            api_key=self._api_key(),
+            base_url=self._base_url(),
+        )
         try:
             try:
                 video = await self._create_and_poll(client, call_kwargs)

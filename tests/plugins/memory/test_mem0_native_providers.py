@@ -112,6 +112,14 @@ def _reset_fake_openai(monkeypatch):
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setattr("openai.AsyncOpenAI", _FakeAsyncOpenAI)
 
+    async def create_client(client_class, **kwargs):
+        return client_class(**kwargs)
+
+    monkeypatch.setattr(
+        "agent.ssl_verify._create_openai_sdk_client",
+        create_client,
+    )
+
 
 @pytest.fixture(autouse=True)
 def _reset_fake_ollama(monkeypatch):

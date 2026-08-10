@@ -384,7 +384,7 @@ async def test_generate_summary_kimi_omits_temperature():
     async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_client = MagicMock(return_value=async_client)
+    compressor._get_client = AsyncMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)
@@ -771,7 +771,7 @@ class TestGenerateSummary:
         async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
         ))
-        tc._get_client = MagicMock(return_value=async_client)
+        tc._get_client = AsyncMock(return_value=async_client)
         metrics = TrajectoryMetrics()
 
         summary = await tc._generate_summary("Turn content", metrics)

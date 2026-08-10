@@ -30,7 +30,8 @@ class TestAsyncClientLazyCreation:
 
         assert comp.client is None
 
-    def test_get_client_creates_new_client(self):
+    @pytest.mark.asyncio
+    async def test_get_client_creates_new_client(self):
         """_get_client() should create a fresh AsyncOpenAI instance."""
         from trajectory_compressor import TrajectoryCompressor
 
@@ -39,18 +40,28 @@ class TestAsyncClientLazyCreation:
         comp.config.base_url = "https://api.example.com/v1"
         comp._client_api_key = "test-key"
         comp.client = None
+        comp._client_init_lock = asyncio.Lock()
 
         mock_async_openai = MagicMock()
-        with patch("openai.AsyncOpenAI", mock_async_openai):
-            client = comp._get_client()
+        create_client = AsyncMock(return_value=MagicMock())
+        with (
+            patch("openai.AsyncOpenAI", mock_async_openai),
+            patch(
+                "agent.ssl_verify._create_openai_sdk_client",
+                create_client,
+            ),
+        ):
+            client = await comp._get_client()
 
-        mock_async_openai.assert_called_once_with(
+        create_client.assert_awaited_once_with(
+            mock_async_openai,
             api_key="test-key",
             base_url="https://api.example.com/v1",
         )
-        assert comp.client is not None
+        assert client is comp.client
 
-    def test_get_client_reuses_owned_client(self):
+    @pytest.mark.asyncio
+    async def test_get_client_reuses_owned_client(self):
         """One compressor lifecycle reuses one event-loop-bound client."""
         from trajectory_compressor import TrajectoryCompressor
 
@@ -59,23 +70,56 @@ class TestAsyncClientLazyCreation:
         comp.config.base_url = "https://api.example.com/v1"
         comp._client_api_key = "test-key"
         comp.client = None
+        comp._client_init_lock = asyncio.Lock()
 
-        call_count = 0
-        instances = []
+        instance = MagicMock()
+        create_client = AsyncMock(return_value=instance)
+        with patch(
+            "agent.ssl_verify._create_openai_sdk_client",
+            create_client,
+        ):
+            client1 = await comp._get_client()
+            client2 = await comp._get_client()
 
-        def mock_constructor(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            instance = MagicMock()
-            instances.append(instance)
+        create_client.assert_awaited_once()
+        assert client1 is client2 is instance
+
+    @pytest.mark.asyncio
+    async def test_get_client_serializes_concurrent_initialization(self):
+        """Concurrent files must share one owned summarizer client."""
+        from trajectory_compressor import TrajectoryCompressor
+
+        comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
+        comp.config = MagicMock()
+        comp.config.base_url = "https://api.example.com/v1"
+        comp._client_api_key = "test-key"
+        comp.client = None
+        comp._client_init_lock = asyncio.Lock()
+
+        construction_started = asyncio.Event()
+        allow_construction = asyncio.Event()
+        instance = MagicMock()
+
+        async def create_client(*args, **kwargs):
+            construction_started.set()
+            await allow_construction.wait()
             return instance
 
-        with patch("openai.AsyncOpenAI", side_effect=mock_constructor):
-            client1 = comp._get_client()
-            client2 = comp._get_client()
+        with patch(
+            "agent.ssl_verify._create_openai_sdk_client",
+            AsyncMock(side_effect=create_client),
+        ) as client_factory:
+            first = asyncio.create_task(comp._get_client())
+            await construction_started.wait()
+            second = asyncio.create_task(comp._get_client())
+            await asyncio.sleep(0)
 
-        assert call_count == 1
-        assert client1 is client2 is instances[0]
+            client_factory.assert_awaited_once()
+            allow_construction.set()
+            first_client, second_client = await asyncio.gather(first, second)
+
+        client_factory.assert_awaited_once()
+        assert first_client is second_client is instance
 
     @pytest.mark.asyncio
     async def test_close_releases_owned_client(self):
@@ -195,7 +239,7 @@ async def test_generate_summary_async_kimi_omits_temperature():
     async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_client = MagicMock(return_value=async_client)
+    compressor._get_client = AsyncMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)
@@ -224,7 +268,7 @@ async def test_generate_summary_async_public_moonshot_kimi_k2_5_omits_temperatur
     async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_client = MagicMock(return_value=async_client)
+    compressor._get_client = AsyncMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)
@@ -253,7 +297,7 @@ async def test_generate_summary_async_public_moonshot_cn_kimi_k2_5_omits_tempera
     async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_client = MagicMock(return_value=async_client)
+    compressor._get_client = AsyncMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)

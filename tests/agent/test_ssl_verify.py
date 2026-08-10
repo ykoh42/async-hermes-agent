@@ -12,6 +12,7 @@ from blockbuster import BlockBuster
 
 from agent.ssl_verify import (
     _create_httpx_client,
+    _create_openai_sdk_client,
     _materialize_httpx_verify,
     _resolve_httpx_client_verify,
     resolve_httpx_verify,
@@ -330,3 +331,88 @@ async def test_httpx_client_cleanup_survives_repeated_cancellation(
     allow_close.set()
     with pytest.raises(asyncio.CancelledError):
         await create
+
+
+async def test_openai_sdk_client_preserves_defaults_without_blocking(
+    clean_ca_env,
+    monkeypatch,
+):
+    import openai
+    from openai import _base_client
+
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        client = await _create_openai_sdk_client(
+            openai.AsyncOpenAI,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+        )
+    finally:
+        blocker.deactivate()
+
+    try:
+        http_client = client._client
+        pool = http_client._transport._pool
+        assert isinstance(http_client, _base_client.AsyncHttpxClientWrapper)
+        assert http_client.follow_redirects is True
+        assert http_client.base_url == client.base_url
+        assert client.timeout == _base_client.DEFAULT_TIMEOUT
+        assert pool._max_connections == 1000
+        assert pool._max_keepalive_connections == 100
+        assert pool._keepalive_expiry == 5.0
+    finally:
+        await client.close()
+
+
+async def test_openai_sdk_constructor_cleanup_survives_repeated_cancellation(
+    monkeypatch,
+):
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class HttpClient:
+        async def aclose(self):
+            close_started.set()
+            await allow_close.wait()
+            close_finished.set()
+
+    class FailingClient:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("constructor failed")
+
+    monkeypatch.setattr(
+        "agent.ssl_verify._create_httpx_client",
+        AsyncMock(return_value=HttpClient()),
+    )
+
+    create = asyncio.create_task(
+        _create_openai_sdk_client(
+            FailingClient,
+            api_key="test-key",
+        )
+    )
+    await close_started.wait()
+    create.cancel()
+    await asyncio.sleep(0)
+    create.cancel()
+    await asyncio.sleep(0)
+
+    assert create.done() is False
+    allow_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await create
+    assert close_finished.is_set()
