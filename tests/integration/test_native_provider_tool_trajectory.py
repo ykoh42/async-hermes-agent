@@ -59,6 +59,22 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
                             "index": 0,
                             "delta": {
                                 "role": "assistant",
+                                "reasoning_content": "NATIVE_ASYNC_TOOL_REASONING",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "tool-request",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "integration-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
                                 "tool_calls": [
                                     {
                                         "index": 0,
@@ -91,6 +107,22 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
             ]
         else:
             chunks = [
+                {
+                    "id": "final-answer",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "integration-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "reasoning_content": "NATIVE_ASYNC_FINAL_REASONING",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
                 {
                     "id": "final-answer",
                     "object": "chat.completion.chunk",
@@ -199,6 +231,8 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
         "assistant",
     ]
     assert "NATIVE_ASYNC_OBSERVATION" in result["messages"][2]["content"]
+    assert result["messages"][1]["reasoning"] == "NATIVE_ASYNC_TOOL_REASONING"
+    assert result["messages"][3]["reasoning"] == "NATIVE_ASYNC_FINAL_REASONING"
 
     assert len(requests) == 4
     first_messages = requests[0]["messages"]
@@ -247,5 +281,11 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
         "gpt",
     ]
     assert '"name": "terminal"' in trajectory[2]["value"]
+    assert trajectory[2]["value"].startswith(
+        "<think>\nNATIVE_ASYNC_TOOL_REASONING\n</think>\n"
+    )
     assert "NATIVE_ASYNC_OBSERVATION" in trajectory[3]["value"]
+    assert trajectory[4]["value"].startswith(
+        "<think>\nNATIVE_ASYNC_FINAL_REASONING\n</think>\n"
+    )
     assert trajectory[4]["value"].endswith("NATIVE_ASYNC_FINAL")
