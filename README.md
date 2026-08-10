@@ -70,6 +70,7 @@ Provider-specific dependencies remain opt-in, for example:
 uv sync --extra anthropic
 uv sync --extra vertex
 uv sync --extra azure-identity
+uv sync --extra supermemory
 ```
 
 ## Skills, MCP, and memory

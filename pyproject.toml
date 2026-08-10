@@ -141,6 +141,9 @@ mem0 = [
     "ollama==0.6.2",
     "psycopg[binary,pool]==3.3.4",
 ]
+# Supermemory's pinned SDK exposes AsyncSupermemory and accepts the harness's
+# owned httpx.AsyncClient, so no worker-thread compatibility layer is needed.
+supermemory = ["supermemory==3.50.0"]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]

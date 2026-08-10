@@ -39,7 +39,7 @@ jobs:
         run: uv lock --check
 
       - name: Install project and test dependencies
-        run: uv sync --locked --python 3.11 --extra dev --extra bedrock
+        run: uv sync --locked --python 3.11 --extra dev --extra bedrock --extra supermemory
 
       - name: Lint
         run: uv run ruff check .
