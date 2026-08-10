@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from blockbuster import BlockBuster
 
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
@@ -131,10 +132,19 @@ class TestIsOAuthToken:
 
 class TestBuildAnthropicClient:
 
+    @pytest.fixture(autouse=True)
+    def no_real_http_client(self, monkeypatch):
+        http_client = MagicMock()
+        http_client.aclose = AsyncMock()
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._build_anthropic_default_http_client",
+            AsyncMock(return_value=http_client),
+        )
+
 
     async def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client("sk-ant-api03-something")
+            await build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["api_key"] == "sk-ant-api03-something"
             assert "auth_token" not in kwargs
@@ -152,7 +162,7 @@ class TestBuildAnthropicClient:
 
     async def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client(
+            await build_anthropic_client(
                 "minimax-secret-123",
                 base_url="https://api.minimax.io/anthropic",
             )
@@ -172,7 +182,7 @@ class TestBuildAnthropicClient:
         1M-context beta even though it now matches `_requires_bearer_auth`.
         """
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client(
+            await build_anthropic_client(
                 "azure-foundry-secret-123",
                 base_url="https://my-resource.openai.azure.com/anthropic",
             )
@@ -193,7 +203,7 @@ class TestBuildAnthropicClient:
         rejects x-api-key with 401 — the SDK must be built with auth_token.
         """
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client(
+            await build_anthropic_client(
                 "foundry-secret-123",
                 base_url="https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic",
             )
@@ -207,9 +217,101 @@ class TestBuildAnthropicClient:
         double-retries inside hermes's outer loop. We delegate retry entirely
         to the outer loop, so the client must be built with max_retries=0."""
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client("sk-ant-api03-something")
+            await build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["max_retries"] == 0
+
+
+async def test_anthropic_http_client_preserves_sdk_defaults_without_blocking(
+    monkeypatch,
+):
+    import anthropic
+    import anthropic._base_client as base_client
+    import agent.anthropic_adapter as adapter
+
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(adapter, "_anthropic_sdk", anthropic)
+
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        client = await build_anthropic_client(
+            "sk-ant-api03-something",
+            timeout=45.0,
+        )
+    finally:
+        blocker.deactivate()
+
+    try:
+        http_client = client._client
+        pool = http_client._transport._pool
+        assert isinstance(http_client, base_client.AsyncHttpxClientWrapper)
+        assert http_client.follow_redirects is True
+        assert pool._max_connections == 1000
+        assert pool._max_keepalive_connections == 100
+        assert pool._keepalive_expiry == 5.0
+        assert pool._socket_options == adapter._anthropic_socket_options()
+        assert http_client.base_url == client.base_url
+        assert client.timeout.read == 45.0
+        assert client.timeout.connect == 10.0
+    finally:
+        await client.close()
+
+
+async def test_anthropic_constructor_cleanup_survives_repeated_cancellation(
+    monkeypatch,
+):
+    import agent.anthropic_adapter as adapter
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class HttpClient:
+        async def aclose(self):
+            close_started.set()
+            await release_close.wait()
+            close_finished.set()
+
+    class FailingAsyncAnthropic:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("constructor failed")
+
+    monkeypatch.setattr(
+        adapter,
+        "_anthropic_sdk",
+        SimpleNamespace(AsyncAnthropic=FailingAsyncAnthropic),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_build_anthropic_default_http_client",
+        AsyncMock(return_value=HttpClient()),
+    )
+
+    build = asyncio.create_task(
+        build_anthropic_client("sk-ant-api03-something")
+    )
+    await close_started.wait()
+    build.cancel()
+    await asyncio.sleep(0)
+    build.cancel()
+    await asyncio.sleep(0)
+
+    assert build.done() is False
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await build
+    assert close_finished.is_set()
 
 
 

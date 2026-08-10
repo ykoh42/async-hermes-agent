@@ -66,7 +66,7 @@ async def test_agent_uses_native_transport_messages_dispatch(monkeypatch):
 
     built = []
 
-    def fake_build(*args, **kwargs):
+    async def fake_build(*args, **kwargs):
         built.append(kwargs)
         return object()
 

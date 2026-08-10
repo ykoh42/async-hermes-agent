@@ -3459,7 +3459,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             client_error = None
             try:
                 await ensure_claude_code_version()
-                agent._anthropic_client = build_anthropic_client(
+                agent._anthropic_client = await build_anthropic_client(
                     api_key,
                     agent.base_url,
                     timeout=timeout,

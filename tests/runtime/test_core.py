@@ -2239,9 +2239,13 @@ async def test_turn_retries_after_native_anthropic_oauth_refresh(monkeypatch, tm
     monkeypatch.setattr(
         "agent.anthropic_adapter.refresh_anthropic_oauth_pure", refresh,
     )
+
+    async def build_anthropic(*_args, **_kwargs):
+        return NativeAnthropicClient()
+
     monkeypatch.setattr(
         "agent.anthropic_adapter.build_anthropic_client",
-        lambda *_args, **_kwargs: NativeAnthropicClient(),
+        build_anthropic,
     )
     monkeypatch.setattr(
         asyncio,

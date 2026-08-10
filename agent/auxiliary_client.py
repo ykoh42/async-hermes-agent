@@ -1722,7 +1722,7 @@ async def _maybe_wrap_anthropic(
         )
 
         await ensure_claude_code_version()
-        real_client = build_anthropic_client(api_key, base_url)
+        real_client = await build_anthropic_client(api_key, base_url)
     except ImportError as exc:
         raise ImportError(
             "This endpoint requires the Anthropic async transport, but the "
@@ -2753,7 +2753,7 @@ async def _try_custom_endpoint(
             )
 
             await ensure_claude_code_version()
-            real_client = build_anthropic_client(custom_key, custom_base)
+            real_client = await build_anthropic_client(custom_key, custom_base)
         except ImportError as exc:
             raise ImportError(
                 "Custom endpoint declares api_mode=anthropic_messages, but the "
@@ -3051,7 +3051,7 @@ async def _try_anthropic(
     )
     try:
         await ensure_claude_code_version()
-        real_client = build_anthropic_client(token, resolved_base_url)
+        real_client = await build_anthropic_client(token, resolved_base_url)
     except ImportError as exc:
         raise ImportError(
             "The Anthropic provider requires the native async transport. "
@@ -5359,7 +5359,7 @@ async def resolve_provider_client(
             provider,
         )
         await ensure_claude_code_version()
-        real_client = build_anthropic_client(token, base_url)
+        real_client = await build_anthropic_client(token, base_url)
         return (
             AnthropicAuxiliaryClient(
                 real_client,
@@ -5553,7 +5553,10 @@ async def resolve_provider_client(
                         )
 
                         await ensure_claude_code_version()
-                        real_client = build_anthropic_client(custom_key, custom_base)
+                        real_client = await build_anthropic_client(
+                            custom_key,
+                            custom_base,
+                        )
                     except ImportError as exc:
                         raise ImportError(
                             f"Named custom provider {provider!r} declares "

@@ -16,7 +16,7 @@ Two DIFFERENT Anthropic endpoints impose OPPOSITE User-Agent requirements:
 from __future__ import annotations
 
 import re
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -24,13 +24,23 @@ import pytest
 class TestOAuthUserAgentPrefix:
     """Inference uses ``claude-code/``; the OAuth token endpoint must NOT."""
 
-    def test_build_anthropic_client_oauth_ua(self):
+    @pytest.mark.asyncio
+    async def test_build_anthropic_client_oauth_ua(self):
         """build_anthropic_client (INFERENCE) with OAuth token must use claude-code UA."""
         from agent.anthropic_adapter import build_anthropic_client
 
         mock_sdk = MagicMock()
-        with patch("agent.anthropic_adapter._get_anthropic_sdk", return_value=mock_sdk):
-            build_anthropic_client("sk-ant-oauth-abc123", "https://api.anthropic.com")
+        with patch(
+            "agent.anthropic_adapter._get_anthropic_sdk",
+            return_value=mock_sdk,
+        ), patch(
+            "agent.anthropic_adapter._build_anthropic_default_http_client",
+            new=AsyncMock(return_value=AsyncMock()),
+        ):
+            await build_anthropic_client(
+                "sk-ant-oauth-abc123",
+                "https://api.anthropic.com",
+            )
 
         # Inspect the kwargs passed to the native async SDK client.
         call_kwargs = mock_sdk.AsyncAnthropic.call_args[1]

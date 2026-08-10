@@ -193,6 +193,10 @@ class TestPoolRuntimeResolution:
 
 class TestClientShape:
 
+    @pytest.fixture(autouse=True)
+    def preload_anthropic_sdk(self):
+        pytest.importorskip("anthropic")
+
 
     def test_lookalike_host_does_not_get_portal_treatment(self):
         """Substring matching would hand a spoofed host the Portal JWT as a
@@ -207,18 +211,22 @@ class TestClientShape:
         assert not _requires_bearer_auth(spoofed)
 
 
-    def test_portal_jwt_authenticates_with_bearer_not_x_api_key(self):
+    @pytest.mark.asyncio
+    async def test_portal_jwt_authenticates_with_bearer_not_x_api_key(self):
         """Portal validates the OAuth invoke JWT as a Bearer credential, the
         same way its /chat/completions route does. Sending it as x-api-key
         (the adapter's third-party default) 401s."""
         from agent.anthropic_adapter import build_anthropic_client
 
-        client = build_anthropic_client("portal-invoke-jwt", PORTAL_URL)
+        client = await build_anthropic_client("portal-invoke-jwt", PORTAL_URL)
+        try:
+            assert client.auth_token == "portal-invoke-jwt"
+            assert client.api_key is None
+        finally:
+            await client.close()
 
-        assert client.auth_token == "portal-invoke-jwt"
-        assert client.api_key is None
-
-    def test_portal_bearer_does_not_also_send_env_anthropic_api_key(
+    @pytest.mark.asyncio
+    async def test_portal_bearer_does_not_also_send_env_anthropic_api_key(
         self, monkeypatch
     ):
         """The Anthropic SDK fills api_key from ANTHROPIC_API_KEY when the
@@ -228,14 +236,17 @@ class TestClientShape:
         from agent.anthropic_adapter import build_anthropic_client
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
-        client = build_anthropic_client("portal-invoke-jwt", PORTAL_URL)
+        client = await build_anthropic_client("portal-invoke-jwt", PORTAL_URL)
 
-        assert client.auth_token == "portal-invoke-jwt"
-        assert client.api_key is None
-        assert "X-Api-Key" not in client.auth_headers
-        assert client.auth_headers.get("Authorization", "").startswith(
-            "Bearer portal-invoke-jwt"
-        )
+        try:
+            assert client.auth_token == "portal-invoke-jwt"
+            assert client.api_key is None
+            assert "X-Api-Key" not in client.auth_headers
+            assert client.auth_headers.get("Authorization", "").startswith(
+                "Bearer portal-invoke-jwt"
+            )
+        finally:
+            await client.close()
 
 
 

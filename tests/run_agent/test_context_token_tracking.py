@@ -28,7 +28,7 @@ def _patch_bootstrap(monkeypatch):
 
 
 class _FakeAnthropicClient:
-    def close(self):
+    async def close(self):
         pass
 
 
@@ -42,7 +42,13 @@ class _FakeOpenAIClient:
 def _make_agent(monkeypatch, api_mode, provider, response_fn):
     _patch_bootstrap(monkeypatch)
     if api_mode == "anthropic_messages":
-        monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", lambda k, b=None, **kwargs: _FakeAnthropicClient())
+        async def build_anthropic(*_args, **_kwargs):
+            return _FakeAnthropicClient()
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_client",
+            build_anthropic,
+        )
     if provider == "openai-codex":
         monkeypatch.setattr(
             "agent.auxiliary_client.resolve_provider_client",

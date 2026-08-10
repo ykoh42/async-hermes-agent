@@ -177,7 +177,7 @@ async def materialize_bearer_for_http(value: Any) -> str:
     raise ValueError("no usable api_key / token provider")
 
 
-def build_bearer_http_client(
+async def build_bearer_http_client(
     token_provider: Callable[[], Awaitable[str]],
     **httpx_kwargs: Any,
 ) -> Any:
@@ -188,6 +188,7 @@ def build_bearer_http_client(
         )
 
     import httpx
+    from agent.ssl_verify import _create_httpx_client
 
     async def inject_bearer(request: httpx.Request) -> None:
         token = await materialize_bearer_for_http(token_provider)
@@ -199,7 +200,7 @@ def build_bearer_http_client(
             request.headers.pop(header_name, None)
         request.headers["Authorization"] = f"Bearer {token}"
 
-    client = httpx.AsyncClient(
+    client = await _create_httpx_client(
         event_hooks={"request": [inject_bearer]},
         **httpx_kwargs,
     )

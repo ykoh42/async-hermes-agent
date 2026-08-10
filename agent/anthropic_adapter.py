@@ -17,6 +17,7 @@ import logging
 import os
 import platform
 import secrets
+import socket
 import stat
 import subprocess  # noqa: F401  # upstream test patch point for keychain isolation
 import sys
@@ -780,7 +781,95 @@ def _common_betas_for_base_url(
     return betas
 
 
-def _build_anthropic_client_with_bearer_hook(
+def _anthropic_socket_options() -> list[tuple[int, int, int | bool]]:
+    """Return the socket options used by Anthropic 0.87's async client."""
+    options: list[tuple[int, int, int | bool]] = [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, True)
+    ]
+    keep_interval = getattr(socket, "TCP_KEEPINTVL", None)
+    if keep_interval is not None:
+        options.append((socket.IPPROTO_TCP, keep_interval, 60))
+    elif sys.platform == "darwin":
+        options.append(
+            (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10), 60)
+        )
+    keep_count = getattr(socket, "TCP_KEEPCNT", None)
+    if keep_count is not None:
+        options.append((socket.IPPROTO_TCP, keep_count, 5))
+    keep_idle = getattr(socket, "TCP_KEEPIDLE", None)
+    if keep_idle is not None:
+        options.append((socket.IPPROTO_TCP, keep_idle, 60))
+    return options
+
+
+async def _build_anthropic_default_http_client(
+    anthropic_sdk: Any,
+    *,
+    base_url: str | None,
+    timeout: Any,
+) -> httpx.AsyncClient:
+    """Build Anthropic's default async HTTP client without loop-blocking setup."""
+    base_client_module = sys.modules.get("anthropic._base_client")
+    client_factory = getattr(base_client_module, "AsyncHttpxClientWrapper", None)
+    if client_factory is None:
+        raise RuntimeError(
+            "The preloaded Anthropic 0.87 runtime does not expose its async "
+            "HTTP client wrapper. Reinstall async-hermes-agent[anthropic]."
+        )
+    limits = getattr(anthropic_sdk, "DEFAULT_CONNECTION_LIMITS", None)
+    if not isinstance(limits, httpx.Limits):
+        raise RuntimeError(
+            "The preloaded Anthropic 0.87 runtime does not expose its "
+            "connection limits. Reinstall async-hermes-agent[anthropic]."
+        )
+    effective_base_url = base_url
+    if effective_base_url is None:
+        effective_base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    if effective_base_url is None:
+        effective_base_url = "https://api.anthropic.com"
+
+    from agent.ssl_verify import _create_httpx_client
+
+    return await _create_httpx_client(
+        _client_factory=client_factory,
+        _transport_options={"socket_options": _anthropic_socket_options()},
+        base_url=effective_base_url,
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=True,
+    )
+
+
+async def _construct_anthropic_client(
+    client_class: Any,
+    kwargs: dict[str, Any],
+    http_client: httpx.AsyncClient,
+) -> Any:
+    """Transfer an HTTP client to the SDK or close it if construction fails."""
+    try:
+        return client_class(http_client=http_client, **kwargs)
+    except BaseException as construction_error:
+        close_task = asyncio.create_task(
+            http_client.aclose(),
+            name="anthropic-http-client-construction-cleanup",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103
+                if close_task.cancelled():
+                    break  # noqa: ASYNC104 - owned cleanup reached a terminal state
+                if cancellation is None:
+                    cancellation = exc
+                continue  # noqa: ASYNC104 - finish closing the owned client
+        if cancellation is not None:
+            raise cancellation from construction_error  # noqa: ASYNC104
+        raise
+
+
+async def _build_anthropic_client_with_bearer_hook(
     token_provider,
     base_url: str = None,
     timeout: float = None,
@@ -817,7 +906,7 @@ def _build_anthropic_client_with_bearer_hook(
 
     kwargs = {
         "timeout": timeout_obj,
-        "http_client": build_bearer_http_client(
+        "http_client": await build_bearer_http_client(
             token_provider,
             timeout=timeout_obj,
         ),
@@ -845,13 +934,18 @@ def _build_anthropic_client_with_bearer_hook(
         raise ImportError(
             "The installed 'anthropic' package does not provide AsyncAnthropic."
         )
-    client = client_class(**kwargs)
+    http_client = kwargs.pop("http_client")
+    client = await _construct_anthropic_client(
+        client_class,
+        kwargs,
+        http_client,
+    )
     client.api_key = None
     client._hermes_token_provider = token_provider
     return client
 
 
-def build_anthropic_client(
+async def build_anthropic_client(
     api_key,
     base_url: str = None,
     timeout: float = None,
@@ -892,7 +986,7 @@ def build_anthropic_client(
     # Callable api_key → Entra ID bearer provider path. Do not construct a
     # synchronous SDK client from the async runtime.
     if callable(api_key) and not isinstance(api_key, str):
-        return _build_anthropic_client_with_bearer_hook(
+        return await _build_anthropic_client_with_bearer_hook(
             api_key, base_url, timeout,
             drop_context_1m_beta=drop_context_1m_beta,
         )
@@ -980,7 +1074,16 @@ def build_anthropic_client(
             "The installed 'anthropic' package does not provide "
             "AsyncAnthropic; upgrade it before using Hermes's async runtime."
         )
-    client = client_class(**kwargs)
+    http_client = await _build_anthropic_default_http_client(
+        _anthropic_sdk,
+        base_url=normalized_base_url or None,
+        timeout=kwargs["timeout"],
+    )
+    client = await _construct_anthropic_client(
+        client_class,
+        kwargs,
+        http_client,
+    )
     # Bearer-only construction leaves ``api_key`` unset, so the SDK fills it
     # from ``ANTHROPIC_API_KEY`` (Hermes loads that into the process env from
     # ``~/.hermes/.env``). The result is dual auth —
@@ -1034,16 +1137,32 @@ async def build_anthropic_bedrock_client(region: str):
     if credentials is None:
         raise RuntimeError("could not resolve credentials from AWS session")
     frozen = await credentials.get_frozen_credentials()
-    client = client_class(
-        aws_access_key=frozen.access_key,
-        aws_secret_key=frozen.secret_key,
-        aws_session_token=frozen.token,
-        aws_region=region,
-        timeout=Timeout(timeout=900.0, connect=10.0),
+    timeout_obj = Timeout(timeout=900.0, connect=10.0)
+    kwargs = {
+        "aws_access_key": frozen.access_key,
+        "aws_secret_key": frozen.secret_key,
+        "aws_session_token": frozen.token,
+        "aws_region": region,
+        "timeout": timeout_obj,
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
-        max_retries=0,
-        default_headers={"anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])},
+        "max_retries": 0,
+        "default_headers": {
+            "anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])
+        },
+    }
+    bedrock_base_url = os.environ.get("ANTHROPIC_BEDROCK_BASE_URL")
+    if bedrock_base_url is None:
+        bedrock_base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+    http_client = await _build_anthropic_default_http_client(
+        _anthropic_sdk,
+        base_url=bedrock_base_url,
+        timeout=timeout_obj,
+    )
+    client = await _construct_anthropic_client(
+        client_class,
+        kwargs,
+        http_client,
     )
     client._hermes_aws_credentials = credentials
     return client

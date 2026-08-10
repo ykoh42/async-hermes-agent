@@ -5359,7 +5359,7 @@ class AIAgent:
                 )
                 if getattr(self, "_anthropic_client_source", None) != client_source:
                     await ensure_claude_code_version()
-                    self._anthropic_client = build_anthropic_client(
+                    self._anthropic_client = await build_anthropic_client(
                         anthropic_key,
                         getattr(self, "_anthropic_base_url", None),
                         timeout=getattr(self, "_provider_request_timeout", None),

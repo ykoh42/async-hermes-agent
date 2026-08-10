@@ -65,6 +65,11 @@ class TestBedrockContext1MBeta:
         with (
             patch.object(adapter, "_anthropic_sdk", fake_sdk),
             patch("aiobotocore.session.get_session", return_value=session),
+            patch.object(
+                adapter,
+                "_build_anthropic_default_http_client",
+                new=AsyncMock(return_value=AsyncMock()),
+            ),
         ):
             await adapter.build_anthropic_bedrock_client(region="us-west-2")
 
@@ -80,3 +85,40 @@ class TestBedrockContext1MBeta:
         # Other common betas still present — no regression.
         assert "interleaved-thinking-2025-05-14" in beta_header
         assert "fine-grained-tool-streaming-2025-05-14" in beta_header
+
+    @pytest.mark.asyncio
+    async def test_bedrock_uses_awaited_anthropic_http_transport(
+        self,
+        monkeypatch,
+    ):
+        import anthropic
+        import anthropic._base_client as base_client
+        import agent.anthropic_adapter as adapter
+
+        credentials = MagicMock(
+            get_frozen_credentials=AsyncMock(
+                return_value=SimpleNamespace(
+                    access_key="access",
+                    secret_key="secret",
+                    token="token",
+                )
+            )
+        )
+        session = MagicMock(get_credentials=AsyncMock(return_value=credentials))
+        monkeypatch.setattr(adapter, "_anthropic_sdk", anthropic)
+        monkeypatch.setattr("aiobotocore.session.get_session", lambda: session)
+
+        client = await adapter.build_anthropic_bedrock_client("us-west-2")
+        try:
+            assert isinstance(
+                client._client,
+                base_client.AsyncHttpxClientWrapper,
+            )
+            assert str(client.base_url) == (
+                "https://bedrock-runtime.us-west-2.amazonaws.com"
+            )
+            assert client._client._transport._pool._socket_options == (
+                adapter._anthropic_socket_options()
+            )
+        finally:
+            await client.close()

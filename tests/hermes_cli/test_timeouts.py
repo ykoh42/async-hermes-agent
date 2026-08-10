@@ -64,15 +64,16 @@ async def test_provider_timeout_helpers_fail_open(monkeypatch):
 
 
 
-def test_anthropic_adapter_honors_timeout_kwarg():
+@pytest.mark.asyncio
+async def test_anthropic_adapter_honors_timeout_kwarg():
     """build_anthropic_client(timeout=X) overrides the 900s default read timeout."""
     pytest = __import__("pytest")
     anthropic = pytest.importorskip("anthropic")  # skip if optional SDK missing
     from agent.anthropic_adapter import build_anthropic_client
 
-    c_default = build_anthropic_client("sk-ant-dummy", None)
-    c_custom = build_anthropic_client("sk-ant-dummy", None, timeout=45.0)
-    c_invalid = build_anthropic_client("sk-ant-dummy", None, timeout=-1)
+    c_default = await build_anthropic_client("sk-ant-dummy", None)
+    c_custom = await build_anthropic_client("sk-ant-dummy", None, timeout=45.0)
+    c_invalid = await build_anthropic_client("sk-ant-dummy", None, timeout=-1)
 
     # Default stays at 900s; custom overrides; invalid falls back to default
     assert c_default.timeout.read == 900.0
@@ -81,6 +82,9 @@ def test_anthropic_adapter_honors_timeout_kwarg():
     # Connect timeout always stays at 10s regardless
     assert c_default.timeout.connect == 10.0
     assert c_custom.timeout.connect == 10.0
+    await c_default.close()
+    await c_custom.close()
+    await c_invalid.close()
 
 
 @pytest.mark.asyncio

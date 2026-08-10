@@ -269,10 +269,14 @@ async def test_main_anthropic_transport_refreshes_minimax_before_request(
     )
     monkeypatch.setattr(auth, "resolve_minimax_oauth_runtime_credentials", resolve)
     fresh_client = object()
+
+    async def build_fresh_client(*_args, **_kwargs):
+        return fresh_client
+
     monkeypatch.setattr(
         anthropic_adapter,
         "build_anthropic_client",
-        lambda *_args, **_kwargs: fresh_client,
+        build_fresh_client,
     )
     create = AsyncMock(return_value="response")
     monkeypatch.setattr(anthropic_adapter, "create_anthropic_message", create)
@@ -337,10 +341,14 @@ async def test_auxiliary_minimax_uses_native_anthropic_client(monkeypatch):
     )
     monkeypatch.setattr(auth, "resolve_minimax_oauth_runtime_credentials", resolve)
     native_client = object()
+
+    async def build_native_client(*_args, **_kwargs):
+        return native_client
+
     monkeypatch.setattr(
         anthropic_adapter,
         "build_anthropic_client",
-        lambda *_args, **_kwargs: native_client,
+        build_native_client,
     )
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",

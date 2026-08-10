@@ -186,16 +186,23 @@ async def _materialize_httpx_proxy(proxy: Any) -> Any:
     )
 
 
-async def _create_httpx_client(**kwargs: Any) -> Any:
+async def _create_httpx_client(
+    *,
+    _client_factory: Any = None,
+    _transport_options: Any = None,
+    **kwargs: Any,
+) -> Any:
     """Construct an AsyncClient after native-async TLS and proxy setup."""
     import httpx
     from httpx._config import DEFAULT_LIMITS
     from httpx._utils import get_environment_proxies
 
     client_kwargs = dict(kwargs)
+    client_factory = _client_factory or httpx.AsyncClient
+    transport_options = dict(_transport_options or {})
     custom_transport = client_kwargs.get("transport")
     if custom_transport is not None and client_kwargs.get("proxy") is None:
-        return httpx.AsyncClient(**client_kwargs)
+        return client_factory(**client_kwargs)
 
     trust_env = bool(client_kwargs.get("trust_env", True))
     cert = client_kwargs.pop("cert", None)
@@ -212,6 +219,7 @@ async def _create_httpx_client(**kwargs: Any) -> Any:
     owned_transports = []
     if custom_transport is None:
         default_transport = httpx.AsyncHTTPTransport(
+            **transport_options,
             verify=verify,
             trust_env=trust_env,
             http1=http1,
@@ -226,6 +234,7 @@ async def _create_httpx_client(**kwargs: Any) -> Any:
         if proxy is not None:
             proxy_config = await _materialize_httpx_proxy(proxy)
             transport = httpx.AsyncHTTPTransport(
+                **transport_options,
                 verify=verify,
                 trust_env=trust_env,
                 http1=http1,
@@ -249,6 +258,7 @@ async def _create_httpx_client(**kwargs: Any) -> Any:
                     continue
                 proxy_config = await _materialize_httpx_proxy(proxy_url)
                 transport = httpx.AsyncHTTPTransport(
+                    **transport_options,
                     verify=verify,
                     trust_env=trust_env,
                     http1=http1,
@@ -263,7 +273,7 @@ async def _create_httpx_client(**kwargs: Any) -> Any:
                 env_mounts.update(mounts)
             client_kwargs["mounts"] = env_mounts
 
-        return httpx.AsyncClient(**client_kwargs)
+        return client_factory(**client_kwargs)
     except BaseException as construction_error:
         async def close_transports() -> None:
             await asyncio.gather(

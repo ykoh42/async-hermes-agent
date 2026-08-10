@@ -166,11 +166,14 @@ class TestMinimaxBetaHeaders:
 
     # -- helper ----------------------------------------------------------
 
-    def _build_and_get_betas(self, api_key, base_url=None):
+    async def _build_and_get_betas(self, api_key, base_url=None):
         """Build client, return the anthropic-beta header string."""
         from agent.anthropic_adapter import build_anthropic_client
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client(api_key, base_url=base_url)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, patch(
+            "agent.anthropic_adapter._build_anthropic_default_http_client",
+            new=AsyncMock(return_value=AsyncMock()),
+        ):
+            await build_anthropic_client(api_key, base_url=base_url)
             kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             headers = kwargs.get("default_headers", {})
             return headers.get("anthropic-beta", "")
@@ -178,7 +181,7 @@ class TestMinimaxBetaHeaders:
     # -- MiniMax global --------------------------------------------------
 
     async def test_minimax_global_omits_tool_streaming(self):
-        betas = self._build_and_get_betas(
+        betas = await self._build_and_get_betas(
             "mm-key-123", base_url="https://api.minimax.io/anthropic"
         )
         assert self._TOOL_BETA not in betas

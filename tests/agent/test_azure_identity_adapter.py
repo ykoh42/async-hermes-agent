@@ -117,7 +117,7 @@ async def test_async_bearer_hook_replaces_conflicting_headers(adapter):
         assert "x-api-key" not in request.headers
         return httpx.Response(200, json={"ok": True})
 
-    client = module.build_bearer_http_client(
+    client = await module.build_bearer_http_client(
         provider,
         transport=httpx.MockTransport(endpoint),
         headers={"Authorization": "Bearer stale", "api-key": "stale"},
@@ -204,7 +204,7 @@ async def test_anthropic_foundry_uses_async_bearer_client(adapter, monkeypatch):
         lambda: SimpleNamespace(AsyncAnthropic=AsyncAnthropic),
     )
 
-    client = anthropic_adapter.build_anthropic_client(
+    client = await anthropic_adapter.build_anthropic_client(
         provider,
         "https://resource.services.ai.azure.com/anthropic",
     )
