@@ -17,17 +17,15 @@ application supplies its own service or UI boundary.
 
 ## 1. Install the current verified release
 
-The v0.20.4 GitHub release has a verified source tag. Install it directly
-until the PyPI Trusted Publisher is configured for this repository:
+The v0.20.4 GitHub release has a verified source tag. Install it directly:
 
 ```bash
 uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
 ```
 
 The package metadata for this release is `async-hermes-agent==0.20.4`.
-PyPI publication is intentionally not presented as complete until the package
-is visible at `pypi.org/project/async-hermes-agent/` and a clean install has
-been verified there.
+PyPI publication is not enabled for this distribution; use the GitHub release
+or a reviewed source checkout.
 
 ## 2. Or install from a checkout
 

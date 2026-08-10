@@ -45,8 +45,8 @@ uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
 ```
 
 The package metadata for this release is `async-hermes-agent==0.20.4`.
-Use the PyPI path only after `async-hermes-agent` is visible on PyPI and the
-clean-install check has passed.
+PyPI publication is not enabled for this distribution; use the GitHub release
+or a reviewed source checkout.
 
 Installing a Git tag or source checkout is also supported. This site does not
 claim a Homebrew, desktop-installer, container-image, or system-service

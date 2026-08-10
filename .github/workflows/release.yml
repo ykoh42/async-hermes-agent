@@ -1,4 +1,4 @@
-name: Publish Python package
+name: Build GitHub release
 
 on:
   release:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pypi-${{ github.event.release.tag_name }}
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
@@ -88,6 +88,34 @@ jobs:
           assert inspect.iscoroutinefunction(AIAgent.run_conversation)
           assert inspect.iscoroutinefunction(AIAgent.chat)
           assert inspect.iscoroutinefunction(AIAgent.close)
+          assert not hasattr(AIAgent, 'arun_conversation')
+          assert not hasattr(AIAgent, 'aclose')
+
+          from agent.trajectory import save_trajectory
+          from batch_runner import BatchRunner
+          from hermes_state import SessionDB
+          from mini_swe_runner import MiniSWERunner
+          from model_tools import get_tool_definitions, handle_function_call
+          from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
+          from tools.skills_tool import skill_view, skills_list
+          from trajectory_compressor import TrajectoryCompressor
+
+          retained_coroutines = (
+              save_trajectory,
+              BatchRunner.run,
+              SessionDB.close,
+              MiniSWERunner.run_task,
+              MiniSWERunner.run_batch,
+              get_tool_definitions,
+              handle_function_call,
+              discover_mcp_tools,
+              shutdown_mcp_servers,
+              skill_view,
+              skills_list,
+              TrajectoryCompressor.close,
+              TrajectoryCompressor.compress_trajectory,
+          )
+          assert all(inspect.iscoroutinefunction(fn) for fn in retained_coroutines)
           PY
 
           uv venv .release-hindsight-venv --python 3.11
@@ -105,6 +133,9 @@ jobs:
           assert inspect.iscoroutinefunction(HindsightMemoryProvider.shutdown)
           PY
 
+      - name: Generate distribution checksums
+        run: cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS
+
       - name: Upload distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -113,21 +144,21 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
+  attach:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      id-token: write
-    environment:
-      name: pypi
-      url: https://pypi.org/p/async-hermes-agent
+      contents: write
     steps:
-      - name: Download distributions
+      - name: Download verified distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: python-distributions
           path: dist/
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - name: Attach distributions to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

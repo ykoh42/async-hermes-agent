@@ -56,7 +56,23 @@ def test_release_workflow_installs_ripgrep_before_testing_source():
     assert "sudo apt-get install --yes ripgrep" in workflow[install_step:test_step]
 
 
-def test_release_documentation_uses_current_pypi_version():
+def test_release_workflow_attaches_distributions_without_pypi_publish():
+    """GitHub releases must remain installable without attempting PyPI writes."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'gh release upload "$RELEASE_TAG" dist/* --clobber' in workflow
+    assert "sha256sum *.whl *.tar.gz > SHA256SUMS" in workflow
+    assert "attach:\n    needs: build" in workflow
+    assert workflow.count("contents: write") == 1
+    assert "permissions:\n  contents: read" in workflow
+    assert "gh-action-pypi-publish" not in workflow
+    assert "upload.pypi.org" not in workflow
+    assert "id-token: write" not in workflow
+
+
+def test_release_documentation_uses_current_package_version():
     """Published install snippets must match the Python package version."""
     project_version = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
