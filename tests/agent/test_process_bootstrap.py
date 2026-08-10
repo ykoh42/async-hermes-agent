@@ -158,6 +158,159 @@ assert not cold_imports, cold_imports
     )
 
 
+def test_retained_state_memory_skill_and_mcp_paths_do_not_cold_import():
+    _run_fresh_interpreter(
+        """
+import asyncio
+import builtins
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+workspace = tempfile.TemporaryDirectory(prefix="async-hermes-retained-import-")
+os.environ["HERMES_HOME"] = workspace.name
+skill_dir = Path(workspace.name) / "skills" / "cold-skill"
+skill_dir.mkdir(parents=True)
+(skill_dir / "SKILL.md").write_text(
+    "---\\nname: cold-skill\\ndescription: cold audit\\n---\\n"
+    "Use native async.\\n"
+)
+
+from hermes_state import SessionDB
+from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
+from tools.memory_tool import MemoryStore
+from tools.skills_tool import skill_view, skills_list
+
+original_import = builtins.__import__
+cold_imports = []
+
+
+def audit_import(name, globals=None, locals=None, fromlist=(), level=0):
+    loaded_before = set(sys.modules)
+    result = original_import(name, globals, locals, fromlist, level)
+    cold_imports.extend(sorted(set(sys.modules) - loaded_before))
+    return result
+
+
+async def main():
+    database = SessionDB(Path(workspace.name) / "state.db")
+    store = MemoryStore()
+    builtins.__import__ = audit_import
+    try:
+        session_id = await database.create_session("cold-session", "test")
+        assert session_id == "cold-session"
+        assert (await database.get_session(session_id))["id"] == session_id
+        await store.load_from_disk()
+        assert (await store.add("memory", "cold memory"))["success"]
+        assert json.loads(await skills_list())["count"] == 1
+        assert json.loads(await skill_view("cold-skill"))["success"]
+        assert await discover_mcp_tools() == []
+    finally:
+        try:
+            await shutdown_mcp_servers()
+            await database.close()
+        finally:
+            builtins.__import__ = original_import
+
+
+asyncio.run(main())
+workspace.cleanup()
+assert not cold_imports, cold_imports
+"""
+    )
+
+
+def test_subagent_plugin_lifecycle_does_not_use_source_file_loader():
+    _run_fresh_interpreter(
+        """
+import asyncio
+import importlib._bootstrap_external as bootstrap_external
+import os
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+workspace = tempfile.TemporaryDirectory(prefix="async-hermes-subagent-import-")
+os.environ["HERMES_HOME"] = workspace.name
+
+from agent.subagent_lifecycle import SubagentLaunchRequest, SubagentLifecycleService
+import tools.delegate_tool as delegate_tool
+
+
+class Child:
+    _subagent_id = "sa-cold-audit"
+    _delegate_role = "leaf"
+    _delegate_depth = 1
+    provider = "test"
+    model = "test-model"
+    session_id = "child-cold-audit"
+
+    async def close(self):
+        return None
+
+
+async def build_child(**_kwargs):
+    return Child()
+
+
+async def run_child(*_args, **_kwargs):
+    return {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "ok",
+        "api_calls": 1,
+        "duration_seconds": 0.01,
+        "_child_role": "leaf",
+        "_child_cost_usd": 0.0,
+    }
+
+
+delegate_tool._build_child_agent = build_child
+delegate_tool._run_single_child = run_child
+
+repo_root = Path(delegate_tool.__file__).resolve().parent.parent
+venv_root = Path(sys.prefix).resolve()
+source_reads = []
+original_get_data = bootstrap_external.SourceFileLoader.get_data
+
+
+def audit_get_data(loader, path):
+    resolved = Path(os.fsdecode(path)).resolve()
+    if resolved.is_relative_to(repo_root) and not resolved.is_relative_to(venv_root):
+        source_reads.append(str(resolved))
+    return original_get_data(loader, path)
+
+
+async def main():
+    parent = SimpleNamespace(
+        session_id="parent-cold-audit",
+        enabled_toolsets=["file"],
+        _current_turn_id="turn-cold-audit",
+        session_estimated_cost_usd=0.0,
+        session_cost_source="none",
+        session_cost_status="unknown",
+    )
+    service = SubagentLifecycleService(lambda: parent)
+    bootstrap_external.SourceFileLoader.get_data = audit_get_data
+    try:
+        handle = await service.launch(SubagentLaunchRequest(goal="audit"))
+        terminal = await service.wait(handle, timeout_seconds=5)
+        assert terminal.completed
+        assert "plugins.browser.browser_use.provider" in sys.modules
+    finally:
+        bootstrap_external.SourceFileLoader.get_data = original_get_data
+
+
+asyncio.run(main())
+workspace.cleanup()
+assert not source_reads, source_reads
+"""
+    )
+
+
 def test_process_bootstrap_preloads_installed_optional_provider_sdks():
     _run_fresh_interpreter(
         """

@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+from hermes_cli import plugins as _plugins_bootstrap  # noqa: F401
+from tools import delegate_tool as _delegate_tool_bootstrap  # noqa: F401
 
 PUBLIC_CONTRACT_VERSION = 1
 _MAX_GOAL_CHARS = 16_000

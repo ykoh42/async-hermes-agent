@@ -12,6 +12,7 @@ second synchronous filesystem read.
 from __future__ import annotations
 
 import importlib.abc
+import importlib.machinery
 import importlib.util
 import sys
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ class _SourceRecord:
     source: str
     filename: str
     is_package: bool
+    search_path: str | None = None
+    is_namespace: bool = False
 
 
 class _MemorySourceLoader(importlib.abc.Loader):
@@ -58,13 +61,28 @@ class _MemorySourceFinder(importlib.abc.MetaPathFinder):
         record = self._records.get(fullname)
         if record is None:
             return None
+        if record.is_namespace:
+            spec = importlib.machinery.ModuleSpec(
+                fullname,
+                loader=None,
+                is_package=True,
+            )
+            spec.submodule_search_locations = [record.search_path or record.filename]
+            return spec
         loader = _MemorySourceLoader(fullname, record)
-        return importlib.util.spec_from_loader(
+        spec = importlib.util.spec_from_loader(
             fullname,
             loader,
             origin=record.filename,
             is_package=record.is_package,
         )
+        if (
+            spec is not None
+            and spec.submodule_search_locations is not None
+            and record.search_path is not None
+        ):
+            spec.submodule_search_locations[:] = [record.search_path]
+        return spec
 
 
 async def _read_source(path: Path) -> str:
@@ -138,6 +156,7 @@ async def _package_source_records(
             source=await _read_source(package_init),
             filename=str(package_init),
             is_package=True,
+            search_path=str(package_init.parent),
         )
         package_dir = package_init.parent
         for child_name in sorted(await aiofiles.os.listdir(package_dir)):
@@ -167,7 +186,51 @@ async def _package_source_records(
     return records
 
 
-async def load_source_package(module_name: str, init_file: Path) -> ModuleType:
+async def _package_alias_records(
+    alias_name: str,
+    init_file: Path,
+) -> dict[str, _SourceRecord]:
+    """Read one package tree under its normal import name.
+
+    Bundled plugin entry modules are executed in the isolated
+    ``hermes_plugins`` namespace, but some upstream plugins intentionally use
+    absolute imports from their canonical ``plugins.<category>`` package.
+    Register those source records with the same in-memory finder, including
+    their package parents, so the absolute import preserves its original
+    module identity without returning to ``SourceFileLoader``.
+    """
+    records = await _package_source_records(alias_name, init_file)
+    alias_parts = alias_name.split(".")
+    package_dir = init_file.parent
+    for depth in range(1, len(alias_parts)):
+        parent_name = ".".join(alias_parts[:-depth])
+        parent_dir = package_dir.parents[depth - 1]
+        parent_init = parent_dir / "__init__.py"
+        has_init = await aiofiles.os.path.isfile(parent_init)
+        if has_init:
+            source = await _read_source(parent_init)
+            filename = str(parent_init)
+        elif await aiofiles.os.path.isdir(parent_dir):
+            source = ""
+            filename = str(parent_dir)
+        else:
+            continue
+        records[parent_name] = _SourceRecord(
+            source=source,
+            filename=filename,
+            is_package=True,
+            search_path=str(parent_dir),
+            is_namespace=not has_init,
+        )
+    return records
+
+
+async def load_source_package(
+    module_name: str,
+    init_file: Path,
+    *,
+    source_alias: str | None = None,
+) -> ModuleType:
     """Load a directory package after an async source-read phase.
 
     The returned package remains backed by its in-memory finder.  This matters
@@ -176,6 +239,8 @@ async def load_source_package(module_name: str, init_file: Path) -> ModuleType:
     ``SourceFileLoader`` after discovery has completed.
     """
     records = await _package_source_records(module_name, init_file)
+    if source_alias is not None:
+        records.update(await _package_alias_records(source_alias, init_file))
     finder = _MemorySourceFinder(records)
     modules_before = set(sys.modules)
     sys.meta_path.insert(0, finder)
@@ -197,9 +262,7 @@ async def load_source_package(module_name: str, init_file: Path) -> ModuleType:
         spec.loader.exec_module(module)  # type: ignore[union-attr]
     except BaseException:
         for loaded_name in tuple(sys.modules):
-            if loaded_name in modules_before:
-                continue
-            if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+            if loaded_name not in modules_before and loaded_name in records:
                 sys.modules.pop(loaded_name, None)
         try:
             sys.meta_path.remove(finder)

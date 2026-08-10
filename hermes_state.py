@@ -2,6 +2,7 @@
 """Native-async SQLite session state for Hermes Agent."""
 
 import asyncio
+import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
 import datetime
 import errno
 import hashlib
@@ -29,6 +30,8 @@ from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from agent.session_activity import ActivityProvenance
 from agent.skill_commands import describe_skill_invocation
+from hermes_cli import config as _config_bootstrap  # noqa: F401
+from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,

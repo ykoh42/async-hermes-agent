@@ -67,6 +67,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
 import inspect
 import json
 import logging
@@ -83,7 +84,10 @@ import aiofiles
 import aiofiles.os
 
 from agent import skill_preprocessing as _skill_preprocessing
+from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
 from tools import path_security as _path_security
+from tools import skill_manager_tool as _skill_manager_bootstrap  # noqa: F401
+from tools import skill_provenance as _skill_provenance_bootstrap  # noqa: F401
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (

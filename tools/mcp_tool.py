@@ -83,6 +83,7 @@ Thread safety:
 """
 
 import asyncio
+import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
 import contextvars
 import errno
 import fnmatch
@@ -107,6 +108,8 @@ from urllib.parse import urlparse
 
 import aiofiles
 import aiofiles.os
+
+from hermes_cli import config as _config_bootstrap  # noqa: F401
 
 from tools.registry import tool_error
 from tools.interrupt import is_interrupted

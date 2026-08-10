@@ -455,6 +455,62 @@ class TestPluginLoading:
                     sys.modules.pop(name, None)
 
     @pytest.mark.asyncio
+    async def test_bundled_absolute_imports_use_async_source_loader(
+        self, tmp_path, monkeypatch
+    ):
+        """Canonical bundled imports must execute from pre-read source."""
+        from importlib._bootstrap_external import SourceFileLoader
+        from hermes_cli.async_source_loader import unload_source_finder
+
+        plugins_dir = tmp_path / "plugins"
+        category_dir = plugins_dir / "browser"
+        plugin_dir = category_dir / "absolute_plugin"
+        plugin_dir.mkdir(parents=True)
+        (plugins_dir / "__init__.py").write_text("")
+        (plugin_dir / "provider.py").write_text("VALUE = 'canonical'\n")
+        (plugin_dir / "__init__.py").write_text(
+            "from plugins.browser.absolute_plugin.provider import VALUE\n"
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_llm_call', lambda **kwargs: VALUE)\n"
+        )
+        manifest = PluginManifest(
+            name="absolute-plugin",
+            source="bundled",
+            path=str(plugin_dir),
+            kind="backend",
+            key="browser/absolute_plugin",
+        )
+
+        for name in tuple(sys.modules):
+            if name == "plugins" or name.startswith("plugins.browser"):
+                sys.modules.pop(name, None)
+
+        original_get_data = SourceFileLoader.get_data
+
+        def reject_plugin_sync_reads(loader, path):
+            if str(path).startswith(str(plugins_dir)):
+                raise AssertionError(f"synchronous plugin read: {path}")
+            return original_get_data(loader, path)
+
+        monkeypatch.setattr(SourceFileLoader, "get_data", reject_plugin_sync_reads)
+        manager = PluginManager()
+        module = await manager._load_directory_module(manifest)
+        try:
+            assert module.VALUE == "canonical"
+            assert sys.modules["plugins.browser"].__spec__.origin is None
+            canonical = sys.modules["plugins.browser.absolute_plugin.provider"]
+            assert canonical.__loader__.__class__.__name__ == "_MemorySourceLoader"
+        finally:
+            unload_source_finder(module)
+            for name in tuple(sys.modules):
+                if (
+                    name.startswith("hermes_plugins.browser__absolute_plugin")
+                    or name == "plugins"
+                    or name.startswith("plugins.browser")
+                ):
+                    sys.modules.pop(name, None)
+
+    @pytest.mark.asyncio
     async def test_async_skill_registration_validates_path_after_register(
         self, tmp_path, monkeypatch
     ):

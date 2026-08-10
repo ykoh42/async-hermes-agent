@@ -48,6 +48,30 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 import aiofiles
 import aiofiles.os
 
+# Bundled backend modules execute from async-preloaded source during discovery,
+# but their imports of stable core ABCs/registries and an installed optional
+# SDK still use Python's synchronous import protocol.  Prime that fixed import
+# graph when the plugin subsystem itself is imported, before its awaited
+# discovery boundary, so registration remains CPU-only on the event loop.
+from agent import browser_provider as _browser_provider_bootstrap  # noqa: F401
+from agent import browser_registry as _browser_registry_bootstrap  # noqa: F401
+from agent import image_gen_provider as _image_gen_provider_bootstrap  # noqa: F401
+from agent import image_gen_registry as _image_gen_registry_bootstrap  # noqa: F401
+from agent import secret_scope as _secret_scope_bootstrap  # noqa: F401
+from agent import video_gen_provider as _video_gen_provider_bootstrap  # noqa: F401
+from agent import video_gen_registry as _video_gen_registry_bootstrap  # noqa: F401
+from agent import web_search_provider as _web_search_provider_bootstrap  # noqa: F401
+from agent import web_search_registry as _web_search_registry_bootstrap  # noqa: F401
+from hermes_cli import profiles as _profiles_bootstrap  # noqa: F401
+from tools import url_safety as _url_safety_bootstrap  # noqa: F401
+from tools import website_policy as _website_policy_bootstrap  # noqa: F401
+from tools import xai_http as _xai_http_bootstrap  # noqa: F401
+
+try:
+    import parallel as _parallel_bootstrap  # noqa: F401
+except Exception:
+    _parallel_bootstrap = None
+
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
@@ -1469,8 +1493,18 @@ class PluginManager:
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
         module_name = f"{_NS_PARENT}.{slug}"
+        source_alias = None
+        if manifest.source == "bundled":
+            key_parts = key.split("/")
+            alias_parts = ("plugins", *plugin_dir.parts[-len(key_parts):])
+            if all(part.isidentifier() for part in alias_parts):
+                source_alias = ".".join(alias_parts)
         try:
-            module = await load_source_package(module_name, init_file)
+            module = await load_source_package(
+                module_name,
+                init_file,
+                source_alias=source_alias,
+            )
         except asyncio.CancelledError:
             for loaded_name in tuple(sys.modules):
                 if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):

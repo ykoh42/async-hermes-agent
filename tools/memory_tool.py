@@ -24,6 +24,7 @@ Design:
 """
 
 import asyncio
+import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
 import json
 import logging
 import time
