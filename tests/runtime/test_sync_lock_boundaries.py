@@ -22,6 +22,7 @@ _SOURCE_FILES = (
     "batch_runner.py",
     "hermes_state.py",
     "hermes_state_portability.py",
+    "hermes_state_schema.py",
     "trajectory_compressor.py",
 )
 

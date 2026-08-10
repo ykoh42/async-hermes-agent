@@ -80,6 +80,7 @@ model_tools.py               tool dispatch
 tools/                       retained tool implementations and MCP client
 hermes_state.py              async SQLite-backed session state
 hermes_state_portability.py  async session export and import
+hermes_state_schema.py       async schema migrations and FTS DDL
 mini_swe_runner.py           single-task trajectory runner
 batch_runner.py              bounded concurrent dataset runner
 trajectory_compressor.py     trajectory post-processing

@@ -260,6 +260,7 @@ uv run pytest -q
 uv run ruff check agent tools hermes_cli plugins providers \
   run_agent.py model_tools.py mini_swe_runner.py batch_runner.py hermes_state.py \
   hermes_state_portability.py \
+  hermes_state_schema.py \
   trajectory_compressor.py
 uv build
 ```

@@ -52,6 +52,7 @@ from hermes_state_common import (
     _sql_session_last_active_by_id,
 )
 from hermes_state_portability import SessionPortabilityMixin
+from hermes_state_schema import SessionSchemaMixin
 
 logger = logging.getLogger(__name__)
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1124,7 +1125,7 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """A normal writer collided with another writer's live compression lease."""
 
 
-class SessionDB(SessionPortabilityMixin):
+class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
     """Native-async session store used by the agent turn path.
 
     The constructor accepts a database path. The SQLite connection and schema
@@ -2008,6 +2009,8 @@ class SessionDB(SessionPortabilityMixin):
                             connection,
                             include_trigram=self._trigram_available,
                         )
+            if self._fts_enabled:
+                await self._migrate_broad_fts_update_triggers(connection)
         else:
             await self._drop_fts_triggers(connection)
         version_row = await (
