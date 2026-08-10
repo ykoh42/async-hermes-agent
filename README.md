@@ -84,6 +84,11 @@ Select `memory.provider: honcho` in `config.yaml`; connection, identity,
 cadence, and session settings are documented in the
 [Honcho provider guide](plugins/memory/honcho/README.md).
 
+OpenViking uses the core native-async HTTP transport and needs no Python
+extra. Server setup, provider configuration, async lifecycle, recall, and tool
+behavior are documented in the
+[OpenViking provider guide](plugins/memory/openviking/README.md).
+
 ## Skills, MCP, and memory
 
 Skills follow the existing Hermes layout. `HERMES_HOME` defaults to
