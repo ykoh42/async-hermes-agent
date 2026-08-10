@@ -60,7 +60,7 @@ jobs:
         run: uv lock --check
 
       - name: Install project and test dependencies
-        run: uv sync --locked --python 3.11 --extra dev --extra bedrock
+        run: uv sync --locked --python 3.11 --extra dev --extra bedrock --extra hindsight
 
       - name: Test released source
         run: scripts/run_tests.sh -j 4 -- -q -W error::pytest.PytestUnhandledThreadExceptionWarning
@@ -88,6 +88,21 @@ jobs:
           assert inspect.iscoroutinefunction(AIAgent.run_conversation)
           assert inspect.iscoroutinefunction(AIAgent.chat)
           assert inspect.iscoroutinefunction(AIAgent.close)
+          PY
+
+          uv venv .release-hindsight-venv --python 3.11
+          uv pip install --python .release-hindsight-venv/bin/python "${wheel}[hindsight]"
+          .release-hindsight-venv/bin/python - <<'PY'
+          import inspect
+
+          from hindsight_client import Hindsight
+          from plugins.memory.hindsight import HindsightMemoryProvider
+
+          assert inspect.iscoroutinefunction(Hindsight.aretain_batch)
+          assert inspect.iscoroutinefunction(Hindsight.arecall)
+          assert inspect.iscoroutinefunction(Hindsight.areflect)
+          assert inspect.iscoroutinefunction(HindsightMemoryProvider.initialize)
+          assert inspect.iscoroutinefunction(HindsightMemoryProvider.shutdown)
           PY
 
       - name: Upload distributions

@@ -71,7 +71,12 @@ uv sync --extra anthropic
 uv sync --extra vertex
 uv sync --extra azure-identity
 uv sync --extra supermemory
+uv sync --extra hindsight
 ```
+
+The Hindsight extra covers cloud and local-external modes. Its
+`local_embedded` mode additionally requires the upstream `hindsight-all`
+runtime.
 
 ## Skills, MCP, and memory
 
