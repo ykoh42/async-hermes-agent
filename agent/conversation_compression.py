@@ -442,10 +442,10 @@ class CompressionCommitFence:
         """Whether pending or future commit admission has been revoked."""
         return self._cancelled or self._admission_revoked
 
-    async def revoke_commit_admission(self) -> bool:
+    async def revoke_commit_admission(self) -> None:
         """Prevent future commit admission, waiting out an active commit."""
         self._admission_revoked = True
-        return await self.cancel_before_commit()
+        await self.cancel_before_commit()
 
 
 def resolve_context_compression_timeouts(
@@ -615,12 +615,12 @@ async def run_compress_context_with_progress_timeout(
                 )
             return messages, await _resolve_fallback_prompt()
     except asyncio.CancelledError:
-        cancellation_won = await fence.revoke_commit_admission()
-        if cancellation_won:
+        await fence.revoke_commit_admission()
+        if fence._commit_started:
+            await _wait_for_commit()
+        else:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        else:
-            await _wait_for_commit()
         raise
     finally:
         if cancel_task is not None:

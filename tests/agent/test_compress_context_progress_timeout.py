@@ -154,6 +154,49 @@ async def test_host_cancellation_revokes_commit_and_propagates():
 
 
 @pytest.mark.asyncio
+async def test_revoke_commit_admission_preserves_upstream_none_result():
+    fence = CompressionCommitFence()
+    assert await fence.revoke_commit_admission() is None
+    assert fence.is_cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_host_cancellation_waits_out_an_admitted_commit():
+    commit_started = asyncio.Event()
+    finish_commit = asyncio.Event()
+    commit_finished = asyncio.Event()
+
+    async def worker(fence: CompressionCommitFence):
+        assert await fence.begin_commit()
+        commit_started.set()
+        try:
+            await finish_commit.wait()
+            return ["committed"], "updated"
+        finally:
+            fence.finish_commit()
+            commit_finished.set()
+
+    host = asyncio.create_task(
+        run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=[],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=30,
+            total_ceiling_seconds=60,
+        )
+    )
+    await commit_started.wait()
+    host.cancel()
+    await asyncio.sleep(0)
+    assert not host.done()
+
+    finish_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await host
+    assert commit_finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_timeout_resolves_callable_fallback_only_after_cancellation():
     fallback = Mock(return_value="lazy-fallback")
 
