@@ -22,6 +22,41 @@ def test_process_bootstrap_preloads_httpcore_in_a_fresh_interpreter():
     )
 
 
+def test_mini_swe_runner_preloads_client_dependencies_before_event_loop():
+    _run_fresh_interpreter(
+        """
+import asyncio
+import os
+import sys
+from unittest.mock import patch
+
+from mini_swe_runner import MiniSWERunner
+
+assert "agent.process_bootstrap" in sys.modules
+
+
+async def main():
+    runner = MiniSWERunner(
+        model="test/model",
+        base_url="http://127.0.0.1:1/v1",
+        api_key="test-key",
+    )
+    with patch.object(
+        os,
+        "listdir",
+        side_effect=AssertionError("synchronous directory scan in event loop"),
+    ):
+        client = await runner._ensure_client()
+    assert client is runner.client
+    await runner._close_owned_client()
+    assert runner.client is None
+
+
+asyncio.run(main())
+"""
+    )
+
+
 def test_process_bootstrap_preloads_installed_optional_provider_sdks():
     _run_fresh_interpreter(
         """

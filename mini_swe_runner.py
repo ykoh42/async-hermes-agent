@@ -23,13 +23,13 @@ from typing import List, Dict, Any, Optional, cast
 
 import aiofiles
 import aiofiles.os
-from openai import AsyncOpenAI
 
 from agent.auxiliary_client import (
     OMIT_TEMPERATURE,
     _fixed_temperature_for_model,
     resolve_provider_client,
 )
+from agent.process_bootstrap import OpenAI as AsyncOpenAI
 from agent.tool_dispatch_helpers import make_tool_result_message
 from hermes_cli.env_loader import load_hermes_dotenv
 from tools.environments.local import LocalEnvironment
