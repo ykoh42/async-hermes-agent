@@ -77,6 +77,25 @@ async def test_all_profiles_register():
 
 
 @pytest.mark.asyncio
+async def test_copilot_acp_profile_preserves_upstream_discovery_contract():
+    _clear_provider_caches()
+    from providers import get_provider_profile
+
+    profile = await get_provider_profile("copilot-acp")
+
+    assert profile is not None
+    assert profile.name == "copilot-acp"
+    assert profile.aliases == ("github-copilot-acp", "copilot-acp-agent")
+    assert profile.api_mode == "chat_completions"
+    assert profile.env_vars == ()
+    assert profile.base_url == "acp://copilot"
+    assert profile.auth_type == "external_process"
+    assert await profile.fetch_models() is None
+    assert await get_provider_profile("github-copilot-acp") is profile
+    assert await get_provider_profile("copilot-acp-agent") is profile
+
+
+@pytest.mark.asyncio
 async def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
     """A user plugin with the same name must override the bundled profile."""
     # Point HERMES_HOME at a fresh temp dir
