@@ -1511,24 +1511,24 @@ async def test_plugin_context_engine_suppresses_codex_threshold_autoraise(
 
 
 
-def test_api_timeout_resolution_uses_the_constructor_snapshot(monkeypatch):
-    """Core request construction must not reread provider settings mid-turn."""
+@pytest.mark.asyncio
+async def test_api_timeout_resolution_rereads_provider_settings(monkeypatch):
+    """Core request construction preserves upstream per-call config lookup."""
     import run_agent
 
-    def fail_if_settings_are_read(*_args, **_kwargs):
-        raise AssertionError("a native async turn must use its timeout snapshot")
-
-    monkeypatch.setattr(run_agent, "get_provider_request_timeout", fail_if_settings_are_read)
-    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", fail_if_settings_are_read)
+    request_timeout = AsyncMock(return_value=42.0)
+    stale_timeout = AsyncMock(return_value=84.0)
+    monkeypatch.setattr(run_agent, "get_provider_request_timeout", request_timeout)
+    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", stale_timeout)
     agent = SimpleNamespace(
-        _provider_request_timeout=42.0,
-        _provider_stale_timeout=84.0,
         provider="custom",
         model="test-model",
     )
 
-    assert AIAgent._resolved_api_call_timeout(agent) == 42.0
-    assert AIAgent._resolved_api_call_stale_timeout_base(agent) == (84.0, False)
+    assert await AIAgent._resolved_api_call_timeout(agent) == 42.0
+    assert await AIAgent._resolved_api_call_stale_timeout_base(agent) == (84.0, False)
+    request_timeout.assert_awaited_once_with("custom", "test-model")
+    stale_timeout.assert_awaited_once_with("custom", "test-model")
 
 
 @pytest.mark.asyncio

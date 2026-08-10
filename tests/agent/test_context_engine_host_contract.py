@@ -122,14 +122,14 @@ async def test_reset_session_state_rebinds_builtin_compressor_after_session_swit
     await agent.reset_session_state()
 
     assert compressor._session_id == "new-sid"
-    assert compressor.get_active_compression_failure_cooldown() is None
+    assert await compressor.get_active_compression_failure_cooldown() is None
     assert compressor._fallback_compression_streak == 0
     assert await db.get_compression_failure_cooldown("old-sid") is not None
     assert await db.get_compression_fallback_streak("old-sid") == 2
 
     compressor._record_compression_failure_cooldown(30.0, "new-timeout")
 
-    assert compressor.get_active_compression_failure_cooldown() is not None
+    assert await compressor.get_active_compression_failure_cooldown() is not None
     assert await db.get_compression_failure_cooldown("new-sid") is None
     assert (await db.get_compression_failure_cooldown("old-sid"))["error"] == "old-timeout"
     await db.close()

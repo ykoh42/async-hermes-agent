@@ -102,7 +102,7 @@ class TestCompressNoOpRegistersIneffective:
         await comp.compress(messages, current_tokens=73_000)
 
         assert comp._ineffective_compression_count >= 2
-        assert not comp.should_compress(73_000), (
+        assert not await comp.should_compress(73_000), (
             "should_compress should return False after 2+ ineffective compressions"
         )
 
@@ -172,12 +172,13 @@ class TestEffectiveCompressionResetsCounter:
 class TestAntiThrashing:
     """Directly test the should_compress anti-thrashing guard."""
 
-    def test_ineffective_count_2_blocks(self):
+    @pytest.mark.asyncio
+    async def test_ineffective_count_2_blocks(self):
         """_ineffective_compression_count >= 2 -> should_compress returns False."""
         comp = _make_compressor(config_context_length=96000)
         comp.last_prompt_tokens = 73_000
         comp._ineffective_compression_count = 2
-        assert not comp.should_compress(73_000)
+        assert not await comp.should_compress(73_000)
 
 
 
@@ -192,13 +193,14 @@ class TestCooldownGuard:
     every turn (inserting a fallback marker repeatedly) and freezes the CLI.
     """
 
-    def test_active_cooldown_blocks(self):
+    @pytest.mark.asyncio
+    async def test_active_cooldown_blocks(self):
         """A future cooldown deadline -> should_compress returns False even
         when tokens are over threshold."""
         comp = _make_compressor(config_context_length=96000)
         comp.last_prompt_tokens = 73_000
         comp._summary_failure_cooldown_until = time.monotonic() + 60
-        assert not comp.should_compress(73_000)
+        assert not await comp.should_compress(73_000)
 
 
 

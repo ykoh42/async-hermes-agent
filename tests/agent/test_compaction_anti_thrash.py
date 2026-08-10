@@ -70,7 +70,7 @@ async def _turn(cc, msgs, real_prompt_tokens):
     real count -- not inside should_compress(), which is called twice per turn
     with two different measures. Returns (msgs, did_compact).
     """
-    if not cc.should_compress(real_prompt_tokens):
+    if not await cc.should_compress(real_prompt_tokens):
         return msgs, False
     msgs = await cc.compress(msgs, current_tokens=real_prompt_tokens)
     cc._verify_compaction_cleared_threshold = True
@@ -128,7 +128,7 @@ class TestFutilityGuard:
                 msgs.append({"role": "user", "content": "next " + "w" * 4000})
 
         assert cc._ineffective_compression_count >= 2
-        assert not cc.should_compress(real_prompt_tokens), (
+        assert not await cc.should_compress(real_prompt_tokens), (
             "compaction that cannot clear the threshold must stop"
         )
         assert fired <= 3, f"expected the loop to break early, compacted {fired}x"
@@ -162,7 +162,7 @@ class TestFutilityGuard:
         msgs = _messages(160, size=2500)
 
         real_prompt = floor + int(skew * estimate_messages_tokens_rough(msgs))
-        assert cc.should_compress(real_prompt)
+        assert await cc.should_compress(real_prompt)
         msgs = await cc.compress(msgs, current_tokens=real_prompt)
         real_after = floor + int(skew * estimate_messages_tokens_rough(msgs))
         cc._verify_compaction_cleared_threshold = True

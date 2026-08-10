@@ -1,5 +1,6 @@
 import asyncio
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -47,6 +48,16 @@ def test_session_source_ignores_process_global_legacy_value(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "legacy-global")
 
     assert _session_source_for_agent("web") == "web"
+
+
+def test_session_source_restores_upstream_env_fallback_on_context_error(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "legacy-global")
+
+    with patch(
+        "gateway.session_context.get_session_env",
+        side_effect=RuntimeError("context unavailable"),
+    ):
+        assert _session_source_for_agent("web") == "legacy-global"
 
 
 def test_set_session_vars_preserves_upstream_positional_order(tmp_path):

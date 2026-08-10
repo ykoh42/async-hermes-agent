@@ -65,18 +65,21 @@ class TestSummarizeToolResultWebExtract:
 
 
 class TestShouldCompress:
-    def test_below_threshold(self, compressor):
+    @pytest.mark.asyncio
+    async def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000
-        assert compressor.should_compress() is False
+        assert await compressor.should_compress() is False
 
-    def test_above_threshold(self, compressor):
+    @pytest.mark.asyncio
+    async def test_above_threshold(self, compressor):
         compressor.last_prompt_tokens = 90000
-        assert compressor.should_compress() is True
+        assert await compressor.should_compress() is True
 
 
-    def test_explicit_tokens(self, compressor):
-        assert compressor.should_compress(prompt_tokens=90000) is True
-        assert compressor.should_compress(prompt_tokens=50000) is False
+    @pytest.mark.asyncio
+    async def test_explicit_tokens(self, compressor):
+        assert await compressor.should_compress(prompt_tokens=90000) is True
+        assert await compressor.should_compress(prompt_tokens=50000) is False
 
 
 
@@ -1808,7 +1811,8 @@ class TestThresholdTokensCap:
             )
             assert comp_str.threshold_tokens_cap is None
 
-    def test_should_compress_fires_at_cap_below_ratio_threshold(self):
+    @pytest.mark.asyncio
+    async def test_should_compress_fires_at_cap_below_ratio_threshold(self):
         """Behavioral: with a cap below the ratio-based threshold,
         should_compress() fires once usage crosses the cap — even though
         the percentage threshold has not been reached (first-fires-wins)."""
@@ -1818,9 +1822,9 @@ class TestThresholdTokensCap:
                 threshold_tokens_cap=200_000,
             )
         # Ratio-based would be 500K; cap pulls the trigger down to 200K.
-        assert comp.should_compress(150_000) is False   # below cap
-        assert comp.should_compress(200_000) is True    # at cap (below 500K pct)
-        assert comp.should_compress(250_000) is True    # above cap
+        assert await comp.should_compress(150_000) is False   # below cap
+        assert await comp.should_compress(200_000) is True    # at cap (below 500K pct)
+        assert await comp.should_compress(250_000) is True    # above cap
 
     def test_default_config_disabled_and_no_behavior_change(self):
         """DEFAULT_CONFIG ships threshold_tokens=None (disabled) and both

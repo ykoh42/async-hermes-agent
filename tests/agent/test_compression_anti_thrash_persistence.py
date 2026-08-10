@@ -73,13 +73,13 @@ class TestCounterRoundTripsBindSessionState:
             first.update_from_response({"prompt_tokens": first.threshold_tokens + 1})
         await _persist_compression_guards(first, db, "s1")
         assert first._ineffective_compression_count == 2
-        assert first.should_compress(10**9) is False
+        assert await first.should_compress(10**9) is False
 
         # Process restart: a brand-new compressor binds the same session.
         second = await _compressor(db, "s1")
         assert second.compression_count == 0  # the #54923 precondition
         assert second._ineffective_compression_count == 2
-        assert second.should_compress(10**9) is False, (
+        assert await second.should_compress(10**9) is False, (
             "a fresh compressor on a resumed session must inherit the "
             "tripped anti-thrash guard instead of re-compacting"
         )
@@ -129,7 +129,7 @@ class TestResetSemanticsPreserved:
         # And a restart sees the cleared state.
         fresh = await _compressor(db, "s1")
         assert fresh._ineffective_compression_count == 0
-        assert fresh.should_compress(10**9) is True
+        assert await fresh.should_compress(10**9) is True
         await db.close()
 
     @pytest.mark.asyncio

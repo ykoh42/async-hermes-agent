@@ -15,8 +15,26 @@ from agent.chat_completion_helpers import interruptible_streaming_api_call
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 
 
+_TIMEOUT_AGENTS = {}
+
+
+@pytest.fixture(autouse=True)
+def _provider_timeout_config(monkeypatch):
+    _TIMEOUT_AGENTS.clear()
+
+    async def configured_timeout(provider, _model):
+        agent = _TIMEOUT_AGENTS.get(provider)
+        return getattr(agent, "_provider_stale_timeout", None)
+
+    monkeypatch.setattr(
+        "hermes_cli.timeouts.get_provider_stale_timeout", configured_timeout
+    )
+    yield
+    _TIMEOUT_AGENTS.clear()
+
+
 def _retry_agent(execute):
-    return SimpleNamespace(
+    agent = SimpleNamespace(
         _execute_model_request=execute,
         api_mode="chat_completions",
         _provider_stale_timeout=0.1,
@@ -43,9 +61,12 @@ def _retry_agent(execute):
         _safe_print=MagicMock(),
         _fire_stream_delta=MagicMock(),
         base_url="https://api.example.test/v1",
-        provider="test-provider",
+        provider="",
         model="test-model",
     )
+    agent.provider = f"test-provider-{id(agent)}"
+    _TIMEOUT_AGENTS[agent.provider] = agent
+    return agent
 
 
 @pytest.mark.asyncio

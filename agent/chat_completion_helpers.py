@@ -339,7 +339,9 @@ async def _interruptible_codex_api_call(agent: Any, api_kwargs: dict) -> Any:
     """Run the upstream Codex internal stream with its three watchdogs."""
     compute_timeout = getattr(agent, "_compute_non_stream_stale_timeout", None)
     stale_timeout = (
-        compute_timeout(api_kwargs) if callable(compute_timeout) else float("inf")
+        await compute_timeout(api_kwargs)
+        if callable(compute_timeout)
+        else float("inf")
     )
     estimated_tokens = estimate_request_context_tokens(api_kwargs)
     openai_codex_backend = _is_openai_codex_backend(agent)
@@ -614,7 +616,7 @@ async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
     if callable(touch_activity):
         touch_activity("waiting for non-streaming API response")
     compute_timeout = getattr(agent, "_compute_non_stream_stale_timeout", None)
-    timeout = compute_timeout(api_kwargs) if callable(compute_timeout) else None
+    timeout = await compute_timeout(api_kwargs) if callable(compute_timeout) else None
     timeout_scope = asyncio.timeout(
         timeout if timeout is not None and math.isfinite(timeout) else None
     )
@@ -1255,7 +1257,16 @@ async def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     → local-endpoint allowance → context-size scaling → reasoning-model floor.
     Every native async provider shares the same patience budget.
     """
-    _cfg_stale = getattr(agent, "_provider_stale_timeout", None)
+    from hermes_cli.timeouts import get_provider_stale_timeout
+
+    provider = getattr(agent, "provider", "") or ""
+    model = (
+        getattr(agent, "model", "")
+        or api_kwargs.get("model")
+        or api_kwargs.get("modelId")
+        or ""
+    )
+    _cfg_stale = await get_provider_stale_timeout(provider, model)
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -1485,7 +1496,7 @@ async def build_api_kwargs(
             session_id=getattr(agent, "session_id", None),
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
-            timeout=agent._resolved_api_call_timeout(),
+            timeout=await agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
@@ -1584,7 +1595,7 @@ async def build_api_kwargs(
             messages=api_messages,
             tools=tools_for_api,
             base_url=agent.base_url,
-            timeout=agent._resolved_api_call_timeout(),
+            timeout=await agent._resolved_api_call_timeout(),
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
@@ -1616,7 +1627,7 @@ async def build_api_kwargs(
         messages=_msgs_for_chat,
         tools=tools_for_api,
         base_url=agent.base_url,
-        timeout=agent._resolved_api_call_timeout(),
+        timeout=await agent._resolved_api_call_timeout(),
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,

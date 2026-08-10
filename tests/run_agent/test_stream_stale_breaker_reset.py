@@ -27,13 +27,21 @@ from run_agent import AIAgent
 def _native_request_agent(execute, *, stale_timeout=0.05):
     return SimpleNamespace(
         _execute_model_request=execute,
-        _compute_non_stream_stale_timeout=lambda _payload: stale_timeout,
+        _compute_non_stream_stale_timeout=AsyncMock(return_value=stale_timeout),
         _provider_stale_timeout=stale_timeout,
         _consecutive_stale_streams=0,
         _current_streamed_assistant_text="",
         _touch_activity=MagicMock(),
         base_url="https://api.example.test/v1",
+        provider="test-provider",
         model="test-model",
+    )
+
+
+def _stream_timeout_config(agent):
+    return patch(
+        "hermes_cli.timeouts.get_provider_stale_timeout",
+        new=AsyncMock(return_value=agent._provider_stale_timeout),
     )
 
 
@@ -93,7 +101,10 @@ async def test_provider_timeout_does_not_increment_stale_watchdog_streak():
         raise TimeoutError("provider stream timeout")
 
     stream_agent = _native_request_agent(stream_timeout)
-    with pytest.raises(TimeoutError, match="provider stream timeout"):
+    with (
+        _stream_timeout_config(stream_agent),
+        pytest.raises(TimeoutError, match="provider stream timeout"),
+    ):
         await interruptible_streaming_api_call(stream_agent, {})
     assert stream_agent._consecutive_stale_streams == 0
 
@@ -160,7 +171,8 @@ async def test_stream_activity_reschedules_idle_timeout():
     agent = _native_request_agent(execute, stale_timeout=0.05)
     agent._consecutive_stale_streams = 2
 
-    assert await interruptible_streaming_api_call(agent, {}) is response
+    with _stream_timeout_config(agent):
+        assert await interruptible_streaming_api_call(agent, {}) is response
     assert agent._consecutive_stale_streams == 0
 
 
@@ -178,7 +190,10 @@ async def test_stream_idle_timeout_retries_and_increments_streak_per_attempt():
 
     agent = _native_request_agent(execute, stale_timeout=0.01)
 
-    with pytest.raises(TimeoutError, match="produced no chunks"):
+    with (
+        _stream_timeout_config(agent),
+        pytest.raises(TimeoutError, match="produced no chunks"),
+    ):
         await interruptible_streaming_api_call(agent, {})
 
     assert cancelled.is_set()
@@ -251,10 +266,11 @@ async def test_chat_stream_stale_returns_partial_stub_and_closes_stream():
 
     agent._fire_stream_delta = record_delta
 
-    response = await interruptible_streaming_api_call(
-        agent,
-        {"model": "test-model", "messages": []},
-    )
+    with _stream_timeout_config(agent):
+        response = await interruptible_streaming_api_call(
+            agent,
+            {"model": "test-model", "messages": []},
+        )
 
     assert response.id == PARTIAL_STREAM_STUB_ID
     assert response.choices[0].message.content == "partial answer"
@@ -362,10 +378,11 @@ async def test_chat_stream_stale_surfaces_dropped_tool_after_visible_text():
 
     agent._fire_stream_delta = record_delta
 
-    response = await interruptible_streaming_api_call(
-        agent,
-        {"model": "test-model", "messages": []},
-    )
+    with _stream_timeout_config(agent):
+        response = await interruptible_streaming_api_call(
+            agent,
+            {"model": "test-model", "messages": []},
+        )
 
     warning = (
         "⚠ Stream stalled mid tool-call (terminal); the action was not "

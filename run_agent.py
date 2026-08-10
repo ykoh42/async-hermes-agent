@@ -105,9 +105,12 @@ async def _launch_cwd_for_session(source: str) -> Optional[str]:
 
 
 def _session_source_for_agent(platform: Optional[str]) -> str:
-    from gateway.session_context import get_session_env
+    try:
+        from gateway.session_context import get_session_env
 
-    source = get_session_env("HERMES_SESSION_SOURCE", "")
+        source = get_session_env("HERMES_SESSION_SOURCE", "")
+    except Exception:
+        source = os.environ.get("HERMES_SESSION_SOURCE", "")
     source = str(source or "").strip()
     if source:
         return source
@@ -1433,7 +1436,7 @@ class AIAgent:
             return False
         return hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com")
 
-    def _resolved_api_call_timeout(self) -> float:
+    async def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
 
         Priority:
@@ -1448,12 +1451,12 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = getattr(self, "_provider_request_timeout", None)
+        cfg = await get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
 
-    def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
+    async def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
 
         Priority:
@@ -1471,7 +1474,7 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = getattr(self, "_provider_stale_timeout", None)
+        cfg = await get_provider_stale_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg, False
 
@@ -1494,7 +1497,7 @@ class AIAgent:
 
         return 90.0, True
 
-    def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
+    async def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request.
 
         Accepts either the full ``api_kwargs`` dict (Chat Completions or
@@ -1502,7 +1505,9 @@ class AIAgent:
         applies the same way to both shapes via
         :func:`agent.chat_completion_helpers.estimate_request_context_tokens`.
         """
-        stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
+        stale_base, uses_implicit_default = (
+            await self._resolved_api_call_stale_timeout_base()
+        )
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
@@ -1862,24 +1867,16 @@ class AIAgent:
         task_id: Optional[str] = None,
         tool_call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Build provenance metadata for external memory-provider mirrors."""
-        metadata: Dict[str, Any] = {
-            "write_origin": write_origin or getattr(
-                self, "_memory_write_origin", "assistant_tool"
-            ),
-            "execution_context": execution_context or getattr(
-                self, "_memory_write_context", "foreground"
-            ),
-            "session_id": self.session_id or "",
-            "parent_session_id": self._parent_session_id or "",
-            "platform": _session_source_for_agent(self.platform),
-            "tool_name": "memory",
-        }
-        if task_id:
-            metadata["task_id"] = task_id
-        if tool_call_id:
-            metadata["tool_call_id"] = tool_call_id
-        return {key: value for key, value in metadata.items() if value not in {None, ""}}
+        """Forwarder — see ``agent.background_review.build_memory_write_metadata``."""
+        from agent.background_review import build_memory_write_metadata
+
+        return build_memory_write_metadata(
+            self,
+            write_origin=write_origin,
+            execution_context=execution_context,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+        )
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
@@ -3513,8 +3510,8 @@ class AIAgent:
                 prefix
                 + "the turn was stopped because session storage could not be "
                 "written (the transcript would have been lost on restart). "
-                "Check disk space / permissions for the state DB, then send "
-                "your message again."
+                "This is often a full disk — free some space (or fix state.db "
+                "permissions), then send your message again."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.

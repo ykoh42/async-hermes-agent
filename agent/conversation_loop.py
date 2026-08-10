@@ -99,6 +99,13 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+
+async def _await_engine_result(value: Any) -> Any:
+    """Await native-async engines while retaining pure synchronous plugins."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -2064,11 +2071,13 @@ async def run_conversation(
                 "should_defer_preflight_to_real_usage",
                 lambda _tokens: False,
             )
-            _compression_cooldown = getattr(
-                _compressor,
-                "get_active_compression_failure_cooldown",
-                lambda: None,
-            )()
+            _compression_cooldown = await _await_engine_result(
+                getattr(
+                    _compressor,
+                    "get_active_compression_failure_cooldown",
+                    lambda: None,
+                )()
+            )
         else:
             # Resolving ContextCompressor.threshold_tokens can live-probe a
             # provider's /models endpoint. A disabled compressor must be a
@@ -2114,7 +2123,9 @@ async def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and await _await_engine_result(
+                _compressor.should_compress(request_pressure_tokens)
+            )
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
@@ -2219,8 +2230,10 @@ async def run_conversation(
             # #62625).
             _block_reason = None
             try:
-                _block_reason = _compressor.should_compress_info(
-                    request_pressure_tokens
+                _block_reason = (
+                    await _await_engine_result(
+                        _compressor.should_compress_info(request_pressure_tokens)
+                    )
                 )[1]
             except Exception:
                 _block_reason = None
@@ -6476,7 +6489,9 @@ async def run_conversation(
                 if (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
-                    and _compressor.should_compress(_real_tokens)
+                    and await _await_engine_result(
+                        _compressor.should_compress(_real_tokens)
+                    )
                 ):
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was
@@ -6520,7 +6535,9 @@ async def run_conversation(
                     _info = getattr(_compressor, "should_compress_info", None)
                     if _info is not None:
                         try:
-                            _block_reason = _info(_real_tokens)[1]
+                            _block_reason = (
+                                await _await_engine_result(_info(_real_tokens))
+                            )[1]
                         except Exception:
                             _block_reason = None
                     if _block_reason:

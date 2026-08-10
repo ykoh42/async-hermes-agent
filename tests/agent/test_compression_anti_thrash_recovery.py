@@ -58,34 +58,35 @@ def _trip(cc: ContextCompressor) -> None:
 
 class TestRecoveryWindow:
 
-
-    def test_effective_probe_clears_the_guard_completely(self):
+    @pytest.mark.asyncio
+    async def test_effective_probe_clears_the_guard_completely(self):
         cc = _compressor()
         _trip(cc)
         base = 1000.0
         with patch("agent.context_compressor.time.monotonic", return_value=base):
-            assert cc.should_compress(cc.threshold_tokens + 1) is False
+            assert await cc.should_compress(cc.threshold_tokens + 1) is False
         with patch(
             "agent.context_compressor.time.monotonic",
             return_value=base + cc._ANTI_THRASH_RECOVERY_SECONDS + 1,
         ):
-            assert cc.should_compress(cc.threshold_tokens + 1) is True
+            assert await cc.should_compress(cc.threshold_tokens + 1) is True
             cc._verify_compaction_cleared_threshold = True
             cc.update_from_response({"prompt_tokens": cc.threshold_tokens - 500})
         assert cc._ineffective_compression_count == 0
         assert cc._anti_thrash_recovery_deadline == 0.0
 
-    def test_fallback_streak_breaker_recovers_too(self):
+    @pytest.mark.asyncio
+    async def test_fallback_streak_breaker_recovers_too(self):
         cc = _compressor()
         cc._fallback_compression_streak = 2
         base = 1000.0
         with patch("agent.context_compressor.time.monotonic", return_value=base):
-            assert cc.should_compress(cc.threshold_tokens + 1) is False
+            assert await cc.should_compress(cc.threshold_tokens + 1) is False
         with patch(
             "agent.context_compressor.time.monotonic",
             return_value=base + cc._ANTI_THRASH_RECOVERY_SECONDS + 1,
         ):
-            assert cc.should_compress(cc.threshold_tokens + 1) is True
+            assert await cc.should_compress(cc.threshold_tokens + 1) is True
         assert cc._fallback_compression_streak == 1
 
 
@@ -107,12 +108,12 @@ class TestRestartSemantics:
         assert cc._anti_thrash_recovery_deadline == 0.0
         base = 5000.0
         with patch("agent.context_compressor.time.monotonic", return_value=base):
-            assert cc.should_compress(cc.threshold_tokens + 1) is False
+            assert await cc.should_compress(cc.threshold_tokens + 1) is False
         with patch(
             "agent.context_compressor.time.monotonic",
             return_value=base + cc._ANTI_THRASH_RECOVERY_SECONDS + 1,
         ):
-            assert cc.should_compress(cc.threshold_tokens + 1) is True
+            assert await cc.should_compress(cc.threshold_tokens + 1) is True
         await _persist_compression_guards(cc, db, "sess-1")
         # The probation reset is durable, so sibling agents on the same
         # session row (gateway hygiene) unblock too.
@@ -125,7 +126,7 @@ class TestRestartSemantics:
         _trip(cc)
         base = 1000.0
         with patch("agent.context_compressor.time.monotonic", return_value=base):
-            assert cc.should_compress(cc.threshold_tokens + 1) is False
+            assert await cc.should_compress(cc.threshold_tokens + 1) is False
         assert cc._anti_thrash_recovery_deadline > 0.0
         await cc.on_session_reset()
         assert cc._anti_thrash_recovery_deadline == 0.0

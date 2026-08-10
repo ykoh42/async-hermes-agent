@@ -44,25 +44,25 @@ def _make_compressor(**kwargs) -> ContextCompressor:
 
 class TestShouldCompressInfo:
 
-
-    def test_cooldown_reports_reason(self):
+    @pytest.mark.asyncio
+    async def test_cooldown_reports_reason(self):
         comp = _make_compressor()
         comp.last_prompt_tokens = 73_000
         comp._summary_failure_cooldown_until = time.monotonic() + 60
-        should, reason = comp.should_compress_info(73_000)
+        should, reason = await comp.should_compress_info(73_000)
         assert should is False
         assert reason is not None
         assert reason.startswith("cooldown:")
 
 
 
-    def test_should_compress_bool_shim_unchanged(self):
-        """should_compress() must still return a bare bool for existing
-        callers in conversation_loop.py (and/or chains)."""
+    @pytest.mark.asyncio
+    async def test_should_compress_returns_bool(self):
+        """Awaiting should_compress() returns the upstream bare bool shape."""
         comp = _make_compressor()
         comp.last_prompt_tokens = 73_000
         comp._summary_failure_cooldown_until = time.monotonic() + 60
-        result = comp.should_compress(73_000)
+        result = await comp.should_compress(73_000)
         assert result is False
         assert not isinstance(result, tuple)
 

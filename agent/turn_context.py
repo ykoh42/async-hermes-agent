@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 import uuid
@@ -52,6 +53,13 @@ from tools import hook_output_spill as _hook_output_spill
 from tools import mcp_tool as _mcp_tool
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_engine_result(value: Any) -> Any:
+    """Await native-async engines while retaining pure synchronous plugins."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def compose_user_api_content(
@@ -688,9 +696,13 @@ async def build_turn_context(
             _idle_floor = int(
                 _compressor.threshold_tokens * _compressor.summary_target_ratio
             )
-            _idle_cooldown = getattr(
-                _compressor, "get_active_compression_failure_cooldown", lambda: None
-            )()
+            _idle_cooldown = await _await_engine_result(
+                getattr(
+                    _compressor,
+                    "get_active_compression_failure_cooldown",
+                    lambda: None,
+                )()
+            )
             if _should_idle_compact(
                 enabled=agent.compression_enabled,
                 idle_after_seconds=_idle_after,
@@ -790,11 +802,13 @@ async def build_turn_context(
             if _last >= 0 and _preflight_tokens > _last:
                 _compressor.last_prompt_tokens = _preflight_tokens
 
-        _compression_cooldown = getattr(
-            _compressor,
-            "get_active_compression_failure_cooldown",
-            lambda: None,
-        )()
+        _compression_cooldown = await _await_engine_result(
+            getattr(
+                _compressor,
+                "get_active_compression_failure_cooldown",
+                lambda: None,
+            )()
+        )
 
         _should_compress_now = False
         _compress_block_reason = None
@@ -819,7 +833,9 @@ async def build_turn_context(
                 _cooldown_secs = _compression_cooldown.get("remaining_seconds", 0.0)
                 _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            _should_compress_now = await _await_engine_result(
+                _compressor.should_compress(_preflight_tokens)
+            )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -830,7 +846,9 @@ async def build_turn_context(
                 _info = getattr(_compressor, "should_compress_info", None)
                 if callable(_info):
                     try:
-                        _compress_block_reason = _info(_preflight_tokens)[1]
+                        _compress_block_reason = (
+                            await _await_engine_result(_info(_preflight_tokens))
+                        )[1]
                     except Exception:
                         _compress_block_reason = None
         if _should_compress_now:
@@ -918,7 +936,9 @@ async def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                if not await _await_engine_result(
+                    _compressor.should_compress(_preflight_tokens)
+                ):
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,

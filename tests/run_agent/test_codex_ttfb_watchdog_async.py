@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,7 +20,7 @@ def _codex_agent(execute, *, stale_timeout: float = 1.0):
         _base_url_lower="https://chatgpt.com/backend-api/codex",
         _base_url_hostname="chatgpt.com",
         _execute_model_request=execute,
-        _compute_non_stream_stale_timeout=lambda _payload: stale_timeout,
+        _compute_non_stream_stale_timeout=AsyncMock(return_value=stale_timeout),
         _consecutive_stale_streams=0,
         _codex_silent_hang_hint=lambda **_kwargs: "Try gpt-5.4 instead.",
         _touch_activity=MagicMock(),

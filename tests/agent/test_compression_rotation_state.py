@@ -386,7 +386,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
         agent = _build_agent_with_db(db, session_id, platform="telegram")
         compressor = _bound_context_compressor(db, session_id)
         await _hydrate_persisted_compression_guards(compressor, db, session_id)
-        assert compressor.get_active_compression_failure_cooldown() is not None
+        assert await compressor.get_active_compression_failure_cooldown() is not None
 
         # A successful forced retry on another agent clears the durable row.
         # This prebound compressor must not keep honoring its stale local timer.
@@ -409,7 +409,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
             )
 
         assert returned is messages
-        assert compressor.get_active_compression_failure_cooldown() is None
+        assert await compressor.get_active_compression_failure_cooldown() is None
         compress.assert_called_once()
         assert await db.get_compression_lock_holder(session_id) is None
         await agent.close()
@@ -443,7 +443,7 @@ class TestGateLevelGuardRefresh:
         await db.set_compression_fallback_streak(session_id, 0)
         await _hydrate_persisted_compression_guards(compressor, db, session_id)
 
-        assert compressor.should_compress(10**9) is True
+        assert await compressor.should_compress(10**9) is True
         assert compressor._fallback_compression_streak == 0
 
     @pytest.mark.asyncio
@@ -461,7 +461,7 @@ class TestGateLevelGuardRefresh:
             "_refresh_durable_guards",
             side_effect=AssertionError("hot path must not refresh"),
         ):
-            assert compressor._automatic_compression_blocked() is False
+            assert await compressor._automatic_compression_blocked() is False
 
 
 class TestCooldownPersistFailureIsNotAClearedRow:
@@ -492,17 +492,17 @@ class TestCooldownPersistFailureIsNotAClearedRow:
             compressor._record_compression_failure_cooldown(60, "rate limited")
             await _persist_compression_guards(compressor, db, session_id)
 
-        state = compressor.get_active_compression_failure_cooldown()
+        state = await compressor.get_active_compression_failure_cooldown()
         assert state is not None
         assert compressor._summary_failure_cooldown_until > 0
-        assert compressor._automatic_compression_blocked() is True
+        assert await compressor._automatic_compression_blocked() is True
 
         # Once a durable round-trip succeeds, the DB is authoritative again.
         compressor._record_compression_failure_cooldown(30, "retry later")
         await _persist_compression_guards(compressor, db, session_id)
         await db.clear_compression_failure_cooldown(session_id)
         await _hydrate_persisted_compression_guards(compressor, db, session_id)
-        assert compressor.get_active_compression_failure_cooldown() is None
+        assert await compressor.get_active_compression_failure_cooldown() is None
         assert compressor._summary_failure_cooldown_until == 0.0
 
     @pytest.mark.asyncio
@@ -521,14 +521,14 @@ class TestCooldownPersistFailureIsNotAClearedRow:
         await _hydrate_persisted_compression_guards(compressor, db, session_id)
         assert compressor._ineffective_compression_count == 2
 
-        assert compressor._automatic_compression_blocked() is True
+        assert await compressor._automatic_compression_blocked() is True
 
         # Another agent's real prompt reading dipped below the threshold and
         # zeroed the durable counter.
         await db.set_compression_ineffective_count(session_id, 0)
         await _hydrate_persisted_compression_guards(compressor, db, session_id)
 
-        assert compressor._automatic_compression_blocked() is False
+        assert await compressor._automatic_compression_blocked() is False
         assert compressor._ineffective_compression_count == 0
 
 

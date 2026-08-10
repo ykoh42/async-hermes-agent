@@ -72,7 +72,8 @@ def test_estimator_empty_inputs():
 # ── default base + tier scaling ────────────────────────────────────────────
 
 
-def test_default_base_is_90s(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_default_base_is_90s(monkeypatch, tmp_path):
     """Default base stale timeout dropped from 300s to 90s (May 2026)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
@@ -80,7 +81,7 @@ def test_default_base_is_90s(monkeypatch, tmp_path):
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    base, implicit = agent._resolved_api_call_stale_timeout_base()
+    base, implicit = await agent._resolved_api_call_stale_timeout_base()
     assert base == 90.0
     assert implicit is True
 
@@ -111,7 +112,7 @@ providers:
 
     agent = _make_agent(tmp_path)
     await agent._ensure_provider_runtime()
-    assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
+    assert await agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
 
 
 # ── openai-codex gateway-scale stale floor ────────────────────────────────

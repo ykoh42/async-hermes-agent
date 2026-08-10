@@ -1706,12 +1706,14 @@ class ContextCompressor(ContextEngine):
             self._fallback_compression_streak = 0
         self._persist_fallback_compression_streak()
 
-    def get_active_compression_failure_cooldown(
+    async def get_active_compression_failure_cooldown(
         self,
         *,
         refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Return the live compression-failure cooldown for the bound session."""
+        if refresh:
+            self._last_cooldown_refresh_was_authoritative = None
         now_mono = time.monotonic()
         local_state = None
         if self._summary_failure_cooldown_until > now_mono:
@@ -1725,10 +1727,48 @@ class ContextCompressor(ContextEngine):
             if not refresh:
                 return local_state
 
-        # Durable state is hydrated asynchronously before this method is
-        # reached.  Keeping this accessor memory-only makes all synchronous
-        # decision helpers safe to call from the event loop.
-        return local_state
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if not session_db or not session_id:
+            return local_state
+
+        getter = getattr(session_db, "get_compression_failure_cooldown", None)
+        if getter is None:
+            return local_state
+        try:
+            state = await getter(session_id)
+        except Exception as exc:
+            if refresh:
+                self._last_cooldown_refresh_was_authoritative = False
+            logger.debug("compression failure cooldown lookup failed: %s", exc)
+            return local_state
+        if refresh:
+            self._last_cooldown_refresh_was_authoritative = True
+        if not state:
+            if refresh:
+                if local_state is not None and self._cooldown_persist_failed:
+                    return local_state
+                self._summary_failure_cooldown_until = 0.0
+                self._last_summary_error = None
+            return None
+
+        remaining_seconds = float(state.get("remaining_seconds") or 0.0)
+        if remaining_seconds <= 0:
+            if refresh:
+                if local_state is not None and self._cooldown_persist_failed:
+                    return local_state
+                self._summary_failure_cooldown_until = 0.0
+                self._last_summary_error = None
+            return None
+
+        self._summary_failure_cooldown_until = now_mono + remaining_seconds
+        self._last_summary_error = state.get("error")
+        self._cooldown_persist_failed = False
+        return {
+            "cooldown_until": float(state.get("cooldown_until") or 0.0),
+            "remaining_seconds": remaining_seconds,
+            "error": self._last_summary_error,
+        }
 
     def _record_compression_failure_cooldown(
         self,
@@ -2303,7 +2343,7 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    async def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -2315,10 +2355,10 @@ class ContextCompressor(ContextEngine):
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
-        decision, _reason = self.should_compress_info(prompt_tokens)
+        decision, _reason = await self.should_compress_info(prompt_tokens)
         return decision
 
-    def should_compress_info(
+    async def should_compress_info(
         self, prompt_tokens: int = None
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
@@ -2347,7 +2387,7 @@ class ContextCompressor(ContextEngine):
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False, None
-        if self._automatic_compression_blocked():
+        if await self._automatic_compression_blocked():
             return False, self._compression_block_reason() or "blocked"
         return True, None
 
@@ -2373,7 +2413,7 @@ class ContextCompressor(ContextEngine):
             return "ineffective"
         return None
 
-    def _refresh_durable_guards(self) -> None:
+    async def _refresh_durable_guards(self) -> None:
         """Re-read durable cooldown + breaker state from the DB.
 
         Cheap, best-effort, and only called when a gate is about to say
@@ -2384,12 +2424,29 @@ class ContextCompressor(ContextEngine):
         counter has a timer — without a re-read the stale in-memory
         snapshot blocks forever.
         """
-        # Refreshing durable state is an async operation owned by the host.
-        # This method remains as a compatibility hook but deliberately does no
-        # synchronous database work.
-        return
+        try:
+            await self.get_active_compression_failure_cooldown(refresh=True)
+        except Exception as exc:
+            logger.debug("compression cooldown refresh failed: %s", exc)
 
-    def _automatic_compression_blocked(self) -> bool:
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if not session_db or not session_id:
+            return
+        try:
+            self._fallback_compression_streak = await (
+                session_db.get_compression_fallback_streak(session_id)
+            )
+        except Exception as exc:
+            logger.debug("compression fallback-streak refresh failed: %s", exc)
+        try:
+            self._ineffective_compression_count = await (
+                session_db.get_compression_ineffective_count(session_id)
+            )
+        except Exception as exc:
+            logger.debug("compression ineffective-count refresh failed: %s", exc)
+
+    async def _automatic_compression_blocked(self) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
         if not self._automatic_compression_blocked_locally():
             return False
@@ -2400,7 +2457,7 @@ class ContextCompressor(ContextEngine):
         # counter) — so refresh and re-evaluate before letting a stale
         # local block outlive the durable state that justified it. The
         # unblocked hot path above never pays for the DB reads.
-        self._refresh_durable_guards()
+        await self._refresh_durable_guards()
         return self._automatic_compression_blocked_locally()
 
     def _automatic_compression_blocked_locally(self) -> bool:

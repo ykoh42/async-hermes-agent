@@ -11,6 +11,8 @@ Mirrors the construction/patching conventions in test_context_compressor.py.
 
 from unittest.mock import patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor, _PRUNED_TOOL_PLACEHOLDER
 
 LARGE_WINDOW = 1_000_000
@@ -68,11 +70,12 @@ def _tool_by_id(msgs, cid):
     return [m for m in msgs if m.get("role") == "tool" and m.get("tool_call_id") == cid][0]
 
 
-def test_prunes_below_compression_threshold():
+@pytest.mark.asyncio
+async def test_prunes_below_compression_threshold():
     """The whole point: prune fires at 120k tokens, far below the ~500k
     (50% of 1M) full-compression trigger that would otherwise never run."""
     c = _compressor(proactive_prune_tokens=48_000, proactive_prune_min_result_chars=8_000)
-    assert c.should_compress(prompt_tokens=120_000) is False  # compression would NOT run
+    assert await c.should_compress(prompt_tokens=120_000) is False
     msgs = _build(8, big_indices={0, 1, 2})
     result, pruned = c.prune_tool_results_only(msgs, current_tokens=120_000)
     assert pruned >= 3

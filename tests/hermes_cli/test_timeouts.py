@@ -118,7 +118,19 @@ async def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     )
     await agent._ensure_provider_runtime()
     # Per-model override wins
-    assert agent._resolved_api_call_timeout() == 42.0
+    assert await agent._resolved_api_call_timeout() == 42.0
+
+    # Upstream resolves this setting for every API call. Editing config must
+    # affect the next call without rebuilding the agent/provider route.
+    _write_config(tmp_path, """\
+        providers:
+          openrouter:
+            request_timeout_seconds: 77
+            models:
+              openai/gpt-4o-mini:
+                timeout_seconds: 43
+        """)
+    assert await agent._resolved_api_call_timeout() == 43.0
 
     # Provider-level (different model, no per-model override). Runtime timeout
     # policy is resolved when the route is constructed; direct attribute
@@ -134,7 +146,7 @@ async def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
         platform="cli",
     )
     await provider_agent._ensure_provider_runtime()
-    assert provider_agent._resolved_api_call_timeout() == 77.0
+    assert await provider_agent._resolved_api_call_timeout() == 77.0
 
     # Case B: no config → env wins
     _write_config(tmp_path, "")
@@ -149,8 +161,41 @@ async def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
         platform="cli",
     )
     await agent2._ensure_provider_runtime()
-    assert agent2._resolved_api_call_timeout() == 999.0
+    assert await agent2._resolved_api_call_timeout() == 999.0
 
     # Case C: no config, no env → 1800.0 default
     monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
-    assert agent2._resolved_api_call_timeout() == 1800.0
+    assert await agent2._resolved_api_call_timeout() == 1800.0
+
+
+@pytest.mark.asyncio
+async def test_stale_timeout_config_is_reread_per_call(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, """\
+        providers:
+          openrouter:
+            stale_timeout_seconds: 80
+        """)
+
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        model="some/model",
+        provider="openrouter",
+        api_key="sk-dummy",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    assert await agent._resolved_api_call_stale_timeout_base() == (80.0, False)
+
+    _write_config(tmp_path, """\
+        providers:
+          openrouter:
+            stale_timeout_seconds: 81
+        """)
+    assert await agent._resolved_api_call_stale_timeout_base() == (81.0, False)

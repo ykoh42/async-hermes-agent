@@ -661,12 +661,12 @@ async def _persist_compression_guards(
     """Durably write the guard state accumulated by an async compression turn."""
     if session_db is None or not session_id:
         return
+    remaining = max(
+        0.0,
+        float(getattr(compressor, "_summary_failure_cooldown_until", 0.0))
+        - time.monotonic(),
+    )
     try:
-        remaining = max(
-            0.0,
-            float(getattr(compressor, "_summary_failure_cooldown_until", 0.0))
-            - time.monotonic(),
-        )
         if remaining:
             await session_db.record_compression_failure_cooldown(
                 session_id,
@@ -675,6 +675,13 @@ async def _persist_compression_guards(
             )
         else:
             await session_db.clear_compression_failure_cooldown(session_id)
+        compressor._cooldown_persist_failed = False
+    except Exception as exc:
+        if remaining:
+            compressor._cooldown_persist_failed = True
+        logger.debug("async compression cooldown persist failed: %s", exc)
+
+    try:
         await session_db.set_compression_fallback_streak(
             session_id, getattr(compressor, "_fallback_compression_streak", 0)
         )
@@ -682,7 +689,7 @@ async def _persist_compression_guards(
             session_id, getattr(compressor, "_ineffective_compression_count", 0)
         )
     except Exception as exc:
-        logger.debug("async compression guard persist failed: %s", exc)
+        logger.debug("async compression breaker persist failed: %s", exc)
 
 
 async def _session_was_rotated_by_compression(
@@ -1708,7 +1715,10 @@ async def compress_context(
             "_automatic_compression_blocked",
             None,
         )
-        if callable(blocked) and blocked(compressor):
+        blocked_result = blocked(compressor) if callable(blocked) else False
+        if inspect.isawaitable(blocked_result):
+            blocked_result = await blocked_result
+        if blocked_result:
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = await agent._build_system_prompt(system_message)
@@ -2013,7 +2023,10 @@ async def compress_context(
             "_automatic_compression_blocked",
             None,
         )
-        if callable(blocked) and blocked(compressor):
+        blocked_result = blocked(compressor) if callable(blocked) else False
+        if inspect.isawaitable(blocked_result):
+            blocked_result = await blocked_result
+        if blocked_result:
             await _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:

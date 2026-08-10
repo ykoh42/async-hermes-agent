@@ -25,8 +25,7 @@ These tests pin the floor's behavior:
    disable stale detection for a reasoning model running on a local
    NIM endpoint.
 3. The stream stale-timeout resolution (mirrored here as in
-   ``test_stream_read_timeout_floor.py`` because the real builder
-   lives inside a worker thread) consults the floor after the
+   ``test_stream_read_timeout_floor.py``) consults the floor after the
    context-size scaling block, raising the timeout for reasoning
    models without lowering it for non-reasoning models.
 """
@@ -34,6 +33,7 @@ These tests pin the floor's behavior:
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -129,7 +129,8 @@ def _make_agent(tmp_path: Path, **overrides):
 
 
 
-def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
     """GPT-5 (non-reasoning) without env var / config -> 90s default, implicit."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
@@ -138,7 +139,9 @@ def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
 
     # No provider config, no env var, no floor match -> 90s implicit default.
     import run_agent
-    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+    monkeypatch.setattr(
+        run_agent, "get_provider_stale_timeout", AsyncMock(return_value=None)
+    )
 
     agent = _make_agent(
         tmp_path,
@@ -146,12 +149,12 @@ def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
         base_url="https://api.openai.com/v1",
         model="gpt-5.5",
     )
-    base, implicit = agent._resolved_api_call_stale_timeout_base()
+    base, implicit = await agent._resolved_api_call_stale_timeout_base()
     assert base == 90.0
     assert implicit is True
 
 
-# ── stream-side mirror (the real builder lives in a worker thread) ────────
+# ── stream-side mirror ────────────────────────────────────────────────────
 
 
 def _resolve_stream_stale_timeout(
@@ -202,7 +205,5 @@ def test_stream_stale_timeout_floor_for_nemotron_3_ultra():
         est_tokens=10_000,
     )
     assert timeout == 600.0
-
-
 
 
