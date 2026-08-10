@@ -172,7 +172,7 @@ async def _get_env_config() -> dict[str, Any]:
     }
 
 
-def _resolve_container_task_id(task_id: str | None = None) -> str:
+def _resolve_container_task_id(task_id: str | None) -> str:
     """Normalize task ids without collapsing independent local sessions."""
     return str(task_id or "default")
 

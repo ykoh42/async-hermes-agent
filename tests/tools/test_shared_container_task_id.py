@@ -19,6 +19,11 @@ def test_none_task_id_maps_to_default():
     assert terminal_tool._resolve_container_task_id(None) == "default"
 
 
+def test_task_id_argument_remains_required():
+    with pytest.raises(TypeError):
+        terminal_tool._resolve_container_task_id()
+
+
 def test_empty_task_id_maps_to_default():
     assert terminal_tool._resolve_container_task_id("") == "default"
 
