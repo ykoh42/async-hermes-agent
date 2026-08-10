@@ -57,6 +57,107 @@ asyncio.run(main())
     )
 
 
+def test_agent_provider_init_does_not_cold_import_inside_event_loop():
+    _run_fresh_interpreter(
+        """
+import asyncio
+import builtins
+import os
+import sys
+import tempfile
+
+workspace = tempfile.TemporaryDirectory(prefix="async-hermes-import-audit-")
+os.environ["HERMES_HOME"] = workspace.name
+
+from run_agent import AIAgent
+
+original_import = builtins.__import__
+cold_imports = []
+
+
+def audit_import(name, globals=None, locals=None, fromlist=(), level=0):
+    loaded_before = set(sys.modules)
+    result = original_import(name, globals, locals, fromlist, level)
+    cold_imports.extend(sorted(set(sys.modules) - loaded_before))
+    return result
+
+
+async def main():
+    agent = None
+    builtins.__import__ = audit_import
+    try:
+        agent = AIAgent(
+            provider="openrouter",
+            model="test/model",
+            base_url="http://127.0.0.1:1/v1",
+            api_key="test-key",
+            enabled_toolsets=["terminal"],
+            quiet_mode=True,
+        )
+        assert await agent._ensure_provider_runtime()
+    finally:
+        try:
+            if agent is not None:
+                await agent.close()
+        finally:
+            builtins.__import__ = original_import
+
+
+asyncio.run(main())
+workspace.cleanup()
+assert not cold_imports, cold_imports
+"""
+    )
+
+
+def test_terminal_lifecycle_does_not_cold_import_inside_event_loop():
+    _run_fresh_interpreter(
+        """
+import asyncio
+import builtins
+import json
+import os
+import sys
+import tempfile
+
+workspace = tempfile.TemporaryDirectory(prefix="async-hermes-terminal-import-")
+os.environ["HERMES_HOME"] = workspace.name
+
+from tools.terminal_tool import cleanup_vm, terminal_tool
+
+original_import = builtins.__import__
+cold_imports = []
+
+
+def audit_import(name, globals=None, locals=None, fromlist=(), level=0):
+    loaded_before = set(sys.modules)
+    result = original_import(name, globals, locals, fromlist, level)
+    cold_imports.extend(sorted(set(sys.modules) - loaded_before))
+    return result
+
+
+async def main():
+    builtins.__import__ = audit_import
+    try:
+        result = await terminal_tool(
+            "printf ASYNC_COLD_TOOL",
+            task_id="cold-import-audit",
+        )
+        assert json.loads(result)["output"] == "ASYNC_COLD_TOOL"
+    finally:
+        try:
+            await cleanup_vm("cold-import-audit")
+        finally:
+            builtins.__import__ = original_import
+
+
+asyncio.run(main())
+workspace.cleanup()
+assert not cold_imports, cold_imports
+"""
+    )
+
+
 def test_process_bootstrap_preloads_installed_optional_provider_sdks():
     _run_fresh_interpreter(
         """

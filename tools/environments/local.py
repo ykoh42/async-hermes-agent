@@ -21,7 +21,19 @@ from typing import Any, Awaitable, Callable
 import aiofiles
 import aiofiles.os
 
+# Prime modules used by retained local imports before subprocess async paths run.
+import hermes_constants as _hermes_constants  # noqa: F401
+
 from agent.delegation_context import delegated_child_subprocess_env
+
+try:
+    from gateway import session_context as _session_context_bootstrap  # noqa: F401
+except Exception:
+    _session_context_bootstrap = None
+try:
+    from tools import env_passthrough as _env_passthrough_bootstrap  # noqa: F401
+except Exception:
+    _env_passthrough_bootstrap = None
 
 
 logger = logging.getLogger(__name__)

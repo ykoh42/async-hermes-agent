@@ -26,6 +26,9 @@ import aiofiles
 import aiofiles.os
 import yaml
 
+# Keep local import/fallback behavior while avoiding cold imports in async paths.
+from gateway import session_context as _session_context_bootstrap  # noqa: F401
+from tools import ansi_strip as _ansi_strip_bootstrap  # noqa: F401
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)

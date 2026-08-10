@@ -23,6 +23,8 @@ from weakref import WeakKeyDictionary
 import aiofiles.os
 import aiosqlite
 
+# Keep the local import patch point below, but load its module before async use.
+from agent import coding_context as _coding_context_bootstrap  # noqa: F401
 from hermes_constants import get_hermes_home
 
 

@@ -26,6 +26,10 @@ import sys
 import urllib.request
 from typing import Any, Optional
 
+# AnyIO selects its asyncio backend through a synchronous first-use import.
+# Prime that mandatory backend beside the HTTP clients before a request starts.
+from anyio._backends import _asyncio as _AnyioAsyncioBackendBootstrap  # noqa: F401
+
 # ``AsyncOpenAI.chat`` lazily imports the complete OpenAI resources package on
 # first access.  If that import is deferred until the first model request, the
 # importlib filesystem walk runs inside the event loop and can pause every

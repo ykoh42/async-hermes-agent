@@ -32,6 +32,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+# These retained modules are imported dynamically below so their attributes
+# remain patchable at the original locations.  Load the modules themselves at
+# the process boundary, before any awaited provider initialization, so a cold
+# request never performs importlib filesystem I/O on the event-loop thread.
+from agent import ssl_guard as _ssl_guard_bootstrap  # noqa: F401
+from agent import agent_runtime_helpers as _agent_runtime_helpers_bootstrap  # noqa: F401
+from agent import anthropic_adapter as _anthropic_adapter_bootstrap  # noqa: F401
+from agent import credits_tracker as _credits_tracker_bootstrap  # noqa: F401
+from agent import transports as _transports_bootstrap
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
@@ -49,10 +58,20 @@ from agent.tool_guardrails import (
     ToolCallGuardrailController,
     ToolGuardrailDecision,
 )
+from hermes_cli import codex_models as _codex_models_bootstrap  # noqa: F401
+from hermes_cli import env_loader as _env_loader_bootstrap  # noqa: F401
+from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
+from hermes_cli import model_normalize as _model_normalize_bootstrap  # noqa: F401
+from hermes_cli import models as _models_bootstrap  # noqa: F401
 from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_constants import get_hermes_home
+from tools import checkpoint_manager as _checkpoint_manager_bootstrap  # noqa: F401
 from utils import base_url_host_matches, base_url_hostname, is_truthy_value
+
+# Transport discovery is pure module registration. Run its existing path at
+# the process boundary so ``AIAgent()`` remains state-only inside async apps.
+_transports_bootstrap._discover_transports()
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does

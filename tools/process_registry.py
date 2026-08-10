@@ -26,6 +26,8 @@ import aiofiles
 import aiofiles.os
 
 from hermes_constants import get_hermes_home
+# Preserve local imports below without first-use importlib I/O in the event loop.
+from tools import ansi_strip as _ansi_strip_bootstrap  # noqa: F401
 from tools.environments.local import build_subprocess_env
 from tools.registry import registry, tool_error
 

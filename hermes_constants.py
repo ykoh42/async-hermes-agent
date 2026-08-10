@@ -13,6 +13,11 @@ from pathlib import Path
 
 import aiofiles.os
 
+try:
+    import pwd as _pwd
+except ImportError:  # Windows
+    _pwd = None
+
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
@@ -430,15 +435,16 @@ async def _iter_real_home_candidates(
     home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
     if home:
         candidates.append(home)
-    try:
-        import pwd
-
-        get_pw_home = aiofiles.os.wrap(lambda: pwd.getpwuid(os.getuid()).pw_dir)
-        pw_home = (await get_pw_home()).strip()
-        if pw_home:
-            candidates.append(pw_home)
-    except Exception:
-        pass
+    if _pwd is not None:
+        try:
+            get_pw_home = aiofiles.os.wrap(
+                lambda: _pwd.getpwuid(os.getuid()).pw_dir
+            )
+            pw_home = (await get_pw_home()).strip()
+            if pw_home:
+                candidates.append(pw_home)
+        except Exception:
+            pass
     userprofile = str(env.get("USERPROFILE") or os.getenv("USERPROFILE", "")).strip()
     if userprofile:
         candidates.append(userprofile)

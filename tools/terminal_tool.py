@@ -13,6 +13,7 @@ import os
 import json
 import re
 import asyncio
+import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
 import contextvars
 import logging
 import threading
@@ -23,6 +24,14 @@ from typing import Any, Callable, List, Optional
 import aiofiles
 import aiofiles.os
 
+# Preserve the original local import patch points after priming their modules.
+from agent import redact as _redact_bootstrap  # noqa: F401
+from agent import verification_evidence as _verification_evidence_bootstrap  # noqa: F401
+from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
+from tools import ansi_strip as _ansi_strip_bootstrap  # noqa: F401
+from tools import file_tools as _file_tools_bootstrap  # noqa: F401
+from tools import process_registry as _process_registry_bootstrap  # noqa: F401
+from tools import tool_output_limits as _tool_output_limits_bootstrap  # noqa: F401
 from tools.environments.local import (
     LocalEnvironment,
     _cwd_usable,

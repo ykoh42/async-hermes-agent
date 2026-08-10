@@ -166,6 +166,10 @@ from agent.model_metadata import (
     is_local_endpoint,
 )
 from agent.usage_pricing import normalize_usage
+# ``AIAgent.__init__`` keeps its upstream local import/patch point. Prime the
+# extracted implementation here so construction inside an async application
+# cannot make importlib scan the filesystem on the event-loop thread.
+from agent import agent_init as _agent_init_bootstrap  # noqa: F401
 # Re-exported for tests that monkeypatch these symbols on run_agent.
 from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
