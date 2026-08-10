@@ -28,6 +28,13 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
+# Keep the optional client construction lazy while loading the installed SDK
+# with the plugin module instead of during the first awaited search.
+try:
+    import parallel as _ParallelBootstrap  # noqa: F401
+except Exception:
+    _ParallelBootstrap = None
+
 async def _get_parallel_client() -> Any:
     """Lazy-load and cache the native async Parallel client."""
     import tools.web_tools as _wt

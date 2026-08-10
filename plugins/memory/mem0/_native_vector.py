@@ -28,6 +28,11 @@ except Exception:
     _PsycopgBootstrap = None
     _PsycopgPoolBootstrap = None
 
+try:
+    import qdrant_client as _QdrantBootstrap  # noqa: F401
+except Exception:
+    _QdrantBootstrap = None
+
 _ISO_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}"
     r"([T ]\d{2}:\d{2}(:\d{2})?"

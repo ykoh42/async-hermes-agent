@@ -22,6 +22,13 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# The Ollama client remains optional and is instantiated lazily, but its
+# synchronous module import must happen before the first awaited memory call.
+try:
+    import ollama as _OllamaBootstrap  # noqa: F401
+except Exception:
+    _OllamaBootstrap = None
+
 
 async def _finish_cleanup(
     cleanup: Coroutine[Any, Any, None], *, error_message: str

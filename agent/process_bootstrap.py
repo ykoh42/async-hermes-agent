@@ -96,6 +96,21 @@ except Exception:
     _PsycopgBootstrap = None
     _PsycopgPoolBootstrap = None
 
+try:
+    import qdrant_client as _QdrantBootstrap  # noqa: F401
+except Exception:
+    _QdrantBootstrap = None
+
+try:
+    import ollama as _OllamaBootstrap  # noqa: F401
+except Exception:
+    _OllamaBootstrap = None
+
+try:
+    import parallel as _ParallelWebBootstrap  # noqa: F401
+except Exception:
+    _ParallelWebBootstrap = None
+
 # MCP OAuth is optional, but its SDK auth modules are imported lazily by the
 # OAuth storage/manager.  Resolve those imports beside the other provider SDK
 # bootstraps so the first OAuth-backed MCP connection cannot perform an

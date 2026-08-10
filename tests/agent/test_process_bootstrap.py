@@ -42,6 +42,9 @@ names = (
     "honcho",
     "psycopg",
     "psycopg_pool",
+    "qdrant_client",
+    "ollama",
+    "parallel",
 )
 available = {name for name in names if present(name)}
 import agent.process_bootstrap
@@ -86,12 +89,36 @@ def present(name):
 
 expected = {
     name
-    for name in ("supermemory", "honcho", "psycopg", "psycopg_pool")
+    for name in (
+        "supermemory",
+        "honcho",
+        "psycopg",
+        "psycopg_pool",
+        "qdrant_client",
+        "ollama",
+    )
     if present(name)
 }
 import plugins.memory.supermemory
 import plugins.memory.honcho.client
 import plugins.memory.mem0._native_vector
+import plugins.memory.mem0._native_oss
 assert expected <= sys.modules.keys()
+"""
+    )
+
+
+def test_parallel_web_plugin_does_not_defer_installed_sdk_import():
+    _run_fresh_interpreter(
+        """
+import importlib.util
+import sys
+
+try:
+    installed = importlib.util.find_spec("parallel") is not None
+except (ImportError, AttributeError, ValueError):
+    installed = False
+import plugins.web.parallel.provider
+assert not installed or "parallel" in sys.modules
 """
     )
