@@ -25,16 +25,29 @@ Design:
 
 import asyncio
 import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
+import errno
 import json
 import logging
+import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
 import aiofiles
 import aiofiles.os
+
+msvcrt = None
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    try:
+        import msvcrt
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +186,52 @@ class MemoryStore:
             lock = asyncio.Lock()
             self._write_lock = lock
         return lock
+
+    @staticmethod
+    @asynccontextmanager
+    async def _file_lock(path: Path):
+        """Acquire the upstream per-file lock without blocking the event loop."""
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        await aiofiles.os.makedirs(lock_path.parent, exist_ok=True)
+        async with aiofiles.open(lock_path, "a+b") as handle:
+            if fcntl is not None:
+                while True:
+                    try:
+                        fcntl.flock(
+                            handle.fileno(),
+                            fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+            elif msvcrt is not None:
+                await handle.seek(0)
+                if not await handle.read(1):
+                    await handle.write(b"\0")
+                    await handle.flush()
+                while True:
+                    try:
+                        await handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN, 13, 36}:
+                            raise
+                        await asyncio.sleep(0.01)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                elif msvcrt is not None:
+                    try:
+                        await handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
 
     def reset_consolidation_failures(self) -> None:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
@@ -319,7 +378,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        async with self._get_write_lock():
+        async with self._get_write_lock(), self._file_lock(self._path_for(target)):
             if await self._reload_target(target, skip_drift=True) is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
             entries = self._entries_for(target)
@@ -365,7 +424,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        async with self._get_write_lock():
+        async with self._get_write_lock(), self._file_lock(self._path_for(target)):
             backup = await self._reload_target(target)
             if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -413,7 +472,7 @@ class MemoryStore:
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
-        async with self._get_write_lock():
+        async with self._get_write_lock(), self._file_lock(self._path_for(target)):
             backup = await self._reload_target(target)
             if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -455,7 +514,7 @@ class MemoryStore:
                 if scan_error:
                     return {"success": False, "error": f"Operation {index + 1}: {scan_error}"}
 
-        async with self._get_write_lock():
+        async with self._get_write_lock(), self._file_lock(self._path_for(target)):
             backup = await self._reload_target(target)
             if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -644,15 +703,37 @@ class MemoryStore:
 
     @staticmethod
     async def _write_file(path: Path, entries: List[str]) -> None:
-        """Atomically write memory entries without a synchronous file call."""
+        """Atomically publish memory with upstream fsync and symlink semantics."""
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        write_path = path
+        if await aiofiles.os.wrap(os.path.islink)(path):
+            resolved = await aiofiles.os.wrap(os.path.realpath)(path)
+            if resolved:
+                write_path = Path(resolved)
         temporary = path.with_name(f".mem_{path.name}.{uuid.uuid4().hex}.tmp")
         write_error: Optional[OSError] = None
         replaced = False
         try:
             async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
                 await handle.write(content)
-            await aiofiles.os.replace(temporary, path)
+                await handle.flush()
+                await aiofiles.os.wrap(os.fsync)(handle.fileno())
+            await aiofiles.os.wrap(os.chmod)(temporary, 0o600)
+            try:
+                await aiofiles.os.replace(temporary, write_path)
+            except OSError as exc:
+                if exc.errno not in {errno.EXDEV, errno.EBUSY}:
+                    raise
+                async with (
+                    aiofiles.open(temporary, "rb") as source,
+                    aiofiles.open(write_path, "wb") as destination,
+                ):
+                    while chunk := await source.read(1024 * 1024):
+                        await destination.write(chunk)
+                    await destination.flush()
+                    await aiofiles.os.wrap(os.fsync)(destination.fileno())
+                await aiofiles.os.wrap(os.chmod)(write_path, 0o600)
+                await aiofiles.os.remove(temporary)
             replaced = True
         except OSError as exc:
             write_error = exc

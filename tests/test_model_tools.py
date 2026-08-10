@@ -161,6 +161,119 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    @pytest.mark.asyncio
+    async def test_tool_request_middleware_failure_is_fail_open(self):
+        with (
+            patch(
+                "hermes_cli.middleware.apply_tool_request_middleware",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("request middleware failed"),
+            ),
+            patch(
+                "model_tools.registry.dispatch",
+                new_callable=AsyncMock,
+                return_value='{"ok":true}',
+            ) as dispatch,
+        ):
+            result = await handle_function_call(
+                "web_search",
+                {"q": "original"},
+                skip_pre_tool_call_hook=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == '{"ok":true}'
+        assert dispatch.await_args.args[1] == {"q": "original"}
+
+    @pytest.mark.asyncio
+    async def test_pre_tool_hook_failure_is_fail_open(self):
+        with (
+            patch(
+                "hermes_cli.plugins.resolve_pre_tool_block",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("pre hook failed"),
+            ),
+            patch(
+                "model_tools.registry.dispatch",
+                new_callable=AsyncMock,
+                return_value='{"ok":true}',
+            ) as dispatch,
+        ):
+            result = await handle_function_call(
+                "web_search",
+                {"q": "test"},
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == '{"ok":true}'
+        dispatch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_failure_returns_upstream_tool_error_shape(self):
+        with patch(
+            "model_tools.registry.dispatch",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("provider secret=abc"),
+        ):
+            result = json.loads(
+                await handle_function_call(
+                    "web_search",
+                    {"q": "test"},
+                    skip_pre_tool_call_hook=True,
+                    skip_tool_request_middleware=True,
+                    skip_tool_execution_middleware=True,
+                )
+            )
+
+        assert result == {
+            "error": "[TOOL_ERROR] Error executing web_search: provider secret=abc"
+        }
+
+    @pytest.mark.asyncio
+    async def test_transform_hook_failure_is_fail_open(self):
+        with (
+            patch(
+                "model_tools.registry.dispatch",
+                new_callable=AsyncMock,
+                return_value='{"ok":true}',
+            ),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name == "transform_tool_result",
+            ),
+            patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("transform failed"),
+            ),
+        ):
+            result = await handle_function_call(
+                "web_search",
+                {"q": "test"},
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == '{"ok":true}'
+
+    @pytest.mark.asyncio
+    async def test_dispatch_cancellation_is_not_converted_to_tool_error(self):
+        with patch(
+            "model_tools.registry.dispatch",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await handle_function_call(
+                    "web_search",
+                    {"q": "test"},
+                    skip_pre_tool_call_hook=True,
+                    skip_tool_request_middleware=True,
+                    skip_tool_execution_middleware=True,
+                )
+
 
 
     @pytest.mark.asyncio

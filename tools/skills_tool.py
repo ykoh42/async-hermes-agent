@@ -89,7 +89,6 @@ from tools import path_security as _path_security
 from tools import skill_manager_tool as _skill_manager_bootstrap  # noqa: F401
 from tools import skill_provenance as _skill_provenance_bootstrap  # noqa: F401
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     get_disabled_skill_names as _get_disabled_skill_names,
@@ -191,6 +190,74 @@ async def _iter_files(directory: Path):
     for child in sorted(directories, key=lambda path: path.name):
         async for result in _iter_files(child):
             yield result
+
+
+async def _linked_skill_files(skill_dir: Path) -> Dict[str, List[str]]:
+    """Build the retained linked-file catalog with upstream filters."""
+    linked: Dict[str, List[str]] = {}
+    references = skill_dir / "references"
+    if await aiofiles.os.path.isdir(references):
+        linked_references = [
+            str(path.relative_to(skill_dir))
+            async for path in _iter_files(references)
+            if path.parent == references and path.suffix == ".md"
+        ]
+        if linked_references:
+            linked["references"] = linked_references
+
+    templates = skill_dir / "templates"
+    template_suffixes = {".md", ".py", ".yaml", ".yml", ".json", ".tex", ".sh"}
+    if await aiofiles.os.path.isdir(templates):
+        linked_templates = [
+            str(path.relative_to(skill_dir))
+            async for path in _iter_files(templates)
+            if path.suffix in template_suffixes
+        ]
+        if linked_templates:
+            linked["templates"] = linked_templates
+
+    assets = skill_dir / "assets"
+    if await aiofiles.os.path.isdir(assets):
+        linked_assets = [
+            str(path.relative_to(skill_dir))
+            async for path in _iter_files(assets)
+        ]
+        if linked_assets:
+            linked["assets"] = linked_assets
+
+    scripts = skill_dir / "scripts"
+    script_suffixes = {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
+    if await aiofiles.os.path.isdir(scripts):
+        linked_scripts = [
+            str(path.relative_to(skill_dir))
+            async for path in _iter_files(scripts)
+            if path.parent == scripts and path.suffix in script_suffixes
+        ]
+        if linked_scripts:
+            linked["scripts"] = linked_scripts
+    return linked
+
+
+async def _available_skill_files(skill_dir: Path) -> Dict[str, List[str]]:
+    """Return the upstream missing-file recovery inventory."""
+    available: Dict[str, List[str]] = {
+        "references": [],
+        "templates": [],
+        "assets": [],
+        "scripts": [],
+        "other": [],
+    }
+    other_suffixes = {".md", ".py", ".yaml", ".yml", ".json", ".tex", ".sh"}
+    async for path in _iter_files(skill_dir):
+        if path.name == "SKILL.md":
+            continue
+        relative = str(path.relative_to(skill_dir))
+        top_level = relative.split("/", 1)[0]
+        if top_level in {"references", "templates", "assets", "scripts"}:
+            available[top_level].append(relative)
+        elif path.suffix in other_suffixes:
+            available["other"].append(relative)
+    return {key: value for key, value in available.items() if value}
 
 
 # Anthropic-recommended limits for progressive disclosure efficiency
@@ -760,6 +827,16 @@ async def skills_list(category: str = None, task_id: str = None) -> str:
                 "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
             }, ensure_ascii=False)
         skills = await _find_all_skills()
+        if not skills:
+            return json.dumps(
+                {
+                    "success": True,
+                    "skills": [],
+                    "categories": [],
+                    "message": "No skills found in skills/ directory.",
+                },
+                ensure_ascii=False,
+            )
         if category:
             skills = [skill for skill in skills if skill.get("category") == category]
         skills = _sort_skills(skills)
@@ -784,10 +861,10 @@ async def _serve_plugin_skill(
 ) -> str:
     """Read a registered plugin skill through the native async file boundary."""
     from hermes_cli.config import load_config_readonly
-    from hermes_cli.plugins import get_plugin_manager
+    from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
 
     config = await load_config_readonly()
-    if namespace in set(cfg_get(config, "plugins", "disabled", default=[]) or []):
+    if namespace in await _get_disabled_plugins(config):
         return json.dumps(
             {
                 "success": False,
@@ -840,22 +917,26 @@ async def _serve_plugin_skill(
     if len(description) > MAX_DESCRIPTION_LENGTH:
         description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
 
-    siblings = [
-        sibling
-        for sibling in get_plugin_manager().list_plugin_skills(namespace)
-        if sibling != bare
-    ]
-    if siblings:
-        banner = (
-            f"[Bundle context: This skill is part of the '{namespace}' plugin.\n"
-            f"Sibling skills: {', '.join(siblings)}.\n"
-            "Use qualified form to invoke siblings "
-            f"(e.g. {namespace}:{siblings[0]}).]\n\n"
-        )
-    else:
-        banner = (
-            f"[Bundle context: This skill is part of the '{namespace}' plugin.]\n\n"
-        )
+    try:
+        siblings = [
+            sibling
+            for sibling in get_plugin_manager().list_plugin_skills(namespace)
+            if sibling != bare
+        ]
+        if siblings:
+            banner = (
+                f"[Bundle context: This skill is part of the '{namespace}' plugin.\n"
+                f"Sibling skills: {', '.join(siblings)}.\n"
+                "Use qualified form to invoke siblings "
+                f"(e.g. {namespace}:{siblings[0]}).]\n\n"
+            )
+        else:
+            banner = (
+                f"[Bundle context: This skill is part of the '{namespace}' "
+                "plugin.]\n\n"
+            )
+    except Exception:
+        banner = ""
 
     rendered_content = content
     if preprocess:
@@ -879,11 +960,10 @@ async def _serve_plugin_skill(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
-            "content": f"{banner}{rendered_content}",
+            "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
-            "_source_path": str(skill_md),
         },
         ensure_ascii=False,
     )
@@ -899,10 +979,18 @@ async def skill_view(
     try:
         lookup_error = _skill_lookup_path_error(name)
         if lookup_error:
-            return tool_error(lookup_error, success=False)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": lookup_error,
+                    "hint": "Use a skill name or relative path within the skills directory.",
+                },
+                ensure_ascii=False,
+            )
+        local_category_name: str | None = None
         if ":" in name:
             from agent.skill_utils import is_valid_namespace, parse_qualified_name
-            from hermes_cli.plugins import get_plugin_manager
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
             namespace, bare = parse_qualified_name(name)
             if not is_valid_namespace(namespace):
@@ -917,6 +1005,7 @@ async def skill_view(
                     ensure_ascii=False,
                 )
 
+            await discover_plugins()
             manager = get_plugin_manager()
             plugin_skill_md = manager.find_plugin_skill(name)
             if plugin_skill_md is not None:
@@ -957,21 +1046,63 @@ async def skill_view(
                     },
                     ensure_ascii=False,
                 )
+            if bare:
+                local_category_name = f"{namespace}/{bare}"
+                local_lookup_error = _skill_lookup_path_error(local_category_name)
+                if local_lookup_error:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": local_lookup_error,
+                            "hint": (
+                                "Use a skill name or relative path within the "
+                                "skills directory."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
         active = _skills_dir()
         roots = [active] if await aiofiles.os.path.isdir(active) else []
         roots.extend(await _external_skills_dirs())
+        if not roots:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "Skills directory does not exist yet. It will be "
+                        "created on first install."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         candidates: list[tuple[Path | None, Path, Path]] = []
         seen: set[Path] = set()
+        from agent.skill_utils import is_skill_support_path
+
         for root in roots:
-            direct = root / name
-            direct_md = direct / "SKILL.md"
-            if await aiofiles.os.path.isfile(direct_md):
-                candidates.append((direct, direct_md, root))
-                seen.add(Path(await _realpath(direct_md)))
-            legacy_md = root / f"{name}.md"
-            if await aiofiles.os.path.isfile(legacy_md):
-                candidates.append((None, legacy_md, root))
-                seen.add(Path(await _realpath(legacy_md)))
+            lookup_names = [name]
+            if local_category_name:
+                lookup_names.append(local_category_name)
+            for lookup_name in lookup_names:
+                direct = root / lookup_name
+                direct_md = direct / "SKILL.md"
+                if (
+                    not await is_skill_support_path(direct, root=root)
+                    and await aiofiles.os.path.isfile(direct_md)
+                ):
+                    resolved_direct = Path(await _realpath(direct_md))
+                    if resolved_direct not in seen:
+                        candidates.append((direct, direct_md, root))
+                        seen.add(resolved_direct)
+                legacy_md = root / f"{lookup_name}.md"
+                if (
+                    not await is_skill_support_path(legacy_md, root=root)
+                    and await aiofiles.os.path.isfile(legacy_md)
+                ):
+                    resolved_legacy = Path(await _realpath(legacy_md))
+                    if resolved_legacy not in seen:
+                        candidates.append((None, legacy_md, root))
+                        seen.add(resolved_legacy)
             async for candidate in _iter_skill_index_files(root, "SKILL.md"):
                 resolved_candidate = Path(await _realpath(candidate))
                 if resolved_candidate in seen:
@@ -1006,24 +1137,40 @@ async def skill_view(
                 "hint": "Use the categorized skill path to choose one match.",
             }, ensure_ascii=False)
 
-        skill_dir, skill_md, skill_root = candidates[0]
+        skill_dir, skill_md, _skill_root = candidates[0]
         target = skill_md
-        if file_path:
-            if skill_dir is None:
-                return tool_error("This legacy flat skill has no linked files.", success=False)
+        if file_path and skill_dir:
             if _path_security.has_traversal_component(file_path):
-                return tool_error("Path traversal ('..') is not allowed.", success=False)
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "Path traversal ('..') is not allowed.",
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
             target = skill_dir / file_path
             try:
                 resolved_target = Path(await _realpath(target))
                 resolved_target.relative_to(Path(await _realpath(skill_dir)))
             except (ValueError, OSError) as exc:
-                return tool_error(
-                    f"Path escapes allowed directory: {exc}", success=False
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Path escapes allowed directory: {exc}",
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
                 )
             if not await aiofiles.os.path.isfile(target):
-                return tool_error(
-                    f"File '{file_path}' not found in skill '{name}'.", success=False
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"File '{file_path}' not found in skill '{name}'.",
+                        "available_files": await _available_skill_files(skill_dir),
+                        "hint": "Use one of the available file paths listed above",
+                    },
+                    ensure_ascii=False,
                 )
 
         try:
@@ -1038,7 +1185,7 @@ async def skill_view(
                 "is_binary": True,
             }, ensure_ascii=False)
 
-        if file_path:
+        if file_path and skill_dir:
             try:
                 from tools.skill_manager_tool import (
                     mark_background_review_skill_read,
@@ -1060,25 +1207,65 @@ async def skill_view(
                 "_source_path": str(target),
             }, ensure_ascii=False)
 
-        frontmatter, _ = _parse_frontmatter(content)
-        skill_name = str(frontmatter.get("name", skill_md.parent.name))
-        if await _is_skill_disabled(skill_name):
-            return tool_error(f"Skill '{skill_name}' is disabled.", success=False)
-        if not skill_matches_platform(frontmatter):
-            return tool_error(
-                f"Skill '{skill_name}' is not supported on this platform.", success=False
+        try:
+            resolved_skill = Path(await _realpath(skill_md))
+            resolved_active = Path(await _realpath(active))
+            resolved_skill.relative_to(resolved_active)
+            outside_skills_dir = False
+        except (OSError, ValueError):
+            outside_skills_dir = True
+        injection_detected = any(
+            pattern in content.lower() for pattern in _INJECTION_PATTERNS
+        )
+        if outside_skills_dir or injection_detected:
+            warnings = []
+            if outside_skills_dir:
+                warnings.append(
+                    "skill file is outside the trusted skills directory "
+                    f"(~/.hermes/skills/): {skill_md}"
+                )
+            if injection_detected:
+                warnings.append(
+                    "skill content contains patterns that may indicate prompt injection"
+                )
+            logger.warning(
+                "Skill security warning for '%s': %s",
+                name,
+                "; ".join(warnings),
             )
-        linked_files = {}
-        if skill_dir is not None:
-            for folder_name in ("references", "templates", "assets", "scripts"):
-                folder = skill_dir / folder_name
-                if await aiofiles.os.path.isdir(folder):
-                    files = [
-                        str(path.relative_to(skill_dir))
-                        async for path in _iter_files(folder)
-                    ]
-                    if files:
-                        linked_files[folder_name] = files
+
+        frontmatter, _ = _parse_frontmatter(content)
+        skill_name = str(
+            frontmatter.get(
+                "name",
+                skill_md.stem if skill_dir is None else skill_dir.name,
+            )
+        )
+        if not skill_matches_platform(frontmatter):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' is not supported on this platform."
+                    ),
+                    "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+                },
+                ensure_ascii=False,
+            )
+        if await _is_skill_disabled(skill_name):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{skill_name}' is disabled. Enable it with "
+                        "`hermes skills` or inspect the files directly on disk."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        linked_files = (
+            await _linked_skill_files(skill_dir) if skill_dir is not None else {}
+        )
         metadata = frontmatter.get("metadata")
         hermes_metadata = metadata.get("hermes", {}) if isinstance(metadata, dict) else {}
         if not isinstance(hermes_metadata, dict):
@@ -1159,12 +1346,19 @@ async def skill_view(
             "success": True,
             "name": skill_name,
             "description": frontmatter.get("description", ""),
-            "tags": _parse_tags(frontmatter.get("tags") or hermes_metadata.get("tags")),
+            "tags": _parse_tags(
+                hermes_metadata.get("tags") or frontmatter.get("tags")
+            ),
             "related_skills": _parse_tags(
-                frontmatter.get("related_skills") or hermes_metadata.get("related_skills")
+                hermes_metadata.get("related_skills")
+                or frontmatter.get("related_skills")
             ),
             "content": rendered_content,
-            "path": str(skill_md.relative_to(skill_root)),
+            "path": (
+                str(skill_md.relative_to(active))
+                if skill_md.is_relative_to(active)
+                else str(skill_md.relative_to(skill_md.parent.parent))
+            ),
             "skill_dir": str(skill_dir) if skill_dir else None,
             "org_provenance": None,
             "linked_files": linked_files or None,

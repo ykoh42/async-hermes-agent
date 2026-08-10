@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -59,6 +60,8 @@ _patch_failure_tracker: dict[str, dict[str, int]] = {}
 _READ_HISTORY_CAP = 500
 _DEDUP_CAP = 1000
 _READ_TIMESTAMPS_CAP = 1000
+_NOT_FOUND_CAP = 500
+_NOT_FOUND_TTL_SECONDS = 60.0
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from the earlier read_file "
     "result in this conversation is still current — refer to that instead "
@@ -67,16 +70,66 @@ _READ_DEDUP_STATUS_MESSAGE = (
 
 
 def _cap_read_tracker_data(task_data: dict) -> None:
-    """Bound per-task read metadata so long sessions cannot grow unbounded."""
+    """Enforce the upstream bounds on per-task read-tracker containers."""
     history = task_data.get("read_history")
-    if history is not None:
-        while len(history) > _READ_HISTORY_CAP:
-            history.pop()
-    for key, cap in (("dedup", _DEDUP_CAP), ("read_timestamps", _READ_TIMESTAMPS_CAP)):
+    if history is not None and len(history) > _READ_HISTORY_CAP:
+        for _ in range(len(history) - _READ_HISTORY_CAP):
+            try:
+                history.pop()
+            except KeyError:
+                break
+
+    for key, cap in (
+        ("dedup", _DEDUP_CAP),
+        ("dedup_hits", _DEDUP_CAP),
+        ("read_timestamps", _READ_TIMESTAMPS_CAP),
+        ("not_found", _NOT_FOUND_CAP),
+    ):
         values = task_data.get(key)
-        if values is not None:
-            while len(values) > cap:
-                values.pop(next(iter(values)))
+        if values is not None and len(values) > cap:
+            for _ in range(len(values) - cap):
+                try:
+                    values.pop(next(iter(values)))
+                except (StopIteration, KeyError):
+                    break
+
+
+async def _check_not_found_cache(
+    op: str, resolved_str: str, task_id: str
+) -> str | None:
+    """Return a fresh cached not-found result without blocking the event loop."""
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        not_found = task_data.get("not_found") if task_data else None
+        entry = not_found.get((op, resolved_str)) if not_found else None
+        if entry is None:
+            return None
+        timestamp, cached_json = entry
+        if time.monotonic() - timestamp > _NOT_FOUND_TTL_SECONDS:
+            not_found.pop((op, resolved_str), None)
+            return None
+
+    if await aiofiles.os.path.exists(resolved_str):
+        with _read_tracker_lock:
+            task_data = _read_tracker.get(task_id)
+            not_found = task_data.get("not_found") if task_data else None
+            if not_found:
+                not_found.pop((op, resolved_str), None)
+        return None
+    return cached_json
+
+
+def _record_not_found(
+    op: str, resolved_str: str, task_id: str, error_json: str
+) -> None:
+    """Cache a not-found result so repeated misses skip suggestion I/O."""
+    state = _read_state(task_id)
+    with _read_tracker_lock:
+        state.setdefault("not_found", {})[(op, resolved_str)] = (
+            time.monotonic(),
+            error_json,
+        )
+        _cap_read_tracker_data(state)
 
 
 def _read_state(task_id: str) -> dict:
@@ -489,11 +542,15 @@ async def _path_resolution_warning(
         workspace_root = await _authoritative_workspace_root(task_id)
         if not workspace_root:
             return None
-        realpath = aiofiles.os.wrap(os.path.realpath)
-        root = Path(await realpath(await _expand_tilde(workspace_root)))
-        target = Path(await realpath(resolved))
+        if _uses_container_paths(task_id):
+            root = _normalize_without_host_deref(
+                Path(await _expand_tilde(workspace_root))
+            )
+        else:
+            realpath = aiofiles.os.wrap(os.path.realpath)
+            root = Path(await realpath(await _expand_tilde(workspace_root)))
         try:
-            target.relative_to(root)
+            resolved.relative_to(root)
             return None
         except ValueError:
             return (
@@ -782,6 +839,7 @@ def notify_other_tool_call(task_id: str = "default") -> None:
             state["last_key"] = None
             state["consecutive"] = 0
             state.setdefault("dedup_hits", {}).clear()
+            state.setdefault("not_found", {}).clear()
 
 
 async def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
@@ -797,6 +855,11 @@ async def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
                 for key, value in state["dedup"].items()
                 if key[0] != resolved
             }
+            not_found = state.get("not_found")
+            if not_found:
+                for key in list(not_found):
+                    if key[1] == resolved:
+                        not_found.pop(key, None)
 
 
 async def _search_result_read_block_error(
@@ -1166,6 +1229,11 @@ async def _handle_read_file(args, **kw):
         return tool_error(block_error)
 
     resolved_str = str(resolved)
+    cached_not_found = await _check_not_found_cache(
+        "read", resolved_str, task_id
+    )
+    if cached_not_found is not None:
+        return cached_not_found
     dedup_key = (resolved_str, offset, limit)
     state = _read_state(task_id)
     mtime = await _file_mtime(resolved)
@@ -1235,10 +1303,12 @@ async def _handle_read_file(args, **kw):
             if score:
                 scored.append((score, os.path.join(display_directory, candidate)))
         scored.sort(key=lambda item: -item[0])
-        return tool_error(
+        error_json = tool_error(
             f"File not found: {path}",
             similar_files=[candidate for _, candidate in scored[:5]],
         )
+        _record_not_found("read", resolved_str, task_id, error_json)
+        return error_json
     except OSError as exc:
         return tool_error(f"Failed to read {path}: {exc}")
 
@@ -2285,6 +2355,12 @@ async def _handle_search_files(args, **kw):
     resolved = await _native_file_path(raw_path, task_id)
     if isinstance(resolved, str):
         return resolved
+    resolved_str = str(resolved)
+    cached_not_found = await _check_not_found_cache(
+        "search", resolved_str, task_id
+    )
+    if cached_not_found is not None:
+        return cached_not_found
     if await aiofiles.os.path.exists(resolved):
         requested_paths = [raw_path]
     else:
@@ -2305,7 +2381,9 @@ async def _handle_search_files(args, **kw):
         else:
             missing_paths.append(str(candidate))
     if not existing_paths:
-        return tool_error(f"Path not found: {raw_path}")
+        error_json = tool_error(f"Path not found: {raw_path}")
+        _record_not_found("search", resolved_str, task_id, error_json)
+        return error_json
 
     output_mode = args.get("output_mode", "content")
     context = max(0, int(args.get("context", 0) or 0))

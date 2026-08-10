@@ -62,13 +62,24 @@ _approval_callback: contextvars.ContextVar[Callable[..., Any] | None] = (
     contextvars.ContextVar("terminal_approval_callback", default=None)
 )
 def _safe_parse_import_env(name: str, default: Any, converter: Callable[[str], Any], type_label: str) -> Any:
-    """Parse an optional import-time setting without breaking tool discovery."""
+    """Parse module-level numeric env vars without breaking import.
+
+    Terminal tool is imported by library callers, tests, and tool discovery.
+    A malformed env var must not make the whole module unloadable.
+    """
     raw = os.getenv(name)
     if raw in (None, ""):
         return default
     try:
         return converter(raw)
     except (TypeError, ValueError):
+        logger.warning(
+            "Invalid value for %s: %r (expected %s). Falling back to %r.",
+            name,
+            raw,
+            type_label,
+            default,
+        )
         return default
 
 
@@ -123,26 +134,32 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 
 def _foreground_background_guidance(command: str) -> str | None:
-    """Return a recovery recipe for foreground commands that would stall a turn."""
+    """Suggest background mode when a foreground command looks long-lived.
+
+    Prevents workflows that start a server/watch process and then stall before
+    follow-up checks or test commands run.
+    """
     if _looks_like_help_or_version_command(command):
         return None
     unquoted = _strip_quotes(command)
     if _SHELL_LEVEL_BACKGROUND_RE.search(unquoted):
         return (
-            "Foreground command uses shell-level background wrappers. Re-send WITHOUT "
-            "the wrapper as terminal(command=\"<cmd>\", background=true), then run "
-            "readiness checks in follow-up terminal calls."
+            "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
+            "Re-send WITHOUT the wrapper as terminal(command=\"<cmd>\", background=true, "
+            "notify_on_complete=true) so Hermes tracks the process, then run readiness "
+            "checks and tests in separate commands."
         )
     if _INLINE_BACKGROUND_AMP_RE.search(unquoted) or _TRAILING_BACKGROUND_AMP_RE.search(unquoted):
         return (
             "Foreground command uses '&' backgrounding. Re-send WITHOUT the '&' as "
-            "terminal(command=\"<cmd>\", background=true), then run readiness checks "
-            "in follow-up terminal calls."
+            "terminal(command=\"<cmd>\", background=true) — add notify_on_complete=true "
+            "for bounded jobs — then run health checks and tests in follow-up terminal calls."
         )
     if any(pattern.search(unquoted) for pattern in _LONG_LIVED_FOREGROUND_PATTERNS):
         return (
-            "This command appears to start a long-lived server or watcher. Run it with "
-            "background=true, verify readiness, then execute tests separately."
+            "This foreground command appears to start a long-lived server/watch process. "
+            "Run it with background=true, verify readiness (health endpoint/log signal), "
+            "then execute tests in a separate command."
         )
     return None
 
@@ -153,14 +170,19 @@ def _parse_env_var(
     converter: Callable[[str], Any] = int,
     type_label: str = "integer",
 ) -> Any:
-    """Parse a terminal environment variable with a useful error message."""
-    raw = os.getenv(name)
-    if raw in (None, ""):
-        return converter(default) if converter is not str else default
+    """Parse an environment variable with a clear error on bad values.
+
+    Without this wrapper, a single malformed env var causes an unhandled
+    conversion error that kills every terminal command.
+    """
+    raw = os.getenv(name, default)
     try:
         return converter(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be valid {type_label}") from exc
+    except (ValueError, json.JSONDecodeError):
+        raise ValueError(
+            f"Invalid value for {name}: {raw!r} (expected {type_label}). "
+            "Check ~/.hermes/.env or environment variables."
+        )
 
 
 async def _get_env_config() -> dict[str, Any]:
@@ -194,7 +216,7 @@ def set_approval_callback(cb):
     _approval_callback.set(cb)
 
 
-def _rewrite_compound_background(command: str, *_args: Any, **_kwargs: Any) -> str:
+def _rewrite_compound_background(command: str) -> str:
     """Wrap top-level ``A && B &`` as ``A && { B & }``.
 
     Bash otherwise backgrounds the whole compound in a subshell, which can
@@ -763,7 +785,7 @@ async def _prepare_terminal_output(
 
 
 def _interpret_exit_code(command: str, exit_code: int) -> str | None:
-    """Explain conventional non-zero statuses that are not actual failures."""
+    """Return a note when a non-zero exit code is conventional, not erroneous."""
     if exit_code == 0:
         return None
     segments = re.split(r"\s*(?:\|\||&&|[|;])\s*", command)
@@ -785,8 +807,20 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
         "ack": {1: "No matches found (not an error)"},
         "diff": {1: "Files differ (expected, not an error)"},
         "colordiff": {1: "Files differ (expected, not an error)"},
+        "find": {
+            1: "Some directories were inaccessible (partial results may still be valid)"
+        },
         "test": {1: "Condition evaluated to false (expected, not an error)"},
         "[": {1: "Condition evaluated to false (expected, not an error)"},
+        "curl": {
+            6: "Could not resolve host",
+            7: "Failed to connect to host",
+            22: "HTTP response code indicated error (e.g. 404, 500)",
+            28: "Operation timed out",
+        },
+        "git": {
+            1: "Non-zero exit (often normal — e.g. 'git diff' returns 1 when files differ)"
+        },
     }
     return semantics.get(base_cmd, {}).get(exit_code)
 

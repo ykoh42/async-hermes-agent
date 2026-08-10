@@ -471,12 +471,17 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     its subprocesses can consume those credentials without duplicating them
     in every MCP server's ``env:`` block.
     """
+    try:
+        from hermes_cli.env_loader import get_secret_source
+    except Exception:
+        get_secret_source = None
     env = {}
     for key, value in os.environ.items():
         if (
             key in _SAFE_ENV_KEYS
             or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
             or key.startswith("XDG_")
+            or (get_secret_source is not None and get_secret_source(key))
         ):
             env[key] = value
     if user_env:
@@ -3716,6 +3721,31 @@ def _signal_reconnect(server: Any) -> bool:
     return True
 
 
+async def _wait_for_server_session_ready(
+    server: "MCPServerTask",
+    *,
+    old_session: Any = None,
+    timeout: float = 15.0,
+) -> bool:
+    """Await the upstream readiness poll without sleeping the event loop."""
+    poll_interval = 0.25
+    iterations = max(1, int(max(float(timeout), 0.0) / poll_interval))
+    for index in range(iterations):
+        session = getattr(server, "session", None)
+        ready = getattr(server, "_ready", None)
+        is_ready = True
+        if ready is not None and hasattr(ready, "is_set"):
+            try:
+                is_ready = bool(ready.is_set())
+            except Exception:
+                is_ready = True
+        if session is not None and session is not old_session and is_ready:
+            return True
+        if index < iterations - 1:
+            await asyncio.sleep(poll_interval)
+    return False
+
+
 async def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
     with _lock:
@@ -3850,35 +3880,43 @@ async def _handle_auth_error_and_retry(
     if recovered:
         with _lock:
             server = _servers.get(server_name)
-        if server is not None and await _await_native_mcp_reconnect(
-            server_name,
-            server,
-            operation_description=f"{operation_description} after OAuth recovery",
-        ):
+        reconnected = False
+        if server is not None:
+            reconnected = await _await_native_mcp_reconnect(
+                server_name,
+                server,
+                operation_description=(
+                    f"{operation_description} after OAuth recovery"
+                ),
+            )
+        if reconnected:
             _reset_server_error(server_name)
+
+        try:
+            result = await retry_call()
             try:
-                result = await retry_call()
-                try:
-                    if "error" not in json.loads(result):
-                        _reset_server_error(server_name)
-                        return result
-                except (json.JSONDecodeError, TypeError):
+                if "error" not in json.loads(result):
                     _reset_server_error(server_name)
                     return result
-            except asyncio.CancelledError:
-                raise
-            except Exception as retry_error:
-                logger.warning(
-                    "MCP %s/%s retry after OAuth recovery failed: %s",
-                    server_name,
-                    operation_description,
-                    retry_error,
-                )
+            except (json.JSONDecodeError, TypeError):
+                _reset_server_error(server_name)
+                return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as retry_error:
+            logger.warning(
+                "MCP %s/%s retry after auth recovery failed: %s",
+                server_name,
+                operation_description,
+                retry_error,
+            )
 
     _bump_server_error(server_name)
     return tool_error(
         f"MCP server '{server_name}' requires re-authentication. "
-        f"Run `hermes mcp login {server_name}` and do not retry this tool.",
+        f"Run `hermes mcp login {server_name}` (or delete the tokens "
+        f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
+        f"this tool — ask the user to re-authenticate.",
         needs_reauth=True,
         server=server_name,
     )
@@ -4419,8 +4457,10 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> list[str]:
             continue
         _whitespace_warned.add(dedupe_key)
         logger.warning(
-            "MCP server '%s': config value '%s' has hidden leading or "
-            "trailing whitespace; check config.yaml or the referenced env var",
+            "MCP server '%s': config value '%s' has hidden leading or trailing "
+            "whitespace — this often causes authentication or connection "
+            "failures. Check for stray spaces/newlines in config.yaml (or the "
+            "referenced env var).",
             server_name,
             key_path,
         )
@@ -4744,7 +4784,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return tool_error(
                     f"MCP server '{server_name}' is unreachable after "
                     f"{_server_error_counts[server_name]} consecutive failures. "
-                    f"Auto-retry available in ~{remaining}s."
+                    f"Auto-retry available in ~{remaining}s. Do NOT retry this "
+                    "tool yet — use alternative approaches or ask the user to "
+                    "check the MCP server."
                 )
 
         server = await _get_connected_server_for_call(server_name)
@@ -4752,22 +4794,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
-        # A recycled stdio server is woken without waiting synchronously on
-        # the caller's event loop.  The normal connected path never enters
-        # this branch.
         if server.session is None:
-            if server._is_recycled_stdio():
-                server._ready.clear()
-            _signal_reconnect(server)
-            deadline = time.monotonic() + min(5.0, float(tool_timeout or 5.0))
-            while server.session is None and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-            if server.session is None:
+            if not await _wait_for_server_session_ready(
+                server,
+                timeout=min(5.0, float(tool_timeout or 5.0)),
+            ):
                 _bump_server_error(server_name)
-                return tool_error(
-                    f"MCP server '{server_name}' transport is down; "
-                    "reconnect requested. Do NOT retry immediately."
-                )
+                if _signal_reconnect(server):
+                    return tool_error(
+                        f"MCP server '{server_name}' transport is down; reconnect "
+                        "requested. Do NOT retry this tool immediately — give it "
+                        "a few seconds to come back."
+                    )
+                return tool_error(f"MCP server '{server_name}' is not connected")
 
         try:
             result = await _await_mcp_operation(
@@ -4887,6 +4926,11 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                     lambda: _call(retry_server), timeout=tool_timeout
                 )
 
+            recovered = await _handle_auth_error_and_retry(
+                server_name, exc, _retry_call, "resources/list"
+            )
+            if recovered is not None:
+                return recovered
             recovered = await _handle_session_expired_and_retry(
                 server_name, exc, _retry_call, "resources/list"
             )
@@ -4952,6 +4996,11 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
                     lambda: _call(retry_server), timeout=tool_timeout
                 )
 
+            recovered = await _handle_auth_error_and_retry(
+                server_name, exc, _retry_call, "resources/read"
+            )
+            if recovered is not None:
+                return recovered
             recovered = await _handle_session_expired_and_retry(
                 server_name, exc, _retry_call, "resources/read"
             )
@@ -5017,6 +5066,11 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
                     lambda: _call(retry_server), timeout=tool_timeout
                 )
 
+            recovered = await _handle_auth_error_and_retry(
+                server_name, exc, _retry_call, "prompts/list"
+            )
+            if recovered is not None:
+                return recovered
             recovered = await _handle_session_expired_and_retry(
                 server_name, exc, _retry_call, "prompts/list"
             )
@@ -5088,6 +5142,11 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
                     lambda: _call(retry_server), timeout=tool_timeout
                 )
 
+            recovered = await _handle_auth_error_and_retry(
+                server_name, exc, _retry_call, "prompts/get"
+            )
+            if recovered is not None:
+                return recovered
             recovered = await _handle_session_expired_and_retry(
                 server_name, exc, _retry_call, "prompts/get"
             )

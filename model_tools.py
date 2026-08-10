@@ -20,6 +20,7 @@ Public API (names and arguments preserved from the original 2,400-line version):
     await check_tool_availability(quiet) -> tuple
 """
 
+import asyncio
 import os
 import json
 import re
@@ -396,6 +397,7 @@ async def _resolve_active_context_length() -> int:
 # handle_function_call  (the main dispatcher)
 # =============================================================================
 
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -907,8 +909,6 @@ async def handle_function_call(
             task_id=task_id,
             tool_call_id=tool_call_id,
             session_id=session_id,
-            turn_id=turn_id,
-            api_request_id=api_request_id,
             user_task=user_task,
             enabled_tools=enabled_tools,
             skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -924,36 +924,48 @@ async def handle_function_call(
     handler_context = _TOOL_HANDLER_CONTEXT.get() or {}
 
     if not skip_tool_request_middleware:
-        from hermes_cli.middleware import apply_tool_request_middleware
+        try:
+            from hermes_cli.middleware import apply_tool_request_middleware
 
-        request_result = await apply_tool_request_middleware(
-            function_name,
-            function_args,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=turn_id or "",
-            api_request_id=api_request_id or "",
-        )
-        if isinstance(request_result.payload, dict):
+            request_result = await apply_tool_request_middleware(
+                function_name,
+                function_args,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+            )
             function_args = request_result.payload
-        if isinstance(request_result.original_payload, dict):
             original_args = request_result.original_payload
-        middleware_trace = list(request_result.trace)
+            middleware_trace = request_result.trace
+        except asyncio.CancelledError:
+            raise
+        except Exception as middleware_error:
+            logger.debug("tool_request middleware error: %s", middleware_error)
+
+    if function_name in _AGENT_LOOP_TOOLS and not handler_context:
+        return tool_error(f"{function_name} must be handled by the agent loop")
 
     if not skip_pre_tool_call_hook:
-        from hermes_cli.plugins import resolve_pre_tool_block
+        block_message = None
+        try:
+            from hermes_cli.plugins import resolve_pre_tool_block
 
-        block_message = await resolve_pre_tool_block(
-            function_name,
-            function_args,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=turn_id or "",
-            api_request_id=api_request_id or "",
-            middleware_trace=middleware_trace,
-        )
+            block_message = await resolve_pre_tool_block(
+                function_name,
+                function_args,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+                middleware_trace=list(middleware_trace),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as hook_error:
+            logger.debug("pre_tool_call hook error: %s", hook_error)
         if block_message is not None:
             result = tool_error(block_message)
             await _emit_post_tool_call_hook(
@@ -1023,11 +1035,20 @@ async def handle_function_call(
                 turn_id=turn_id or "",
                 api_request_id=api_request_id or "",
             )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        error_message = f"Error executing {function_name}: {str(exc)}"
+        logger.exception(error_message)
+        return tool_error(_sanitize_tool_error(error_message))
     finally:
         if approval_tokens is not None:
-            from tools.approval import reset_current_observability_context
+            try:
+                from tools.approval import reset_current_observability_context
 
-            reset_current_observability_context(approval_tokens)
+                reset_current_observability_context(approval_tokens)
+            except Exception:
+                pass
     duration_ms = int((time.monotonic() - started) * 1000)
 
     await _emit_post_tool_call_hook(
@@ -1043,29 +1064,34 @@ async def handle_function_call(
         middleware_trace=middleware_trace,
     )
 
-    from hermes_cli.lifecycle import has_hook, invoke_hook
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
 
-    if has_hook("transform_tool_result"):
-        status, error_type, error_message = _tool_result_observer_fields(result)
-        hook_results = await invoke_hook(
-            "transform_tool_result",
-            tool_name=function_name,
-            args=function_args,
-            result=result,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=turn_id or "",
-            api_request_id=api_request_id or "",
-            duration_ms=duration_ms,
-            status=status,
-            error_type=error_type,
-            error_message=error_message,
-        )
-        for hook_result in hook_results:
-            if isinstance(hook_result, str):
-                result = hook_result
-                break
+        if has_hook("transform_tool_result"):
+            status, error_type, error_message = _tool_result_observer_fields(result)
+            hook_results = await invoke_hook(
+                "transform_tool_result",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+                duration_ms=duration_ms,
+                status=status,
+                error_type=error_type,
+                error_message=error_message,
+            )
+            for hook_result in hook_results:
+                if isinstance(hook_result, str):
+                    result = hook_result
+                    break
+    except asyncio.CancelledError:
+        raise
+    except Exception as hook_error:
+        logger.debug("transform_tool_result hook error: %s", hook_error)
     return result
 
 

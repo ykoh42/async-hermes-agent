@@ -275,6 +275,54 @@ class TestMemoryStorePersistence:
         await store.load_from_disk()
         assert len(store.memory_entries) == 2
 
+    async def test_concurrent_stores_do_not_lose_profile_writes(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        original_write = MemoryStore._write_file
+
+        async def delayed_write(path, entries):
+            await asyncio.sleep(0.03)
+            await original_write(path, entries)
+
+        monkeypatch.setattr(
+            MemoryStore,
+            "_write_file",
+            staticmethod(delayed_write),
+        )
+        first = MemoryStore()
+        second = MemoryStore()
+        await asyncio.gather(first.load_from_disk(), second.load_from_disk())
+
+        results = await asyncio.gather(
+            first.add("memory", "first fact"),
+            second.add("memory", "second fact"),
+        )
+
+        assert all(result["success"] for result in results)
+        reloaded = MemoryStore()
+        await reloaded.load_from_disk()
+        assert set(reloaded.memory_entries) == {"first fact", "second fact"}
+
+    async def test_atomic_memory_write_preserves_symlink_target(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        real_file = tmp_path / "managed-memory.md"
+        real_file.write_text("existing fact", encoding="utf-8")
+        memory_link = tmp_path / "MEMORY.md"
+        memory_link.symlink_to(real_file)
+
+        store = MemoryStore()
+        await store.load_from_disk()
+        result = await store.add("memory", "new fact")
+
+        assert result["success"] is True
+        assert memory_link.is_symlink()
+        assert real_file.read_text(encoding="utf-8") == (
+            "existing fact\n§\nnew fact"
+        )
+
     async def test_cancelled_atomic_write_removes_temporary_file(
         self, tmp_path, monkeypatch
     ):

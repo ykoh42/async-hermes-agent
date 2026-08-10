@@ -1538,7 +1538,9 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         
         for file_path in jsonl_files:
             async with aiofiles.open(file_path, encoding="utf-8") as handle:
-                line_num = 0
+                # Upstream's directory path uses enumerate(handle)'s zero-based
+                # index (the single-file CLI path intentionally starts at 1).
+                line_num = -1
                 async for line in handle:
                     line_num += 1
                     line = line.strip()

@@ -3,7 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -272,6 +272,18 @@ class TestSkillsList:
         assert filtered["count"] == 1
         assert filtered["skills"][0]["name"] == "skill-a"
 
+    async def test_existing_empty_directory_preserves_upstream_response(self, tmp_path):
+        tmp_path.mkdir(exist_ok=True)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            result = json.loads(await skills_list())
+
+        assert result == {
+            "success": True,
+            "skills": [],
+            "categories": [],
+            "message": "No skills found in skills/ directory.",
+        }
+
     async def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
@@ -297,6 +309,30 @@ class TestSkillsList:
 
 @pytest.mark.asyncio
 class TestSkillView:
+    async def test_plugin_qualified_name_falls_back_to_local_category(
+        self, tmp_path
+    ):
+        manager = MagicMock()
+        manager.find_plugin_skill.return_value = None
+        manager.list_plugin_skills.return_value = []
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "hermes_cli.plugins.discover_plugins",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "hermes_cli.plugins.get_plugin_manager",
+                return_value=manager,
+            ),
+        ):
+            _make_skill(tmp_path, "deploy", category="ops")
+            result = json.loads(await skill_view("ops:deploy", preprocess=False))
+
+        assert result["success"] is True
+        assert result["name"] == "deploy"
+        assert result["path"] == "ops/deploy/SKILL.md"
+
     async def test_preprocesses_template_vars_and_preserves_raw_opt_out(
         self, tmp_path
     ):
@@ -398,6 +434,42 @@ class TestSkillView:
         # The skill view advertises what else can be opened.
         assert skill["linked_files"] is not None
         assert "references" in skill["linked_files"]
+        assert missing["available_files"] == {"references": ["references/api.md"]}
+        assert missing["hint"] == "Use one of the available file paths listed above"
+
+    async def test_linked_file_filters_and_metadata_tag_precedence(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(
+                tmp_path,
+                "filtered",
+                frontmatter_extra=(
+                    "tags: [top-level]\n"
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    tags: [hermes-meta]\n"
+                ),
+            )
+            references = skill_dir / "references"
+            references.mkdir()
+            (references / "included.md").write_text("included")
+            (references / "ignored.txt").write_text("ignored")
+            nested_reference = references / "nested"
+            nested_reference.mkdir()
+            (nested_reference / "ignored.md").write_text("ignored")
+            scripts = skill_dir / "scripts"
+            scripts.mkdir()
+            (scripts / "included.py").write_text("pass")
+            nested_script = scripts / "nested"
+            nested_script.mkdir()
+            (nested_script / "ignored.py").write_text("pass")
+
+            result = json.loads(await skill_view("filtered", preprocess=False))
+
+        assert result["tags"] == ["hermes-meta"]
+        assert result["linked_files"] == {
+            "references": ["references/included.md"],
+            "scripts": ["scripts/included.py"],
+        }
 
     async def test_disabled_skill_blocked_enabled_allowed(self, tmp_path):
         with (

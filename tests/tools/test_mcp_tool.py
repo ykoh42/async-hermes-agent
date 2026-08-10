@@ -971,6 +971,28 @@ class TestBuildSafeEnv:
         assert "DATABASE_URL" not in result
         assert "API_SECRET" not in result
 
+    def test_external_secret_source_vars_are_passed(self, monkeypatch):
+        """Configured upstream secret sources are explicit pass-throughs."""
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setattr(
+            env_loader,
+            "get_secret_source",
+            lambda key: "command:secret" if key == "MCP_API_TOKEN" else None,
+        )
+        with patch.dict(
+            "os.environ",
+            {"PATH": "/usr/bin", "MCP_API_TOKEN": "resolved-token"},
+            clear=True,
+        ):
+            result = _build_safe_env(None)
+
+        assert result == {
+            "PATH": "/usr/bin",
+            "MCP_API_TOKEN": "resolved-token",
+        }
+
     def test_windows_location_vars_passed_without_secrets(self):
         """Windows launcher tools need location vars, but secrets stay filtered."""
         from tools.mcp_tool import _build_safe_env
