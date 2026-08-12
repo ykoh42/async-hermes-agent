@@ -76,6 +76,8 @@ class _MemorySourceFinder(importlib.abc.MetaPathFinder):
             origin=record.filename,
             is_package=record.is_package,
         )
+        if spec is not None:
+            spec.has_location = True
         if (
             spec is not None
             and spec.submodule_search_locations is not None
@@ -254,6 +256,7 @@ async def load_source_package(
         )
         if spec is None:
             raise ImportError(f"Cannot create module spec for {init_file}")
+        spec.has_location = True
         if spec.submodule_search_locations is not None:
             spec.submodule_search_locations[:] = [str(init_file.parent)]
         module = importlib.util.module_from_spec(spec)
@@ -336,6 +339,7 @@ async def load_source_module(
         )
         if spec is None:
             raise ImportError(f"Cannot create module spec for {source_file}")
+        spec.has_location = True
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)  # type: ignore[union-attr]

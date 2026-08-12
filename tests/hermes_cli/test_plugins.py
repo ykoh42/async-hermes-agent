@@ -399,6 +399,7 @@ class TestPluginLoading:
         module = await manager._load_directory_module(manifest)
         try:
             assert module.VALUE == "from-helper"
+            assert module.__file__ == str(plugin_dir / "__init__.py")
             assert "hermes_plugins.relative_plugin.helper" in sys.modules
         finally:
             unload_source_finder(module)
@@ -446,6 +447,7 @@ class TestPluginLoading:
         module = await manager._load_directory_module(manifest)
         try:
             assert module.VALUE == "from-nested-helper"
+            assert module.__file__ == str(plugin_dir / "__init__.py")
             assert "hermes_plugins.nested_relative_plugin.subpkg" in sys.modules
             assert "hermes_plugins.nested_relative_plugin.subpkg.helper" in sys.modules
         finally:
@@ -481,6 +483,11 @@ class TestPluginLoading:
             key="browser/absolute_plugin",
         )
 
+        original_plugin_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "plugins" or name.startswith("plugins.browser")
+        }
         for name in tuple(sys.modules):
             if name == "plugins" or name.startswith("plugins.browser"):
                 sys.modules.pop(name, None)
@@ -500,6 +507,7 @@ class TestPluginLoading:
             assert sys.modules["plugins.browser"].__spec__.origin is None
             canonical = sys.modules["plugins.browser.absolute_plugin.provider"]
             assert canonical.__loader__.__class__.__name__ == "_MemorySourceLoader"
+            assert canonical.__file__ == str(plugin_dir / "provider.py")
         finally:
             unload_source_finder(module)
             for name in tuple(sys.modules):
@@ -509,6 +517,7 @@ class TestPluginLoading:
                     or name.startswith("plugins.browser")
                 ):
                     sys.modules.pop(name, None)
+            sys.modules.update(original_plugin_modules)
 
     @pytest.mark.asyncio
     async def test_async_skill_registration_validates_path_after_register(
