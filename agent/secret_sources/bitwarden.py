@@ -63,7 +63,7 @@ from agent.secret_sources.base import (
     ErrorKind,
     SecretSource,
     _finish_subprocess_communicate,
-    communicate_subprocess,
+    _communicate_subprocess,
     get_source_environment,
 )
 
@@ -757,7 +757,7 @@ async def _run_bws_list(
     except OSError as exc:
         raise RuntimeError(f"failed to invoke bws: {exc}") from exc
 
-    stdout_bytes, stderr_bytes = await communicate_subprocess(
+    stdout_bytes, stderr_bytes = await _communicate_subprocess(
         proc,
         timeout=_BWS_RUN_TIMEOUT,
         timeout_message=(

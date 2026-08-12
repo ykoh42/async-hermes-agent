@@ -58,7 +58,7 @@ from agent.secret_sources._cache import (
 from agent.secret_sources.base import (
     ErrorKind,
     SecretSource,
-    communicate_subprocess,
+    _communicate_subprocess,
     get_source_environment,
 )
 
@@ -305,7 +305,7 @@ async def _run_op_read(
     except OSError as exc:
         raise RuntimeError(f"failed to invoke op: {exc}") from exc
 
-    stdout_bytes, stderr_bytes = await communicate_subprocess(
+    stdout_bytes, stderr_bytes = await _communicate_subprocess(
         proc,
         timeout=_OP_RUN_TIMEOUT,
         timeout_message=(

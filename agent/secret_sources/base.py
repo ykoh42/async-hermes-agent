@@ -102,7 +102,7 @@ async def _finish_subprocess_communicate(
     return result
 
 
-async def communicate_subprocess(
+async def _communicate_subprocess(
     process: asyncio.subprocess.Process,
     *,
     timeout: float,
@@ -394,7 +394,7 @@ async def run_secret_cli(
             f"failed to invoke {Path(str(argv[0])).name}: {exc}"
         ) from exc
 
-    stdout_bytes, stderr_bytes = await communicate_subprocess(
+    stdout_bytes, stderr_bytes = await _communicate_subprocess(
         proc,
         timeout=timeout,
         timeout_message=(

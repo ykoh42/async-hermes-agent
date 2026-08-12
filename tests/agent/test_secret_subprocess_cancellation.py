@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from agent.secret_sources.base import communicate_subprocess
+from agent.secret_sources.base import _communicate_subprocess
 
 
 @pytest.mark.asyncio
@@ -31,7 +31,7 @@ async def test_repeated_cancellation_waits_for_secret_helper_reap():
             killed.set()
 
     helper = asyncio.create_task(
-        communicate_subprocess(
+        _communicate_subprocess(
             ControlledProcess(),
             timeout=60,
             timeout_message="timed out",
