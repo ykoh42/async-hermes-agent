@@ -1177,13 +1177,17 @@ async def build_turn_context(
     # content, so the crash persist below writes both in the same row and
     # replay can reproduce the sent prefix byte-for-byte. Guarded by the
     # same predicate the api_messages build uses, so the stamped bytes are
-    # exactly the bytes the loop sends. MoA turns append per-call aggregated
+    # exactly the bytes the loop sends. codex_app_server turns bypass the
+    # api_messages build entirely (the codex thread gets the plain user
+    # message), so stamping there would persist bytes that were never sent.
+    # MoA turns append per-call aggregated
     # reference context to the same API
     # copy AFTER this composition, so the stamped bytes would never match the
     # wire either — skip the stamp rather than persist provably wrong "exact
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
     if (
         not moa_active
+        and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
     ):

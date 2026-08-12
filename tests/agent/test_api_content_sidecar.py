@@ -256,6 +256,24 @@ def _stub_runtime_main():
 
 class TestPrologueStamping:
     @pytest.mark.asyncio
+    async def test_stamps_api_content_from_plugin_context(self):
+        agent = _FakeAgent()
+        with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            new_callable=AsyncMock,
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = await _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"  # clean content untouched
+        assert msg["api_content"] == compose_user_api_content(
+            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
+        )
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        # The early persist saw the stamped sidecar (written in one insert).
+        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
+
+    @pytest.mark.asyncio
     async def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
         with patch(
@@ -266,6 +284,20 @@ class TestPrologueStamping:
             ctx = await _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
+
+    @pytest.mark.asyncio
+    async def test_no_stamp_for_codex_app_server(self):
+        """codex_app_server turns bypass the api_messages build, so the
+        injected bytes are never sent — stamping would persist a lie."""
+        agent = _FakeAgent()
+        agent.api_mode = "codex_app_server"
+        with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            new_callable=AsyncMock,
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = await _build(agent)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
 # ---------------------------------------------------------------------------
 # Flush: persist-override rows keep the sent bytes in the sidecar (#48677)

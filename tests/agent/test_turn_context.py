@@ -186,6 +186,41 @@ async def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+# ── Trivial-prompt prefetch gate (PR #25350 salvage) ──────────────────────
+#
+# The prologue is the ONLY place the per-turn asynchronous
+# memory_manager.prefetch_all() fires; a bare greeting must not block the
+# turn on provider network round-trips, while a substantive question must
+# still prefetch. These assert the gate at the call site (the classifier
+# itself is covered in tests/agent/test_memory_provider.py).
+
+
+def _agent_with_memory_manager():
+    agent = _FakeAgent()
+    mm = MagicMock()
+    mm.on_turn_start = AsyncMock()
+    mm.prefetch_all = AsyncMock(return_value="REMEMBERED CONTEXT")
+    agent._memory_manager = mm
+    return agent, mm
+
+
+@pytest.mark.asyncio
+async def test_prefetch_skipped_for_trivial_user_message():
+    agent, mm = _agent_with_memory_manager()
+    ctx = await _build(agent, user_message="hi!")
+    mm.prefetch_all.assert_not_awaited()
+    assert ctx.ext_prefetch_cache == ""
+
+
+@pytest.mark.asyncio
+async def test_prefetch_runs_for_substantive_user_message():
+    agent, mm = _agent_with_memory_manager()
+    query = "what did we decide about the deploy pipeline?"
+    ctx = await _build(agent, user_message=query)
+    mm.prefetch_all.assert_awaited_once_with(query)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
 @pytest.mark.asyncio
 async def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
@@ -353,7 +388,6 @@ async def test_between_turns_refresh_never_swallows_non_exception_base_error():
         pytest.raises(FatalRefresh, match="fatal"),
     ):
         await _build(agent)
-
 
 
 
