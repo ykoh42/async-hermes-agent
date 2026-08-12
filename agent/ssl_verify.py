@@ -35,7 +35,7 @@ async def resolve_httpx_verify(
     Priority:
     1. ``ssl_verify: false`` — disable verification (local dev only)
     2. explicit ``ca_bundle`` (per-provider ``ssl_ca_cert`` config field)
-    3. ``HERMES_CA_BUNDLE``, ``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``,
+    3. ``HERMES_CA_BUNDLE``, ``REQUESTS_CA_BUNDLE``, ``SSL_CERT_FILE``,
        ``CURL_CA_BUNDLE`` env vars
     4. ``True`` (httpx/certifi default)
 
@@ -50,14 +50,16 @@ async def resolve_httpx_verify(
         )
         return False
 
-    effective_ca = (
-        (ca_bundle or "").strip()
-        or os.getenv("HERMES_CA_BUNDLE", "").strip()
-        or os.getenv("SSL_CERT_FILE", "").strip()
-        or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
-        or os.getenv("CURL_CA_BUNDLE", "").strip()
+    candidates = (
+        (ca_bundle or "").strip(),
+        os.getenv("HERMES_CA_BUNDLE", "").strip(),
+        os.getenv("REQUESTS_CA_BUNDLE", "").strip(),
+        os.getenv("SSL_CERT_FILE", "").strip(),
+        os.getenv("CURL_CA_BUNDLE", "").strip(),
     )
-    if effective_ca:
+    for effective_ca in candidates:
+        if not effective_ca:
+            continue
         ca_path = await aiofiles.os.wrap(Path.expanduser)(Path(effective_ca))
         if await aiofiles.os.path.isfile(ca_path):
             return await aiofiles.os.wrap(ssl.create_default_context)(

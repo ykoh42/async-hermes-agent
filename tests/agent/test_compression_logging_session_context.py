@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import hermes_logging
 import pytest
+from gateway.session_context import get_session_env, scoped_current_session_id
 from hermes_state import SessionDB
 
 
@@ -70,19 +71,21 @@ async def test_logging_session_context_follows_compression_rotation(tmp_path: Pa
     # conversation_loop.py pins the logging tag to the ORIGINAL id at turn start.
     hermes_logging.set_session_context(parent_sid)
     try:
-        messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-        await agent._compress_context(messages, "sys", approx_tokens=120_000)
+        with scoped_current_session_id(parent_sid):
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+            await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-        # The id actually rotated (sanity — otherwise the assertion is vacuous).
-        assert agent.session_id != parent_sid
+            # The id actually rotated (sanity — otherwise the assertions are vacuous).
+            assert agent.session_id != parent_sid
 
-        # The logging context must now match the NEW id, not the stale one.
-        current = hermes_logging._session_id_var.get()
-        assert current == agent.session_id, (
-            "Logging session context did not follow the compaction rotation: "
-            f"log tag still {current!r}, agent.session_id is {agent.session_id!r} "
-            "(see #34089)."
-        )
+            # Both task-local consumers must now match the NEW id, not the stale one.
+            assert get_session_env("HERMES_SESSION_ID") == agent.session_id
+            current = hermes_logging._session_id_var.get()
+            assert current == agent.session_id, (
+                "Logging session context did not follow the compaction rotation: "
+                f"log tag still {current!r}, agent.session_id is {agent.session_id!r} "
+                "(see #34089)."
+            )
     finally:
         hermes_logging.clear_session_context()
         await agent.close()

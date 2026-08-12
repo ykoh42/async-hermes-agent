@@ -329,6 +329,51 @@ async def test_agent_owned_timeout_records_cooldown_after_worker_rollback(
 
 
 @pytest.mark.asyncio
+async def test_agent_owned_timeout_never_exposes_mutated_worker_snapshot(
+    monkeypatch,
+):
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._cached_system_prompt = "sys"
+    agent._conversation_root_id = AsyncMock(return_value=None)
+    agent._session_db = None
+    agent.session_id = "snapshot-isolation"
+    agent.context_compressor = MagicMock()
+    agent.context_compressor._consecutive_timeout_failures = 0
+    agent.context_compressor.record_timeout_failure = MagicMock()
+    agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+    agent._touch_activity = MagicMock()
+
+    mutated = asyncio.Event()
+
+    async def mutate_then_block(_agent, worker_messages, _system_message, **_kwargs):
+        worker_messages[:] = [{"role": "assistant", "content": "worker mutation"}]
+        mutated.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.compress_context", mutate_then_block
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda _config=None: (0.01, 0.05),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", AsyncMock(return_value={})
+    )
+
+    original = [{"role": "user", "content": "keep-me"}]
+    with patch("agent.portal_tags.get_conversation_context", return_value=object()):
+        returned, prompt = await AIAgent._compress_context(agent, original, "sys")
+
+    assert mutated.is_set()
+    assert returned is original
+    assert returned == [{"role": "user", "content": "keep-me"}]
+    assert prompt == "sys"
+
+
+@pytest.mark.asyncio
 async def test_timeout_guard_state_is_persisted_natively(tmp_path):
     from hermes_state import SessionDB
 

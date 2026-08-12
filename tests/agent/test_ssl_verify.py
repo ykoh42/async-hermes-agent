@@ -45,6 +45,52 @@ async def test_default_without_env_is_true(clean_ca_env):
     assert await resolve_httpx_verify() is True
 
 
+async def test_ca_env_priority_matches_upstream_requests_resolver(
+    clean_ca_env,
+    monkeypatch,
+    tmp_path,
+):
+    requests_bundle = tmp_path / "requests.pem"
+    ssl_bundle = tmp_path / "ssl.pem"
+    requests_bundle.write_text("requests")
+    ssl_bundle.write_text("ssl")
+    seen = []
+
+    def create_default_context(*, cafile=None, capath=None):
+        seen.append((cafile, capath))
+        return object()
+
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(requests_bundle))
+    monkeypatch.setenv("SSL_CERT_FILE", str(ssl_bundle))
+    monkeypatch.setattr(ssl, "create_default_context", create_default_context)
+
+    await resolve_httpx_verify()
+
+    assert seen == [(str(requests_bundle), None)]
+
+
+async def test_invalid_higher_priority_ca_env_falls_through_to_valid_candidate(
+    clean_ca_env,
+    monkeypatch,
+    tmp_path,
+):
+    requests_bundle = tmp_path / "requests.pem"
+    requests_bundle.write_text("requests")
+    seen = []
+
+    def create_default_context(*, cafile=None, capath=None):
+        seen.append((cafile, capath))
+        return object()
+
+    monkeypatch.setenv("HERMES_CA_BUNDLE", str(tmp_path / "missing.pem"))
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(requests_bundle))
+    monkeypatch.setattr(ssl, "create_default_context", create_default_context)
+
+    await resolve_httpx_verify()
+
+    assert seen == [(str(requests_bundle), None)]
+
+
 async def test_ca_directory_falls_back_to_upstream_true(
     clean_ca_env,
     tmp_path,

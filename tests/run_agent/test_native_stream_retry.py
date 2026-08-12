@@ -102,6 +102,25 @@ async def test_transient_stream_errors_retry_then_return_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_interrupt_after_provider_response_is_not_swallowed(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    response = object()
+    agent = None
+
+    async def execute(_api_kwargs, **_kwargs):
+        agent._interrupt_requested = True
+        return response
+
+    agent = _retry_agent(execute)
+
+    with pytest.raises(
+        InterruptedError,
+        match="interrupted during streaming API call",
+    ):
+        await interruptible_streaming_api_call(agent, {})
+
+
+@pytest.mark.asyncio
 async def test_empty_stream_retries_then_logs_exhaustion(monkeypatch):
     monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
     execute = AsyncMock(
@@ -337,7 +356,7 @@ async def test_partial_tool_retry_exhaustion_returns_warning_stub(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_interrupt_flag_stops_before_transient_retry(monkeypatch):
+async def test_interrupt_flag_wins_over_transient_retry(monkeypatch):
     monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
     holder = {}
     attempts = 0
@@ -351,11 +370,11 @@ async def test_interrupt_flag_stops_before_transient_retry(monkeypatch):
     agent = _retry_agent(execute)
     holder["agent"] = agent
 
-    with pytest.raises(InterruptedError, match="before stream retry"):
+    with pytest.raises(InterruptedError, match="post-worker"):
         await interruptible_streaming_api_call(agent, {})
 
     assert attempts == 1
-    agent._emit_stream_drop.assert_called_once()
+    agent._emit_stream_drop.assert_not_called()
 
 
 @pytest.mark.asyncio

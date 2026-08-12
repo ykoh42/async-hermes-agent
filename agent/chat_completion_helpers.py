@@ -1018,6 +1018,10 @@ async def interruptible_streaming_api_call(
         except InterruptedError:
             raise
         except Exception as caught:
+            if getattr(agent, "_interrupt_requested", False):
+                raise InterruptedError(
+                    "Agent interrupted during streaming API call (post-worker)"
+                ) from None
             error: Exception = caught
             watchdog_timeout = (
                 isinstance(caught, TimeoutError) and timeout_scope.expired()
@@ -1244,6 +1248,10 @@ async def interruptible_streaming_api_call(
                 logger.exception("Streaming failed before delivery: %s", error)
             raise error
 
+        if getattr(agent, "_interrupt_requested", False):
+            raise InterruptedError(
+                "Agent interrupted during streaming API call (post-worker)"
+            )
         _reset_stale_streak(agent)
         return response
 
