@@ -5,19 +5,21 @@ Batch Agent Runner
 This module provides parallel batch processing capabilities for running the agent
 across multiple prompts from a dataset. It includes:
 - Dataset loading and batching
-- Parallel batch processing with multiprocessing
+- Bounded parallel batch processing with asyncio tasks
 - Checkpointing for fault tolerance and resumption
 - Trajectory saving in the proper format (from/value pairs)
 - Tool usage statistics aggregation across all batches
 
 Usage:
-    python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run
-    
-    # Resume an interrupted run
-    python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run --resume
-    
-    # Use a specific toolset distribution
-    python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run --distribution=image_gen
+    runner = BatchRunner(
+        dataset_file="data.jsonl",
+        batch_size=10,
+        run_name="my_run",
+    )
+    await runner.run()
+
+    # Resume an interrupted run.
+    await runner.run(resume=True)
 """
 
 # IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
@@ -1232,7 +1234,7 @@ async def main(
         api_key (str): API key for model authentication
         base_url (str): Base URL for model API
         max_turns (int): Maximum number of tool calling iterations per prompt (default: 10)
-        num_workers (int): Number of parallel worker processes (default: 4)
+        num_workers (int): Maximum number of concurrent async batch tasks (default: 4)
         resume (bool): Resume from checkpoint if run was interrupted (default: False)
         verbose (bool): Enable verbose logging (default: False)
         list_distributions (bool): List available toolset distributions and exit
@@ -1248,26 +1250,20 @@ async def main(
         prefill_messages_file (str): Path to JSON file containing prefill messages (list of {role, content} dicts)
         max_samples (int): Only process the first N samples from the dataset (optional, processes all if not set)
         
-    Examples:
-        # Basic usage
-        python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run
-        
-        # Resume interrupted run
-        python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run --resume
-        
-        # Use specific distribution
-        python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=image_test --distribution=image_gen
-        
-        # With disabled reasoning and max tokens
-        python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run \\
-                               --reasoning_disabled --max_tokens=128000
-        
-        # With prefill messages from file
-        python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run \\
-                               --prefill_messages_file=configs/prefill_opus.json
-        
-        # List available distributions
-        python batch_runner.py --list_distributions
+    Example:
+        await main(
+            dataset_file="data.jsonl",
+            batch_size=10,
+            run_name="my_run",
+        )
+
+        # Resume an interrupted run.
+        await main(
+            dataset_file="data.jsonl",
+            batch_size=10,
+            run_name="my_run",
+            resume=True,
+        )
     """
     # Handle list distributions
     if list_distributions:
