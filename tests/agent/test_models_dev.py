@@ -1,6 +1,7 @@
 """Tests for agent.models_dev — models.dev registry integration."""
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -151,11 +152,13 @@ class TestFetchModelsDev:
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
         md._models_dev_lock = None
+        md._models_dev_refresh_task = None
         yield
         md._models_dev_cache = {}
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
         md._models_dev_lock = None
+        md._models_dev_refresh_task = None
 
     @pytest.mark.asyncio
     async def test_disk_cache_short_circuits_network(self, tmp_path, monkeypatch):
@@ -181,7 +184,137 @@ class TestFetchModelsDev:
         client_cls.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_concurrent_fetches_share_one_request(self, tmp_path, monkeypatch):
+    async def test_stale_disk_cache_returns_without_foreground_network(self):
+        import agent.models_dev as md
+
+        with (
+            patch.object(
+                md,
+                "_disk_cache_age_seconds",
+                new=AsyncMock(return_value=md._MODELS_DEV_CACHE_TTL + 60),
+            ),
+            patch.object(
+                md,
+                "_load_disk_cache",
+                new=AsyncMock(return_value=SAMPLE_REGISTRY),
+            ),
+            patch.object(md, "_start_background_refresh_models_dev") as refresh,
+            patch.object(
+                md,
+                "_fetch_models_dev_from_network",
+                new=AsyncMock(),
+            ) as network,
+        ):
+            result = await fetch_models_dev()
+
+        assert result == SAMPLE_REGISTRY
+        refresh.assert_called_once_with()
+        network.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_cache_failure_enters_backoff_and_suppresses_retry(self):
+        import agent.models_dev as md
+
+        md._models_dev_cache = SAMPLE_REGISTRY
+        md._models_dev_cache_time = time.time() - md._MODELS_DEV_CACHE_TTL - 1
+        network = AsyncMock(side_effect=OSError("models.dev unreachable"))
+
+        with patch.object(md, "_fetch_models_dev_from_network", new=network):
+            first = await fetch_models_dev()
+            refresh_task = md._models_dev_refresh_task
+            assert refresh_task is not None
+            await refresh_task
+
+            second = await fetch_models_dev()
+
+        assert first == second == SAMPLE_REGISTRY
+        assert md._models_dev_retry_after > time.time()
+        network.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_cache_returns_before_background_refresh_finishes(self):
+        import agent.models_dev as md
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_refresh():
+            started.set()
+            await release.wait()
+            return SAMPLE_REGISTRY
+
+        md._models_dev_cache = {"stale": {}}
+        md._models_dev_cache_time = time.time() - md._MODELS_DEV_CACHE_TTL - 1
+        with (
+            patch.object(md, "_fetch_models_dev_from_network", new=slow_refresh),
+            patch.object(md, "_save_disk_cache", new=AsyncMock()),
+        ):
+            result = await asyncio.wait_for(fetch_models_dev(), timeout=0.1)
+            assert result == {"stale": {}}
+            await asyncio.wait_for(started.wait(), timeout=0.1)
+            refresh_task = md._models_dev_refresh_task
+            assert refresh_task is not None and not refresh_task.done()
+            release.set()
+            await asyncio.wait_for(refresh_task, timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_background_refresh_clears_task_without_backoff(self):
+        import agent.models_dev as md
+
+        started = asyncio.Event()
+
+        async def blocked_refresh():
+            started.set()
+            await asyncio.Event().wait()
+
+        md._models_dev_cache = {"stale": {}}
+        md._models_dev_cache_time = time.time() - md._MODELS_DEV_CACHE_TTL - 1
+        with patch.object(
+            md,
+            "_fetch_models_dev_from_network",
+            new=blocked_refresh,
+        ):
+            assert await fetch_models_dev() == {"stale": {}}
+            await asyncio.wait_for(started.wait(), timeout=0.1)
+            refresh_task = md._models_dev_refresh_task
+            assert refresh_task is not None
+            refresh_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await refresh_task
+            await asyncio.sleep(0)
+
+        assert md._models_dev_refresh_task is None
+        assert md._models_dev_retry_after == 0
+
+    @pytest.mark.asyncio
+    async def test_background_refresh_success_commits_registry(self):
+        import agent.models_dev as md
+
+        md._models_dev_cache = {"stale": {}}
+        md._models_dev_cache_time = 0
+        md._models_dev_retry_after = time.time() - 1
+
+        with (
+            patch.object(
+                md,
+                "_fetch_models_dev_from_network",
+                new=AsyncMock(return_value=SAMPLE_REGISTRY),
+            ),
+            patch.object(md, "_save_disk_cache", new=AsyncMock()) as save,
+        ):
+            await md._background_refresh_models_dev()
+
+        save.assert_awaited_once_with(SAMPLE_REGISTRY)
+        assert md._models_dev_cache == SAMPLE_REGISTRY
+        assert md._models_dev_cache_time > 0
+        assert md._models_dev_retry_after == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_refreshes_share_one_network_request(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         response = MagicMock()
         response.json.return_value = SAMPLE_REGISTRY
@@ -197,6 +330,30 @@ class TestFetchModelsDev:
 
         assert results == [SAMPLE_REGISTRY] * 6
         client.get.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_bypasses_failure_backoff(self):
+        import agent.models_dev as md
+
+        network = AsyncMock(
+            side_effect=[OSError("models.dev unreachable"), SAMPLE_REGISTRY]
+        )
+        with (
+            patch.object(
+                md,
+                "_disk_cache_age_seconds",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(md, "_load_disk_cache", new=AsyncMock(return_value={})),
+            patch.object(md, "_save_disk_cache", new=AsyncMock()),
+            patch.object(md, "_fetch_models_dev_from_network", new=network),
+        ):
+            assert await fetch_models_dev() == {}
+            assert md._models_dev_retry_after > time.time()
+            assert await fetch_models_dev(force_refresh=True) == SAMPLE_REGISTRY
+
+        assert network.await_count == 2
+        assert md._models_dev_retry_after == 0
 
 
 # ---------------------------------------------------------------------------

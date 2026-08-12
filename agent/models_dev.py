@@ -10,13 +10,13 @@ of 4000+ models across 109+ providers.  Provides:
 
 Data resolution order:
   1. In-memory cache (fresh, or stale served immediately while a single
-     background daemon thread refreshes)
+     background async task refreshes)
   2. Disk cache (~/.hermes/models_dev_cache.json — any age; stale data is
      served rather than blocking callers on the network)
   3. Network fetch (https://models.dev/api.json) — only when no cache
      exists at all; failed refreshes back off for 5 minutes process-wide
-Latency-sensitive callers (gateway route-identity checks) pass
-``allow_network=False`` and never touch the network.
+Latency-sensitive callers pass ``allow_network=False`` and never touch the
+network.
 
 Other modules should import the dataclasses and query functions from here
 rather than parsing the raw JSON themselves.
@@ -41,6 +41,7 @@ _models_dev_cache: Dict[str, Any] = {}
 _models_dev_cache_time: float = 0
 _models_dev_retry_after: float = 0
 _models_dev_lock: Optional[asyncio.Lock] = None
+_models_dev_refresh_task: Optional[asyncio.Task[None]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +196,169 @@ def _get_cache_path() -> Path:
     return get_hermes_home() / "models_dev_cache.json"
 
 
+async def _load_disk_cache() -> Dict[str, Any]:
+    """Load models.dev data from disk cache using native async file I/O."""
+    try:
+        import aiofiles
+        import aiofiles.os
+
+        cache_path = _get_cache_path()
+        if await aiofiles.os.path.exists(cache_path):
+            async with aiofiles.open(cache_path, encoding="utf-8") as fh:
+                data = json.loads(await fh.read())
+            return data if isinstance(data, dict) else {}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Failed to load models.dev disk cache: %s", exc)
+    return {}
+
+
+async def _disk_cache_age_seconds() -> Optional[float]:
+    """Return disk-cache age, or None when it cannot be determined."""
+    try:
+        import aiofiles.os
+
+        cache_path = _get_cache_path()
+        if not await aiofiles.os.path.exists(cache_path):
+            return None
+        stat_result = await aiofiles.os.stat(cache_path)
+        age = time.time() - stat_result.st_mtime
+        return age if age >= 0 else None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Failed to stat models.dev disk cache: %s", exc)
+        return None
+
+
+async def _save_disk_cache(data: Dict[str, Any]) -> None:
+    """Atomically save models.dev data with native async file operations."""
+    import aiofiles
+    import aiofiles.os
+
+    cache_path = _get_cache_path()
+    temp_path = cache_path.with_name(f".{cache_path.name}.tmp")
+    try:
+        await aiofiles.os.makedirs(cache_path.parent, exist_ok=True)
+        async with aiofiles.open(temp_path, "w", encoding="utf-8") as fh:
+            await fh.write(json.dumps(data, separators=(",", ":")))
+        await aiofiles.os.replace(temp_path, cache_path)
+    except asyncio.CancelledError:
+        try:
+            await aiofiles.os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            await aiofiles.os.remove(temp_path)
+        except OSError:
+            pass
+        logger.debug("Failed to save models.dev disk cache: %s", exc)
+
+
+async def _fetch_models_dev_from_network() -> Dict[str, Any]:
+    """Fetch the live registry without touching local caches."""
+    import httpx
+
+    from agent.ssl_verify import _create_httpx_client
+
+    async with (await _create_httpx_client(
+        timeout=httpx.Timeout(10.0, connect=5.0),
+    )) as client:
+        response = await client.get(MODELS_DEV_URL)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, dict) or not data:
+        raise ValueError("models.dev returned an empty or invalid registry")
+    return data
+
+
+def _mark_stale_cache_grace() -> None:
+    """Give stale cache data a short in-memory grace before retrying."""
+    global _models_dev_cache_time
+    grace_time = time.time() - _MODELS_DEV_CACHE_TTL + _MODELS_DEV_RETRY_DELAY
+    if grace_time > _models_dev_cache_time:
+        _models_dev_cache_time = grace_time
+
+
+async def _commit_registry(data: Dict[str, Any], *, where: str) -> None:
+    """Persist a freshly fetched registry and clear failure backoff."""
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+    await _save_disk_cache(data)
+    _models_dev_cache = data
+    _models_dev_cache_time = time.time()
+    _models_dev_retry_after = 0
+    logger.debug(
+        "Refreshed models.dev registry (%s): %d providers, %d total models",
+        where,
+        len(data),
+        sum(
+            len(provider.get("models", {}))
+            for provider in data.values()
+            if isinstance(provider, dict)
+        ),
+    )
+
+
+def _note_refresh_failure(exc: Exception, *, where: str) -> None:
+    """Arm the process-wide retry backoff after a failed refresh."""
+    global _models_dev_retry_after
+    _models_dev_retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
+    logger.debug(
+        "models.dev refresh failed (%s); retry suppressed for %ds: %s",
+        where,
+        _MODELS_DEV_RETRY_DELAY,
+        exc,
+    )
+
+
+async def _background_refresh_models_dev() -> None:
+    """Best-effort native async refresh after serving stale cache data."""
+    global _models_dev_lock
+    try:
+        data = await _fetch_models_dev_from_network()
+        if _models_dev_lock is None:
+            _models_dev_lock = asyncio.Lock()
+        async with _models_dev_lock:
+            await _commit_registry(data, where="background")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if _models_dev_lock is None:
+            _models_dev_lock = asyncio.Lock()
+        async with _models_dev_lock:
+            _note_refresh_failure(exc, where="background")
+
+
+def _consume_refresh_task(task: asyncio.Task[None]) -> None:
+    """Clear the tracked refresh task and consume terminal exceptions."""
+    global _models_dev_refresh_task
+    if _models_dev_refresh_task is task:
+        _models_dev_refresh_task = None
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        logger.debug("models.dev background refresh failed", exc_info=True)
+
+
+def _start_background_refresh_models_dev() -> None:
+    """Start at most one event-loop-owned refresh task outside backoff."""
+    global _models_dev_refresh_task
+    if time.time() < _models_dev_retry_after:
+        return
+    if _models_dev_refresh_task is not None and not _models_dev_refresh_task.done():
+        return
+    _models_dev_refresh_task = asyncio.create_task(
+        _background_refresh_models_dev(),
+        name="models-dev-refresh",
+    )
+    _models_dev_refresh_task.add_done_callback(_consume_refresh_task)
+
+
 async def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
     """Look up context_length for a provider+model combo in models.dev.
 
@@ -329,15 +493,27 @@ async def fetch_models_dev(
     *,
     allow_network: bool = True,
 ) -> Dict[str, Any]:
-    """Fetch the models.dev registry without blocking the event loop.
+    """Fetch models.dev with upstream cache semantics and native async I/O.
 
-    CLI/setup callers continue to use :func:`fetch_models_dev`, while the
-    agent turn uses this native transport.  Stale capability data is safe to
-    serve, so the async path never starts a background thread as a side
-    effect of a request.
+    Fresh memory wins. Stale memory or disk data is returned immediately
+    while one tracked async refresh runs. With no cache, callers share one
+    foreground request. Failed automatic refreshes back off for five minutes;
+    ``force_refresh`` bypasses both caches and the backoff.
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
     global _models_dev_lock
+
+    if not allow_network:
+        if _models_dev_cache:
+            return _models_dev_cache
+        disk_data = await _load_disk_cache()
+        if disk_data:
+            _models_dev_cache = disk_data
+            disk_age = await _disk_cache_age_seconds()
+            _models_dev_cache_time = (
+                time.time() - disk_age if disk_age is not None else 0
+            )
+        return _models_dev_cache
 
     if (
         not force_refresh
@@ -346,66 +522,68 @@ async def fetch_models_dev(
     ):
         return _models_dev_cache
 
+    if not force_refresh and _models_dev_cache:
+        _mark_stale_cache_grace()
+        _start_background_refresh_models_dev()
+        logger.debug(
+            "Using stale in-memory models.dev cache; refreshing in background"
+        )
+        return _models_dev_cache
+
+    if not force_refresh:
+        disk_age = await _disk_cache_age_seconds()
+        if disk_age is not None:
+            disk_data = await _load_disk_cache()
+            if disk_data:
+                _models_dev_cache = disk_data
+                if disk_age < _MODELS_DEV_CACHE_TTL:
+                    _models_dev_cache_time = time.time() - disk_age
+                    logger.debug(
+                        "Loaded models.dev from fresh disk cache "
+                        "(%d providers, age=%.0fs)",
+                        len(disk_data),
+                        disk_age,
+                    )
+                else:
+                    _mark_stale_cache_grace()
+                    _start_background_refresh_models_dev()
+                    logger.debug(
+                        "Using stale models.dev disk cache (age=%.0fs); "
+                        "refreshing in background",
+                        disk_age,
+                    )
+                return _models_dev_cache
+
+    if not force_refresh and time.time() < _models_dev_retry_after:
+        return _models_dev_cache
+
     if _models_dev_lock is None:
         _models_dev_lock = asyncio.Lock()
 
     async with _models_dev_lock:
-        if (
-            not force_refresh
-            and _models_dev_cache
-            and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL
-        ):
-            return _models_dev_cache
-
-        import aiofiles
-        import aiofiles.os
-
-        cache_path = _get_cache_path()
         if not force_refresh:
-            try:
-                if await aiofiles.os.path.exists(cache_path):
-                    async with aiofiles.open(cache_path, encoding="utf-8") as fh:
-                        disk_data = json.loads(await fh.read())
-                    if isinstance(disk_data, dict) and disk_data:
-                        _models_dev_cache = disk_data
-                        _models_dev_cache_time = time.time()
-                        return _models_dev_cache
-            except Exception as exc:
-                logger.debug("Failed to load async models.dev cache: %s", exc)
-
-        if not allow_network or (
-            not force_refresh and time.time() < _models_dev_retry_after
-        ):
-            return _models_dev_cache
-
-        import httpx
-        from agent.ssl_verify import _create_httpx_client
+            if _models_dev_cache:
+                return _models_dev_cache
+            if time.time() < _models_dev_retry_after:
+                return _models_dev_cache
 
         try:
-            async with (await _create_httpx_client(
-                timeout=httpx.Timeout(10.0, connect=5.0),
-            )) as client:
-                response = await client.get(MODELS_DEV_URL)
-                response.raise_for_status()
-                data = response.json()
-            if not isinstance(data, dict) or not data:
-                raise ValueError("models.dev returned an empty or invalid registry")
+            data = await _fetch_models_dev_from_network()
+            await _commit_registry(data, where="foreground")
+            return data
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _models_dev_retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
-            logger.debug("Async models.dev refresh failed: %s", exc)
-            return _models_dev_cache
+            _note_refresh_failure(exc, where="foreground")
 
-        _models_dev_cache = data
-        _models_dev_cache_time = time.time()
-        _models_dev_retry_after = 0
-        try:
-            await aiofiles.os.makedirs(cache_path.parent, exist_ok=True)
-            async with aiofiles.open(cache_path, "w", encoding="utf-8") as fh:
-                await fh.write(json.dumps(data, separators=(",", ":")))
-        except Exception as exc:
-            logger.debug("Failed to persist async models.dev cache: %s", exc)
+        if not _models_dev_cache:
+            _models_dev_cache = await _load_disk_cache()
+            _models_dev_cache_time = 0
+            if _models_dev_cache:
+                logger.debug(
+                    "Loaded stale models.dev disk cache (%d providers)",
+                    len(_models_dev_cache),
+                )
         return _models_dev_cache
 
 
