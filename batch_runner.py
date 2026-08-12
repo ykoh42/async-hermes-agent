@@ -37,8 +37,11 @@ import json
 import asyncio
 import aiofiles
 import aiofiles.os
+import aiofiles.tempfile
+import errno
 import logging
 import os
+import stat
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -73,13 +76,83 @@ DEFAULT_TOOL_STATS = {'count': 0, 'success': 0, 'failure': 0}
 async def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
     """Atomically publish a JSON checkpoint without blocking batch workers."""
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.tmp")
+    target = str(path)
+    if await aiofiles.os.path.islink(target):
+        target = await aiofiles.os.wrap(os.path.realpath)(target)
+
+    original_mode: int | None = None
+    original_owner: tuple[int, int] | None = None
+    try:
+        target_stat = await aiofiles.os.stat(target)
+        original_mode = stat.S_IMODE(target_stat.st_mode)
+        if os.name == "posix":
+            original_owner = (target_stat.st_uid, target_stat.st_gid)
+    except OSError:
+        pass
+
     serialized = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
-    async with aiofiles.open(temporary_path, "w", encoding="utf-8") as output:
-        await output.write(serialized)
-        await output.flush()
-        await aiofiles.os.wrap(os.fsync)(output.fileno())
-    await aiofiles.os.replace(temporary_path, path)
+    temporary = ""
+    try:
+        async with aiofiles.tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.stem}_",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = output.name
+            await output.write(serialized)
+            await output.flush()
+            await aiofiles.os.wrap(os.fsync)(output.fileno())
+        try:
+            await aiofiles.os.replace(temporary, target)
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EBUSY):
+                raise
+            temporary_stat = await aiofiles.os.stat(temporary)
+            async with (
+                aiofiles.open(temporary, "rb") as source,
+                aiofiles.open(target, "wb") as destination,
+            ):
+                while chunk := await source.read(1024 * 1024):
+                    await destination.write(chunk)
+                await destination.flush()
+                await aiofiles.os.wrap(os.fsync)(destination.fileno())
+            try:
+                await aiofiles.os.wrap(os.chmod)(
+                    target, stat.S_IMODE(temporary_stat.st_mode)
+                )
+                await aiofiles.os.wrap(os.utime)(
+                    target,
+                    ns=(temporary_stat.st_atime_ns, temporary_stat.st_mtime_ns),
+                )
+            except OSError:
+                pass
+            await aiofiles.os.remove(temporary)
+        temporary = ""
+
+        if original_owner is not None and hasattr(os, "chown"):
+            try:
+                await aiofiles.os.wrap(os.chown)(
+                    target,
+                    original_owner[0],
+                    original_owner[1],
+                )
+            except OSError:
+                pass
+        if original_mode is not None:
+            try:
+                await aiofiles.os.wrap(os.chmod)(target, original_mode)
+            except OSError:
+                pass
+    except BaseException:
+        if temporary:
+            try:
+                await aiofiles.os.remove(temporary)
+            except OSError:
+                pass
+        raise
 
 
 async def _append_jsonl_line(path: Path, payload: Dict[str, Any]) -> None:
@@ -1021,7 +1094,7 @@ class BatchRunner:
                 pending_tasks = [task for task in batch_tasks if not task.done()]
                 for pending in pending_tasks:
                     pending.cancel()
-                if pending_tasks:
+                if batch_tasks:
                     cleanup = asyncio.gather(*batch_tasks, return_exceptions=True)
                     cleanup_cancellation: asyncio.CancelledError | None = None
                     while True:

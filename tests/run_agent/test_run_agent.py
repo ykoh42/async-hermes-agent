@@ -2336,6 +2336,10 @@ class TestConcurrentToolExecution:
         agent._context_engine_tool_names = {"context_query"}
         assert agent_runtime_owns_post_tool_hook(agent, "context_query") is True
 
+        agent._memory_manager = SimpleNamespace(
+            has_tool=lambda name: name == "memory_extra"
+        )
+        assert agent_runtime_owns_post_tool_hook(agent, "memory_extra") is True
         assert agent_runtime_owns_post_tool_hook(agent, "web_search") is False
 
 
@@ -2356,7 +2360,13 @@ class TestConcurrentToolExecution:
         assistant_message = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
 
-        with patch("tools.registry.registry.get_entry", return_value=None):
+        with (
+            patch("tools.registry.registry.get_entry", return_value=None),
+            patch(
+                "model_tools._emit_post_tool_call_hook",
+                new_callable=AsyncMock,
+            ) as post_hook,
+        ):
             await agent._execute_tool_calls(
                 assistant_message,
                 messages,
@@ -2370,6 +2380,9 @@ class TestConcurrentToolExecution:
         )
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"matches": ["result"]}
+        post_hook.assert_awaited_once()
+        assert post_hook.await_args.kwargs["function_name"] == "context_query"
+        assert post_hook.await_args.kwargs["tool_call_id"] == "context-1"
 
 
 

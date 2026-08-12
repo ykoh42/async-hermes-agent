@@ -72,7 +72,8 @@ def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
         return True
     if getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
         return True
-    return False
+    memory_manager = getattr(agent, "_memory_manager", None)
+    return bool(memory_manager and memory_manager.has_tool(function_name))
 
 
 def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:

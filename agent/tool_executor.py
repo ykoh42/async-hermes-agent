@@ -324,6 +324,7 @@ async def _run_agent_tool_execution_middleware(
     begin_execution=None,
     start_order: int = 0,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    emit_runtime_post_hook: bool = False,
 ) -> _ManagedToolResult:
     """Execute one native tool without bypassing the established policy path.
 
@@ -353,7 +354,13 @@ async def _run_agent_tool_execution_middleware(
         else function_args
     )
     trace.extend(request_result.trace)
-    state = {"args": request_args, "blocked": False, "dispatched": False}
+    state = {
+        "args": request_args,
+        "blocked": False,
+        "dispatched": False,
+        "started": None,
+        "post_hook_emitted": False,
+    }
     dispatch_lock = asyncio.Lock()
 
     async def _authorized_dispatch(next_args: dict[str, Any]) -> Any:
@@ -454,6 +461,7 @@ async def _run_agent_tool_execution_middleware(
         else:
             await begin_execution(start_order, _begin)
         started = time.monotonic()
+        state["started"] = started
         try:
             result = await execute(next_args, trace)
         except asyncio.CancelledError as exc:
@@ -475,6 +483,7 @@ async def _run_agent_tool_execution_middleware(
                 },
                 ensure_ascii=False,
             )
+            state["post_hook_emitted"] = True
             await _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
@@ -503,6 +512,28 @@ async def _run_agent_tool_execution_middleware(
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
+    if (
+        emit_runtime_post_hook
+        and state["dispatched"]
+        and not state["blocked"]
+        and not state["post_hook_emitted"]
+    ):
+        started = state["started"]
+        duration_ms = (
+            int((time.monotonic() - started) * 1000)
+            if isinstance(started, float)
+            else 0
+        )
+        await _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args=state["args"],
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            duration_ms=duration_ms,
+            middleware_trace=list(trace),
+        )
     return _ManagedToolResult(
         result=result,
         args=state["args"],
@@ -757,6 +788,12 @@ async def _execute_tool_calls_native(
         if runtime_sink is not None:
             runtime_sink[index] = (name, args, middleware_trace)
         if malformed_args_result is None:
+            memory_manager = getattr(agent, "_memory_manager", None)
+            runtime_owns_post_hook = bool(
+                name in (getattr(agent, "_context_engine_tool_names", None) or set())
+                or (memory_manager and memory_manager.has_tool(name))
+            )
+
             async def _dispatch(next_args, middleware_trace):
                 if name in (
                     getattr(agent, "_context_engine_tool_names", None) or set()
@@ -766,7 +803,6 @@ async def _execute_tool_calls_native(
                         next_args,
                         messages=messages,
                     )
-                memory_manager = getattr(agent, "_memory_manager", None)
                 if memory_manager and memory_manager.has_tool(name):
                     return await memory_manager.handle_tool_call(name, next_args)
                 dispatch_kwargs = {
@@ -849,6 +885,7 @@ async def _execute_tool_calls_native(
                 begin_execution=begin_execution,
                 start_order=index,
                 authorization_gate=authorization_gate,
+                emit_runtime_post_hook=runtime_owns_post_hook,
             )
             result = managed.result
             blocked = managed.blocked

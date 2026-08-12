@@ -361,6 +361,10 @@ async def test_external_memory_tool_uses_native_manager_dispatch():
         patch("tools.registry.registry.get_entry", return_value=None),
         _native_policy_path(),
         patch("model_tools.handle_function_call", new_callable=AsyncMock) as registry_dispatch,
+        patch(
+            "model_tools._emit_post_tool_call_hook",
+            new_callable=AsyncMock,
+        ) as post_hook,
     ):
         await execute_tool_calls_segmented(
             agent,
@@ -372,6 +376,9 @@ async def test_external_memory_tool_uses_native_manager_dispatch():
 
     memory_dispatch.assert_awaited_once_with("external_recall", {})
     registry_dispatch.assert_not_awaited()
+    post_hook.assert_awaited_once()
+    assert post_hook.await_args.kwargs["function_name"] == "external_recall"
+    assert post_hook.await_args.kwargs["tool_call_id"] == "memory-1"
     assert json.loads(messages[0]["content"]) == {"memories": ["fact"]}
 
 

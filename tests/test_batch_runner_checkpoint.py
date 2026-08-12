@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,12 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from batch_runner import BatchRunner, _append_jsonl_line, _process_batch_worker
+from batch_runner import (
+    BatchRunner,
+    _append_jsonl_line,
+    _atomic_json_write,
+    _process_batch_worker,
+)
 
 
 @pytest.fixture
@@ -74,6 +81,46 @@ class TestSaveCheckpoint:
         tmp_files = [f for f in runner.checkpoint_file.parent.iterdir()
                      if ".tmp" in f.name]
         assert len(tmp_files) == 0
+
+    @pytest.mark.asyncio
+    async def test_preserves_upstream_symlink_target(self, runner, tmp_path):
+        target = tmp_path / "real-checkpoint.json"
+        target.write_text("{}", encoding="utf-8")
+        link = tmp_path / "checkpoint-link.json"
+        link.symlink_to(target)
+        runner.checkpoint_file = link
+
+        await runner._save_checkpoint(
+            {"run_name": "test", "completed_prompts": [4]}
+        )
+
+        assert link.is_symlink()
+        assert json.loads(target.read_text(encoding="utf-8"))["completed_prompts"] == [4]
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+    async def test_preserves_upstream_target_mode(self, runner):
+        runner.checkpoint_file.write_text("{}", encoding="utf-8")
+        runner.checkpoint_file.chmod(0o640)
+
+        await runner._save_checkpoint(
+            {"run_name": "test", "completed_prompts": [5]}
+        )
+
+        assert stat.S_IMODE(runner.checkpoint_file.stat().st_mode) == 0o640
+
+
+@pytest.mark.asyncio
+async def test_atomic_json_write_uses_isolated_temp_files_for_concurrent_writers(
+    tmp_path,
+):
+    target = tmp_path / "checkpoint.json"
+    await asyncio.gather(
+        *(_atomic_json_write(target, {"writer": index}) for index in range(12))
+    )
+
+    assert json.loads(target.read_text(encoding="utf-8"))["writer"] in range(12)
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 @pytest.mark.asyncio

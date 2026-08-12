@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import asyncio
+import gc
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -161,6 +162,51 @@ class TestTaskCleanupOnInterruption:
             with pytest.raises(RuntimeError, match="boom"):
                 await runner.run()
         assert sibling_cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_run_retrieves_already_completed_sibling_errors(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner(tmp_path, monkeypatch)
+        both_finished = asyncio.Event()
+        finished = 0
+
+        async def worker(args):
+            nonlocal finished
+            try:
+                raise RuntimeError(f"boom-{args[0]}")
+            finally:
+                finished += 1
+                if finished == 2:
+                    both_finished.set()
+
+        def wait_for_both_before_first_result(tasks):
+            async def first_result():
+                await both_finished.wait()
+                return await tasks[0]
+
+            return [first_result()]
+
+        reports = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reports.append(context))
+        monkeypatch.setattr(batch_runner, "_process_batch_worker", worker)
+        monkeypatch.setattr(batch_runner.asyncio, "as_completed", wait_for_both_before_first_result)
+        try:
+            with pytest.raises(RuntimeError, match="boom-0"):
+                await runner.run()
+            await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert [
+            report
+            for report in reports
+            if report.get("message") == "Task exception was never retrieved"
+        ] == []
 
     @pytest.mark.asyncio
     async def test_run_cancels_and_awaits_workers_when_caller_cancels(
