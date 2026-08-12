@@ -5390,32 +5390,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_row_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load a conversation through the native async SQLite connection."""
-        if not session_id:
-            return []
         session_ids = [session_id]
-        async with self._read_ctx() as connection:
-            if include_ancestors:
-                current = session_id
-                seen = set()
-                while current and current not in seen:
-                    seen.add(current)
-                    row = await (
-                        await connection.execute(
-                            "SELECT parent_session_id FROM sessions "
-                            "WHERE id = ?",
-                            (current,),
-                        )
-                    ).fetchone()
-                    parent = (
-                        row["parent_session_id"] if row is not None else None
-                    )
-                    if not parent:
-                        break
-                    session_ids.insert(0, parent)
-                    current = parent
+        if include_ancestors:
+            session_ids = await self._session_lineage_root_to_tip(session_id)
 
+        active_clause = "" if include_inactive else " AND active = 1"
+        async with self._read_ctx() as connection:
             placeholders = ",".join("?" for _ in session_ids)
-            active_clause = "" if include_inactive else " AND active = 1"
             rows = await (
                 await connection.execute(
                     f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
