@@ -85,13 +85,15 @@ async def test_live_reasoning_tool_observation_and_final_trajectory(
             f"tools and reply exactly {final}."
         )
 
+    assert result["completed"] is True, result
+    trajectory_path = tmp_path / "trajectory_samples.jsonl"
+    assert trajectory_path.exists(), result
     async with aiofiles.open(
-        tmp_path / "trajectory_samples.jsonl",
+        trajectory_path,
         encoding="utf-8",
     ) as handle:
         rows = [json.loads(line) for line in (await handle.read()).splitlines()]
 
-    assert result["completed"] is True
     assert [message["role"] for message in result["messages"]] == [
         "user",
         "assistant",

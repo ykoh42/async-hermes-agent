@@ -3470,14 +3470,14 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             from agent.anthropic_adapter import (
                 _is_oauth_token,
                 build_anthropic_client,
-                ensure_claude_code_version,
+                _ensure_claude_code_version,
             )
 
             agent._anthropic_api_key = api_key
             agent._anthropic_base_url = agent.base_url
             client_error = None
             try:
-                await ensure_claude_code_version()
+                await _ensure_claude_code_version()
                 agent._anthropic_client = await build_anthropic_client(
                     api_key,
                     agent.base_url,

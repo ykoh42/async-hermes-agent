@@ -103,6 +103,49 @@ class TestEstimateMessagesTokensRough:
         # string representation.
         assert 1500 <= result < 2000
 
+    async def test_api_content_substitutes_for_content_not_added_to_it(self):
+        """``api_content`` replaces ``content`` on the wire, so count one."""
+        body = "cached prompt bytes " * 2000
+        wire_shape = {"role": "user", "content": body}
+        persisted_shape = {"role": "user", "content": body, "api_content": body}
+
+        assert estimate_messages_tokens_rough([persisted_shape]) == \
+            estimate_messages_tokens_rough([wire_shape])
+
+    async def test_api_content_is_counted_when_it_differs_from_content(self):
+        """The sidecar is what's sent, so its size is the one that matters."""
+        big_sidecar = "cached prompt bytes " * 2000
+        msg = {"role": "user", "content": "short", "api_content": big_sidecar}
+
+        result = estimate_messages_tokens_rough([msg])
+
+        assert result >= (len(big_sidecar) // 4) * 0.9
+
+    async def test_non_string_api_content_does_not_displace_content(self):
+        """Only a wire-substitutable sidecar may displace stored content."""
+        body = "clean stored content " * 2000
+        baseline = estimate_messages_tokens_rough([{"role": "user", "content": body}])
+
+        for bad_sidecar in (None, "", 42, ["not", "a", "string"]):
+            msg = {"role": "user", "content": body, "api_content": bad_sidecar}
+            assert estimate_messages_tokens_rough([msg]) >= baseline, bad_sidecar
+
+        tool_row = {"role": "tool", "content": body, "api_content": "ignored"}
+        assert estimate_messages_tokens_rough([tool_row]) >= baseline
+
+    async def test_image_stripping_survives_shadow_extraction(self):
+        """Shared wire-shadow extraction preserves flat image accounting."""
+        import base64
+        import os
+
+        payload = "data:image/png;base64," + base64.b64encode(os.urandom(300_000)).decode()
+        msg = {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": payload}}],
+        }
+
+        assert estimate_messages_tokens_rough([msg]) < 5_000
+
 
 
 class TestEstimateRequestTokensRough:
@@ -158,6 +201,37 @@ class TestEstimateRequestTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
+    async def test_nvidia_deepseek_v4_pro_context_is_endpoint_scoped(self):
+        """NVIDIA's 262K NIM window must not lower DeepSeek V4 globally."""
+        accepted_urls = (
+            "https://integrate.api.nvidia.com/v1",
+            "https://INTEGRATE.API.NVIDIA.COM/v1/",
+            "https://integrate.api.nvidia.com:443/v1",
+        )
+        rejected_urls = (
+            "http://integrate.api.nvidia.com/v1",
+            "https://integrate.api.nvidia.com:8443/v1",
+            "https://integrate.api.nvidia.com/v1/other",
+            "https://integrate.api.nvidia.com/v1?route=other",
+            "https://example.invalid/v1",
+            "https://api.deepseek.com/v1",
+            "https://openrouter.ai/api/v1",
+        )
+
+        for base_url in accepted_urls:
+            assert _get_static_context_length(
+                "deepseek-ai/deepseek-v4-pro",
+                provider="nvidia",
+                base_url=base_url,
+            ) == 262_144
+
+        for base_url in rejected_urls:
+            assert _get_static_context_length(
+                "deepseek-ai/deepseek-v4-pro",
+                provider="nvidia",
+                base_url=base_url,
+            ) == 1_000_000
+
     async def test_k3_context_is_scoped_to_confirmed_coding_endpoint(self):
         """The bare ``k3`` slug's 1 Mi context must not leak to unverified endpoints.
 
@@ -414,6 +488,196 @@ class TestCodexOAuthContextLength:
         assert remaining.get(other_key) == 128_000
 
 
+
+
+# =========================================================================
+# Custom endpoint model metadata
+# =========================================================================
+
+class TestFetchEndpointModelMetadata:
+    def setup_method(self):
+        import agent.model_metadata as mm
+        mm._endpoint_model_metadata_cache.clear()
+        mm._endpoint_model_metadata_cache_time.clear()
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    async def test_auth_failure_stops_after_first_candidate(self, status_code):
+        import agent.model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = status_code
+        response.raise_for_status.side_effect = RuntimeError(str(status_code))
+        client = _async_http_client(response=response)
+
+        with patch(
+            "agent.model_metadata._create_httpx_client",
+            new_callable=AsyncMock,
+            return_value=client,
+        ):
+            result = await mm.fetch_endpoint_model_metadata(
+                "https://custom.example/v1"
+            )
+
+        assert result == {}
+        client.get.assert_awaited_once()
+        response.raise_for_status.assert_not_called()
+        response.json.assert_not_called()
+
+    async def test_auth_failure_empty_result_is_cached(self):
+        import agent.model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = 401
+        response.raise_for_status.side_effect = RuntimeError("401")
+        client = _async_http_client(response=response)
+
+        with patch(
+            "agent.model_metadata._create_httpx_client",
+            new_callable=AsyncMock,
+            return_value=client,
+        ):
+            first = await mm.fetch_endpoint_model_metadata(
+                "https://custom.example/v1"
+            )
+            second = await mm.fetch_endpoint_model_metadata(
+                "https://custom.example/v1"
+            )
+
+        assert first == second == {}
+        client.get.assert_awaited_once()
+
+    async def test_not_found_still_tries_alternate_candidate(self):
+        import agent.model_metadata as mm
+
+        not_found = MagicMock()
+        not_found.status_code = 404
+        not_found.raise_for_status.side_effect = RuntimeError("404")
+        success = MagicMock()
+        success.status_code = 200
+        success.json.return_value = {
+            "data": [{"id": "test/model", "context_length": 32768}]
+        }
+        client = _async_http_client(side_effect=[not_found, success])
+
+        with patch(
+            "agent.model_metadata._create_httpx_client",
+            new_callable=AsyncMock,
+            return_value=client,
+        ):
+            result = await mm.fetch_endpoint_model_metadata(
+                "https://custom.example/v1"
+            )
+
+        assert result["test/model"]["context_length"] == 32768
+        assert client.get.await_count == 2
+        assert [call.args[0] for call in client.get.await_args_list] == [
+            "https://custom.example/v1/models",
+            "https://custom.example/models",
+        ]
+        not_found.json.assert_not_called()
+
+
+class TestFallbackWarning:
+    """Unknown context windows warn once instead of silently using 256K."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned_set(self):
+        from agent import model_metadata as mm
+        mm._FALLBACK_WARNED.clear()
+        yield
+        mm._FALLBACK_WARNED.clear()
+
+    @staticmethod
+    def _patch_all_lookups():
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        for target, value in [
+            ("agent.model_metadata.get_cached_context_length", None),
+            ("agent.model_metadata.fetch_model_metadata", {}),
+            ("agent.model_metadata.fetch_endpoint_model_metadata", {}),
+            ("agent.model_metadata._query_ollama_api_show", None),
+            ("agent.model_metadata._query_anthropic_context_length", None),
+            ("agent.model_metadata._endpoint_scoped_context_length", None),
+            ("agent.model_metadata._resolve_endpoint_context_length", None),
+            ("agent.models_dev.lookup_models_dev_context", None),
+        ]:
+            stack.enter_context(
+                patch(target, new_callable=AsyncMock, return_value=value)
+                if target not in {
+                    "agent.model_metadata._endpoint_scoped_context_length"
+                }
+                else patch(target, return_value=value)
+            )
+        return stack
+
+    async def test_warning_emitted_on_fallback(self, caplog):
+        import logging
+
+        with self._patch_all_lookups():
+            with caplog.at_level(logging.WARNING, logger="agent.model_metadata"):
+                result = await get_model_context_length(
+                    "totally-unknown-model-xyz"
+                )
+
+        assert result == DEFAULT_FALLBACK_CONTEXT
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("totally-unknown-model-xyz" in r.getMessage() for r in warnings)
+        assert any("model.context_length" in r.getMessage() for r in warnings)
+
+    async def test_warning_fires_once_per_model(self, caplog):
+        import logging
+
+        with self._patch_all_lookups():
+            with caplog.at_level(logging.WARNING, logger="agent.model_metadata"):
+                for _ in range(3):
+                    await get_model_context_length("totally-unknown-model-xyz")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "falling back" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    async def test_warning_emitted_on_custom_endpoint_fallback(self, caplog):
+        import logging
+
+        with self._patch_all_lookups(), patch(
+            "agent.model_metadata._query_local_context_length",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with caplog.at_level(logging.WARNING, logger="agent.model_metadata"):
+                result = await get_model_context_length(
+                    "totally-unknown-model-xyz",
+                    base_url="http://192.168.1.50:8080/v1",
+                )
+
+        assert result == DEFAULT_FALLBACK_CONTEXT
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("totally-unknown-model-xyz" in r.getMessage() for r in warnings)
+        assert any("model.context_length" in r.getMessage() for r in warnings)
+
+    async def test_no_warning_when_cached(self, caplog):
+        import logging
+
+        with patch(
+            "agent.model_metadata.get_cached_context_length",
+            new_callable=AsyncMock,
+            return_value=32_000,
+        ):
+            with caplog.at_level(logging.WARNING, logger="agent.model_metadata"):
+                result = await get_model_context_length(
+                    "some-model",
+                    base_url="http://127.0.0.1:1/v1",
+                )
+
+        assert result == 32_000
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "falling back" in r.getMessage()
+        ]
+        assert not warnings
 
 
 # =========================================================================

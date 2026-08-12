@@ -1718,10 +1718,10 @@ async def _maybe_wrap_anthropic(
     try:
         from agent.anthropic_adapter import (
             build_anthropic_client,
-            ensure_claude_code_version,
+            _ensure_claude_code_version,
         )
 
-        await ensure_claude_code_version()
+        await _ensure_claude_code_version()
         real_client = await build_anthropic_client(api_key, base_url)
     except ImportError as exc:
         raise ImportError(
@@ -2749,10 +2749,10 @@ async def _try_custom_endpoint(
         try:
             from agent.anthropic_adapter import (
                 build_anthropic_client,
-                ensure_claude_code_version,
+                _ensure_claude_code_version,
             )
 
-            await ensure_claude_code_version()
+            await _ensure_claude_code_version()
             real_client = await build_anthropic_client(custom_key, custom_base)
         except ImportError as exc:
             raise ImportError(
@@ -3016,7 +3016,7 @@ async def _try_anthropic(
         from agent.anthropic_adapter import (
             _is_oauth_token,
             build_anthropic_client,
-            ensure_claude_code_version,
+            _ensure_claude_code_version,
             resolve_anthropic_token,
         )
         from agent.credential_pool import load_pool
@@ -3050,7 +3050,7 @@ async def _try_anthropic(
         model or _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     )
     try:
-        await ensure_claude_code_version()
+        await _ensure_claude_code_version()
         real_client = await build_anthropic_client(token, resolved_base_url)
     except ImportError as exc:
         raise ImportError(
@@ -5347,7 +5347,7 @@ async def resolve_provider_client(
     if provider == "minimax-oauth":
         from agent.anthropic_adapter import (
             build_anthropic_client,
-            ensure_claude_code_version,
+            _ensure_claude_code_version,
         )
         from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
 
@@ -5358,7 +5358,7 @@ async def resolve_provider_client(
             model or _get_aux_model_for_provider(provider),
             provider,
         )
-        await ensure_claude_code_version()
+        await _ensure_claude_code_version()
         real_client = await build_anthropic_client(token, base_url)
         return (
             AnthropicAuxiliaryClient(
@@ -5549,10 +5549,10 @@ async def resolve_provider_client(
                     try:
                         from agent.anthropic_adapter import (
                             build_anthropic_client,
-                            ensure_claude_code_version,
+                            _ensure_claude_code_version,
                         )
 
-                        await ensure_claude_code_version()
+                        await _ensure_claude_code_version()
                         real_client = await build_anthropic_client(
                             custom_key,
                             custom_base,
