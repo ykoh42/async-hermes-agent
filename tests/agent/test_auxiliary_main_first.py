@@ -208,6 +208,100 @@ class TestResolveAutoMainFirst:
 class TestResolveVisionMainFirst:
     """Vision auto-detection prefers the main provider first."""
 
+    @staticmethod
+    def _nous_vision_patches(requested="auto", resolved_model=None):
+        client = MagicMock()
+        return client, (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(requested, resolved_model, None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._read_main_provider",
+                new=AsyncMock(return_value="nous"),
+            ),
+            patch(
+                "agent.auxiliary_client._read_main_model",
+                new=AsyncMock(return_value="tencent/hy3:free"),
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_strict_vision_backend",
+                new=AsyncMock(
+                    return_value=(client, "stepfun/step-3.7-flash:free")
+                ),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_nous_main_vision_uses_portal_pick_not_text_chat_model(self):
+        client, patches = self._nous_vision_patches()
+        with patches[0], patches[1], patches[2], patches[3] as strict:
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, resolved_client, model = await resolve_vision_provider_client()
+
+        assert (provider, resolved_client, model) == (
+            "nous",
+            client,
+            "stepfun/step-3.7-flash:free",
+        )
+        strict.assert_awaited_once_with("nous", None)
+
+    @pytest.mark.asyncio
+    async def test_nous_main_vision_honours_explicit_vision_model(self):
+        explicit = "qwen/qwen3-vl-8b-instruct"
+        client, patches = self._nous_vision_patches(resolved_model=explicit)
+        with patches[0], patches[1], patches[2], patches[3] as strict:
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, resolved_client, model = await resolve_vision_provider_client()
+
+        assert (provider, resolved_client, model) == ("nous", client, explicit)
+        strict.assert_awaited_once_with("nous", explicit)
+
+    @pytest.mark.asyncio
+    async def test_nous_explicit_vision_provider_also_skips_chat_model(self):
+        client, patches = self._nous_vision_patches(requested="nous")
+        with patches[0], patches[1], patches[2], patches[3] as strict:
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, resolved_client, model = await resolve_vision_provider_client()
+
+        assert (provider, resolved_client, model) == (
+            "nous",
+            client,
+            "stepfun/step-3.7-flash:free",
+        )
+        strict.assert_awaited_once_with("nous", None)
+
+    @pytest.mark.asyncio
+    async def test_nous_text_aux_still_uses_main_chat_model(self):
+        client = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client._read_main_model_for_aux",
+                new=AsyncMock(return_value="tencent/hy3:free"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_nous",
+                new=AsyncMock(
+                    return_value=(client, "stepfun/step-3.7-flash:free")
+                ),
+            ) as try_nous,
+            patch(
+                "agent.auxiliary_client._maybe_wrap_anthropic",
+                new=AsyncMock(return_value=client),
+            ),
+        ):
+            from agent.auxiliary_client import resolve_provider_client
+
+            resolved_client, model = await resolve_provider_client("nous")
+
+        assert resolved_client is client
+        assert model == "tencent/hy3:free"
+        try_nous.assert_awaited_once()
+        assert try_nous.await_args.kwargs["vision"] is False
+
     @pytest.mark.asyncio
     async def test_openrouter_main_vision_uses_main_model(self, monkeypatch):
         """OpenRouter main with vision-capable model → aux vision uses main model."""

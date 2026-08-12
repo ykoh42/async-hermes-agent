@@ -7,7 +7,32 @@ client entry across models.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_count_default():
+    from agent import auxiliary_client as ac
+
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        new=AsyncMock(return_value={}),
+    ):
+        assert await ac._transient_retry_count() == ac._DEFAULT_TRANSIENT_RETRIES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(-1, 0), (0, 0), (4, 4), (20, 6), ("3", 3), ("invalid", 2)],
+)
+async def test_transient_retry_count_config_and_bounds(configured, expected):
+    from agent import auxiliary_client as ac
+
+    config = {"auxiliary": {"transient_retries": configured}}
+    assert await ac._transient_retry_count(config) == expected
 
 
 @pytest.mark.asyncio

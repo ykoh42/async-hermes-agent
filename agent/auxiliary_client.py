@@ -14,6 +14,10 @@ Resolution order for text tasks (auto mode):
   6. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, MiniMax-CN)
   7. None
 
+OpenRouter fallback cost guard: ``auxiliary.free_only: true`` restricts the
+step-2 fallback to ``:free`` SKUs; ``auxiliary.openrouter_model`` overrides
+the default. A one-time WARNING is logged for non-``:free`` models.
+
 Resolution order for vision/multimodal tasks (auto mode):
   1. Selected main provider, if it is one of the supported vision backends below
   2. OpenRouter
@@ -54,7 +58,7 @@ import re
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.credential_pool import load_pool
@@ -2154,6 +2158,51 @@ async def _resolve_api_key_provider(
 # ── Provider resolution helpers ─────────────────────────────────────────────
 
 
+_paid_lane_warned: set[str] = set()
+
+
+def _is_free_model(model: Optional[str]) -> bool:
+    """Return whether ``model`` is an OpenRouter ``:free`` SKU."""
+    return bool(model) and str(model).strip().endswith(":free")
+
+
+async def _aux_openrouter_settings(
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
+    """Return the upstream OpenRouter cost guard and fallback model."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        if config is None:
+            config = await load_config_readonly()
+        free_only = bool(
+            cfg_get(config, "auxiliary", "free_only", default=False)
+        )
+        value = cfg_get(config, "auxiliary", "openrouter_model")
+        selected = (
+            value.strip()
+            if isinstance(value, str) and value.strip()
+            else _OPENROUTER_MODEL
+        )
+        return free_only, selected
+    except Exception:
+        return False, _OPENROUTER_MODEL
+
+
+def _warn_paid_lane_once(model: str) -> None:
+    """Warn once before an auxiliary OpenRouter paid lane is engaged."""
+    if model in _paid_lane_warned:
+        return
+    _paid_lane_warned.add(model)
+    logger.warning(
+        "Auxiliary client: PAID lane engaged for auxiliary task — OpenRouter "
+        "fallback model %r is not a :free SKU and may incur real spend. Set "
+        "auxiliary.free_only: true to restrict auxiliary fallbacks to free "
+        "models, or auxiliary.openrouter_model to a :free model.",
+        model,
+    )
+
+
 async def _try_openrouter(
     explicit_api_key: str = None,
     model: str = None,
@@ -2164,6 +2213,21 @@ async def _try_openrouter(
         from hermes_cli.config import load_config_readonly
 
         config = await load_config_readonly()
+    free_only, configured_model = await _aux_openrouter_settings(config)
+    openrouter_model = model or configured_model
+    if free_only and not _is_free_model(openrouter_model):
+        logger.warning(
+            "Auxiliary client: auxiliary.free_only is enabled but the "
+            "OpenRouter fallback model %r is not a :free SKU — skipping the "
+            "OpenRouter fallback. Set auxiliary.openrouter_model to a :free "
+            "model (e.g. nvidia/nemotron-3-ultra-550b-a55b:free) or disable "
+            "auxiliary.free_only.",
+            openrouter_model,
+        )
+        _mark_provider_unhealthy("openrouter", ttl=60)
+        return None, None
+    if not _is_free_model(openrouter_model):
+        _warn_paid_lane_once(openrouter_model)
     openrouter_config = config.get("openrouter", {}) if isinstance(config, dict) else {}
     if not isinstance(openrouter_config, dict):
         openrouter_config = {}
@@ -2177,7 +2241,7 @@ async def _try_openrouter(
             base_url=OPENROUTER_BASE_URL,
             config=config,
             default_headers=build_or_headers(openrouter_config),
-        ), model or _OPENROUTER_MODEL
+        ), openrouter_model
 
     pool_present, entry = await _select_pool_entry("openrouter")
     if pool_present:
@@ -2193,7 +2257,7 @@ async def _try_openrouter(
                 base_url=base_url,
                 config=config,
                 default_headers=build_or_headers(openrouter_config),
-            ), model or _OPENROUTER_MODEL
+            ), openrouter_model
         # Pool exists but is exhausted (no usable runtime key) — fall through to
         # the OPENROUTER_API_KEY env-var path rather than failing outright.
         logger.debug(
@@ -2210,7 +2274,7 @@ async def _try_openrouter(
         base_url=OPENROUTER_BASE_URL,
         config=config,
         default_headers=build_or_headers(openrouter_config),
-    ), model or _OPENROUTER_MODEL
+    ), openrouter_model
 
 
 async def _describe_openrouter_unavailable() -> str:
@@ -3453,9 +3517,32 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
+_DEFAULT_TRANSIENT_RETRIES = 2
 # Base for exponential backoff between transient retries (seconds). Overridable
 # so tests can zero it out and not sleep real wall-clock time.
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0
+
+
+async def _transient_retry_count(
+    config: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Return the configured same-provider transient retry count.
+
+    The upstream setting is clamped to ``[0, 6]``.  Reuse a caller's async
+    config snapshot on the hot path; direct callers still get the same value
+    through the native-async read-only loader.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        if config is None:
+            config = await load_config_readonly()
+        value = cfg_get(config, "auxiliary", "transient_retries")
+        if value is None:
+            return _DEFAULT_TRANSIENT_RETRIES
+        return max(0, min(int(value), 6))
+    except Exception:
+        return _DEFAULT_TRANSIENT_RETRIES
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -4065,6 +4152,122 @@ def _fallback_entry_timeout(
     return None
 
 
+def _fallback_provider_from_label(label: str) -> str:
+    """Recover the provider identifier from a fallback display label."""
+    match = re.match(
+        r"(?:fallback_chain\[\d+\]|main-agent)\(([^)]+)\)$",
+        label or "",
+    )
+    return match.group(1).strip() if match else str(label or "").strip()
+
+
+class _FallbackDestination(NamedTuple):
+    provider: str
+    base_url: str
+    api_mode: Optional[str]
+    model: Optional[str]
+
+
+async def _complete_fallback_destination(
+    provider: str,
+    base_url: str,
+    api_mode: Optional[str],
+    model: Optional[str],
+) -> _FallbackDestination:
+    if not api_mode:
+        if _endpoint_speaks_anthropic_messages(base_url):
+            api_mode = "anthropic_messages"
+        else:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = await resolve_runtime_provider(
+                    requested=provider,
+                    explicit_base_url=base_url or None,
+                    target_model=model or "",
+                )
+                api_mode = str(runtime.get("api_mode") or "").strip() or None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+    return _FallbackDestination(provider, base_url, api_mode, model)
+
+
+async def _fallback_destination_from_entry(
+    entry: Dict[str, Any],
+    fb_client: Any,
+    fb_model: Optional[str],
+) -> _FallbackDestination:
+    provider = str(entry.get("provider") or "").strip()
+    base_url = str(
+        entry.get("base_url") or getattr(fb_client, "base_url", "") or ""
+    ).strip()
+    api_mode = (
+        str(entry.get("api_mode") or entry.get("transport") or "").strip()
+        or None
+    )
+    model = fb_model or str(entry.get("model") or "").strip() or None
+    return await _complete_fallback_destination(
+        provider, base_url, api_mode, model
+    )
+
+
+async def _fallback_destination(
+    task: Optional[str],
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> _FallbackDestination:
+    """Return the resolved route identity used by a fallback request."""
+    attached = getattr(fb_client, "_hermes_fallback_destination", None)
+    if isinstance(attached, _FallbackDestination):
+        return attached
+
+    if task and config is not None:
+        match = re.match(r"fallback_chain\[(\d+)\]", fb_label or "")
+        if match:
+            try:
+                chain = _get_auxiliary_task_config(task, config=config).get(
+                    "fallback_chain"
+                )
+                entry = chain[int(match.group(1))] if isinstance(chain, list) else None
+            except Exception:
+                entry = None
+            if isinstance(entry, dict):
+                return await _fallback_destination_from_entry(
+                    entry, fb_client, fb_model
+                )
+
+    return await _complete_fallback_destination(
+        _fallback_provider_from_label(fb_label),
+        str(getattr(fb_client, "base_url", "") or ""),
+        None,
+        fb_model,
+    )
+
+
+async def _replan_fallback_cache_sections(
+    messages: list,
+    tools: Optional[list],
+    *,
+    destination: _FallbackDestination,
+) -> tuple[list, Optional[list]]:
+    """Strip source decoration and plan cache sections for one destination."""
+    from agent.agent_runtime_helpers import plan_cache_sections_for_destination
+
+    return await plan_cache_sections_for_destination(
+        messages,
+        tools,
+        provider=destination.provider,
+        base_url=destination.base_url,
+        api_mode=destination.api_mode or "",
+        model=destination.model or "",
+    )
+
+
 async def _call_fallback_candidate(
     fb_client: Any,
     fb_model: Optional[str],
@@ -4092,18 +4295,29 @@ async def _call_fallback_candidate(
             effective_timeout,
         )
         effective_timeout = fb_timeout
-    fb_base = str(getattr(fb_client, "base_url", "") or "")
-    fb_kwargs = _build_call_kwargs(
-        fb_label,
+    destination = await _fallback_destination(
+        task,
+        fb_client,
         fb_model,
+        fb_label,
+        config=config,
+    )
+    fallback_messages, fallback_tools = await _replan_fallback_cache_sections(
         messages,
+        tools,
+        destination=destination,
+    )
+    fb_kwargs = _build_call_kwargs(
+        destination.provider,
+        destination.model,
+        fallback_messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        tools=tools,
+        tools=fallback_tools,
         timeout=effective_timeout,
         extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=fb_base,
+        base_url=destination.base_url,
         task=task,
         config=config,
     )
@@ -4115,27 +4329,48 @@ async def _call_fallback_candidate(
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
+        fb_provider = _auth_refresh_provider_for_route(
+            destination.provider,
+            destination.base_url,
+        )
         if fb_provider not in {
             "auto",
             "",
             None,
         } and await _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = await _get_cached_client(
-                fb_provider, fb_model, config=config
+                fb_provider,
+                destination.model,
+                base_url=destination.base_url or None,
+                api_mode=destination.api_mode,
+                config=config,
             )
             if retry_client is not None:
-                retry_kwargs = _build_call_kwargs(
+                retry_destination = _FallbackDestination(
                     fb_provider,
-                    retry_model or fb_model,
-                    messages,
+                    destination.base_url
+                    or str(getattr(retry_client, "base_url", "") or ""),
+                    destination.api_mode,
+                    retry_model or destination.model,
+                )
+                retry_messages, retry_tools = (
+                    await _replan_fallback_cache_sections(
+                        messages,
+                        tools,
+                        destination=retry_destination,
+                    )
+                )
+                retry_kwargs = _build_call_kwargs(
+                    retry_destination.provider,
+                    retry_destination.model,
+                    retry_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    tools=tools,
+                    tools=retry_tools,
                     timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base),
+                    base_url=retry_destination.base_url,
                     task=task,
                     config=config,
                 )
@@ -4589,14 +4824,10 @@ async def _try_configured_fallback_for_unavailable_client(
 
 
 def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
-    """Resolve inline or env-backed API key from a fallback-chain entry."""
-    explicit = str(entry.get("api_key") or "").strip()
-    if explicit:
-        return explicit
-    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
-    if key_env:
-        return os.getenv(key_env, "").strip() or None
-    return None
+    """Resolve a fallback key through the profile-scoped secret boundary."""
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    return resolve_entry_api_key(entry)
 
 
 async def _resolve_fallback_entry(
@@ -4614,13 +4845,27 @@ async def _resolve_fallback_entry(
     api_mode = (
         str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
     )
-    return await resolve_provider_client(
+    client, resolved_model = await resolve_provider_client(
         provider,
         model=model,
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
     )
+    if client is not None:
+        try:
+            client._hermes_fallback_destination = (
+                await _fallback_destination_from_entry(
+                    entry,
+                    client,
+                    resolved_model,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+    return client, resolved_model
 
 
 async def _try_main_fallback_chain(
@@ -6192,10 +6437,15 @@ async def resolve_vision_provider_client(
             # DeepSeek-V4-Flash default) and _main_model_supports_vision can't be
             # trusted to catch that. Only fall back to the chat model when no
             # provider default is available (catalog unreachable).
-            vision_model = _resolve_provider_vision_default(main_provider) or main_model
+            provider_vision_default = _resolve_provider_vision_default(main_provider)
+            vision_model = provider_vision_default or main_model
             if main_provider == "nous":
+                # Nous selects a tier-aware vision model inside
+                # _try_nous(vision=True). Passing the text chat model here
+                # overrides that Portal selection. Only an explicit vision
+                # model (or a provider-scoped vision default) may override it.
                 sync_client, default_model = await _resolve_strict_vision_backend(
-                    main_provider, vision_model
+                    main_provider, resolved_model or provider_vision_default
                 )
                 if sync_client is not None:
                     logger.info(
@@ -8263,7 +8513,7 @@ async def call_llm(
 
     first_err: Exception | None = None
     try:
-        # Retry ONCE on the same provider for a transient transport blip
+        # Retry on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
         _force_stream = _provider_requires_stream(
@@ -8277,6 +8527,7 @@ async def call_llm(
                 return await _create_with_stream(client, _kwargs, task)
             return await client.chat.completions.create(**_kwargs)
 
+        transient_err: Exception | None = None
         try:
             return await _validate_llm_response(
                 await _create(kwargs),
@@ -8284,26 +8535,49 @@ async def call_llm(
                 provider=resolved_provider,
                 base_url=_client_base,
             )
-        except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+        except Exception as caught_transient:
+            if not _is_transient_transport_error(caught_transient):
                 raise
             # See call_llm(): compression is on the critical preflight path,
             # so skip the same-provider retry on a full-budget timeout and
             # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            if task == "compression" and _is_timeout_error(caught_transient):
                 logger.info(
                     "Auxiliary compression (async): timeout on the critical "
                     "path; skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    caught_transient,
                 )
                 raise
-            logger.info(
-                "Auxiliary %s (async): transient transport error; retrying "
-                "once on the same provider before fallback: %s",
-                task or "call",
-                transient_err,
+            transient_err = caught_transient
+
+        assert transient_err is not None
+        max_transient_retries = await _transient_retry_count(config_snapshot)
+        last_transient = transient_err
+        for attempt in range(1, max_transient_retries + 1):
+            backoff = min(
+                _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)),
+                8.0,
             )
-            return await _validate_llm_response(await _create(kwargs), task)
+            logger.info(
+                "Auxiliary %s (async): transient transport error "
+                "(attempt %d/%d); retrying same provider after %.1fs "
+                "before fallback: %s",
+                task or "call",
+                attempt,
+                max_transient_retries,
+                backoff,
+                last_transient,
+            )
+            await asyncio.sleep(backoff)
+            try:
+                return await _validate_llm_response(
+                    await _create(kwargs), task
+                )
+            except Exception as retry_transient:
+                if not _is_transient_transport_error(retry_transient):
+                    raise
+                last_transient = retry_transient
+        raise last_transient
     except Exception as caught:
         first_err = caught
 

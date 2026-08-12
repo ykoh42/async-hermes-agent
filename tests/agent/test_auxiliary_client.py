@@ -1283,6 +1283,125 @@ class TestExplicitProviderRouting:
         assert mock_create.call_args.kwargs["base_url"] == OPENROUTER_BASE_URL
 
 
+class TestOpenRouterPaidLaneGuard:
+    @pytest.mark.asyncio
+    async def test_free_only_skips_paid_default_model(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        try:
+            with patch(
+                "agent.auxiliary_client._create_openai_client",
+                new=AsyncMock(),
+            ) as create:
+                assert await _try_openrouter(
+                    config={"auxiliary": {"free_only": True}}
+                ) == (None, None)
+            create.assert_not_awaited()
+        finally:
+            aux._reset_aux_unhealthy_cache()
+
+    @pytest.mark.asyncio
+    async def test_free_only_allows_free_model(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        free_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+        client = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client._select_pool_entry",
+                new=AsyncMock(return_value=(False, None)),
+            ),
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                new=AsyncMock(return_value=client),
+            ),
+        ):
+            resolved_client, model = await _try_openrouter(
+                config={
+                    "auxiliary": {
+                        "free_only": True,
+                        "openrouter_model": free_model,
+                    }
+                }
+            )
+        assert (resolved_client, model) == (client, free_model)
+
+    @pytest.mark.asyncio
+    async def test_configured_model_overrides_hardcoded_default(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        client = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client._select_pool_entry",
+                new=AsyncMock(return_value=(False, None)),
+            ),
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                new=AsyncMock(return_value=client),
+            ),
+        ):
+            resolved_client, model = await _try_openrouter(
+                config={"auxiliary": {"openrouter_model": "some/vendor-model"}}
+            )
+        assert (resolved_client, model) == (client, "some/vendor-model")
+
+    @pytest.mark.asyncio
+    async def test_explicit_caller_model_respects_free_only(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        try:
+            with patch(
+                "agent.auxiliary_client._create_openai_client",
+                new=AsyncMock(),
+            ) as create:
+                assert await _try_openrouter(
+                    model="google/gemini-3.6-flash",
+                    config={"auxiliary": {"free_only": True}},
+                ) == (None, None)
+            create.assert_not_awaited()
+        finally:
+            aux._reset_aux_unhealthy_cache()
+
+    @pytest.mark.asyncio
+    async def test_paid_lane_warns_once(self, monkeypatch, caplog):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        aux._paid_lane_warned.discard(_OPENROUTER_MODEL)
+        client = MagicMock()
+        try:
+            with (
+                patch(
+                    "agent.auxiliary_client._select_pool_entry",
+                    new=AsyncMock(return_value=(False, None)),
+                ),
+                patch(
+                    "agent.auxiliary_client._create_openai_client",
+                    new=AsyncMock(return_value=client),
+                ),
+                caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"),
+            ):
+                await _try_openrouter(config={"auxiliary": {}})
+                await _try_openrouter(config={"auxiliary": {}})
+            warnings = [
+                record
+                for record in caplog.records
+                if "PAID lane engaged" in record.getMessage()
+            ]
+            assert len(warnings) == 1
+        finally:
+            aux._paid_lane_warned.discard(_OPENROUTER_MODEL)
+
+    def test_is_free_model(self):
+        from agent.auxiliary_client import _is_free_model
+
+        assert _is_free_model("nvidia/nemotron:free")
+        assert not _is_free_model("google/gemini-3.6-flash")
+        assert not _is_free_model("")
+        assert not _is_free_model(None)
+
+
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
 
@@ -1989,6 +2108,87 @@ class TestStaleFallbackCandidateSkip:
                 )
 
 
+class TestAsynchronousFallbackCachePlans:
+    @staticmethod
+    async def _call(entry):
+        from agent.auxiliary_client import _call_fallback_candidate
+
+        client = MagicMock()
+        client.base_url = entry["base_url"]
+        client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("fallback")
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        config = {"auxiliary": {"moa_aggregator": {"fallback_chain": [entry]}}}
+        with patch(
+            "agent.agent_runtime_helpers.prompt_caching_disabled_from_config",
+            new=AsyncMock(return_value=False),
+        ):
+            await _call_fallback_candidate(
+                client,
+                entry["model"],
+                f"fallback_chain[0]({entry['provider']})",
+                task="moa_aggregator",
+                messages=[
+                    {"role": "system", "content": "stable prefix"},
+                    {"role": "user", "content": "lookup"},
+                ],
+                temperature=None,
+                max_tokens=None,
+                tools=tools,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+                config=config,
+            )
+        return client.chat.completions.create.await_args.kwargs, tools
+
+    @pytest.mark.asyncio
+    async def test_async_fallback_replans_cache_sections_like_sync(self):
+        request, original_tools = await self._call(
+            {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+            }
+        )
+        assert "cache_control" in request["tools"][-1]
+        assert "cache_control" not in original_tools[-1]
+
+    @pytest.mark.asyncio
+    async def test_third_party_anthropic_fallback_keeps_message_markers_without_tool_marker(
+        self,
+    ):
+        request, original_tools = await self._call(
+            {
+                "provider": "custom",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://api.minimax.io/anthropic",
+                "api_mode": "anthropic_messages",
+            }
+        )
+        assert "cache_control" not in request["tools"][-1]
+        assert "cache_control" not in original_tools[-1]
+        assert any(
+            isinstance(part, dict) and "cache_control" in part
+            for message in request["messages"]
+            for part in (
+                message.get("content")
+                if isinstance(message.get("content"), list)
+                else []
+            )
+        )
+
+
 class TestAuxiliaryFallbackLayering:
     """Explicit-provider users get layered fallback: configured_chain → main agent → warn."""
 
@@ -2307,7 +2507,7 @@ async def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch
 
 
 class TestTransientTransportRetry:
-    """call_llm retries ONCE on the same provider for a transient transport
+    """call_llm retries on the same provider for a transient transport
     blip before escalating to the fallback chain.
 
     Salvaged from PR #16587 (@ARegalado1). The original fixed only the
@@ -2348,6 +2548,34 @@ class TestTransientTransportRetry:
             )
         # Non-transient: single attempt, no same-target retry.
         assert client.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_uses_configured_retry_count_and_async_backoff(self):
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create = AsyncMock(
+            side_effect=[ConnectionError("first"), ConnectionError("second"), {"ok": True}]
+        )
+        p1, p2, p3 = self._patches(client)
+        with (
+            p1,
+            p2,
+            p3,
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                new=AsyncMock(
+                    return_value={"auxiliary": {"transient_retries": 2}}
+                ),
+            ),
+            patch("agent.auxiliary_client.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            result = await call_llm(
+                task="memory", messages=[{"role": "user", "content": "hi"}]
+            )
+
+        assert result == {"ok": True}
+        assert client.chat.completions.create.call_count == 3
+        assert [call.args[0] for call in sleep.await_args_list] == [1.0, 2.0]
 
     @pytest.mark.asyncio
     async def test_compression_skips_same_provider_retry_on_timeout(self):
