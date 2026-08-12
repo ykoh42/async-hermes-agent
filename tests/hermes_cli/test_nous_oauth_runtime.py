@@ -420,3 +420,44 @@ async def test_main_agent_nous_refresh_rebuilds_deferred_runtime(monkeypatch):
     resolve.assert_awaited_once_with(timeout_seconds=15.0, force_refresh=True)
     assert agent._deferred_provider_runtime["api_key"] == "new-key"
     agent._ensure_provider_runtime.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages"])
+async def test_main_agent_nous_refresh_rebuilds_when_token_is_unchanged(
+    monkeypatch,
+    api_mode,
+):
+    """A forced Nous refresh also repairs a stale transport with the same JWT."""
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "nous"
+    agent.api_mode = api_mode
+    agent.model = "anthropic/claude-opus-4.8"
+    agent.api_key = "same-key"
+    agent._provider_request_timeout = None
+    agent._provider_stale_timeout = None
+    agent._ensure_provider_runtime = AsyncMock(return_value=True)
+    resolve = AsyncMock(
+        return_value={
+            "api_key": "same-key",
+            "base_url": auth.DEFAULT_NOUS_INFERENCE_URL,
+        }
+    )
+    monkeypatch.setattr(auth, "resolve_nous_runtime_credentials", resolve)
+
+    refreshed = await agent._try_refresh_nous_client_credentials(force=True)
+
+    assert refreshed is True
+    assert agent._deferred_provider_runtime == {
+        "provider": "nous",
+        "model": "anthropic/claude-opus-4.8",
+        "api_key": "same-key",
+        "base_url": auth.DEFAULT_NOUS_INFERENCE_URL,
+        "api_mode": api_mode,
+        "request_timeout": None,
+        "stale_timeout": None,
+        "update_primary": False,
+    }
+    agent._ensure_provider_runtime.assert_awaited_once_with()

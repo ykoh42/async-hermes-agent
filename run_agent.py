@@ -1594,6 +1594,15 @@ class AIAgent:
             return True
         return self._is_copilot_url()
 
+    def _is_codex_backend(self) -> bool:
+        """Return True for the ChatGPT OAuth Codex Responses backend."""
+        return (
+            getattr(self, "api_mode", None) == "codex_responses"
+            and getattr(self, "_base_url_hostname", "") == "chatgpt.com"
+            and "/backend-api/codex"
+            in (getattr(self, "_base_url_lower", "") or "")
+        )
+
     def _anthropic_prompt_cache_policy(
         self,
         *,
@@ -4994,9 +5003,6 @@ class AIAgent:
             api_key = str(credentials.get("api_key") or "").strip()
             base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
             if not api_key or not base_url:
-                return False
-            old_key = str(self.api_key or "").strip()
-            if old_key and api_key == old_key:
                 return False
             self._deferred_provider_runtime = {
                 "provider": self.provider,

@@ -379,6 +379,7 @@ _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 # Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
 # immediately; cancellation-resistant tasks must not hang process exit.
+_MCP_SERVER_SHUTDOWN_TIMEOUT = 10.0
 _MCP_LOOP_DRAIN_TIMEOUT = 3.0
 
 # Environment variables that are safe to pass to stdio subprocesses
@@ -3539,19 +3540,48 @@ class MCPServerTask:
         # returning "reconnect".
         self._reconnect_event.set()
         if self._task and not self._task.done():
-            try:
-                await asyncio.wait_for(self._task, timeout=10)
-            except asyncio.TimeoutError:
+            _, pending = await asyncio.wait(
+                {self._task},
+                timeout=_MCP_SERVER_SHUTDOWN_TIMEOUT,
+            )
+            if pending:
                 logger.warning(
                     "MCP server '%s' shutdown timed out, cancelling task",
                     self.name,
                 )
                 self._task.cancel()
+                _, pending = await asyncio.wait(
+                    {self._task},
+                    timeout=_MCP_LOOP_DRAIN_TIMEOUT,
+                )
+                if pending:
+                    logger.warning(
+                        "MCP server '%s' task still pending after %.1fs "
+                        "cancellation drain",
+                        self.name,
+                        _MCP_LOOP_DRAIN_TIMEOUT,
+                    )
+            if self._task.done():
                 await asyncio.gather(self._task, return_exceptions=True)
         if self._pending_refresh_tasks:
-            for task in list(self._pending_refresh_tasks):
+            refresh_tasks = set(self._pending_refresh_tasks)
+            for task in refresh_tasks:
                 task.cancel()
-            await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
+            _, pending = await asyncio.wait(
+                refresh_tasks,
+                timeout=_MCP_LOOP_DRAIN_TIMEOUT,
+            )
+            if pending:
+                logger.warning(
+                    "MCP server '%s' has %d refresh task(s) still pending "
+                    "after %.1fs cancellation drain",
+                    self.name,
+                    len(pending),
+                    _MCP_LOOP_DRAIN_TIMEOUT,
+                )
+            finished = refresh_tasks - pending
+            if finished:
+                await asyncio.gather(*finished, return_exceptions=True)
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
         self.session = None

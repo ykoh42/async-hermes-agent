@@ -2353,6 +2353,7 @@ async def run_conversation(
                         api_kwargs,
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
+                        sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2488,6 +2489,7 @@ async def run_conversation(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
+                            sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     from agent.chat_completion_helpers import (
                         interruptible_api_call,

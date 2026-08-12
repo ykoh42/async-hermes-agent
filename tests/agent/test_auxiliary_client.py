@@ -834,6 +834,97 @@ class TestAnthropicOAuthFlag:
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
 
+class TestAuxiliaryNousPoolAwareness:
+    @pytest.mark.asyncio
+    async def test_try_nous_refreshes_stale_pool_entry(self):
+        stale_token = _jwt_with_claims(
+            {"scope": "inference:invoke", "exp": int(time.time() - 60)}
+        )
+        fresh_token = _jwt_with_claims(
+            {"scope": "inference:invoke", "exp": int(time.time() + 3600)}
+        )
+
+        class _Entry:
+            def __init__(self, token):
+                self.access_token = "pooled-access-token"
+                self.agent_key = token
+                self.agent_key_expires_at = "2099-01-01T00:00:00+00:00"
+                self.scope = "inference:invoke"
+                self.inference_base_url = "https://inference.pool.example/v1"
+
+        class _Pool:
+            refreshed = False
+
+            def has_credentials(self):
+                return True
+
+            async def select(self):
+                return _Entry(stale_token)
+
+            async def try_refresh_current(self):
+                self.refreshed = True
+                return _Entry(fresh_token)
+
+        pool = _Pool()
+        client = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client.load_pool",
+                new=AsyncMock(return_value=pool),
+            ),
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                new=AsyncMock(return_value=client),
+            ) as create_client,
+            patch(
+                "hermes_cli.models.get_nous_recommended_aux_model",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "agent.nous_rate_guard.nous_rate_limit_remaining",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            from agent.auxiliary_client import _try_nous
+
+            resolved_client, model = await _try_nous()
+
+        assert pool.refreshed is True
+        assert resolved_client is client
+        assert model == _NOUS_MODEL
+        assert create_client.await_args.kwargs["api_key"] == fresh_token
+        assert (
+            create_client.await_args.kwargs["base_url"]
+            == "https://inference.pool.example/v1"
+        )
+
+
+class TestRefreshNousRecommendedModel:
+    @pytest.mark.asyncio
+    async def test_falls_back_to_default_when_portal_unavailable(self):
+        with patch(
+            "hermes_cli.models.get_nous_recommended_aux_model",
+            new=AsyncMock(side_effect=RuntimeError("portal down")),
+        ):
+            out = await _refresh_nous_recommended_model(
+                vision=False,
+                stale_model="some/dead-model",
+            )
+        assert out == _NOUS_MODEL
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_distinct_alternative(self):
+        with patch(
+            "hermes_cli.models.get_nous_recommended_aux_model",
+            new=AsyncMock(return_value=_NOUS_MODEL),
+        ):
+            out = await _refresh_nous_recommended_model(
+                vision=False,
+                stale_model=_NOUS_MODEL,
+            )
+        assert out is None
+
+
 class TestBuildCodexClient:
     @pytest.mark.asyncio
     async def test_pool_without_selected_entry_falls_back_to_auth_store(self):
@@ -3246,6 +3337,44 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_refresh.assert_awaited_once_with("openai-codex")
 
     @pytest.mark.asyncio
+    async def test_call_llm_retries_nous_after_401(self):
+        stale_client = MagicMock()
+        stale_client.base_url = "https://inference-api.nousresearch.com/v1"
+        stale_client.chat.completions.create = AsyncMock(
+            side_effect=_AuxAuth401("stale nous key")
+        )
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://inference-api.nousresearch.com/v1"
+        fresh_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("fresh-nous")
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("nous", "nous-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                new=AsyncMock(return_value=(stale_client, "nous-model")),
+            ),
+            patch(
+                "agent.auxiliary_client._refresh_nous_auxiliary_client",
+                new=AsyncMock(return_value=(fresh_client, "nous-model")),
+            ) as refresh_client,
+        ):
+            result = await call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result.choices[0].message.content == "fresh-nous"
+        stale_client.chat.completions.create.assert_awaited_once()
+        fresh_client.chat.completions.create.assert_awaited_once()
+        refresh_client.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(
         self, monkeypatch
     ):
@@ -4387,6 +4516,84 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
             codex_runtime._consume_codex_event_stream = original_consume
 
 
+class TestCodexAuxiliaryAdapterCompletedResponse:
+    @pytest.mark.asyncio
+    async def test_accepts_completed_response_when_stream_was_requested(self):
+        completed = SimpleNamespace(
+            status="completed",
+            id="resp_completed",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[
+                        SimpleNamespace(
+                            type="output_text",
+                            text="completed response",
+                        )
+                    ],
+                )
+            ],
+            usage=SimpleNamespace(
+                input_tokens=11,
+                output_tokens=3,
+                total_tokens=14,
+            ),
+        )
+
+        class FakeResponses:
+            async def create(self, **kwargs):
+                assert kwargs["stream"] is True
+                return completed
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.6-terra")
+
+        response = await adapter.create(
+            messages=[{"role": "user", "content": "review this"}],
+        )
+
+        assert response.choices[0].message.content == "completed response"
+        assert response.usage.prompt_tokens == 11
+        assert response.usage.completion_tokens == 3
+        assert response.usage.total_tokens == 14
+
+
+class TestMoaAggregatorStreamingBypass:
+    @pytest.mark.asyncio
+    async def test_moa_aggregator_stream_bypasses_relay_for_codex_auxiliary_client(
+        self, monkeypatch
+    ):
+        """MoA owns streaming and receives the Codex adapter result directly."""
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        completed = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        real_client = SimpleNamespace(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex/",
+        )
+        client = CodexAuxiliaryClient(real_client, "gpt-5.6-sol")
+        direct_create = AsyncMock(return_value=completed)
+        monkeypatch.setattr(client.chat.completions, "create", direct_create)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_cached_client",
+            AsyncMock(return_value=(client, "gpt-5.6-sol")),
+        )
+
+        result = await call_llm(
+            task="moa_aggregator",
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "只回答 OK"}],
+            stream=True,
+        )
+
+        assert result is completed
+        direct_create.assert_awaited_once()
+        assert direct_create.await_args.kwargs["stream"] is True
+
+
 # ---------------------------------------------------------------------------
 # Issue #23432 — auxiliary timeout poisons cached client; later aux calls fail
 # ---------------------------------------------------------------------------
@@ -4716,13 +4923,16 @@ class TestAnthropicExplicitApiKey:
         with patch(
             "agent.auxiliary_client._try_anthropic",
             new=AsyncMock(return_value=(client, "claude-test")),
-        ):
+        ) as try_anthropic:
             resolved_client, model = await resolve_provider_client(
                 provider="anthropic", explicit_api_key="explicit-fallback-key"
             )
 
         assert resolved_client is client
         assert model == "claude-haiku-4-5-20251001"
+        assert try_anthropic.await_args.kwargs["explicit_api_key"] == (
+            "explicit-fallback-key"
+        )
 
 
 # ── Auxiliary unhealthy-provider TTL cache (issue #23570) ────────────────

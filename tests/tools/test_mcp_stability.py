@@ -314,3 +314,42 @@ class TestMCPInitialConnectionRetry:
 
 class TestMCPLoopDrainOnStop:
     """Compatibility shell left empty after removing the shared MCP loop."""
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_bounded_when_task_ignores_cancellation(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        from tools import mcp_tool
+
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def cancellation_resistant():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+
+        server = mcp_tool.MCPServerTask("resistant-shutdown")
+        server._task = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        monkeypatch.setattr(mcp_tool, "_MCP_SERVER_SHUTDOWN_TIMEOUT", 0.01)
+        monkeypatch.setattr(mcp_tool, "_MCP_LOOP_DRAIN_TIMEOUT", 0.01)
+
+        try:
+            with caplog.at_level("WARNING", logger=mcp_tool.logger.name):
+                async with asyncio.timeout(0.5):
+                    await server.shutdown()
+
+            assert cancelled.is_set()
+            assert server._task.done() is False
+            assert any(
+                "still pending after" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            release.set()
+            await server._task

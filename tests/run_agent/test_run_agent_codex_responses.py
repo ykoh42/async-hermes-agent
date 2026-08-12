@@ -635,6 +635,67 @@ async def test_run_codex_stream_returns_collected_items_when_stream_ends_without
     assert response.output == [output_item]
 
 
+@pytest.mark.asyncio
+async def test_run_codex_stream_stops_after_terminal_before_next_pull(monkeypatch):
+    """A post-terminal transport error must not discard a completed response."""
+    agent = _build_agent(monkeypatch)
+    message_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="All done.")],
+    )
+    usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
+    calls = {"create": 0, "pulls": 0}
+
+    class _PostTerminalDroppingStream:
+        def __aiter__(self):
+            async def _iterate():
+                calls["pulls"] += 1
+                yield SimpleNamespace(
+                    type="response.output_item.done",
+                    item=message_item,
+                )
+                calls["pulls"] += 1
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(
+                        status="completed",
+                        usage=usage,
+                        id="resp_post_terminal_1",
+                    ),
+                )
+                calls["pulls"] += 1
+                raise RuntimeError("connection dropped after terminal frame")
+
+            return _iterate()
+
+        async def aclose(self):
+            return None
+
+    async def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs["stream"] is True
+        return _PostTerminalDroppingStream()
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=_fake_create),
+    )
+
+    from agent.codex_runtime import run_codex_stream
+
+    response = await run_codex_stream(
+        agent,
+        _codex_request_kwargs(),
+        client=agent.client,
+    )
+
+    assert calls == {"create": 1, "pulls": 2}
+    assert response.status == "completed"
+    assert response.usage is usage
+    assert response.id == "resp_post_terminal_1"
+    assert response.output == [message_item]
+
+
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 
@@ -825,6 +886,90 @@ async def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["final_response"] == "OK"
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["content"] == "OK"
+
+
+def test_codex_backend_detection_is_narrow(monkeypatch):
+    codex = _build_agent(monkeypatch)
+    copilot = _build_copilot_agent(monkeypatch)
+
+    assert codex._is_codex_backend() is True
+    assert copilot._is_codex_backend() is False
+
+    codex.provider = "custom"
+    assert codex._is_codex_backend() is True
+    codex.api_mode = "chat_completions"
+    assert codex._is_codex_backend() is False
+
+
+@pytest.mark.asyncio
+async def test_codex_preflight_defangs_harmony_tokens_after_middleware(monkeypatch):
+    """Both mutable request boundaries reject literal Harmony wire tokens."""
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "_disable_streaming", True)
+    token = "<\x7cstart\x7c>"
+    captured = {}
+
+    async def _request_middleware(request, **_context):
+        assert token not in str(request["input"])
+        replacement = dict(request)
+        replacement["instructions"] = "Inspect source containing " + token
+        replacement["input"] = [
+            {
+                "type": "function_call_output",
+                "call_id": "call_poisoned",
+                "output": "source contains " + token,
+            }
+        ]
+        return SimpleNamespace(
+            payload=replacement,
+            original_payload=request,
+            changed=True,
+            trace=[],
+        )
+
+    async def _execution_middleware(request, next_call, **_context):
+        assert token in str(request)
+        return await next_call(request)
+
+    async def _capture_api_call(api_kwargs, **_):
+        captured.update(api_kwargs)
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        _request_middleware,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_execution_middleware",
+        _execution_middleware,
+    )
+    monkeypatch.setattr(agent, "_execute_model_request", _capture_api_call)
+
+    result = await agent.run_conversation("Read " + token)
+
+    assert result["completed"] is True
+    assert token not in captured["instructions"]
+    assert token not in str(captured["input"])
+    assert "<｜start｜>" in captured["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_responses_preflight_preserves_harmony_tokens(monkeypatch):
+    agent = _build_copilot_agent(monkeypatch)
+    setattr(agent, "_disable_streaming", True)
+    token = "<\x7cstart\x7c>"
+    captured = {}
+
+    async def _capture_api_call(api_kwargs, **_):
+        captured.update(api_kwargs)
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_execute_model_request", _capture_api_call)
+
+    result = await agent.run_conversation("Read " + token)
+
+    assert result["completed"] is True
+    assert token in str(captured["input"])
 
 
 @pytest.mark.asyncio

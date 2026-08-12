@@ -1328,6 +1328,13 @@ async def run_codex_stream(
                                 exc_info=True,
                             )
                     commentary_text_deltas = []
+            if event_type in _TERMINAL_EVENT_TYPES:
+                # A valid terminal frame fully determines the response. Do
+                # not pull the iterator again: some servers close the socket
+                # immediately afterwards and surface that close as a protocol
+                # error, which must not discard or duplicate an already-billed
+                # completion.
+                break
     finally:
         close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
         if inspect.iscoroutinefunction(close):
