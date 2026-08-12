@@ -5286,6 +5286,22 @@ class AIAgent:
         Anthropic Messages uses its native async SDK. Providers without a
         native transport fail before the request rather than using a worker.
         """
+        if (
+            base_url_host_matches(
+                str(getattr(self, "_base_url", "") or ""),
+                "githubcopilot.com",
+            )
+            and self._api_kwargs_have_image_parts(api_kwargs)
+        ):
+            api_kwargs = dict(api_kwargs)
+            request_headers = dict(api_kwargs.get("extra_headers") or {})
+            request_headers["Copilot-Vision-Request"] = (
+                self._copilot_headers_for_request(is_vision=True)[
+                    "Copilot-Vision-Request"
+                ]
+            )
+            api_kwargs["extra_headers"] = request_headers
+
         if self.api_mode == "codex_responses":
             request_client = await self._ensure_primary_openai_client(
                 reason=(
@@ -5623,7 +5639,50 @@ class AIAgent:
 
         result = await create_completion(**request)
 
-        if not use_streaming or hasattr(result, "choices"):
+        if not use_streaming:
+            return result
+        if hasattr(result, "choices"):
+            logger.info(
+                "Streaming request returned a final response object instead of "
+                "an iterator; switching %s/%s to non-streaming for this session.",
+                getattr(self, "provider", None) or "unknown",
+                getattr(self, "model", None) or "unknown",
+            )
+            self._disable_streaming = True
+            choices = result.choices
+            first_choice = (
+                choices[0]
+                if isinstance(choices, (list, tuple)) and choices
+                else None
+            )
+            message = getattr(first_choice, "message", None)
+            first_delta_fired = False
+
+            def _fire_first_delta() -> None:
+                nonlocal first_delta_fired
+                if first_delta_fired:
+                    return
+                first_delta_fired = True
+                if on_first_delta is not None:
+                    try:
+                        on_first_delta()
+                    except Exception:
+                        pass
+
+            if message is not None:
+                reasoning_text = (
+                    getattr(message, "reasoning_content", None)
+                    or getattr(message, "reasoning", None)
+                )
+                if isinstance(reasoning_text, str) and reasoning_text:
+                    _fire_first_delta()
+                    self._fire_reasoning_delta(reasoning_text)
+                content = getattr(message, "content", None)
+                if isinstance(content, str) and content:
+                    _fire_first_delta()
+                    if _on_stream_text is not None:
+                        _on_stream_text()
+                    self._fire_stream_delta(content)
             return result
 
         writer_token = claim_stream_writer(self)
@@ -6208,6 +6267,38 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
         return await restore_primary_runtime(self)
+
+    @staticmethod
+    def _api_kwargs_have_image_parts(api_kwargs: dict) -> bool:
+        """Return True when the outbound request still contains native image parts."""
+        if not isinstance(api_kwargs, dict):
+            return False
+        candidates = []
+        messages = api_kwargs.get("messages")
+        if isinstance(messages, list):
+            candidates.extend(messages)
+        response_input = api_kwargs.get("input")
+        if isinstance(response_input, list):
+            candidates.extend(response_input)
+
+        def _contains_image(value: Any) -> bool:
+            if isinstance(value, dict):
+                if value.get("type") in {"image_url", "input_image"}:
+                    return True
+                return any(_contains_image(item) for item in value.values())
+            if isinstance(value, list):
+                return any(_contains_image(item) for item in value)
+            return False
+
+        return any(_contains_image(item) for item in candidates)
+
+    def _copilot_headers_for_request(self, *, is_vision: bool) -> dict:
+        from hermes_cli.copilot_auth import copilot_request_headers
+
+        return copilot_request_headers(
+            is_agent_turn=True,
+            is_vision=is_vision,
+        )
 
     async def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,
