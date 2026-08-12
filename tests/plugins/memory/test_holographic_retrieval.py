@@ -65,7 +65,7 @@ async def retriever_with_facts(tmp_path):
     """MemoryStore seeded with a few facts for retrieval tests."""
     db_path = tmp_path / "test_facts.db"
     store = MemoryStore(str(db_path))
-    await store.initialize()
+    await store._initialize()
     await store.add_fact(
         content="The Thursday deployment rollback failed because of stale migration state.",
         category="project",
@@ -120,7 +120,7 @@ async def hoisted_retriever(tmp_path):
     becomes a literal ./:memory: file that leaks state across runs (and
     the NULL-vector test below would permanently corrupt it)."""
     store = MemoryStore(str(tmp_path / "hoist_store.db"))
-    await store.initialize()
+    await store._initialize()
     for i in range(30):
         await store.add_fact(
             content=f"deploy target {i} setting alpha beta gamma option {i % 7}",

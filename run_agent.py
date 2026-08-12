@@ -3119,7 +3119,13 @@ class AIAgent:
             codex_session = getattr(self, "_codex_session", None)
             request_interrupt = getattr(codex_session, "request_interrupt", None)
             if callable(request_interrupt):
-                request_interrupt()
+                try:
+                    request_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to interrupt Codex app-server turn",
+                        exc_info=True,
+                    )
 
         # The active native client registers an abort callback so a sibling
         # service task can shut down the in-flight request promptly.

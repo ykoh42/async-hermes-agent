@@ -828,7 +828,7 @@ def clear_file_ops_cache(task_id: str | None = None) -> None:
         else:
             _patch_failure_tracker.pop(task_id, None)
     if task_id is not None:
-        file_state.get_registry().clear_task(task_id)
+        file_state.get_registry()._clear_task(task_id)
 
 
 def notify_other_tool_call(task_id: str = "default") -> None:

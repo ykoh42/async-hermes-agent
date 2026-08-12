@@ -1176,9 +1176,6 @@ async def test_session_db_meta_round_trip(tmp_path):
     try:
         await database.set_meta("goal:session", '{"status":"active"}')
         assert await database.get_meta("goal:session") == '{"status":"active"}'
-        assert await database.delete_meta("missing") is False
-        assert await database.delete_meta("goal:session") is True
-        assert await database.get_meta("goal:session") is None
 
     finally:
         await database.close()

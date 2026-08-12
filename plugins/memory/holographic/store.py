@@ -162,7 +162,7 @@ class MemoryStore:
         self._initialize_lock = asyncio.Lock()
         self._closed = False
 
-    async def initialize(self) -> None:
+    async def _initialize(self) -> None:
         """Open the loop-local shared connection and initialize its schema."""
         if self._entry is not None:
             return
@@ -257,7 +257,7 @@ class MemoryStore:
         await self._conn.commit()
 
     async def _ready(self) -> tuple[aiosqlite.Connection, asyncio.Lock]:
-        await self.initialize()
+        await self._initialize()
         if self._conn is None or self._lock is None:
             raise RuntimeError("MemoryStore is not initialized")
         return self._conn, self._lock
@@ -874,7 +874,7 @@ class MemoryStore:
                 self._closed = True
 
     async def __aenter__(self) -> "MemoryStore":
-        await self.initialize()
+        await self._initialize()
         return self
 
     async def __aexit__(self, *_: object) -> None:

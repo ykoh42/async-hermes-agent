@@ -39,7 +39,7 @@ class TestSharedConnection:
     async def test_same_path_shares_one_connection(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         try:
             assert a._conn is b._conn
             assert a._lock is b._lock
@@ -52,7 +52,7 @@ class TestSharedConnection:
     async def test_different_paths_get_distinct_connections(self, tmp_path):
         a = MemoryStore(tmp_path / "one.db")
         b = MemoryStore(tmp_path / "two.db")
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         try:
             assert a._conn is not b._conn
             assert len(MemoryStore._shared) == 2
@@ -68,7 +68,7 @@ class TestSharedConnection:
 
         a = MemoryStore(real_dir / "memory_store.db")
         b = MemoryStore(link_dir / "memory_store.db")
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         try:
             assert a._conn is b._conn
             assert len(MemoryStore._shared) == 1
@@ -79,7 +79,7 @@ class TestSharedConnection:
     async def test_writes_visible_across_instances(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         try:
             fact_id = await a.add_fact(
                 "Hermes likes shared connections",
@@ -94,8 +94,8 @@ class TestSharedConnection:
     async def test_schema_initialised_once_per_connection(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
-        await a.initialize()
-        await b.initialize()
+        await a._initialize()
+        await b._initialize()
         try:
             assert MemoryStore._shared[a._registry_key]["ready"] is True
             await b.add_fact("schema still works")
@@ -108,7 +108,7 @@ class TestCloseSemantics:
     async def test_closing_one_instance_keeps_sibling_alive(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         await a.close()
         try:
             assert await b.add_fact("survivor write") > 0
@@ -118,7 +118,7 @@ class TestCloseSemantics:
     async def test_last_close_releases_connection(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         conn = a._conn
         await a.close()
         await b.close()
@@ -129,7 +129,7 @@ class TestCloseSemantics:
     async def test_close_is_idempotent(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
-        await asyncio.gather(a.initialize(), b.initialize())
+        await asyncio.gather(a._initialize(), b._initialize())
         await a.close()
         await a.close()
         try:
@@ -158,7 +158,7 @@ class TestConcurrency:
 
         async def writer(index: int) -> None:
             store = MemoryStore(db_path)
-            await store.initialize()
+            await store._initialize()
             try:
                 for sequence in range(fact_count):
                     await store.add_fact(
@@ -178,7 +178,7 @@ class TestConcurrency:
     async def test_failed_write_does_not_pin_write_lock(self, db_path, monkeypatch):
         broken = MemoryStore(db_path)
         sibling = MemoryStore(db_path)
-        await asyncio.gather(broken.initialize(), sibling.initialize())
+        await asyncio.gather(broken._initialize(), sibling._initialize())
 
         async def fail_rebuild(self, conn, category):
             await asyncio.sleep(0)

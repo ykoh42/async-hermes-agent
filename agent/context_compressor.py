@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -1357,6 +1358,7 @@ class ContextCompressor(ContextEngine):
             "protected_head_tokens": None,
             "protected_tail_tokens": None,
             "middle_window_tokens": None,
+            "prellm_skip_count": 0,
             "aux_prompt_tokens": None,
             "aux_output_reservation": None,
             "aux_provider": "",
@@ -1617,9 +1619,45 @@ class ContextCompressor(ContextEngine):
         """Bind session-scoped compression state for a new or resumed session."""
         await super().on_session_start(session_id, **kwargs)
         boundary_reason = kwargs.get("boundary_reason")
+        old_session_id = kwargs.get("old_session_id")
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
+        if boundary_reason == "compression" and old_session_id:
+            getter = getattr(session_db, "get_compression_fallback_streak", None)
+            if callable(getter):
+                try:
+                    stored_streak = await getter(old_session_id)
+                    if isinstance(stored_streak, (int, float, str)):
+                        previous_fallback_streak = max(0, int(stored_streak))
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    logger.debug(
+                        "compression parent fallback streak lookup failed: %s",
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "compression parent fallback streak lookup failed (non-sqlite): %s",
+                        exc,
+                    )
+            count_getter = getattr(
+                session_db, "get_compression_ineffective_count", None
+            )
+            if callable(count_getter):
+                try:
+                    stored_count = await count_getter(old_session_id)
+                    if isinstance(stored_count, (int, float, str)):
+                        previous_ineffective_count = max(0, int(stored_count))
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    logger.debug(
+                        "compression parent ineffective count lookup failed: %s",
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "compression parent ineffective count lookup failed (non-sqlite): %s",
+                        exc,
+                    )
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
             # Rotation creates a fresh child row before this callback. Preserve
@@ -1633,7 +1671,22 @@ class ContextCompressor(ContextEngine):
             # an armed guard (#54923).
             if self._ineffective_compression_count != previous_ineffective_count:
                 self._ineffective_compression_count = previous_ineffective_count
-                self._persist_ineffective_compression_count()
+                setter = getattr(
+                    session_db, "set_compression_ineffective_count", None
+                )
+                if callable(setter) and session_id:
+                    try:
+                        await setter(session_id, previous_ineffective_count)
+                    except sqlite3.Error as exc:
+                        logger.debug(
+                            "compression ineffective count persist failed: %s",
+                            exc,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "compression ineffective count persist failed (non-sqlite): %s",
+                            exc,
+                        )
 
     def _load_fallback_compression_streak(self) -> None:
         """Compatibility no-op; async turn prologue owns DB hydration."""

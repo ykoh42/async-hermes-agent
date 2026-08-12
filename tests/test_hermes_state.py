@@ -1,6 +1,7 @@
 """Behavior contracts for the native-async ``SessionDB`` interface."""
 
 import inspect
+import json
 import sqlite3
 import time
 
@@ -73,6 +74,8 @@ def test_public_session_interface_is_async():
         "close",
     ):
         assert inspect.iscoroutinefunction(getattr(SessionDB, name)), name
+    assert not hasattr(SessionDB, "delete_meta")
+    assert not hasattr(SessionDB, "get_message_storage_state")
 
 
 @pytest.mark.asyncio
@@ -381,8 +384,6 @@ async def test_titles_meta_search_and_recent_listing(db):
 
     await db.set_meta("checkpoint", "ready")
     assert await db.get_meta("checkpoint") == "ready"
-    assert await db.delete_meta("checkpoint") is True
-    assert await db.get_meta("checkpoint") is None
 
     sessions = await db.list_sessions_rich(source="library")
     assert [session["id"] for session in sessions] == ["s1"]
@@ -1525,12 +1526,20 @@ async def test_rewind_is_auditable_and_excluded_from_live_replay(db):
     await db.create_session("s1", source="library")
     await db.append_message("s1", role="user", content="first")
     await db.append_message("s1", role="assistant", content="reply")
-    target = await db.append_message("s1", role="user", content="retry this")
+    target = await db.append_message(
+        "s1",
+        role="user",
+        content="retry this",
+        display_metadata={"phase": "retry"},
+    )
     await db.append_message("s1", role="assistant", content="discarded")
 
     result = await db.rewind_to_message("s1", target)
     assert result["rewound_count"] == 2
     assert result["target_message"]["content"] == "retry this"
+    assert result["target_message"]["display_metadata"] == json.dumps(
+        {"phase": "retry"}
+    )
     assert [message["content"] for message in await db.get_messages("s1")] == [
         "first",
         "reply",

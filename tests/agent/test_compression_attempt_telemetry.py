@@ -105,6 +105,7 @@ async def test_compression_attempt_telemetry_is_metadata_only(caplog):
     assert payload["protected_head_tokens"] is not None
     assert payload["protected_tail_tokens"] is not None
     assert payload["middle_window_tokens"] is not None
+    assert payload["prellm_skip_count"] == 0
     assert payload["chunking"] is False
     assert payload["chunk_count"] in {0, 1}
     assert payload["commit_status"] == "committed"

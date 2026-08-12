@@ -1961,9 +1961,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _session_row_dict(row) -> Dict[str, Any]:
         data = dict(row)
-        resolved = data.pop("_system_prompt_resolved", None)
-        if "system_prompt" in data:
-            data["system_prompt"] = resolved
+        if "_system_prompt_resolved" in data:
+            resolved = data.pop("_system_prompt_resolved")
+            if "system_prompt" in data:
+                data["system_prompt"] = resolved
         return data
 
     async def _execute_write(
@@ -3565,17 +3566,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         await self._execute_write(_set)
 
-    async def delete_meta(self, key: str) -> bool:
-        """Delete one metadata key and report whether a row was removed."""
-
-        async def _delete(connection):
-            cursor = await connection.execute(
-                "DELETE FROM state_meta WHERE key = ?", (key,)
-            )
-            return cursor.rowcount > 0
-
-        return await self._execute_write(_delete)
-
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return one session row through the adapter's async connection."""
         async with self._read_ctx() as connection:
@@ -4160,7 +4150,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return int(await self._execute_write(_finalize) or 0)
 
     @staticmethod
-    def _decode_message_row(row) -> Dict[str, Any]:
+    def _decode_message_row(
+        row, *, operation: str = "get_messages"
+    ) -> Dict[str, Any]:
         """Decode one SQLite message row without touching ``SessionDB``."""
         message = dict(row)
         if "content" in message:
@@ -4170,8 +4162,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 message["tool_calls"] = json.loads(message["tool_calls"])
             except (json.JSONDecodeError, TypeError):
                 logger.warning(
-                    "Failed to deserialize tool_calls in async session read; "
-                    "falling back to []"
+                    "Failed to deserialize tool_calls in %s, falling back to []",
+                    operation,
                 )
                 message["tool_calls"] = []
         if message.get("display_metadata") is not None:
@@ -4296,12 +4288,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(
                 f"message {target_message_id} not found in session {session_id}"
             )
-        target = self._decode_message_row(row)
+        target = dict(row)
         if target.get("role") != "user":
             raise ValueError(
                 "rewind target must be a 'user' message "
                 f"(got role={target.get('role')!r}, id={target_message_id})"
             )
+        target["content"] = self._decode_content(target.get("content"))
 
         async def _rewind(conn):
             cursor = await conn.execute(
@@ -4403,12 +4396,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         rows = list(reversed(before)) + list(after)
         return {
-            "window": [self._decode_message_row(row) for row in rows],
+            "window": [
+                self._decode_message_row(row, operation="get_messages_around")
+                for row in rows
+            ],
             "messages_before": max(0, len(before) - 1),
             "messages_after": len(after),
         }
 
-    async def get_message_storage_state(
+    async def _get_message_storage_state(
         self, message_id: int
     ) -> Optional[Dict[str, Any]]:
         """Return storage flags for one message id without a raw connection."""

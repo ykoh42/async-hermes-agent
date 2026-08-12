@@ -326,7 +326,7 @@ async def test_initialize_cancellation_closes_connection_and_registry(
 
     monkeypatch.setattr(MemoryStore, "_init_db", paused_init)
     store = MemoryStore(tmp_path / "cancel.db")
-    task = asyncio.create_task(store.initialize())
+    task = asyncio.create_task(store._initialize())
     await started.wait()
     connection = next(iter(MemoryStore._shared.values()))["conn"]
     task.cancel()
@@ -344,7 +344,7 @@ async def test_cancelled_write_finishes_before_reraising(
     tmp_path,
 ):
     store = MemoryStore(tmp_path / "write-cancel.db", hrr_dim=64)
-    await store.initialize()
+    await store._initialize()
     rebuild_started = asyncio.Event()
     release_rebuild = asyncio.Event()
     rebuild_completed = asyncio.Event()
@@ -379,7 +379,7 @@ async def test_close_finishes_owned_connection_before_reraising_cancellation(
     tmp_path,
 ):
     store = MemoryStore(tmp_path / "close-cancel.db")
-    await store.initialize()
+    await store._initialize()
     connection = store._conn
     original_close = connection.close
     close_started = asyncio.Event()

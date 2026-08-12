@@ -244,3 +244,30 @@ class TestCompressionBoundaryCarry:
         # still inherits the armed guard.
         assert await db.get_compression_ineffective_count("child") == 1
         await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fresh_compressor_loads_parent_guards_at_rotation_boundary(
+        self, tmp_path
+    ):
+        """A reconstructed engine must inherit the durable parent guards."""
+        db = _db(tmp_path)
+        await db.create_session("parent", source="cli")
+        await db.set_compression_fallback_streak("parent", 2)
+        await db.set_compression_ineffective_count("parent", 1)
+        await db.create_session(
+            "child", source="cli", parent_session_id="parent"
+        )
+
+        cc = await _compressor(db, "unrelated")
+        await cc.on_session_start(
+            "child",
+            boundary_reason="compression",
+            old_session_id="parent",
+            session_db=db,
+        )
+
+        assert cc._session_id == "child"
+        assert cc._fallback_compression_streak == 2
+        assert cc._ineffective_compression_count == 1
+        assert await db.get_compression_ineffective_count("child") == 1
+        await db.close()

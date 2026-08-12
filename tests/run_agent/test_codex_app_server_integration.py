@@ -69,6 +69,21 @@ def test_api_mode_is_codex_app_server():
     assert agent.client is None
 
 
+def test_interrupt_ignores_codex_session_request_failure():
+    agent = _make_agent()
+
+    def request_interrupt():
+        raise RuntimeError("interrupt transport failed")
+
+    agent._codex_session = SimpleNamespace(request_interrupt=request_interrupt)
+
+    agent.interrupt("stop")
+
+    assert agent._interrupt_requested is True
+    assert agent._interrupt_message == "stop"
+    assert agent._interrupt_event.is_set()
+
+
 @pytest.mark.asyncio
 async def test_run_conversation_preserves_result_and_message_shape(fake_session):
     agent = _make_agent()

@@ -180,7 +180,7 @@ async def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]
     if not message_id:
         return None
     try:
-        getter = getattr(db, "get_message_storage_state", None)
+        getter = getattr(db, "_get_message_storage_state", None)
         if not callable(getter):
             return None
         row = await getter(message_id)

@@ -251,7 +251,7 @@ class HolographicMemoryProvider(MemoryProvider):
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
         self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
-        await self._store.initialize()
+        await self._store._initialize()
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
