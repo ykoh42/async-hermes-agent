@@ -367,6 +367,35 @@ async def test_native_chat_stream_preserves_reused_tool_index_and_extra_content(
 
 
 @pytest.mark.asyncio
+async def test_native_chat_stream_closes_async_generator_after_early_break():
+    closed = asyncio.Event()
+    agent = None
+
+    async def chunks():
+        try:
+            yield _chat_chunk(content="partial")
+            agent._claim_stream_writer()
+            yield _chat_chunk(content="stale", finish="stop")
+        finally:
+            closed.set()
+
+    stream = chunks()
+    agent = _native_chat_agent(stream)
+    agent._fire_reasoning_delta = MagicMock()
+    agent._fire_stream_delta = MagicMock()
+    agent._fire_tool_gen_started = MagicMock()
+
+    response = await agent._execute_model_request(
+        {"model": "test-model", "messages": []},
+        use_streaming=True,
+    )
+
+    assert response.id == PARTIAL_STREAM_STUB_ID
+    assert response.choices[0].message.content == "partial"
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_native_chat_stream_close_failure_preserves_response_and_rebuilds_client():
     class _CloseFailingStream(_AsyncChatStream):
         async def aclose(self):

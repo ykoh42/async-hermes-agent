@@ -5793,16 +5793,22 @@ class AIAgent:
                 except Exception:
                     pass
         finally:
-            close = getattr(result, "aclose", None) or getattr(
-                result, "close", None
-            )
-            if inspect.iscoroutinefunction(close):
+            async_close = getattr(result, "aclose", None)
+            close = async_close or getattr(result, "close", None)
+            if callable(close) and (
+                async_close is not None or inspect.iscoroutinefunction(close)
+            ):
                 try:
-                    await _finish_owned_task(
-                        asyncio.create_task(
-                            close(),
-                            name="chat-completion-stream-close",
+                    close_awaitable = close()
+                    if not inspect.isawaitable(close_awaitable):
+                        raise TypeError(
+                            "native async stream close did not return an awaitable"
                         )
+                    close_task = asyncio.ensure_future(close_awaitable)
+                    if hasattr(close_task, "set_name"):
+                        close_task.set_name("chat-completion-stream-close")
+                    await _finish_owned_task(
+                        close_task
                     )
                 except asyncio.CancelledError:
                     raise

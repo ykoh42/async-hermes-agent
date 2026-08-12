@@ -7,6 +7,7 @@ auxiliary call streams and ticks the hook per chunk, so outer watchdogs
 hook, behavior is byte-for-byte the old non-streaming call.
 """
 
+import asyncio
 import threading
 import time
 from types import SimpleNamespace
@@ -203,6 +204,21 @@ class TestAggregateChatStream:
         result = await _aggregate_chat_stream(stream)
         assert result.choices[0].message.content == "ok"
         assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_error_closes_async_generator(self):
+        closed = asyncio.Event()
+
+        async def chunks():
+            try:
+                yield _chunk(content="too late")
+            finally:
+                closed.set()
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            await _aggregate_chat_stream(chunks(), total_ceiling=0)
+
+        assert closed.is_set()
 
 
 

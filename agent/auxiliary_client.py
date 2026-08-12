@@ -8104,9 +8104,17 @@ async def _aggregate_chat_stream(
             acc.feed(chunk)
     finally:
         try:
-            close = getattr(chunks, "aclose", None) or getattr(chunks, "close", None)
-            if inspect.iscoroutinefunction(close):
-                await close()
+            async_close = getattr(chunks, "aclose", None)
+            close = async_close or getattr(chunks, "close", None)
+            if callable(close) and (
+                async_close is not None or inspect.iscoroutinefunction(close)
+            ):
+                close_awaitable = close()
+                if not inspect.isawaitable(close_awaitable):
+                    raise TypeError(
+                        "native async stream close did not return an awaitable"
+                    )
+                await close_awaitable
         except Exception:
             pass
     return acc.finish()

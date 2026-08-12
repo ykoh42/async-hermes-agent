@@ -646,36 +646,34 @@ async def test_run_codex_stream_stops_after_terminal_before_next_pull(monkeypatc
     )
     usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
     calls = {"create": 0, "pulls": 0}
+    stream_closed = False
 
-    class _PostTerminalDroppingStream:
-        def __aiter__(self):
-            async def _iterate():
-                calls["pulls"] += 1
-                yield SimpleNamespace(
-                    type="response.output_item.done",
-                    item=message_item,
-                )
-                calls["pulls"] += 1
-                yield SimpleNamespace(
-                    type="response.completed",
-                    response=SimpleNamespace(
-                        status="completed",
-                        usage=usage,
-                        id="resp_post_terminal_1",
-                    ),
-                )
-                calls["pulls"] += 1
-                raise RuntimeError("connection dropped after terminal frame")
-
-            return _iterate()
-
-        async def aclose(self):
-            return None
+    async def _post_terminal_dropping_stream():
+        nonlocal stream_closed
+        try:
+            calls["pulls"] += 1
+            yield SimpleNamespace(
+                type="response.output_item.done",
+                item=message_item,
+            )
+            calls["pulls"] += 1
+            yield SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    usage=usage,
+                    id="resp_post_terminal_1",
+                ),
+            )
+            calls["pulls"] += 1
+            raise RuntimeError("connection dropped after terminal frame")
+        finally:
+            stream_closed = True
 
     async def _fake_create(**kwargs):
         calls["create"] += 1
         assert kwargs["stream"] is True
-        return _PostTerminalDroppingStream()
+        return _post_terminal_dropping_stream()
 
     agent.client = SimpleNamespace(
         responses=SimpleNamespace(create=_fake_create),
@@ -694,6 +692,7 @@ async def test_run_codex_stream_stops_after_terminal_before_next_pull(monkeypatc
     assert response.usage is usage
     assert response.id == "resp_post_terminal_1"
     assert response.output == [message_item]
+    assert stream_closed is True
 
 
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
