@@ -615,16 +615,13 @@ class MemoryManager:
                 # while asyncio propagates cancellation through ``await``.
                 return await asyncio.shield(task) or ""
         except TimeoutError:
-            # ``asyncio.timeout`` has already requested cancellation of the
-            # awaited task.  Do not await an uncooperative provider here: a
-            # coroutine that suppresses CancelledError must not turn a bounded
-            # provider timeout into an unbounded agent turn.  Keep the task in
-            # the per-provider map until its done callback runs, preserving the
-            # upstream contract that a still-stuck prefetch suppresses the next
-            # turn rather than overlapping provider calls.
-            task.cancel()
+            # The shield keeps the provider call alive after this bounded wait,
+            # matching upstream's worker contract: suppress overlapping
+            # prefetches until the timed-out call actually returns. Shutdown
+            # still tracks and cancels the owned task deterministically.
             logger.warning(
-                "Memory provider '%s' prefetch timed out after %.1fs",
+                "Memory provider '%s' prefetch timed out after %.1fs; skipping it "
+                "until the stuck call returns",
                 provider.name,
                 self._external_prefetch_timeout,
             )
@@ -1046,34 +1043,26 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
-        providers = [
-            provider for provider in self._providers
-            if provider.name != "builtin"
-        ]
-        if not providers:
-            return
-
-        async def _run() -> None:
-            for provider in providers:
-                try:
-                    metadata_mode = self._provider_memory_write_metadata_mode(provider)
-                    if metadata_mode == "keyword":
-                        await provider.on_memory_write(
-                            action, target, content, metadata=dict(metadata or {})
-                        )
-                    elif metadata_mode == "positional":
-                        await provider.on_memory_write(
-                            action, target, content, dict(metadata or {})
-                        )
-                    else:
-                        await provider.on_memory_write(action, target, content)
-                except Exception as e:
-                    logger.debug(
-                        "Memory provider '%s' on_memory_write failed: %s",
-                        provider.name, e,
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                if metadata_mode == "keyword":
+                    await provider.on_memory_write(
+                        action, target, content, metadata=dict(metadata or {})
                     )
-
-        self._submit_background(_run)
+                elif metadata_mode == "positional":
+                    await provider.on_memory_write(
+                        action, target, content, dict(metadata or {})
+                    )
+                else:
+                    await provider.on_memory_write(action, target, content)
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' on_memory_write failed: %s",
+                    provider.name, e,
+                )
 
     # Actions the bridge mirrors to external providers. The built-in memory
     # tool can also return non-mutating shapes (errors, staged-for-approval
@@ -1284,4 +1273,3 @@ class MemoryManager:
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
                 )
-                raise

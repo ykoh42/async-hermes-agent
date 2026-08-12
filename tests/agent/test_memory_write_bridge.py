@@ -61,7 +61,6 @@ async def test_notifies_remove_with_old_text_after_success():
         json.dumps({"success": True}),
         {"action": "remove", "target": "memory", "old_text": "stale preference entry"},
     )
-    await mgr.flush_pending(timeout=5.0)
     assert provider.calls == [
         {
             "action": "remove",
@@ -97,7 +96,6 @@ async def test_build_metadata_callback_is_merged_per_op():
         {"action": "add", "target": "memory", "content": "fact"},
         build_metadata=lambda: {"session_id": "s1", "tool_name": "memory"},
     )
-    await mgr.flush_pending(timeout=5.0)
     assert provider.calls == [
         {
             "action": "add",

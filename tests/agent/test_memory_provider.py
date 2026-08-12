@@ -378,7 +378,7 @@ async def test_memory_manager_session_switch_isolates_provider_failure():
 
 
 @pytest.mark.asyncio
-async def test_external_prefetch_timeout_skips_stuck_provider():
+async def test_external_prefetch_timeout_skips_stuck_provider(caplog):
     manager = MemoryManager(external_prefetch_timeout=0.01)
     provider = _Provider(delay=0.2)
     manager.add_provider(provider)
@@ -399,30 +399,25 @@ async def test_external_prefetch_timeout_skips_stuck_provider():
             await heartbeat_task
 
     assert heartbeat > 1
+    assert "skipping it until the stuck call returns" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_prefetch_timeout_does_not_overlap_uncancellable_provider():
+async def test_prefetch_timeout_does_not_overlap_running_provider():
     started = asyncio.Event()
     release = asyncio.Event()
     finished = asyncio.Event()
 
-    class _UncooperativeProvider(_Provider):
+    class _SlowProvider(_Provider):
         async def prefetch(self, query, *, session_id=""):
             started.set()
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                # A real provider may be in a cancellation boundary that
-                # cannot finish immediately.  The manager must still return
-                # at its timeout and suppress overlapping calls.
-                await release.wait()
+            await release.wait()
             self.events.append(("prefetch", query, session_id))
             finished.set()
             return "late"
 
     manager = MemoryManager(external_prefetch_timeout=0.01)
-    provider = _UncooperativeProvider()
+    provider = _SlowProvider()
     manager.add_provider(provider)
 
     first = asyncio.create_task(manager.prefetch_all("first"))
@@ -563,7 +558,7 @@ def test_memory_manager_rejects_sync_provider_contract():
 
 
 @pytest.mark.asyncio
-async def test_memory_manager_propagates_provider_initialization_failure():
+async def test_memory_manager_isolates_provider_initialization_failure(caplog):
     class _BrokenProvider(_Provider):
         async def initialize(self, session_id, **kwargs):
             raise RuntimeError("provider unavailable")
@@ -571,8 +566,9 @@ async def test_memory_manager_propagates_provider_initialization_failure():
     manager = MemoryManager()
     manager.add_provider(_BrokenProvider())
 
-    with pytest.raises(RuntimeError, match="provider unavailable"):
-        await manager.initialize_all("session")
+    await manager.initialize_all("session")
+
+    assert "Memory provider 'external' initialize failed: provider unavailable" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -930,12 +926,17 @@ async def test_on_memory_write_tolerates_provider_failure():
         async def on_memory_write(self, action, target, content, metadata=None):
             raise RuntimeError("boom")
 
+    class _RecordingProvider(_Provider):
+        async def on_memory_write(self, action, target, content, metadata=None):
+            self.events.append(("write", action, target, content, metadata))
+
     manager = MemoryManager()
-    manager.add_provider(_BrokenProvider("external"))
+    good = _RecordingProvider("good")
+    manager._providers = [_BrokenProvider("broken"), good]
 
     await manager.on_memory_write("add", "user", "test")
 
-    assert await manager.flush_pending(timeout=1.0)
+    assert good.events == [("write", "add", "user", "test", {})]
 
 
 def _run_memory_injection(enabled_toolsets, *, disabled_toolsets=None, schemas=()):
