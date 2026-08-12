@@ -1201,6 +1201,9 @@ async def _execute_tool_calls_native(
                             await asyncio.gather(
                                 *pending, return_exceptions=True
                             )
+                            await asyncio.gather(
+                                *done, return_exceptions=True
+                            )
                             raise task_error
                 if not timed_out:
                     await asyncio.gather(*tasks)

@@ -7,6 +7,7 @@ are made.
 
 import ast
 import asyncio
+import gc
 import inspect
 import io
 import json
@@ -1796,6 +1797,50 @@ class TestConcurrentToolExecution:
         assert "alpha" in messages[0]["content"]
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_retrieves_simultaneous_worker_failures(self, agent):
+        """A failed parallel batch must observe every completed task error."""
+        from agent.tool_executor import execute_tool_calls_concurrent
+
+        tool_calls = [
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c1"),
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c2"),
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+        entered = 0
+        release = asyncio.Event()
+
+        async def fail_together(*_args, **kwargs):
+            nonlocal entered
+            entered += 1
+            if entered == len(tool_calls):
+                release.set()
+            await release.wait()
+            raise RuntimeError(kwargs["tool_call_id"])
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        diagnostics = []
+        loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+        try:
+            with patch(
+                "agent.tool_executor._run_agent_tool_execution_middleware",
+                side_effect=fail_together,
+            ):
+                with pytest.raises(RuntimeError, match="c[12]"):
+                    await execute_tool_calls_concurrent(
+                        agent, message, [], "task-1"
+                    )
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert not any(
+            context.get("message") == "Task exception was never retrieved"
+            for context in diagnostics
+        )
 
     @pytest.mark.asyncio
     async def test_preflight_interrupt_skips_entire_parallel_batch(self, agent):
