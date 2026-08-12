@@ -73,11 +73,17 @@ async def test_live_provider_instances_overlap_and_shared_agent_serializes_turns
         shared,
     ):
         first_task = asyncio.create_task(
-            first.run_conversation("Reply exactly LIVE_CONCURRENT_FIRST."),
+            first.run_conversation(
+                "Return only the token inside brackets, without the brackets "
+                "or punctuation: [LIVE_CONCURRENT_FIRST]"
+            ),
             name="live-provider-first",
         )
         second_task = asyncio.create_task(
-            second.run_conversation("Reply exactly LIVE_CONCURRENT_SECOND."),
+            second.run_conversation(
+                "Return only the token inside brackets, without the brackets "
+                "or punctuation: [LIVE_CONCURRENT_SECOND]"
+            ),
             name="live-provider-second",
         )
         try:
@@ -104,13 +110,19 @@ async def test_live_provider_instances_overlap_and_shared_agent_serializes_turns
         assert second_result["final_response"].strip() == "LIVE_CONCURRENT_SECOND"
 
         shared_first = asyncio.create_task(
-            shared.run_conversation("Reply exactly LIVE_SHARED_FIRST."),
+            shared.run_conversation(
+                "Return only the token inside brackets, without the brackets "
+                "or punctuation: [LIVE_SHARED_FIRST]"
+            ),
             name="live-shared-first",
         )
         await asyncio.wait_for(shared._model_request_active.wait(), timeout=10)
         cached_prompt = shared._cached_system_prompt
         shared_second = asyncio.create_task(
-            shared.run_conversation("Reply exactly LIVE_SHARED_SECOND."),
+            shared.run_conversation(
+                "Return only the token inside brackets, without the brackets "
+                "or punctuation: [LIVE_SHARED_SECOND]"
+            ),
             name="live-shared-second",
         )
         try:
