@@ -3198,7 +3198,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             agent.api_mode = "chat_completions"
             agent.api_key = str(pending.get("api_key") or "moa-virtual-provider")
             agent.base_url = "moa://local"
-            agent.client = build_moa_facade(agent, model)
+            agent.client = await build_moa_facade(agent, model)
             agent._anthropic_client = None
             agent._anthropic_client_source = None
             agent._client_kwargs = {}
@@ -3345,12 +3345,13 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 deferred_client_kwargs["default_headers"] = build_or_headers(
                     config_snapshot.get("openrouter") or {}
                 )
-            merged_headers = _merge_user_headers(
-                deferred_client_kwargs.get("default_headers"),
-                config=config_snapshot,
-            )
-            if merged_headers:
-                deferred_client_kwargs["default_headers"] = merged_headers
+            if not bool(pending.get("route_changed")):
+                merged_headers = _merge_user_headers(
+                    deferred_client_kwargs.get("default_headers"),
+                    config=config_snapshot,
+                )
+                if merged_headers:
+                    deferred_client_kwargs["default_headers"] = merged_headers
 
             custom_providers = get_compatible_custom_providers(config_snapshot)
             apply_custom_provider_tls_to_client_kwargs(

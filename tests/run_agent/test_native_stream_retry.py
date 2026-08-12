@@ -243,6 +243,28 @@ async def test_delivered_delta_returns_empty_stub_when_callback_keeps_no_text(
 
 
 @pytest.mark.asyncio
+async def test_content_filter_stream_error_tags_partial_stub(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    holder = {}
+
+    async def execute(*_args, **kwargs):
+        agent = holder["agent"]
+        agent._current_streamed_assistant_text = "Writing the file: "
+        kwargs["_on_stream_text"]()
+        raise RuntimeError("output new_sensitive (1027) [MiniMax-M2.7]")
+
+    agent = _retry_agent(execute)
+    holder["agent"] = agent
+
+    response = await interruptible_streaming_api_call(agent, {})
+
+    assert response.id == PARTIAL_STREAM_STUB_ID
+    assert response.choices[0].message.content == "Writing the file:"
+    assert response._content_filter_terminated is True
+    agent._emit_stream_drop.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_partial_tool_stream_retries_and_resets_delivery(monkeypatch):
     monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
     response = object()

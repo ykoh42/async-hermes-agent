@@ -760,3 +760,37 @@ class TestMicroCompaction:
         assert not unstamped, (
             "splice must not strip _db_persisted from surviving messages"
         )
+
+
+@pytest.mark.asyncio
+class TestDefragFlushCursorInvalidation:
+    async def _defrag_setup(self):
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+
+        cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
+        messages = await cc._micro_compact(_conversation(exchanges=8))
+        for message in messages:
+            if message.get(COMPRESSED_SUMMARY_METADATA_KEY):
+                message[_DB_PERSISTED_MARKER] = True
+        cc._micro_compact_rolling_summary = "x" * 40_000
+        return cc, messages
+
+    async def test_defrag_marker_pop_raises_invalidation_flag(self):
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+
+        cc, messages = await self._defrag_setup()
+        assert cc._flush_scan_cursor_invalidated is False
+
+        result = await cc._micro_compact(messages)
+
+        markers = _summary_markers(result)
+        assert len(markers) == 1
+        assert not markers[0].get(_DB_PERSISTED_MARKER)
+        assert cc._flush_scan_cursor_invalidated is True
+
+    async def test_no_defrag_no_flag(self):
+        cc = _compressor()
+
+        await cc._micro_compact(_conversation(exchanges=8))
+
+        assert cc._flush_scan_cursor_invalidated is False

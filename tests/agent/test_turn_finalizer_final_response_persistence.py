@@ -173,3 +173,81 @@ async def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     assert persisted[-1]["content"] == "Here is your answer."
     assert persisted[-1]["tool_calls"]
     assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
+
+
+@pytest.mark.asyncio
+async def test_final_response_fill_invalidates_flush_scan_cursor():
+    """The fill's marker pop must invalidate the bounded flush-scan cursor."""
+    agent = FakeAgent()
+    agent._db_flush_scan_prefix = ["prior-snapshot"]
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "t1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                }
+            ],
+            "_db_persisted": True,
+        },
+    ]
+
+    await finalize_turn(
+        agent,
+        final_response="Here is your answer.",
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert agent._db_flush_scan_prefix is None
+
+
+@pytest.mark.asyncio
+async def test_micro_defrag_invalidation_is_consumed_before_persistence():
+    class DefragCompressor:
+        _micro_compact_enabled = True
+        _flush_scan_cursor_invalidated = True
+        last_prompt_tokens = 0
+
+        async def _micro_compact(self, messages, *, session_db):
+            assert session_db is None
+            return messages
+
+    agent = FakeAgent()
+    agent.context_compressor = DefragCompressor()
+    agent._db_flush_scan_prefix = ["prior-snapshot"]
+
+    await finalize_turn(
+        agent,
+        final_response="answer",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert agent.context_compressor._flush_scan_cursor_invalidated is False
+    assert agent._db_flush_scan_prefix is None

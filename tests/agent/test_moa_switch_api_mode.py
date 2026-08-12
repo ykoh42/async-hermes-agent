@@ -32,7 +32,11 @@ def _make_fake_agent():
 
 
 @pytest.mark.asyncio
-async def test_switch_to_moa_uses_native_async_facade():
+@pytest.mark.parametrize(
+    "incoming_api_mode",
+    ["codex_responses", "anthropic_messages", "chat_completions", ""],
+)
+async def test_switch_to_moa_uses_native_async_facade(incoming_api_mode):
     from agent import agent_runtime_helpers as arh
 
     agent = _make_fake_agent()
@@ -49,7 +53,7 @@ async def test_switch_to_moa_uses_native_async_facade():
         new_provider="moa",
         api_key="moa-virtual-provider",
         base_url="moa://local",
-        api_mode="chat_completions",
+        api_mode=incoming_api_mode,
     )
 
     assert agent.provider == "moa"

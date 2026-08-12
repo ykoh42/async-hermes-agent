@@ -73,7 +73,6 @@ class TestIdentityFlush:
                 await agent.close()
                 await db.close()
 
-
     @pytest.mark.asyncio
     async def test_repeated_flush_same_turn_writes_once(self):
         """Identity tracking preserves #860 same-turn dedup behavior."""
@@ -94,6 +93,7 @@ class TestIdentityFlush:
             finally:
                 await agent.close()
                 await db.close()
+
 
     @pytest.mark.asyncio
     async def test_cursor_reset_starts_new_turn_identity_window(self):
@@ -206,6 +206,47 @@ class TestIdentityFlush:
                 # marker iff it was handled.
                 assert agent._flushed_db_message_ids == set()
                 assert new_assistant.get("_db_persisted") is True
+            finally:
+                await agent.close()
+                await db.close()
+
+
+class TestFlushCursorMarkerPop:
+    @pytest.mark.asyncio
+    async def test_filled_row_repersists_after_marker_pop_and_cursor_invalidation(
+        self,
+    ):
+        """A filled, previously flushed row must reach the durable transcript."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(Path(tmpdir) / "t.db")
+            agent = await _make_agent(db)
+            try:
+                tool_row = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "t1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                }
+                messages = [tool_row]
+                await agent._flush_messages_to_session_db_unlocked(messages)
+                assert messages[0].get("_db_persisted") is True
+                assert agent._db_flush_scan_prefix is not None
+
+                messages[0]["content"] = "the final answer"
+                messages[0].pop("_db_persisted", None)
+                agent._db_flush_scan_prefix = None
+
+                messages.append({"role": "user", "content": "next question"})
+                await agent._flush_messages_to_session_db_unlocked(messages)
+
+                assert "the final answer" in await _contents(db)
             finally:
                 await agent.close()
                 await db.close()

@@ -63,3 +63,25 @@ async def test_run_conversation_persists_tokens_for_telegram_sessions(tmp_path):
     finally:
         await agent.close()
         await session_db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(
+    monkeypatch,
+):
+    sentinel_db = object()
+
+    class FakeSessionDB:
+        def __new__(cls):
+            return sentinel_db
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+    agent = _make_agent(None, platform="acp")
+
+    resolved = await agent._get_session_db_for_recall()
+
+    assert resolved is sentinel_db
+    assert agent._session_db is sentinel_db
+    assert await agent._get_session_db_for_recall() is sentinel_db

@@ -795,7 +795,12 @@ async def _execute_tool_calls_native(
                 elif name == "todo":
                     dispatch_kwargs["store"] = getattr(agent, "_todo_store", None)
                 elif name == "session_search":
-                    dispatch_kwargs["db"] = getattr(agent, "_session_db", None)
+                    get_recall_db = getattr(agent, "_get_session_db_for_recall", None)
+                    dispatch_kwargs["db"] = (
+                        await get_recall_db()
+                        if callable(get_recall_db)
+                        else getattr(agent, "_session_db", None)
+                    )
                     dispatch_kwargs["current_session_id"] = getattr(
                         agent, "session_id", None
                     )

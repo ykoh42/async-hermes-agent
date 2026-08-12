@@ -12,6 +12,7 @@ import hashlib
 import asyncio
 import logging
 import re
+from types import SimpleNamespace
 from typing import Any
 
 from agent.auxiliary_client import call_llm
@@ -834,15 +835,26 @@ async def _run_references_parallel(
 
             if pending and agent is not None and getattr(agent, "_interrupt_requested", False):
                 interrupted = True
-                for task in pending:
+                interrupted_tasks = list(pending)
+                for task in interrupted_tasks:
                     task.cancel()
-                for task in pending:
+                outcomes = await asyncio.gather(
+                    *interrupted_tasks,
+                    return_exceptions=True,
+                )
+                for task, outcome in zip(interrupted_tasks, outcomes):
                     index = tasks[task]
-                    results[index] = (
-                        _slot_label(reference_models[index]),
-                        _INTERRUPTED_REFERENCE_NOTE,
-                        _RefAccounting(CanonicalUsage()),
-                    )
+                    if not isinstance(outcome, BaseException):
+                        # The call finished between the interrupt check and
+                        # cancellation. Preserve its billed output and usage,
+                        # matching upstream's future.done() race handling.
+                        results[index] = outcome
+                    else:
+                        results[index] = (
+                            _slot_label(reference_models[index]),
+                            _INTERRUPTED_REFERENCE_NOTE,
+                            _RefAccounting(CanonicalUsage()),
+                        )
                 break
 
     if interrupted:
@@ -1264,6 +1276,53 @@ async def aggregate_moa_context(
     )
 
 
+def _completed_response_as_stream_chunk(response: Any) -> Any:
+    """Convert a completed response into one chat-completions delta chunk."""
+    choices = getattr(response, "choices", None)
+    first_choice = choices[0] if isinstance(choices, (list, tuple)) and choices else None
+    message = getattr(first_choice, "message", None)
+    raw_tool_calls = getattr(message, "tool_calls", None)
+    tool_call_deltas = None
+    if isinstance(raw_tool_calls, (list, tuple)) and raw_tool_calls:
+        tool_call_deltas = []
+        for index, tool_call in enumerate(raw_tool_calls):
+            function = getattr(tool_call, "function", None)
+            tool_call_deltas.append(
+                SimpleNamespace(
+                    index=getattr(tool_call, "index", index),
+                    id=getattr(tool_call, "id", None),
+                    type=getattr(tool_call, "type", None) or "function",
+                    function=SimpleNamespace(
+                        name=getattr(function, "name", None),
+                        arguments=getattr(function, "arguments", None),
+                    ),
+                )
+            )
+    delta = SimpleNamespace(
+        content=getattr(message, "content", None),
+        tool_calls=tool_call_deltas,
+        reasoning_content=getattr(message, "reasoning_content", None),
+        reasoning=getattr(message, "reasoning", None),
+        reasoning_details=getattr(message, "reasoning_details", None),
+    )
+    choice = SimpleNamespace(
+        index=getattr(first_choice, "index", 0),
+        delta=delta,
+        finish_reason=getattr(first_choice, "finish_reason", None) or "stop",
+    )
+    return SimpleNamespace(
+        id=getattr(response, "id", None),
+        model=getattr(response, "model", None),
+        choices=[choice],
+        usage=getattr(response, "usage", None),
+    )
+
+
+async def _completed_response_stream(response: Any):
+    """Yield the native-async equivalent of upstream's one-chunk iterator."""
+    yield _completed_response_as_stream_chunk(response)
+
+
 def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str) -> None:
     """Attach the per-turn reference block at the END of the aggregator prompt.
 
@@ -1643,6 +1702,8 @@ class MoAChatCompletions:
                     self._pending_trace["aggregator_output"] = _extract_text(_agg_response)
                 except Exception:  # pragma: no cover - defensive
                     self._pending_trace["aggregator_output"] = None
+        if stream and hasattr(_agg_response, "choices"):
+            return _completed_response_stream(_agg_response)
         return _agg_response
 
     async def create(self, **api_kwargs: Any) -> Any:
@@ -2052,7 +2113,7 @@ class MoAClient:
         )
 
 
-def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
+async def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
     """Build the MoA facade client for ``agent``, wiring the reference relay.
 
     Single construction point for ``MoAClient`` wherever the agent's shared
@@ -2125,8 +2186,24 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
         except Exception:
             pass
 
+    resolved_preset = preset_name
+    if resolved_preset is None and getattr(agent, "provider", None) == "moa":
+        resolved_preset = getattr(agent, "model", None)
+
+    resolved_preset = str(resolved_preset or "default")
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.moa_config import normalize_moa_config
+
+        moa_cfg = normalize_moa_config((await load_config_readonly()).get("moa") or {})
+        presets = moa_cfg.get("presets") or {}
+        if resolved_preset not in presets:
+            resolved_preset = moa_cfg.get("default_preset") or "default"
+    except Exception:
+        resolved_preset = "default"
+
     return MoAClient(
-        str(preset_name or getattr(agent, "model", None) or "default"),
+        resolved_preset,
         reference_callback=_moa_reference_relay,
         # Thread the agent through so the reference fan-out wait can be
         # aborted on a user interrupt (see _run_references_parallel).

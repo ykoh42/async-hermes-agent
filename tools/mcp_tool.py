@@ -3870,21 +3870,24 @@ async def _await_native_mcp_reconnect(
     """Request and await a transport reconnect on the current agent loop."""
     if not hasattr(server, "_reconnect_event") or not hasattr(server, "_ready"):
         return False
+    old_session = getattr(server, "session", None)
     logger.info(
         "MCP server '%s': requesting reconnect for %s", server_name, operation_description,
     )
     server._ready.clear()
     server._reconnect_event.set()
-    try:
-        await asyncio.wait_for(server._ready.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
+    if not await _wait_for_server_session_ready(
+        server,
+        old_session=old_session,
+        timeout=timeout,
+    ):
         logger.warning(
             "MCP server '%s': reconnect did not become ready within %.1fs",
             server_name,
             timeout,
         )
         return False
-    return server.session is not None
+    return True
 
 
 async def _handle_auth_error_and_retry(

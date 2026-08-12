@@ -79,6 +79,46 @@ def _install_stub_server(mcp_tool, name):
     return server
 
 
+@pytest.mark.asyncio
+async def test_session_expired_reconnect_waits_for_distinct_session():
+    from tools.mcp_tool import _await_native_mcp_reconnect
+
+    old_session = object()
+    new_session = object()
+    server = SimpleNamespace(
+        session=old_session,
+        _ready=asyncio.Event(),
+    )
+    server._ready.set()
+    replacement_task = None
+
+    class ReconnectEvent:
+        def set(self):
+            nonlocal replacement_task
+
+            async def replace_session():
+                # A reconnect lifecycle can publish readiness before its stale
+                # session reference has been swapped out. The waiter must not
+                # retry against that old object.
+                server._ready.set()
+                await asyncio.sleep(0.01)
+                server.session = new_session
+
+            replacement_task = asyncio.create_task(replace_session())
+
+    server._reconnect_event = ReconnectEvent()
+
+    assert await _await_native_mcp_reconnect(
+        "srv",
+        server,
+        operation_description="tools/call health",
+        timeout=0.5,
+    ) is True
+    assert server.session is new_session
+    assert replacement_task is not None
+    await replacement_task
+
+
 
 # ---------------------------------------------------------------------------
 # Parallel coverage for resources/list, resources/read, prompts/list,

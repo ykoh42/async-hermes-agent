@@ -1291,7 +1291,7 @@ async def try_recover_primary_transport(
             # the reference_callback relay survives recovery (#53802).
             from agent.moa_loop import build_moa_facade
 
-            agent.client = build_moa_facade(agent, agent.model)
+            agent.client = await build_moa_facade(agent, agent.model)
         else:
             agent._deferred_provider_runtime = {
                 "provider": agent.provider,
@@ -1537,7 +1537,7 @@ async def restore_primary_runtime(agent) -> bool:
             # emitting moa.reference/moa.aggregating display events (#53802).
             from agent.moa_loop import build_moa_facade
 
-            agent.client = build_moa_facade(agent, agent.model)
+            agent.client = await build_moa_facade(agent, agent.model)
             agent._anthropic_client = None
             agent._anthropic_client_source = None
         else:

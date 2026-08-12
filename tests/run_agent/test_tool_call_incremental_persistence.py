@@ -156,6 +156,42 @@ async def test_unknown_tool_is_returned_as_observation_instead_of_fail_fast():
 
 
 @pytest.mark.asyncio
+async def test_session_search_uses_agent_owned_lazy_database():
+    from model_tools import _TOOL_HANDLER_CONTEXT
+
+    async def flush(_messages):
+        return True
+
+    agent = _agent(flush)
+    sentinel_db = object()
+    agent._get_session_db_for_recall = AsyncMock(return_value=sentinel_db)
+    call = _tool_call("session_search", "search-1", {"query": "Hermes"})
+    messages = []
+    captured = {}
+
+    async def dispatch(*_args, **_kwargs):
+        captured.update(_TOOL_HANDLER_CONTEXT.get() or {})
+        return json.dumps({"success": True, "results": []})
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=dispatch),
+        _native_tool_entry(),
+        _native_policy_path(),
+    ):
+        await execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            finalize=False,
+        )
+
+    agent._get_session_db_for_recall.assert_awaited_once_with()
+    assert captured["db"] is sentinel_db
+    assert captured["current_session_id"] == "session-1"
+
+
+@pytest.mark.asyncio
 async def test_invoke_tool_preserves_unknown_tool_error_contract():
     agent = _agent(AsyncMock(return_value=True))
 

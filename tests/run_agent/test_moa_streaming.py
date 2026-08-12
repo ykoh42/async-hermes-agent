@@ -92,6 +92,66 @@ async def test_create_streams_aggregator_when_requested(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_build_moa_facade_ignores_fallback_model_name_when_restoring(
+    monkeypatch, tmp_path
+):
+    """Fallback restore must not reinterpret its model as an MoA preset."""
+    home = tmp_path / ".hermes"
+    _write_cfg(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent.moa_loop import build_moa_facade
+
+    agent = SimpleNamespace(
+        provider="moa",
+        model="deepseek-v4-flash",
+        tool_progress_callback=None,
+    )
+
+    client = await build_moa_facade(agent, None)
+
+    assert client.chat.completions.preset_name == "review"
+
+
+@pytest.mark.asyncio
+async def test_create_wraps_completed_aggregator_response_as_delta_chunk(
+    monkeypatch, tmp_path
+):
+    """A completed stream response remains consumable by the async loop."""
+    completed = _response("aggregator acted")
+    completed.choices[0].message.tool_calls = [
+        SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="read_file", arguments='{"path":"x"}'),
+        )
+    ]
+
+    def on_call(kwargs):
+        if kwargs["task"] == "moa_aggregator":
+            return completed
+        return None
+
+    facade, calls = _facade(monkeypatch, tmp_path, on_call=on_call)
+    stream = await facade.create(
+        messages=[{"role": "user", "content": "q"}],
+        tools=[],
+        stream=True,
+    )
+
+    chunks = [chunk async for chunk in stream]
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.choices[0].delta.content == "aggregator acted"
+    assert chunk.choices[0].delta.tool_calls[0].index == 0
+    assert chunk.choices[0].delta.tool_calls[0].function.name == "read_file"
+    assert chunk.choices[0].finish_reason == "stop"
+
+    agg = next(c for c in calls if c["task"] == "moa_aggregator")
+    assert agg["stream"] is True
+
+
+@pytest.mark.asyncio
 async def test_create_non_stream_path_unchanged(monkeypatch, tmp_path):
     """Default (no stream): the aggregator call carries NO stream/stream_options
     keys, so the non-streaming path is byte-identical to before."""

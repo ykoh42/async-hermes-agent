@@ -62,7 +62,7 @@ async def test_credential_rotation_rebuilds_natively_without_sync_settings_io():
 
 
 @pytest.mark.asyncio
-async def test_credential_rotation_drops_previous_route_headers():
+async def test_credential_rotation_replaces_route_scoped_tls_settings():
     native_client = _NativeClient()
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -79,6 +79,64 @@ async def test_credential_rotation_drops_previous_route_headers():
             skip_memory=True,
         )
         agent._runtime_config_loaded = True
+        agent._runtime_config_snapshot = {
+            "custom_providers": [
+                {
+                    "name": "b",
+                    "base_url": "https://b.example/v1",
+                    "ssl_verify": True,
+                }
+            ]
+        }
+        agent._client_kwargs.update(
+            ssl_verify=False,
+            ssl_ca_cert="/a.pem",
+        )
+        entry = SimpleNamespace(
+            id="pool-entry-b",
+            runtime_api_key="new-key",
+            access_token="",
+            runtime_base_url="https://b.example/v1",
+            base_url="https://b.example/v1",
+        )
+
+        await agent._swap_credential(entry)
+
+    assert agent._client_kwargs["ssl_verify"] is True
+    assert "ssl_ca_cert" not in agent._client_kwargs
+    await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_credential_rotation_does_not_carry_global_headers_across_routes():
+    native_client = _NativeClient()
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=native_client),
+    ):
+        agent = AIAgent(
+            provider="custom",
+            model="shared-model",
+            api_key="old-key",
+            base_url="https://a.example/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._runtime_config_loaded = True
+        agent._runtime_config_snapshot = {
+            "model": {
+                "default_headers": {"Authorization": "global-secret"},
+            },
+            "custom_providers": [
+                {
+                    "name": "b",
+                    "base_url": "https://b.example/v1",
+                    "extra_headers": {"X-Route": "b"},
+                }
+            ],
+        }
         agent._client_kwargs["default_headers"] = {"Authorization": "old-secret"}
         entry = SimpleNamespace(
             id="pool-entry-b",
@@ -90,5 +148,7 @@ async def test_credential_rotation_drops_previous_route_headers():
 
         await agent._swap_credential(entry)
 
-    assert "default_headers" not in agent._client_kwargs
+    headers = agent._client_kwargs["default_headers"]
+    assert "Authorization" not in headers
+    assert headers["X-Route"] == "b"
     await agent.close()

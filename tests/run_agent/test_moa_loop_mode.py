@@ -586,6 +586,39 @@ async def test_references_parallel_interrupt_aborts_wait(monkeypatch):
         release_wedged.set()  # don't leak a blocked task past the test
 
 
+@pytest.mark.asyncio
+async def test_interrupted_but_completed_reference_keeps_real_accounting(
+    monkeypatch,
+):
+    """A task completing just before cancellation keeps its billed result."""
+    from agent import moa_loop
+
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
+    fake_agent = SimpleNamespace(_interrupt_requested=True)
+
+    async def fake_call_llm(**_kwargs):
+        return _response_with_usage("slowish output", prompt=11, completion=4)
+
+    real_wait = asyncio.wait
+
+    async def misclassified_wait(pending, **_kwargs):
+        await real_wait(pending)
+        return set(), set(pending)
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(moa_loop.asyncio, "wait", misclassified_wait)
+
+    out = await moa_loop._run_references_parallel(
+        [{"provider": "slowish", "model": "m1"}],
+        [{"role": "user", "content": "hi"}],
+        agent=fake_agent,
+    )
+
+    assert out[0][1] == "slowish output"
+    assert isinstance(out[0][2], moa_loop._RefAccounting)
+    assert out[0][2].usage.input_tokens == 11
+
+
 def _ref_config(home, fanout: str | None = None):
     home.mkdir()
     fanout_line = f"\n      fanout: {fanout}" if fanout else ""

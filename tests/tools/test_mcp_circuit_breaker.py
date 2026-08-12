@@ -104,6 +104,83 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
+    """A successful half-open probe closes the breaker."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = 0
+
+    async def call_tool_success(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        result = MagicMock()
+        result.isError = False
+        result.content = [MagicMock(text="ok")]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", call_tool_success)
+    fake_now = [1000.0]
+    monkeypatch.setattr(mcp_tool.time, "monotonic", lambda: fake_now[0])
+    try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+
+        blocked = json.loads(await handler({}))
+        assert "unreachable" in blocked.get("error", "").lower()
+        assert call_count == 0
+
+        fake_now[0] += mcp_tool._CIRCUIT_BREAKER_COOLDOWN_SEC + 1.0
+        result = json.loads(await handler({}))
+        assert result.get("result") == "ok"
+        assert call_count == 1
+        assert mcp_tool._server_error_counts.get("srv") == 0
+        assert "srv" not in mcp_tool._server_breaker_opened_at
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
+    """A failed half-open probe restarts the cooldown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = 0
+
+    async def call_tool_failure(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("still broken")
+
+    _install_stub_server(mcp_tool, "srv", call_tool_failure)
+    fake_now = [1000.0]
+    monkeypatch.setattr(mcp_tool.time, "monotonic", lambda: fake_now[0])
+    try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
+        fake_now[0] += mcp_tool._CIRCUIT_BREAKER_COOLDOWN_SEC + 1.0
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+
+        first = json.loads(await handler({}))
+        assert "error" in first
+        assert call_count == 1
+        assert mcp_tool._server_breaker_opened_at["srv"] == fake_now[0]
+
+        second = json.loads(await handler({}))
+        assert "unreachable" in second.get("error", "").lower()
+        assert call_count == 1
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 
 
 

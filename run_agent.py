@@ -675,6 +675,26 @@ class AIAgent:
         await self.close()
         return False
 
+    async def _get_session_db_for_recall(self):
+        """Return the agent-owned SessionDB, creating the default lazily."""
+        # Persistence-isolated forks must not reopen the canonical state DB:
+        # doing so would re-arm transcript persistence for the fork's harness
+        # turn. Recall degrades to no database for those agents.
+        if getattr(self, "_persist_disabled", False):
+            return None
+        if self._session_db is not None:
+            return self._session_db
+        try:
+            from hermes_state import SessionDB
+
+            self._session_db = SessionDB()
+            return self._session_db
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("SessionDB unavailable for recall", exc_info=True)
+            return None
+
     async def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
         if getattr(self, "_persist_disabled", False):
@@ -4902,6 +4922,11 @@ class AIAgent:
                 provider=self.provider or "",
             )
 
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        route_changed = normalize_route_base_url(
+            self.base_url
+        ) != normalize_route_base_url(runtime_base)
         self._credential_pool_entry_id = getattr(entry, "id", None)
         self._deferred_provider_runtime = {
             "provider": self.provider,
@@ -4914,6 +4939,7 @@ class AIAgent:
             "api_mode": self.api_mode,
             "request_timeout": getattr(self, "_provider_request_timeout", None),
             "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+            "route_changed": route_changed,
             # Pool selection must not replace the user-selected primary
             # snapshot while a fallback is temporarily active.
             "update_primary": False,
