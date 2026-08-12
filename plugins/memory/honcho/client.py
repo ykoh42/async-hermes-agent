@@ -36,6 +36,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain pipes and reap one owned git helper process."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 # Keep client construction lazy while ensuring the installed SDK itself is
 # loaded before an awaited memory operation begins.
 try:
@@ -758,12 +791,15 @@ class HonchoClientConfig:
                 stdin=asyncio.subprocess.DEVNULL,
                 cwd=cwd,
             )
+            communicate_task = asyncio.create_task(root.communicate())
             try:
-                stdout, _ = await asyncio.wait_for(root.communicate(), timeout=5)
+                stdout, _ = await asyncio.wait_for(
+                    asyncio.shield(communicate_task), timeout=5
+                )
             except (TimeoutError, asyncio.CancelledError):
                 if root.returncode is None:
                     root.kill()
-                await root.communicate()
+                await _finish_process_communicate(root, communicate_task)
                 raise
             if root.returncode == 0:
                 return Path(stdout.decode("utf-8", errors="replace").strip()).name

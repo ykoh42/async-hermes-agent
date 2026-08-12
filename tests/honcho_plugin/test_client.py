@@ -1,5 +1,6 @@
 """Tests for plugins/memory/honcho/client.py — Honcho client configuration."""
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -147,6 +148,55 @@ class TestResolveSessionName:
         ):
             result = await config.resolve_session_name("/home/user/hermes-agent/subdir")
         assert result == "hermes-agent"
+
+    async def test_git_repo_name_reaps_process_before_repeated_cancellation(
+        self, monkeypatch
+    ):
+        class Process:
+            def __init__(self):
+                self.returncode = None
+                self.communicate_calls = 0
+                self.killed = False
+                self.kill_called = asyncio.Event()
+                self.allow_reap = asyncio.Event()
+                self.reaped = False
+
+            async def communicate(self):
+                self.communicate_calls += 1
+                await self.allow_reap.wait()
+                self.returncode = -9
+                self.reaped = True
+                return b"", b""
+
+            def kill(self):
+                self.killed = True
+                self.kill_called.set()
+
+        process = Process()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.asyncio.create_subprocess_exec",
+            create_process,
+        )
+
+        request = asyncio.create_task(HonchoClientConfig._git_repo_name("/tmp"))
+        await asyncio.sleep(0)
+        request.cancel()
+        await process.kill_called.wait()
+        request.cancel()
+        await asyncio.sleep(0)
+
+        assert request.done() is False
+        process.allow_reap.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        assert process.killed is True
+        assert process.reaped is True
+        assert process.communicate_calls == 1
 
 
 class TestResolveConfigPath:
