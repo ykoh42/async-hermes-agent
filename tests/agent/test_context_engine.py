@@ -2,7 +2,9 @@
 
 import json
 import pytest
+from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 from agent.context_engine import ContextEngine
 from agent.context_compressor import ContextCompressor
@@ -234,3 +236,108 @@ class TestPluginContextEngineDeepCopy:
         assert clone.last_total_tokens == 1500
         assert clone.compression_count == 3
         assert clone is not engine
+
+
+class TestInitAgentDoesNotMutatePluginSingleton:
+    @staticmethod
+    def _agent(builtin):
+        return SimpleNamespace(
+            _context_engine_selected=False,
+            context_compressor=builtin,
+            _compression_threshold_autoraised="unchanged",
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_init_source_deepcopies_singleton_not_aliases(
+        self,
+        monkeypatch,
+    ):
+        from agent.agent_init import _select_context_engine
+
+        singleton = StubEngine(context_length=1_000_000, threshold_pct=0.20)
+        agent = self._agent(ContextCompressor(model="test", quiet_mode=True))
+        monkeypatch.setattr(
+            "plugins.context_engine.load_context_engine",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_context_engine",
+            AsyncMock(return_value=singleton),
+        )
+
+        await _select_context_engine(
+            agent,
+            {"context": {"engine": "stub"}},
+        )
+
+        assert agent.context_compressor is not singleton
+        assert agent.context_compressor.name == singleton.name
+        assert agent._context_engine_is_plugin is True
+
+    @pytest.mark.asyncio
+    async def test_child_init_does_not_corrupt_parent_singleton(
+        self,
+        monkeypatch,
+    ):
+        from agent.agent_init import _select_context_engine
+
+        singleton = StubEngine(context_length=1_000_000, threshold_pct=0.20)
+        agent = self._agent(ContextCompressor(model="test", quiet_mode=True))
+        monkeypatch.setattr(
+            "plugins.context_engine.load_context_engine",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_context_engine",
+            AsyncMock(return_value=singleton),
+        )
+
+        await _select_context_engine(
+            agent,
+            {"context": {"engine": "stub"}},
+        )
+        agent.context_compressor.update_model(
+            model="MiniMax-M2",
+            context_length=204_800,
+            provider="minimax",
+        )
+
+        assert singleton.context_length == 1_000_000
+        assert singleton.threshold_tokens == 200_000
+        assert agent.context_compressor.context_length == 204_800
+
+    @pytest.mark.asyncio
+    async def test_unpicklable_engine_falls_back_gracefully(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        from agent.agent_init import _select_context_engine
+
+        class _UncopyableEngine(StubEngine):
+            def __deepcopy__(self, memo):
+                raise RuntimeError("uncopyable state")
+
+        singleton = _UncopyableEngine()
+        builtin = ContextCompressor(model="test", quiet_mode=True)
+        agent = self._agent(builtin)
+        monkeypatch.setattr(
+            "plugins.context_engine.load_context_engine",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_context_engine",
+            AsyncMock(return_value=singleton),
+        )
+
+        with caplog.at_level("WARNING", logger="agent.agent_init"):
+            await _select_context_engine(
+                agent,
+                {"context": {"engine": "stub"}},
+            )
+
+        assert agent.context_compressor is builtin
+        assert agent._context_engine_is_plugin is False
+        assert agent._context_engine_selected is True
+        assert singleton.context_length == 200_000
+        assert "could not be safely copied" in caplog.text
