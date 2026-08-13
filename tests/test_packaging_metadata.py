@@ -15,6 +15,28 @@ KITTENTTS_OFFICIAL_WHEEL_URL = (
 KITTENTTS_OFFICIAL_WHEEL_SHA256 = (
     "482a436c4f1f3192153710376e459ff3689517ebcda7c2b051e2fd4187b41851"
 )
+_PRE_PYTHON_311_STDLIB_BACKPORTS = frozenset({"backports.zoneinfo", "tomli"})
+
+
+def _find_pre_python_311_stdlib_backport_imports(
+    source: str,
+) -> list[tuple[int, str]]:
+    """Return absolute imports of obsolete stdlib backports and descendants."""
+    violations = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported = {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported = {f"{node.module}.{alias.name}" for alias in node.names}
+        else:
+            continue
+        for module in imported:
+            if any(
+                module == backport or module.startswith(f"{backport}.")
+                for backport in _PRE_PYTHON_311_STDLIB_BACKPORTS
+            ):
+                violations.append((node.lineno, module))
+    return violations
 
 
 def test_release_versions_match_upstream_revision_policy():
@@ -409,6 +431,59 @@ def test_retained_runtime_dependencies_are_declared_and_exact_pinned():
     assert "protobuf==6.33.6" in core
     assert _locked_versions("protobuf") == {"6.33.6"}
     assert "packaging==26.0" in extras["hindsight"]
+
+
+def test_published_runtime_has_no_pre_python_311_stdlib_backports():
+    """Published code must use stdlib modules guaranteed by requires-python."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    setuptools = data["tool"]["setuptools"]
+    runtime_files = {
+        REPO_ROOT / f"{module}.py"
+        for module in setuptools["py-modules"]
+    }
+    package_names = {
+        pattern.split(".", 1)[0]
+        for pattern in setuptools["packages"]["find"]["include"]
+    }
+    for package_name in package_names:
+        runtime_files.update((REPO_ROOT / package_name).rglob("*.py"))
+
+    violations = []
+    for source_path in sorted(runtime_files):
+        source = source_path.read_text(encoding="utf-8")
+        for lineno, module in _find_pre_python_311_stdlib_backport_imports(source):
+            violations.append(
+                f"{source_path.relative_to(REPO_ROOT)}:{lineno}: {module}"
+            )
+
+    assert violations == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import tomli",
+        "import tomli.decoder",
+        "from tomli import decoder",
+        "from backports import zoneinfo",
+        "from backports.zoneinfo import ZoneInfo",
+    ],
+)
+def test_pre_python_311_stdlib_backport_detector_rejects_equivalent_imports(source):
+    assert _find_pre_python_311_stdlib_backport_imports(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import tomllib",
+        "from tomllib import loads",
+        "import backports",
+        "from backports import unrelated",
+    ],
+)
+def test_pre_python_311_stdlib_backport_detector_allows_unrelated_imports(source):
+    assert _find_pre_python_311_stdlib_backport_imports(source) == []
 
 
 def test_full_suite_workflows_install_the_backends_they_exercise():

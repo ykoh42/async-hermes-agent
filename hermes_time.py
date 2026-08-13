@@ -17,14 +17,9 @@ import logging
 import os
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    # Python 3.8 fallback (shouldn't be needed — Hermes requires 3.9+)
-    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
 
 # Cached state — resolved once, reused on every call.
 # Call reset_cache() to force re-resolution (e.g. after config changes).
@@ -110,4 +105,3 @@ async def now() -> datetime:
         return datetime.now(tz)
     # No timezone configured — use server-local (still tz-aware)
     return datetime.now().astimezone()
-

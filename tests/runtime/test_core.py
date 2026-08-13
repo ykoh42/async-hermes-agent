@@ -4111,6 +4111,7 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
     agent._session_db = database
     agent._session_db_created = False
     agent.compression_enabled = False
+    agent._environment_probe = False
     agent._tool_snapshot_initialized = True
     agent._mcp_discovery_started = True
     agent._skip_mcp_refresh = True
@@ -4347,6 +4348,7 @@ async def test_cancellation_during_normal_finalizer_finishes_same_task_once(
     agent._session_db = database
     agent._session_db_created = False
     agent.compression_enabled = False
+    agent._environment_probe = False
     agent._tool_snapshot_initialized = True
     agent._mcp_discovery_started = True
     agent._skip_mcp_refresh = True
@@ -4523,6 +4525,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
     agent._session_db = database
     agent._session_db_created = False
     agent.compression_enabled = False
+    agent._environment_probe = False
     agent.valid_tool_names = {tool_name}
     agent._tool_snapshot_initialized = True
 
