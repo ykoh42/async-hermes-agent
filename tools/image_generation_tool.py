@@ -24,7 +24,7 @@ import json
 import logging
 import datetime
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any
 
 from agent.secret_scope import get_secret
 
@@ -76,7 +76,7 @@ _KREA_NATIVE_MODELS = {
 }
 
 
-def _normalize_krea_model(model_id: Optional[str]) -> Optional[str]:
+def _normalize_krea_model(model_id: str | None) -> str | None:
     """Return the native Krea plugin model id when ``model_id`` is ``krea-2-*``."""
     if not isinstance(model_id, str):
         return None
@@ -86,7 +86,7 @@ def _normalize_krea_model(model_id: Optional[str]) -> Optional[str]:
     return None
 
 
-def is_krea_model(model_id: Optional[str]) -> bool:
+def is_krea_model(model_id: str | None) -> bool:
     """True when ``model_id`` is a native Krea plugin id (``krea-2-*``)."""
     return _normalize_krea_model(model_id) is not None
 
@@ -112,7 +112,7 @@ def is_krea_model(model_id: Optional[str]) -> bool:
 #
 # ``upscale`` controls whether to chain Clarity Upscaler after generation.
 
-FAL_MODELS: Dict[str, Dict[str, Any]] = {
+FAL_MODELS: dict[str, dict[str, Any]] = {
     "fal-ai/flux-2/klein/9b": {
         "display": "FLUX 2 Klein 9B",
         "speed": "<1s",
@@ -478,7 +478,7 @@ def _get_managed_fal_client(managed_gateway):
     )
 
 
-async def _submit_fal_request(model: str, arguments: Dict[str, Any]):
+async def _submit_fal_request(model: str, arguments: dict[str, Any]):
     """Submit through direct FAL or the managed queue and await its result."""
     # Trigger the lazy import on first call. Idempotent.
     _load_fal_client()
@@ -576,9 +576,9 @@ def _build_fal_payload(
     model_id: str,
     prompt: str,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
-    seed: Optional[int] = None,
-    overrides: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    seed: int | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a FAL request payload for `model_id` from unified inputs.
 
     Translates aspect_ratio into the model's native size spec (preset enum,
@@ -593,7 +593,7 @@ def _build_fal_payload(
     if aspect not in sizes:
         aspect = DEFAULT_ASPECT_RATIO
 
-    payload: Dict[str, Any] = dict(meta.get("defaults", {}))
+    payload: dict[str, Any] = dict(meta.get("defaults", {}))
     payload["prompt"] = (prompt or "").strip()
 
     if size_style in {"image_size_preset", "gpt_literal"}:
@@ -626,9 +626,9 @@ def _build_fal_edit_payload(
     prompt: str,
     image_urls: list,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
-    seed: Optional[int] = None,
-    overrides: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    seed: int | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a FAL *edit* request payload (image-to-image) from unified inputs.
 
     Every FAL edit endpoint takes ``image_urls`` (a list of source/reference
@@ -647,7 +647,7 @@ def _build_fal_edit_payload(
     if aspect not in sizes:
         aspect = DEFAULT_ASPECT_RATIO
 
-    payload: Dict[str, Any] = dict(meta.get("defaults", {}))
+    payload: dict[str, Any] = dict(meta.get("defaults", {}))
     payload["prompt"] = (prompt or "").strip()
     payload["image_urls"] = list(image_urls)
 
@@ -684,7 +684,7 @@ def _build_fal_edit_payload(
 async def _upscale_image(
     image_url: str,
     original_prompt: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Upscale an image using FAL.ai's Clarity Upscaler.
 
     Returns upscaled image dict, or None on failure (caller falls back to
@@ -738,13 +738,13 @@ async def _upscale_image(
 async def image_generate_tool(
     prompt: str,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
-    num_inference_steps: Optional[int] = None,
-    guidance_scale: Optional[float] = None,
-    num_images: Optional[int] = None,
-    output_format: Optional[str] = None,
-    seed: Optional[int] = None,
-    image_url: Optional[str] = None,
-    reference_image_urls: Optional[list] = None,
+    num_inference_steps: int | None = None,
+    guidance_scale: float | None = None,
+    num_images: int | None = None,
+    output_format: str | None = None,
+    seed: int | None = None,
+    image_url: str | None = None,
+    reference_image_urls: list | None = None,
 ) -> str:
     """Generate an image from a text prompt, or edit a source image, via FAL.
 
@@ -826,7 +826,7 @@ async def image_generate_tool(
             )
             aspect_lc = DEFAULT_ASPECT_RATIO
 
-        overrides: Dict[str, Any] = {}
+        overrides: dict[str, Any] = {}
         if num_inference_steps is not None:
             overrides["num_inference_steps"] = num_inference_steps
         if guidance_scale is not None:
@@ -1128,8 +1128,8 @@ async def _read_configured_image_provider():
 async def _dispatch_to_plugin_provider(
     prompt: str,
     aspect_ratio: str,
-    image_url: Optional[str] = None,
-    reference_image_urls: Optional[list] = None,
+    image_url: str | None = None,
+    reference_image_urls: list | None = None,
 ):
     """Route the call to a plugin-registered provider when one is selected.
 
@@ -1187,7 +1187,7 @@ async def _dispatch_to_plugin_provider(
             "error_type": "provider_not_registered",
         })
 
-    kwargs: Dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
+    kwargs: dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
     try:
         if configured_model:
             kwargs["model"] = configured_model
@@ -1268,9 +1268,9 @@ async def _dispatch_to_plugin_provider(
 async def _maybe_route_managed_krea(
     prompt: str,
     aspect_ratio: str,
-    image_url: Optional[str] = None,
-    reference_image_urls: Optional[list] = None,
-) -> Optional[str]:
+    image_url: str | None = None,
+    reference_image_urls: list | None = None,
+) -> str | None:
     """Route a native ``krea-2-*`` model to the managed Krea gateway, in managed mode.
 
     Returns a JSON result string when handled by the Krea managed gateway, or
@@ -1313,7 +1313,7 @@ async def _maybe_route_managed_krea(
     if provider is None:
         return None
 
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
         "model": normalized,
@@ -1401,7 +1401,7 @@ async def _handle_image_generate(args, **kw):
 _GENERIC_IMAGE_DESCRIPTION = IMAGE_GENERATE_SCHEMA["description"]
 
 
-async def _active_image_capabilities() -> Dict[str, Any]:
+async def _active_image_capabilities() -> dict[str, Any]:
     """Best-effort: return the active backend/model's image capabilities.
 
     Resolution order mirrors the runtime dispatch:
@@ -1411,7 +1411,7 @@ async def _active_image_capabilities() -> Dict[str, Any]:
     Returns a dict like ``{"modalities": [...], "max_reference_images": N,
     "model": "...", "provider": "..."}``. Never raises.
     """
-    info: Dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
+    info: dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
 
     configured_provider = await _read_configured_image_provider()
     if configured_provider and configured_provider != "fal":
@@ -1458,7 +1458,7 @@ async def _active_image_capabilities() -> Dict[str, Any]:
     return info
 
 
-async def _build_dynamic_image_schema() -> Dict[str, Any]:
+async def _build_dynamic_image_schema() -> dict[str, Any]:
     """Build a description reflecting whether the active model supports editing."""
     parts = [_GENERIC_IMAGE_DESCRIPTION]
 

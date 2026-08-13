@@ -14,7 +14,7 @@ decision while preserving ``pre_verify`` for user/plugin policy.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from utils import is_truthy_value
 
@@ -32,7 +32,7 @@ CODING_VERIFY_GUIDANCE = (
 )
 
 
-async def max_verify_nudges(config: Optional[dict[str, Any]] = None) -> int:
+async def max_verify_nudges(config: dict[str, Any] | None = None) -> int:
     """Bound on consecutive ``pre_verify`` continue directives per turn (>= 0)."""
     agent_cfg = await _agent_cfg(config)
     raw = agent_cfg.get("max_verify_nudges")
@@ -43,8 +43,8 @@ async def max_verify_nudges(config: Optional[dict[str, Any]] = None) -> int:
 
 
 async def coding_verify_guidance(
-    config: Optional[dict[str, Any]] = None,
-) -> Optional[str]:
+    config: dict[str, Any] | None = None,
+) -> str | None:
     """Return the optional guidance appended to verification-stop nudges."""
     if not is_truthy_value(
         (await _agent_cfg(config)).get("verify_guidance", True), default=True
@@ -53,7 +53,7 @@ async def coding_verify_guidance(
     return CODING_VERIFY_GUIDANCE
 
 
-async def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+async def _agent_cfg(config: dict[str, Any] | None) -> dict[str, Any]:
     if config is None:
         try:
             from hermes_cli.config import load_config_readonly

@@ -16,7 +16,7 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import urlparse
 
 import aiofiles
@@ -91,16 +91,16 @@ def _strip_provider_prefix(model: str) -> str:
         return suffix
     return model
 
-_model_metadata_cache: Dict[str, Dict[str, Any]] = {}
+_model_metadata_cache: dict[str, dict[str, Any]] = {}
 _model_metadata_cache_time: float = 0
-_novita_metadata_cache: Dict[str, Dict[str, Any]] = {}
+_novita_metadata_cache: dict[str, dict[str, Any]] = {}
 _novita_metadata_cache_time: float = 0
 _MODEL_CACHE_TTL = 3600
 _EndpointMetadataCacheKey = tuple[str, str]
-_endpoint_model_metadata_cache: Dict[
-    _EndpointMetadataCacheKey, Dict[str, Dict[str, Any]]
+_endpoint_model_metadata_cache: dict[
+    _EndpointMetadataCacheKey, dict[str, dict[str, Any]]
 ] = {}
-_endpoint_model_metadata_cache_time: Dict[_EndpointMetadataCacheKey, float] = {}
+_endpoint_model_metadata_cache_time: dict[_EndpointMetadataCacheKey, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
 
 
@@ -153,12 +153,12 @@ _local_probe_disk_lock = _PerPathAsyncLocks()
 # of being pinned to the stale type for the whole process lifetime.
 # Values are (server_type, monotonic_timestamp).
 _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
-_endpoint_probe_path_cache: Dict[str, tuple] = {}
+_endpoint_probe_path_cache: dict[str, tuple] = {}
 _ENDPOINT_BLACKHOLE_TTL_SECONDS = 30.0
-_endpoint_blackhole_cache: Dict[str, float] = {}
+_endpoint_blackhole_cache: dict[str, float] = {}
 
 
-def _endpoint_host_key(base_url: str) -> Optional[str]:
+def _endpoint_host_key(base_url: str) -> str | None:
     normalized = _normalize_base_url(base_url)
     if not normalized:
         return None
@@ -219,10 +219,10 @@ def _local_probe_disk_cache_path() -> Path:
     return get_hermes_home() / "cache" / "local_endpoint_probes.json"
 
 
-async def _load_local_probe_disk_cache() -> Dict[str, Any]:
+async def _load_local_probe_disk_cache() -> dict[str, Any]:
     try:
         async with aiofiles.open(
-            _local_probe_disk_cache_path(), "r", encoding="utf-8"
+            _local_probe_disk_cache_path(), encoding="utf-8"
         ) as handle:
             data = json.loads(await handle.read())
         return data if isinstance(data, dict) else {}
@@ -230,7 +230,7 @@ async def _load_local_probe_disk_cache() -> Dict[str, Any]:
         return {}
 
 
-async def _local_probe_disk_get(kind: str, key: str) -> Optional[Any]:
+async def _local_probe_disk_get(kind: str, key: str) -> Any | None:
     """Return a fresh cached value for ``kind:key``, else None."""
     entry = (await _load_local_probe_disk_cache()).get(f"{kind}:{key}")
     if not isinstance(entry, dict):
@@ -273,7 +273,7 @@ def _get_model_metadata_cache_path() -> Path:
     return get_hermes_home() / "cache" / "openrouter_model_metadata.json"
 
 
-async def _model_metadata_disk_cache_age_seconds() -> Optional[float]:
+async def _model_metadata_disk_cache_age_seconds() -> float | None:
     try:
         stat = await aiofiles.os.stat(_get_model_metadata_cache_path())
         age = time.time() - stat.st_mtime
@@ -282,10 +282,10 @@ async def _model_metadata_disk_cache_age_seconds() -> Optional[float]:
         return None
 
 
-async def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
+async def _load_model_metadata_disk_cache() -> dict[str, dict[str, Any]]:
     try:
         async with aiofiles.open(
-            _get_model_metadata_cache_path(), "r", encoding="utf-8"
+            _get_model_metadata_cache_path(), encoding="utf-8"
         ) as handle:
             data = json.loads(await handle.read())
         if not isinstance(data, dict):
@@ -301,7 +301,7 @@ async def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
 
 
 async def _save_model_metadata_disk_cache(
-    data: Dict[str, Dict[str, Any]],
+    data: dict[str, dict[str, Any]],
 ) -> None:
     try:
         path = _get_model_metadata_cache_path()
@@ -365,7 +365,7 @@ MINIMUM_CONTEXT_LENGTH = 64_000
 # values are (result, monotonic_timestamp). Not persisted to disk — cross-
 # restart freshness is handled by the reconcile logic re-probing after expiry.
 _LOCAL_CTX_PROBE_TTL_SECONDS = 30.0
-_LOCAL_CTX_PROBE_CACHE: Dict[tuple, tuple] = {}
+_LOCAL_CTX_PROBE_CACHE: dict[tuple, tuple] = {}
 
 
 def _local_context_probe_cache_key(
@@ -624,7 +624,7 @@ def _normalize_base_url(base_url: str) -> str:
     return (base_url or "").strip().rstrip("/")
 
 
-def _auth_headers(api_key: str = "") -> Dict[str, str]:
+def _auth_headers(api_key: str = "") -> dict[str, str]:
     token = str(api_key or "").strip()
     if not token:
         return {}
@@ -640,7 +640,7 @@ def _is_custom_endpoint(base_url: str) -> bool:
     return bool(normalized) and not _is_openrouter_base_url(normalized)
 
 
-_URL_TO_PROVIDER: Dict[str, str] = {
+_URL_TO_PROVIDER: dict[str, str] = {
     "api.openai.com": "openai",
     "chatgpt.com": "openai",
     "api.anthropic.com": "anthropic",
@@ -720,7 +720,7 @@ async def _ensure_provider_url_map() -> None:
     _extend_provider_url_map_from_loaded_profiles()
 
 
-def _infer_provider_from_url(base_url: str) -> Optional[str]:
+def _infer_provider_from_url(base_url: str) -> str | None:
     """Infer the models.dev provider name from a base URL.
 
     This allows context length resolution via models.dev for custom endpoints
@@ -752,7 +752,7 @@ def _is_known_provider_base_url(base_url: str) -> bool:
     return _infer_provider_from_url(base_url) is not None
 
 
-def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
+def _endpoint_scoped_context_length(model: str, base_url: str) -> int | None:
     """Return context metadata confirmed for one provider endpoint.
 
     Kimi Coding serves K3 under the bare slug ``k3``, but users may also
@@ -1020,7 +1020,7 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
-async def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+async def detect_local_server_type(base_url: str, api_key: str = "") -> str | None:
     """Detect which local server is running at base_url by probing known endpoints.
 
     Returns one of: "ollama", "lm-studio", "vllm", "llamacpp", or None.
@@ -1064,7 +1064,7 @@ async def detect_local_server_type(base_url: str, api_key: str = "") -> Optional
             _note_endpoint_blackholed(server_url)
             raise exc
 
-    result: Optional[str] = None
+    result: str | None = None
     try:
         async with (await _create_httpx_client(
             timeout=2.0,
@@ -1132,7 +1132,7 @@ def _iter_nested_dicts(value: Any):
             yield from _iter_nested_dicts(item)
 
 
-def _coerce_reasonable_int(value: Any, minimum: int = 1024, maximum: int = 10_000_000) -> Optional[int]:
+def _coerce_reasonable_int(value: Any, minimum: int = 1024, maximum: int = 10_000_000) -> int | None:
     try:
         if isinstance(value, bool):
             return None
@@ -1146,7 +1146,7 @@ def _coerce_reasonable_int(value: Any, minimum: int = 1024, maximum: int = 10_00
     return None
 
 
-def _extract_first_int(payload: Dict[str, Any], keys: tuple[str, ...]) -> Optional[int]:
+def _extract_first_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     keyset = {key.lower() for key in keys}
     for mapping in _iter_nested_dicts(payload):
         for key, value in mapping.items():
@@ -1158,19 +1158,19 @@ def _extract_first_int(payload: Dict[str, Any], keys: tuple[str, ...]) -> Option
     return None
 
 
-def _extract_context_length(payload: Dict[str, Any]) -> Optional[int]:
+def _extract_context_length(payload: dict[str, Any]) -> int | None:
     return _extract_first_int(payload, _CONTEXT_LENGTH_KEYS)
 
 
-def _extract_max_completion_tokens(payload: Dict[str, Any]) -> Optional[int]:
+def _extract_max_completion_tokens(payload: dict[str, Any]) -> int | None:
     return _extract_first_int(payload, _MAX_COMPLETION_KEYS)
 
 
-def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_pricing(payload: dict[str, Any]) -> dict[str, Any]:
     novita_input = payload.get("input_token_price_per_m")
     novita_output = payload.get("output_token_price_per_m")
     if novita_input is not None or novita_output is not None:
-        pricing: Dict[str, Any] = {}
+        pricing: dict[str, Any] = {}
         if novita_input is not None:
             pricing["prompt"] = str(float(novita_input) / 10_000 / 1_000_000)
         if novita_output is not None:
@@ -1186,7 +1186,7 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(deepinfra_pricing, dict) and any(
         k in deepinfra_pricing for k in ("input_tokens", "output_tokens", "cache_read_tokens")
     ):
-        result: Dict[str, Any] = {}
+        result: dict[str, Any] = {}
         if deepinfra_pricing.get("input_tokens") is not None:
             result["prompt"] = str(float(deepinfra_pricing["input_tokens"]) / 1_000_000)
         if deepinfra_pricing.get("output_tokens") is not None:
@@ -1206,7 +1206,7 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized = {str(key).lower(): value for key, value in mapping.items()}
         if not any(any(alias in normalized for alias in aliases) for aliases in alias_map.values()):
             continue
-        pricing: Dict[str, Any] = {}
+        pricing: dict[str, Any] = {}
         for target, aliases in alias_map.items():
             for alias in aliases:
                 if alias in normalized and normalized[alias] not in {None, ""}:
@@ -1217,7 +1217,7 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: Dict[str, Any]) -> None:
+def _add_model_aliases(cache: dict[str, dict[str, Any]], model_id: str, entry: dict[str, Any]) -> None:
     cache[model_id] = entry
     if "/" in model_id:
         bare_model = model_id.split("/", 1)[1]
@@ -1226,7 +1226,7 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
 
 async def fetch_model_metadata(
     force_refresh: bool = False,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """Fetch OpenRouter model metadata over a native async HTTP transport."""
     global _model_metadata_cache, _model_metadata_cache_time
 
@@ -1273,7 +1273,7 @@ async def fetch_model_metadata(
             return _model_metadata_cache
         return {}
 
-    cache: Dict[str, Dict[str, Any]] = {}
+    cache: dict[str, dict[str, Any]] = {}
     for model in payload.get("data", []) if isinstance(payload, dict) else []:
         if not isinstance(model, dict):
             continue
@@ -1303,7 +1303,7 @@ async def fetch_endpoint_model_metadata(
     base_url: str,
     api_key: str = "",
     force_refresh: bool = False,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """Fetch an OpenAI-compatible ``/models`` catalog without blocking."""
     normalized = _normalize_base_url(base_url)
     normalized = _localhost_to_ipv4(normalized)
@@ -1344,14 +1344,14 @@ async def fetch_endpoint_model_metadata(
                 )
                 response.raise_for_status()
                 native_payload = response.json()
-                cache: Dict[str, Dict[str, Any]] = {}
+                cache: dict[str, dict[str, Any]] = {}
                 for model in native_payload.get("models", []):
                     if not isinstance(model, dict):
                         continue
                     model_id = model.get("key") or model.get("id")
                     if not model_id:
                         continue
-                    entry: Dict[str, Any] = {
+                    entry: dict[str, Any] = {
                         "name": model.get("name", model_id)
                     }
                     for instance in model.get("loaded_instances", []) or []:
@@ -1410,14 +1410,14 @@ async def fetch_endpoint_model_metadata(
                     _note_endpoint_blackholed(normalized)
                 continue
 
-    cache: Dict[str, Dict[str, Any]] = {}
+    cache: dict[str, dict[str, Any]] = {}
     for model in (payload or {}).get("data", []) if isinstance(payload, dict) else []:
         if not isinstance(model, dict):
             continue
         model_id = model.get("id")
         if not model_id:
             continue
-        entry: Dict[str, Any] = {"name": model.get("name", model_id)}
+        entry: dict[str, Any] = {"name": model.get("name", model_id)}
         context_length = _extract_context_length(model)
         if context_length is not None:
             entry["context_length"] = context_length
@@ -1465,7 +1465,7 @@ async def _resolve_endpoint_context_length(
     model: str,
     base_url: str,
     api_key: str = "",
-) -> Optional[int]:
+) -> int | None:
     """Resolve context length from an endpoint's live ``/models`` metadata."""
     endpoint_metadata = await fetch_endpoint_model_metadata(base_url, api_key=api_key)
     matched = endpoint_metadata.get(model)
@@ -1490,11 +1490,11 @@ def _get_context_cache_path() -> Path:
     return get_hermes_home() / "context_length_cache.yaml"
 
 
-async def _load_context_cache() -> Dict[str, int]:
+async def _load_context_cache() -> dict[str, int]:
     """Load the model+provider -> context_length cache from disk."""
     path = _get_context_cache_path()
     try:
-        async with aiofiles.open(path, "r", encoding="utf-8") as handle:
+        async with aiofiles.open(path, encoding="utf-8") as handle:
             data = yaml.safe_load(await handle.read()) or {}
         return data.get("context_lengths") or {}
     except FileNotFoundError:
@@ -1541,7 +1541,7 @@ async def save_context_length(model: str, base_url: str, length: int) -> None:
             logger.debug("Failed to save context length cache: %s", e)
 
 
-async def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
+async def get_cached_context_length(model: str, base_url: str) -> int | None:
     """Look up a previously discovered context length for model+provider."""
     key = _context_cache_key(model, base_url)
     cache = await _load_context_cache()
@@ -1605,7 +1605,7 @@ async def _invalidate_cached_context_length(model: str, base_url: str) -> None:
             )
 
 
-def get_next_probe_tier(current_length: int) -> Optional[int]:
+def get_next_probe_tier(current_length: int) -> int | None:
     """Return the next lower probe tier, or None if already at minimum."""
     for tier in CONTEXT_PROBE_TIERS:
         if tier < current_length:
@@ -1613,7 +1613,7 @@ def get_next_probe_tier(current_length: int) -> Optional[int]:
     return None
 
 
-def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
+def parse_context_limit_from_error(error_msg: str) -> int | None:
     """Try to extract the actual context limit from an API error message.
 
     Many providers include the limit in their error text, e.g.:
@@ -1646,7 +1646,7 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
 def get_context_length_from_provider_error(
     error_msg: str,
     current_context_length: int,
-) -> Optional[int]:
+) -> int | None:
     """Return a provider-reported lower context limit, if one is present.
 
     Context-overflow recovery must not invent a new model window size.  Some
@@ -1663,7 +1663,7 @@ def get_context_length_from_provider_error(
     return None
 
 
-def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
+def parse_available_output_tokens_from_error(error_msg: str) -> int | None:
     """Detect an "output cap too large" error and return how many output tokens are available.
 
     Background — two distinct context errors exist:
@@ -1871,7 +1871,7 @@ def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
 
 async def query_ollama_num_ctx(
     model: str, base_url: str, api_key: str = ""
-) -> Optional[int]:
+) -> int | None:
     """Query Ollama's ``/api/show`` endpoint without blocking the event loop.
 
     Successful values are cached through the same native-async disk cache as
@@ -1950,7 +1950,7 @@ async def query_ollama_supports_vision(
     model: str,
     base_url: str,
     api_key: str = "",
-) -> Optional[bool]:
+) -> bool | None:
     """Query Ollama vision capabilities without a blocking HTTP client."""
     import httpx
 
@@ -1997,7 +1997,7 @@ async def query_ollama_supports_vision(
 
 async def _query_ollama_api_show(
     model: str, base_url: str, api_key: str = ""
-) -> Optional[int]:
+) -> int | None:
     """Query an Ollama server's native ``/api/show`` for context length.
 
     Provider-agnostic: works against ANY Ollama-compatible server regardless
@@ -2045,7 +2045,7 @@ async def _query_ollama_api_show(
 
 async def _query_ollama_api_show_uncached(
     model: str, base_url: str, api_key: str = ""
-) -> Optional[int]:
+) -> int | None:
     """Uncached body of ``_query_ollama_api_show`` — one POST to ``/api/show``."""
     import httpx
 
@@ -2137,7 +2137,7 @@ def _model_name_suggests_grok_4_3(model: str) -> bool:
 
 async def _query_local_context_length(
     model: str, base_url: str, api_key: str = ""
-) -> Optional[int]:
+) -> int | None:
     """Query a local server for the model's context length (short-TTL cached).
 
     The live-probe paths added for local endpoints (reconcile-on-hit and the
@@ -2177,7 +2177,7 @@ async def _query_local_context_length(
 
 async def _query_local_context_length_uncached(
     model: str, base_url: str, api_key: str = ""
-) -> Optional[int]:
+) -> int | None:
     """Query a local server for the model's context length."""
     import httpx
 
@@ -2294,7 +2294,7 @@ def _normalize_model_version(model: str) -> str:
 
 async def _query_anthropic_context_length(
     model: str, base_url: str, api_key: str
-) -> Optional[int]:
+) -> int | None:
     """Query Anthropic's /v1/models endpoint for context length.
 
     Only works with regular ANTHROPIC_API_KEY (sk-ant-api*).
@@ -2340,7 +2340,7 @@ async def _query_anthropic_context_length(
 #
 # Used as a fallback when the live probe fails (no token, network error).
 # Longest keys first so substring match picks the most specific entry.
-_CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
+_CODEX_OAUTH_CONTEXT_FALLBACK: dict[str, int] = {
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex": 272_000,
@@ -2362,7 +2362,7 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 }
 
 
-_codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
+_codex_oauth_context_cache: dict[str, tuple[dict[str, int], float]] = {}
 _CODEX_OAUTH_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
 
@@ -2371,7 +2371,7 @@ def _codex_oauth_token_fingerprint(access_token: str) -> str:
     return hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16]
 
 
-def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
+def _extract_chatgpt_account_id(access_token: str) -> str | None:
     """Extract ``chatgpt_account_id`` from the Codex OAuth JWT.
 
     The Codex ``/backend-api/codex/models`` endpoint returns the per-account
@@ -2401,7 +2401,7 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
 
 async def _fetch_codex_oauth_context_lengths_with_source(
     access_token: str,
-) -> Tuple[Dict[str, int], bool]:
+) -> tuple[dict[str, int], bool]:
     """Fetch Codex catalogue data and report whether it came from HTTP.
 
     The in-process cache is scoped by token fingerprint because Codex model
@@ -2447,7 +2447,7 @@ async def _fetch_codex_oauth_context_lengths_with_source(
         return {}, False
 
     entries = data.get("models", []) if isinstance(data, dict) else []
-    result: Dict[str, int] = {}
+    result: dict[str, int] = {}
     for item in entries:
         if not isinstance(item, dict):
             continue
@@ -2463,7 +2463,7 @@ async def _fetch_codex_oauth_context_lengths_with_source(
 
 async def _resolve_codex_oauth_context_length_with_source(
     model: str, access_token: str = ""
-) -> Tuple[Optional[int], str]:
+) -> tuple[int | None, str]:
     """Resolve a Codex OAuth model's real context window.
 
     Prefers a live probe of chatgpt.com/backend-api/codex/models (when we
@@ -2506,7 +2506,7 @@ async def _resolve_nous_context_length(
     model: str,
     base_url: str = "",
     api_key: str = "",
-) -> Tuple[Optional[int], str]:
+) -> tuple[int | None, str]:
     """Resolve Nous Portal model context length.
 
     Tries the live Nous inference endpoint first (authoritative), then falls
@@ -2537,7 +2537,7 @@ async def _resolve_nous_context_length(
 
     metadata = await fetch_model_metadata()
 
-    def _safe_ctx(or_id: str, entry: dict) -> Optional[int]:
+    def _safe_ctx(or_id: str, entry: dict) -> int | None:
         ctx = entry.get("context_length")
         if ctx is None:
             return None
@@ -3140,7 +3140,7 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
-def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
+def estimate_messages_tokens_rough(messages: list[dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
@@ -3184,7 +3184,7 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
 # Because the api_messages build shallow-copies history dicts each iteration,
 # the copies share the same content strings — so unchanged history messages
 # hit the memo even though the outer dicts are fresh objects every turn.
-_MSG_TOKENS_CACHE: Dict[Any, Tuple[list, int]] = {}
+_MSG_TOKENS_CACHE: dict[Any, tuple[list, int]] = {}
 _MSG_TOKENS_CACHE_MAX = 4096
 
 
@@ -3235,7 +3235,7 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
     return tokens
 
 
-def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
+def _count_image_tokens(msg: dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     count = 0
     content = msg.get("content") if isinstance(msg, dict) else None
@@ -3261,7 +3261,7 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
-def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
     Two adjustments to the raw persisted dict:
@@ -3288,7 +3288,7 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
         and bool(sidecar)
         and msg.get("role") in ("user", "assistant")
     )
-    shadow: Dict[str, Any] = {}
+    shadow: dict[str, Any] = {}
     for k, v in msg.items():
         if k in ("_anthropic_content_blocks", "reasoning_details"):
             continue
@@ -3319,7 +3319,7 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     return shadow
 
 
-def _estimate_message_chars(msg: Dict[str, Any]) -> int:
+def _estimate_message_chars(msg: dict[str, Any]) -> int:
     """Char count for token estimation, excluding base64 image data.
 
     Base64 images are counted via `_count_image_tokens` instead; including
@@ -3330,7 +3330,7 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     return len(str(_wire_message_shadow(msg)))
 
 
-def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
+def _estimate_message_tokens_without_images(msg: dict[str, Any]) -> int:
     """Token estimate for a message shadow with image payloads stripped."""
     if not isinstance(msg, dict):
         return estimate_tokens_rough(str(msg))
@@ -3338,10 +3338,10 @@ def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
 
 
 def estimate_request_tokens_rough(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     *,
     system_prompt: str = "",
-    tools: Optional[List[Dict[str, Any]]] = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -3368,7 +3368,7 @@ def estimate_request_tokens_rough(
 # transient tool lists over its lifetime, so the cache is bounded and evicts
 # oldest-first (insertion-ordered dict) once it exceeds the cap. The cap is
 # generous relative to how rarely toolsets are rebuilt within a process.
-_TOOLS_TOKENS_CACHE: dict[int, Tuple[int, str, str, int]] = {}
+_TOOLS_TOKENS_CACHE: dict[int, tuple[int, str, str, int]] = {}
 _TOOLS_TOKENS_CACHE_MAX = 256
 
 
@@ -3384,7 +3384,7 @@ def _tool_name_for_cache(tool: Any) -> str:
     return name if isinstance(name, str) else ""
 
 
-def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+def _estimate_tools_tokens_rough(tools: list[dict[str, Any]]) -> int:
     if not tools:
         return 0
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 import aiofiles.os
 
@@ -19,7 +19,7 @@ async def normalize_path(path: str) -> str:
     return await aiofiles.os.path.abspath(expanded)
 
 
-async def find_git_worktree(start: str) -> Optional[str]:
+async def find_git_worktree(start: str) -> str | None:
     """Walk up from ``start`` looking for a ``.git`` file or directory."""
     try:
         start_path = Path(await normalize_path(start))
@@ -72,9 +72,9 @@ async def nearest_root(
     start: str,
     markers: Iterable[str],
     *,
-    excludes: Optional[Iterable[str]] = None,
-    ceiling: Optional[str] = None,
-) -> Optional[str]:
+    excludes: Iterable[str] | None = None,
+    ceiling: str | None = None,
+) -> str | None:
     """Return the nearest ancestor containing a requested project marker."""
     try:
         start_path = Path(await normalize_path(start))
@@ -112,8 +112,8 @@ async def nearest_root(
 async def resolve_workspace_for_file(
     file_path: str,
     *,
-    cwd: Optional[str] = None,
-) -> Tuple[Optional[str], bool]:
+    cwd: str | None = None,
+) -> tuple[str | None, bool]:
     """Resolve the git workspace root that gates LSP for ``file_path``."""
     active_cwd = cwd or await aiofiles.os.getcwd()
     cwd_root = await find_git_worktree(active_cwd)

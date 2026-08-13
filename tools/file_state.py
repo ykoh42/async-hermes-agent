@@ -41,7 +41,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 from weakref import WeakKeyDictionary
 
 import aiofiles.os
@@ -53,7 +53,7 @@ from hermes_constants import get_hermes_home
 # (mtime, read_ts, partial).  partial=True when read_file returned a
 # windowed view (offset > 1 or limit < total_lines) — writes that happen
 # after a partial read should still warn so the model re-reads in full.
-ReadStamp = Tuple[float, float, bool]
+ReadStamp = tuple[float, float, bool]
 
 # Number of resolved-path entries retained per agent.  Bounded to keep
 # long sessions from accumulating unbounded state.  On overflow we drop
@@ -102,10 +102,10 @@ async def _resolve_profile_identity(lexical: str) -> str:
 class _FileProfileState:
     """Read/write coordination metadata owned by one canonical profile."""
 
-    reads: Dict[str, Dict[str, ReadStamp]] = field(
+    reads: dict[str, dict[str, ReadStamp]] = field(
         default_factory=lambda: defaultdict(dict)
     )
-    last_writer: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+    last_writer: dict[str, tuple[str, float]] = field(default_factory=dict)
     metadata_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -116,7 +116,7 @@ class FileStateRegistry:
         self._profile_states: dict[str, _FileProfileState] = {}
         self._profile_states_lock = threading.RLock()
         self._path_locks: WeakKeyDictionary[
-            asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]
+            asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
         ] = WeakKeyDictionary()
         self._path_locks_lock = threading.RLock()
 
@@ -154,12 +154,12 @@ class FileStateRegistry:
             return state
 
     @property
-    def _reads(self) -> Dict[str, Dict[str, ReadStamp]]:
+    def _reads(self) -> dict[str, dict[str, ReadStamp]]:
         """Private dict-compatible view for the active profile."""
         return self._profile_state().reads
 
     @property
-    def _last_writer(self) -> Dict[str, Tuple[str, float]]:
+    def _last_writer(self) -> dict[str, tuple[str, float]]:
         """Private dict-compatible view for the active profile."""
         return self._profile_state().last_writer
 
@@ -186,7 +186,7 @@ class FileStateRegistry:
         resolved: str,
         *,
         partial: bool = False,
-        mtime: Optional[float] = None,
+        mtime: float | None = None,
     ) -> None:
         if _disabled():
             return
@@ -207,7 +207,7 @@ class FileStateRegistry:
         task_id: str,
         resolved: str,
         *,
-        mtime: Optional[float] = None,
+        mtime: float | None = None,
     ) -> None:
         """Record a successful write.
 
@@ -231,7 +231,7 @@ class FileStateRegistry:
             state.reads[task_id][resolved] = (float(mtime), now, False)
             _cap_dict(state.reads[task_id], _MAX_PATHS_PER_AGENT)
 
-    async def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
+    async def check_stale(self, task_id: str, resolved: str) -> str | None:
         """Return a model-facing warning if this write would be stale.
 
         Three staleness classes, in order of severity:
@@ -313,7 +313,7 @@ class FileStateRegistry:
         exclude_task_id: str,
         since_ts: float,
         paths: Iterable[str],
-    ) -> Dict[str, List[str]]:
+    ) -> dict[str, list[str]]:
         """Return ``{writer_task_id: [paths]}`` for writes done after
         ``since_ts`` by agents OTHER than ``exclude_task_id``.
 
@@ -324,7 +324,7 @@ class FileStateRegistry:
             return {}
         state = self._profile_state()
         paths_set = set(paths)
-        out: Dict[str, List[str]] = defaultdict(list)
+        out: dict[str, list[str]] = defaultdict(list)
         with state.metadata_lock:
             for p, (writer_tid, ts) in state.last_writer.items():
                 if writer_tid == exclude_task_id:
@@ -335,7 +335,7 @@ class FileStateRegistry:
                     out[writer_tid].append(p)
         return dict(out)
 
-    def known_reads(self, task_id: str) -> List[str]:
+    def known_reads(self, task_id: str) -> list[str]:
         """Return the list of resolved paths this agent has read."""
         if _disabled():
             return []
@@ -418,7 +418,7 @@ async def note_write(
     await _registry.note_write(task_id, str(resolved_or_path))
 
 
-async def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
+async def check_stale(task_id: str, resolved_or_path: str | Path) -> str | None:
     return await _registry.check_stale(task_id, str(resolved_or_path))
 
 
@@ -430,11 +430,11 @@ def writes_since(
     exclude_task_id: str,
     since_ts: float,
     paths: Iterable[str | Path],
-) -> Dict[str, List[str]]:
+) -> dict[str, list[str]]:
     return _registry.writes_since(exclude_task_id, since_ts, [str(p) for p in paths])
 
 
-def known_reads(task_id: str) -> List[str]:
+def known_reads(task_id: str) -> list[str]:
     return _registry.known_reads(task_id)
 
 

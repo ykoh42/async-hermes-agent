@@ -35,7 +35,7 @@ class _DefaultCredentials:
 
 
 class _FakeBedrockClient:
-    instances: list["_FakeBedrockClient"] = []
+    instances: list[_FakeBedrockClient] = []
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs

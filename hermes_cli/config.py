@@ -29,7 +29,8 @@ import time
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional, List, Tuple, Set
+from typing import Any
+from collections.abc import Callable
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 _CONFIG_PARSE_WARNED: set = set()
 
 
-def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
+def _backup_corrupt_config(config_path: Path) -> Path | None:
     """Preserve a corrupted ``config.yaml`` by copying it to a timestamped ``.bak``.
 
     When the YAML can't be parsed, ``load_config()`` silently falls back to
@@ -172,8 +173,8 @@ async def _warn_config_parse_failure_from_event_loop(
         return
     _CONFIG_PARSE_WARNED.add(key)
 
-    backup_path: Optional[Path] = None
-    candidate: Optional[Path] = None
+    backup_path: Path | None = None
+    candidate: Path | None = None
     candidate_created = False
     backup_complete = False
     try:
@@ -335,13 +336,13 @@ def _reject_denylisted_env_var(key: str) -> None:
             "~/.hermes/.env directly."
         )
 
-_LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
+_LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 # The native read-only loader keeps the unexpanded sources separately from the
 # historical expanded snapshot above.  A malformed edit must retain the last
 # valid policy while re-resolving user refs for the *current* profile; retaining
 # an already-expanded dict would hand profile A's credential to profile B.
-_LAST_READONLY_CONFIG_SOURCES_BY_PATH: Dict[
-    str, Tuple[Dict[str, Any], Dict[str, Any]]
+_LAST_READONLY_CONFIG_SOURCES_BY_PATH: dict[
+    str, tuple[dict[str, Any], dict[str, Any]]
 ] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
@@ -355,11 +356,11 @@ _LAST_READONLY_CONFIG_SOURCES_BY_PATH: Dict[
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, tuple] = {}
+_LOAD_CONFIG_CACHE: dict[str, tuple] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
-_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_RAW_CONFIG_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
 # Serializes all config read/write paths. libyaml's C extension is not
 # thread-safe for concurrent safe_load() on the same file, and multiple
 # tool threads (approval.py, browser_tool.py, setup flows) hit
@@ -414,7 +415,7 @@ _MANAGED_SYSTEM_NAMES = {
 _IGNORED_MANAGED_VALUES = frozenset({"brew", "homebrew"})
 
 
-def get_managed_system() -> Optional[str]:
+def get_managed_system() -> str | None:
     """Return the package manager owning this install, if any."""
     raw = os.getenv("HERMES_MANAGED", "").strip()
     if raw:
@@ -481,7 +482,7 @@ def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_hermes_home() / ".env"
 
-def _resolve_hermes_uid_gid() -> tuple[Optional[int], Optional[int]]:
+def _resolve_hermes_uid_gid() -> tuple[int | None, int | None]:
     """Read the HERMES_UID / HERMES_GID env vars set by Docker deployments.
 
     Docker containers running Hermes commonly set these to map the in-container
@@ -588,11 +589,11 @@ def _is_container() -> bool:
         return True
     # LXC / cgroup-based detection
     try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as f:
+        with open("/proc/1/cgroup", encoding="utf-8") as f:
             cgroup_content = f.read()
         if "docker" in cgroup_content or "lxc" in cgroup_content or "kubepods" in cgroup_content:
             return True
-    except (OSError, IOError):
+    except OSError:
         pass
     return False
 
@@ -721,7 +722,7 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa
 
 # Track which env vars were introduced in each config version.
 # Migration only mentions vars new since the user's previous version.
-ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
+ENV_VARS_BY_VERSION: dict[int, list[str]] = {
     3: ["FIRECRAWL_API_KEY", "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "FAL_KEY"],
     10: ["TAVILY_API_KEY"],
 }
@@ -732,7 +733,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
 # dict is intentionally empty — no single env var is universally required.
 REQUIRED_ENV_VARS = {}
 
-def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
+def get_missing_env_vars(required_only: bool = False) -> list[dict[str, Any]]:
     """
     Check which environment variables are missing.
     
@@ -806,12 +807,12 @@ def _set_nested(config, dotted_key: str, value):
 
 
 def clear_model_endpoint_credentials(
-    model_cfg: Dict[str, Any],
+    model_cfg: dict[str, Any],
     *,
     clear_api_key: bool = True,
     clear_api_mode: bool = True,
     clear_base_url: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Remove stale inline endpoint credentials from a model config.
 
     ``model.api_key`` is valid only for explicit custom endpoint assignments.
@@ -947,7 +948,7 @@ def _format_config_get_value(value, *, as_json: bool) -> str:
     return str(value)
 
 
-def get_missing_config_fields() -> List[Dict[str, Any]]:
+def get_missing_config_fields() -> list[dict[str, Any]]:
     """
     Check which config fields are missing or outdated (recursive).
     
@@ -975,7 +976,7 @@ def get_missing_config_fields() -> List[Dict[str, Any]]:
     return missing
 
 
-async def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
+async def get_missing_skill_config_vars() -> list[dict[str, Any]]:
     """Return skill-declared config vars that are missing or empty in config.yaml.
 
     Scans all enabled skills for ``metadata.hermes.config`` entries, then checks
@@ -1002,7 +1003,7 @@ async def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
         return []
 
     config = await load_config_readonly()
-    missing: List[Dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
     for var in all_vars:
         # Skill config is stored under skills.config.<logical_key>
         storage_key = f"{SKILL_CONFIG_PREFIX}.{var['key']}"
@@ -1046,7 +1047,7 @@ def _normalize_custom_provider_entry(
     entry: Any,
     *,
     provider_key: str = "",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Return a runtime-compatible custom provider entry or ``None``."""
     if not isinstance(entry, dict):
         return None
@@ -1061,7 +1062,7 @@ def _normalize_custom_provider_entry(
     entry = dict(entry)
 
     # Accept camelCase aliases commonly used in hand-written configs.
-    _CAMEL_ALIASES: Dict[str, str] = {
+    _CAMEL_ALIASES: dict[str, str] = {
         "apiKey": "api_key",
         "baseUrl": "base_url",
         "apiMode": "api_mode",
@@ -1143,7 +1144,7 @@ def _normalize_custom_provider_entry(
     if not name:
         return None
 
-    normalized: Dict[str, Any] = {
+    normalized: dict[str, Any] = {
         "name": name,
         "base_url": base_url,
     }
@@ -1180,7 +1181,7 @@ def _normalize_custom_provider_entry(
         # Preserve both by converting to the dict shape downstream code
         # expects; otherwise normalize silently drops the list and /model
         # shows the provider with (0) models.
-        normalized_models: Dict[str, Any] = {}
+        normalized_models: dict[str, Any] = {}
         for item in models:
             if isinstance(item, str) and item.strip():
                 normalized_models[item.strip()] = {}
@@ -1239,7 +1240,7 @@ def _custom_provider_entry_to_provider_config(
     entry: Any,
     *,
     provider_key: str = "",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Translate a legacy custom provider entry to the v12 providers shape."""
     normalized = _normalize_custom_provider_entry(
         dict(entry) if isinstance(entry, dict) else entry,
@@ -1248,7 +1249,7 @@ def _custom_provider_entry_to_provider_config(
     if normalized is None:
         return None
 
-    provider_entry: Dict[str, Any] = {"api": normalized["base_url"]}
+    provider_entry: dict[str, Any] = {"api": normalized["base_url"]}
 
     for field in (
         "name",
@@ -1274,12 +1275,12 @@ def _custom_provider_entry_to_provider_config(
     return provider_entry
 
 
-def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, Any]]:
+def providers_dict_to_custom_providers(providers_dict: Any) -> list[dict[str, Any]]:
     """Normalize ``providers`` config entries into the legacy custom-provider shape."""
     if not isinstance(providers_dict, dict):
         return []
 
-    custom_providers: List[Dict[str, Any]] = []
+    custom_providers: list[dict[str, Any]] = []
     for key, entry in providers_dict.items():
         if isinstance(entry, dict) and not is_provider_enabled(entry):
             continue
@@ -1291,8 +1292,8 @@ def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, An
 
 
 def get_compatible_custom_providers(
-    config: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Return a deduplicated custom-provider view across legacy and v12+ config.
 
     ``custom_providers`` remains the on-disk legacy format, while ``providers``
@@ -1303,11 +1304,11 @@ def get_compatible_custom_providers(
     if config is None:
         config = load_config()
 
-    compatible: List[Dict[str, Any]] = []
+    compatible: list[dict[str, Any]] = []
     seen_provider_keys: set = set()
     seen_name_url_pairs: set = set()
 
-    def _append_if_new(entry: Optional[Dict[str, Any]]) -> None:
+    def _append_if_new(entry: dict[str, Any] | None) -> None:
         if entry is None:
             return
         provider_key = str(entry.get("provider_key", "") or "").strip().lower()
@@ -1340,7 +1341,7 @@ def get_compatible_custom_providers(
     return compatible
 
 
-def _coerce_ssl_verify(value: Any) -> Optional[bool]:
+def _coerce_ssl_verify(value: Any) -> bool | None:
     if value is None:
         return None
     if isinstance(value, bool):
@@ -1356,9 +1357,9 @@ def _coerce_ssl_verify(value: Any) -> Optional[bool]:
 
 def get_custom_provider_tls_settings(
     base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    custom_providers: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return TLS settings from a matching ``custom_providers`` / ``providers`` entry."""
     if custom_providers is None:
         try:
@@ -1375,7 +1376,7 @@ def get_custom_provider_tls_settings(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         ca = entry.get("ssl_ca_cert")
         if isinstance(ca, str) and ca.strip():
             out["ssl_ca_cert"] = ca.strip()
@@ -1387,10 +1388,10 @@ def get_custom_provider_tls_settings(
 
 
 def apply_custom_provider_tls_to_client_kwargs(
-    client_kwargs: Dict[str, Any],
+    client_kwargs: dict[str, Any],
     base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
+    custom_providers: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """Attach per-provider TLS knobs to OpenAI client kwargs when matched."""
     tls = get_custom_provider_tls_settings(base_url, custom_providers, config)
@@ -1400,7 +1401,7 @@ def apply_custom_provider_tls_to_client_kwargs(
         client_kwargs["ssl_verify"] = tls["ssl_verify"]
 
 
-def normalize_extra_headers(extra_headers: Any) -> Dict[str, str]:
+def normalize_extra_headers(extra_headers: Any) -> dict[str, str]:
     """Normalize a raw ``extra_headers`` value into a ``dict[str, str]``.
 
     Stringifies keys and values and drops entries whose value is ``None``.
@@ -1419,9 +1420,9 @@ def normalize_extra_headers(extra_headers: Any) -> Dict[str, str]:
 
 def get_custom_provider_extra_headers(
     base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, str]:
+    custom_providers: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, str]:
     """Return ``extra_headers`` from a matching ``providers`` / ``custom_providers`` entry.
 
     Matches the entry whose normalized route identity equals *base_url*,
@@ -1452,10 +1453,10 @@ def get_custom_provider_extra_headers(
 
 
 def apply_custom_provider_extra_headers_to_client_kwargs(
-    client_kwargs: Dict[str, Any],
+    client_kwargs: dict[str, Any],
     base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
+    custom_providers: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """Merge per-provider ``extra_headers`` onto OpenAI client ``default_headers``.
 
@@ -1477,9 +1478,9 @@ def apply_custom_provider_extra_headers_to_client_kwargs(
 def get_custom_provider_context_length(
     model: str,
     base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Optional[int]:
+    custom_providers: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> int | None:
     """Look up a per-model ``context_length`` override from ``custom_providers``.
 
     Matches any entry whose normalized route identity equals ``base_url`` and
@@ -1566,7 +1567,7 @@ def _raw_config_has_explicit_version() -> bool:
     return isinstance(raw, dict) and "_config_version" in raw
 
 
-def check_config_version() -> Tuple[int, int]:
+def check_config_version() -> tuple[int, int]:
     """
     Check the raw on-disk config schema version.
 
@@ -1642,7 +1643,7 @@ class ConfigIssue:
     hint: str
 
 
-def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
+def validate_config_structure(config: dict[str, Any] | None = None) -> list["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
     Catches common YAML formatting mistakes that produce confusing runtime
@@ -1656,7 +1657,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
         except Exception:
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
-    issues: List[ConfigIssue] = []
+    issues: list[ConfigIssue] = []
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
@@ -1791,7 +1792,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     return issues
 
 
-def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
+def print_config_warnings(config: dict[str, Any] | None = None) -> None:
     """Print config structure warnings to stderr at startup.
 
     Called early in CLI and gateway init so users see problems before
@@ -1813,7 +1814,7 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     sys.stderr.write("\n".join(lines) + "\n\n")
 
 
-def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> None:
+def warn_deprecated_cwd_env_vars(config: dict[str, Any] | None = None) -> None:
     """Warn if MESSAGING_CWD or TERMINAL_CWD is set in .env instead of config.yaml.
 
     These env vars are deprecated — the canonical setting is terminal.cwd
@@ -1860,7 +1861,7 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
         sys.stderr.write("\n".join(lines) + "\n\n")
 
 
-def _persist_migration(config: Dict[str, Any]) -> None:
+def _persist_migration(config: dict[str, Any]) -> None:
     """Persist a migrated config under the migration write invariant.
 
     THE INVARIANT (single source of truth for the whole migration pipeline):
@@ -1886,7 +1887,7 @@ def _persist_migration(config: Dict[str, Any]) -> None:
     save_config(config)
 
 
-def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
+def migrate_config(interactive: bool = True, quiet: bool = False) -> dict[str, Any]:
     """
     Migrate config to latest version, prompting for new required fields.
     
@@ -2156,7 +2157,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
+def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> tuple[dict, set]:
     """Remove the given dotted leaf keys from a nested config dict.
 
     Returns ``(pruned_cfg, set_of_stripped_keys_that_were_present)``. Used by
@@ -2181,7 +2182,7 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
 
 def _env_expand_match_with(
     m: re.Match,
-    resolver: Callable[[str], Optional[str]],
+    resolver: Callable[[str], str | None],
 ) -> str:
     """Expand one ``${...}`` config reference.
 
@@ -2236,7 +2237,7 @@ def _env_expand_match(m: re.Match) -> str:
     return _env_expand_match_with(m, os.environ.get)
 
 
-def _env_ref_var_name(ref: str) -> Optional[str]:
+def _env_ref_var_name(ref: str) -> str | None:
     """Normalize a ``${...}`` body to the env-var name it reads, or None
     when the ref uses a non-env source and never touches the environment."""
     ref = ref.strip()
@@ -2250,7 +2251,7 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
 
 def _expand_env_vars_with(
     obj: Any,
-    resolver: Callable[[str], Optional[str]],
+    resolver: Callable[[str], str | None],
 ) -> Any:
     """Recursively expand config refs with an explicit value resolver."""
     if isinstance(obj, str):
@@ -2310,9 +2311,9 @@ def _env_ref_snapshot(obj, snapshot=None):
 
 def _env_ref_snapshot_with(
     obj: Any,
-    resolver: Callable[[str], Optional[str]],
-    snapshot: Optional[Dict[str, Optional[str]]] = None,
-) -> Dict[str, Optional[str]]:
+    resolver: Callable[[str], str | None],
+    snapshot: dict[str, str | None] | None = None,
+) -> dict[str, str | None]:
     """Capture referenced values through the same resolver used to expand."""
     if snapshot is None:
         snapshot = {}
@@ -2409,7 +2410,7 @@ def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
     return current
 
 
-def _explicit_config_paths(config: Dict[str, Any]) -> Set[Tuple[str, ...]]:
+def _explicit_config_paths(config: dict[str, Any]) -> set[tuple[str, ...]]:
     """Return leaf paths explicitly present in a raw config dict.
 
     Computed on the **raw** (un-normalized, un-expanded) config so that
@@ -2420,9 +2421,9 @@ def _explicit_config_paths(config: Dict[str, Any]) -> Set[Tuple[str, ...]]:
     ``_strip_default_values`` so only user-authored keys survive the
     defaults-strip pass.
     """
-    paths: Set[Tuple[str, ...]] = set()
+    paths: set[tuple[str, ...]] = set()
 
-    def _walk(value: Any, path: Tuple[str, ...]) -> None:
+    def _walk(value: Any, path: tuple[str, ...]) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
                 _walk(child, path + (key,))
@@ -2435,10 +2436,10 @@ def _explicit_config_paths(config: Dict[str, Any]) -> Set[Tuple[str, ...]]:
 
 
 def _strip_default_values(
-    config: Dict[str, Any],
-    defaults: Dict[str, Any] = DEFAULT_CONFIG,
-    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
-) -> Dict[str, Any]:
+    config: dict[str, Any],
+    defaults: dict[str, Any] = DEFAULT_CONFIG,
+    preserve_keys: set[tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
     """Return *config* without keys whose values match *defaults*.
 
     Keys in *preserve_keys* (explicitly present in the user's raw config,
@@ -2452,13 +2453,13 @@ def _strip_default_values(
     """
     preserve_keys = {("_config_version",)} | set(preserve_keys or ())
 
-    def _strip(value: Any, default: Any, path: Tuple[str, ...]) -> Any:
+    def _strip(value: Any, default: Any, path: tuple[str, ...]) -> Any:
         if path in preserve_keys:
             return copy.deepcopy(value)
 
         if isinstance(value, dict) and value:
             default_dict = default if isinstance(default, dict) else {}
-            stripped: Dict[str, Any] = {}
+            stripped: dict[str, Any] = {}
             for key, child in value.items():
                 child_default = default_dict.get(key)
                 stripped_child = _strip(child, child_default, path + (key,))
@@ -2474,7 +2475,7 @@ def _strip_default_values(
 
         return copy.deepcopy(value)
 
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     for key, value in config.items():
         stripped = _strip(value, defaults.get(key), (key,))
         if stripped is not None:
@@ -2482,7 +2483,7 @@ def _strip_default_values(
     return result
 
 
-def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_root_model_keys(config: dict[str, Any]) -> dict[str, Any]:
     """Move stale root-level provider/base_url/context_length into model section.
 
     Some users (or older code) placed ``provider:``, ``base_url:``, or
@@ -2566,7 +2567,7 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_max_turns_config(config: dict[str, Any]) -> dict[str, Any]:
     """Normalize legacy root-level max_turns into agent.max_turns.
 
     Only injects the schema default when the user actually set max_turns
@@ -2600,7 +2601,7 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def is_provider_enabled(provider_cfg: Optional[Dict[str, Any]]) -> bool:
+def is_provider_enabled(provider_cfg: dict[str, Any] | None) -> bool:
     """Return whether a ``providers.<name>`` config block is enabled.
 
     A provider is enabled by default. Only an explicit ``enabled: false`` in
@@ -2625,7 +2626,7 @@ def is_provider_enabled(provider_cfg: Optional[Dict[str, Any]]) -> bool:
     return bool(flag)
 
 
-def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
+def cfg_get(cfg: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
     """Traverse nested dict keys safely, returning ``default`` on any miss.
 
     Canonical helper for the ``cfg.get("X", {}).get("Y", default)`` pattern
@@ -2672,7 +2673,7 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
-def read_raw_config() -> Dict[str, Any]:
+def read_raw_config() -> dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
     Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
@@ -2711,8 +2712,8 @@ def read_raw_config() -> Dict[str, Any]:
 
 
 async def read_user_config_raw(
-    config_path: Optional[Path] = None,
-) -> Dict[str, Any]:
+    config_path: Path | None = None,
+) -> dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
@@ -2763,7 +2764,7 @@ async def read_user_config_raw(
     return data if isinstance(data, dict) else {}
 
 
-def read_raw_config_readonly() -> Dict[str, Any]:
+def read_raw_config_readonly() -> dict[str, Any]:
     """Fast-path variant of ``read_raw_config()`` for callers that ONLY READ.
 
     Returns the cached raw-config dict directly, skipping the per-call
@@ -2808,7 +2809,7 @@ def read_raw_config_readonly() -> Dict[str, Any]:
         return cached_copy
 
 
-def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
+def require_readable_config_before_write(config_path: Path | None = None) -> None:
     """Refuse to replace an existing config.yaml that cannot be read."""
     if config_path is None:
         config_path = get_config_path()
@@ -2858,7 +2859,7 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
-def load_config() -> Dict[str, Any]:
+def load_config() -> dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
     Cached on the config file's (mtime_ns, size). Returns a deepcopy of
@@ -2875,7 +2876,7 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-async def load_config_readonly() -> Dict[str, Any]:
+async def load_config_readonly() -> dict[str, Any]:
     """Load behavioral configuration without synchronous file I/O.
 
     Preserve the upstream read-only cache contract through native async file
@@ -2895,7 +2896,7 @@ async def load_config_readonly() -> Dict[str, Any]:
 
     async def _signature(
         path: Path, *, suppress_os_error: bool = False
-    ) -> Optional[Tuple[int, int]]:
+    ) -> tuple[int, int] | None:
         try:
             stat_result = await aiofiles.os.stat(path)
         except FileNotFoundError:
@@ -2927,7 +2928,7 @@ async def load_config_readonly() -> Dict[str, Any]:
         managed_cache_sig = managed_sig or (0, 0)
 
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
+            cache_sig: tuple[int, int, int, int] | None = (
                 user_sig[0],
                 user_sig[1],
                 managed_cache_sig[0],
@@ -3011,7 +3012,7 @@ async def load_config_readonly() -> Dict[str, Any]:
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars_with(normalized, user_env_resolver)
-        managed_config: Dict[str, Any] = {}
+        managed_config: dict[str, Any] = {}
         if managed_path is not None and managed_sig is not None:
             try:
                 parsed_managed_config = await _read_yaml(managed_path)
@@ -3091,7 +3092,7 @@ def _terminal_env_value(value: Any) -> str:
     return str(value)
 
 
-def terminal_config_env_var_for_key(key: str) -> Optional[str]:
+def terminal_config_env_var_for_key(key: str) -> str | None:
     """Return the env var mirrored by a ``terminal.*`` config key."""
     prefix = "terminal."
     if not key.startswith(prefix):
@@ -3101,10 +3102,10 @@ def terminal_config_env_var_for_key(key: str) -> Optional[str]:
 
 def apply_terminal_config_to_env(
     *,
-    env: Optional[Dict[str, str]] = None,
-    config: Optional[Dict[str, Any]] = None,
-    override: Optional[bool] = None,
-) -> Dict[str, str]:
+    env: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
+    override: bool | None = None,
+) -> dict[str, str]:
     """Bridge ``terminal.*`` config into the env vars terminal tools read.
 
     ``tools.terminal_tool`` is intentionally environment-driven because it also
@@ -3142,7 +3143,7 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
@@ -3150,7 +3151,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         try:
             st = config_path.stat()
-            user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+            user_sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
             user_sig = None
 
@@ -3170,7 +3171,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
+            cache_sig: tuple[int, int, int, int] | None = (
                 user_sig[0],
                 user_sig[1],
                 managed_sig[0],
@@ -3232,15 +3233,15 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     # expanded one. Expand defensively — idempotent when the
                     # stored value is already expanded.
                     from typing import cast as _cast
-                    lkg_copy: Dict[str, Any] = _cast(
-                        Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
+                    lkg_copy: dict[str, Any] = _cast(
+                        dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
                     )
                     if cache_sig is not None:
                         # Cache under the corrupt file's signature (empty env
                         # snapshot: always valid) so repeated loads don't
                         # re-parse the broken file; fixing the file changes the
                         # signature and triggers a normal reload.
-                        _empty_env: Dict[str, Optional[str]] = {}
+                        _empty_env: dict[str, str | None] = {}
                         _LOAD_CONFIG_CACHE[path_key] = (
                             cache_sig[0], cache_sig[1],
                             cache_sig[2], cache_sig[3],
@@ -3358,10 +3359,10 @@ _COMMENTED_SECTIONS = """
 
 
 def save_config(
-    config: Dict[str, Any],
+    config: dict[str, Any],
     *,
     strip_defaults: bool = True,
-    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+    preserve_keys: set[tuple[str, ...]] | None = None,
     merge_existing: bool = False,
 ):
     """Save configuration to ~/.hermes/config.yaml.\n
@@ -3408,7 +3409,7 @@ def save_config(
         # DEFAULT_CONFIG; using the raw dict preserves which paths the
         # user actually set so _strip_default_values can keep them.
         _raw_for_paths = read_raw_config()
-        explicit_raw_paths: Optional[Set[Tuple[str, ...]]] = (
+        explicit_raw_paths: set[tuple[str, ...]] | None = (
             _explicit_config_paths(_raw_for_paths) if _raw_for_paths else None
         )
         if merge_existing and _raw_for_paths:
@@ -3432,7 +3433,7 @@ def save_config(
         # Strip schema-default values so the user's custom settings are not
         # silently reset on every save.  Keys the user explicitly set (paths
         # from the raw pre-normalisation config) are always preserved.
-        effective_preserve_keys: Set[Tuple[str, ...]] = {("_config_version",)}
+        effective_preserve_keys: set[tuple[str, ...]] = {("_config_version",)}
         if explicit_raw_paths:
             effective_preserve_keys.update(explicit_raw_paths)
         if preserve_keys:
@@ -3441,7 +3442,7 @@ def save_config(
         if strip_defaults and effective_preserve_keys:
             # _preserve_env_ref_templates may return Any; cast for type-checker.
             from typing import cast as _cast
-            normalized = _cast(Dict[str, Any], normalized)
+            normalized = _cast(dict[str, Any], normalized)
             normalized = _strip_default_values(
                 normalized,  # type: ignore[arg-type]
                 DEFAULT_CONFIG,
@@ -3496,7 +3497,7 @@ def _parse_env_value(raw_value: str) -> str:
     return value
 
 
-def load_env() -> Dict[str, str]:
+def load_env() -> dict[str, str]:
     """Load environment variables from ~/.hermes/.env.
 
     Normalizes line endings before parsing while treating each assignment's
@@ -3527,7 +3528,7 @@ def load_env() -> Dict[str, str]:
         if cached_key == cache_key:
             return dict(cached_vars)
 
-    env_vars: Dict[str, str] = {}
+    env_vars: dict[str, str] = {}
 
     if env_path.exists():
         # On Windows, open() defaults to the system locale (cp1252) which can
@@ -3560,7 +3561,7 @@ def load_env() -> Dict[str, str]:
 # is the explicit knob for writers that update .env via this module
 # (set_env_value, save_env, etc.) without relying on filesystem mtime
 # resolution.
-_env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int]], Dict[str, str]]] = None
+_env_cache: tuple[tuple[str, float | None, int | None], dict[str, str]] | None = None
 
 
 def invalidate_env_cache() -> None:
@@ -3946,7 +3947,7 @@ def reload_env() -> int:
     return count
 
 
-def get_env_value(key: str) -> Optional[str]:
+def get_env_value(key: str) -> str | None:
     """Read a credential without escaping the active profile scope."""
     try:
         from agent.secret_scope import UnscopedSecretError, get_secret
@@ -3966,7 +3967,7 @@ def get_env_value(key: str) -> Optional[str]:
     return env_vars.get(key)
 
 
-async def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
+async def get_env_value_prefer_dotenv(key: str) -> str | None:
     """Async credential lookup for agent/provider execution paths.
 
     The dotenv file is read through ``aiofiles`` before falling back to the
@@ -3976,10 +3977,10 @@ async def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
         import aiofiles
 
         env_path = get_env_path()
-        env_vars: Dict[str, str] = {}
+        env_vars: dict[str, str] = {}
         try:
             async with aiofiles.open(
-                env_path, "r", encoding="utf-8-sig", errors="replace"
+                env_path, encoding="utf-8-sig", errors="replace"
             ) as handle:
                 raw_lines = await handle.readlines()
         except FileNotFoundError:

@@ -29,7 +29,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import hermes_time as _hermes_time
 
@@ -120,7 +120,7 @@ def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> 
     return base
 
 
-async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+async def build_system_prompt_parts(agent: Any, system_message: str | None = None) -> dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
     Returns a dict with three keys:
@@ -143,13 +143,13 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
     _context_cwd = await resolve_context_cwd()
-    _coding_config: Optional[dict] = None
+    _coding_config: dict | None = None
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
     # None falls back to the historical flat default. This value is stable for
     # the life of the conversation, so it does not threaten prompt caching.
-    _ctx_len: Optional[int] = None
+    _ctx_len: int | None = None
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None:
         _cc_len = getattr(_cc, "context_length", None)
@@ -157,7 +157,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             _ctx_len = _cc_len
 
     # ── Stable tier ────────────────────────────────────────────────
-    stable_parts: List[str] = []
+    stable_parts: list[str] = []
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
@@ -319,8 +319,8 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # the cross-session-stable prefix, while placing the live git/workspace
     # snapshot behind its own cache boundary. The post-snapshot blocks must
     # stay in their historical position after the workspace snapshot.
-    coding_workspace_parts: List[str] = []
-    coding_trailing_parts: List[str] = []
+    coding_workspace_parts: list[str] = []
+    coding_trailing_parts: list[str] = []
     if agent.valid_tool_names:
         try:
             if _coding_config is None:
@@ -346,7 +346,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # workspace snapshot. With no snapshot, the coding tail instead remains
     # directly after the coding prefix in the cacheable prefix.
     if coding_workspace_parts:
-        post_workspace_parts: List[str] = []
+        post_workspace_parts: list[str] = []
     else:
         stable_parts.extend(coding_trailing_parts)
         post_workspace_parts = stable_parts
@@ -405,7 +405,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         post_workspace_parts.append(_effective_hint)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
-    context_parts: List[str] = []
+    context_parts: list[str] = []
 
     if coding_workspace_parts:
         context_parts.extend(coding_workspace_parts)
@@ -436,7 +436,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             context_parts.append(context_files_prompt)
 
     # ── Volatile tier (changes per session/turn — never cached) ───
-    volatile_parts: List[str] = []
+    volatile_parts: list[str] = []
 
     if agent._memory_store:
         if agent._memory_enabled:
@@ -485,7 +485,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     }
 
 
-async def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
+async def build_system_prompt(agent: Any, system_message: str | None = None) -> str:
     """Assemble the full system prompt from all layers.
 
     Called once per session (cached on ``agent._cached_system_prompt``) and
@@ -528,7 +528,7 @@ async def invalidate_system_prompt(agent: Any) -> None:
 
 async def reconstruct_static_prefix(
     agent: Any,
-    system_message: Optional[str] = None,
+    system_message: str | None = None,
     *,
     log_label: str = "restore",
 ) -> None:

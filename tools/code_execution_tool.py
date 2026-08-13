@@ -45,7 +45,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -82,8 +82,8 @@ def _assemble_stdout_result(
     head: bytes,
     tail: bytes = b"",
     *,
-    total_bytes: Optional[int] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    total_bytes: int | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Build display stdout plus explicit truncation metadata.
 
     The agent receives execute_code results as JSON. A textual truncation
@@ -105,7 +105,7 @@ def _assemble_stdout_result(
     else:
         stdout_text = captured.decode("utf-8", errors="replace")
 
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "stdout_truncated": truncated,
         "stdout_bytes_captured": len(captured),
         "stdout_bytes_total": total,
@@ -120,7 +120,7 @@ def _assemble_stdout_result(
     return stdout_text, metadata
 
 
-def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
+def _truncate_stdout_text(stdout_text: str) -> tuple[str, dict[str, Any]]:
     """Cap a complete stdout string by bytes using the same head/tail policy."""
     stdout_bytes = stdout_text.encode("utf-8", errors="replace")
     if len(stdout_bytes) <= MAX_STDOUT_BYTES:
@@ -381,7 +381,7 @@ _TOOL_STUBS = {
 }
 
 
-def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]:
+def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> str | None:
     """Map well-known sandbox script failures to one actionable recovery hint.
 
     Production mining (state.db): the top execute_code failure classes are
@@ -436,7 +436,7 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
     return None
 
 
-def generate_hermes_tools_module(enabled_tools: List[str],
+def generate_hermes_tools_module(enabled_tools: list[str],
                                  transport: str = "uds") -> str:
     """
     Build the source code for the hermes_tools.py stub module.
@@ -938,8 +938,8 @@ async def _rpc_poll_loop(
 
 async def _execute_remote(
     code: str,
-    task_id: Optional[str],
-    enabled_tools: Optional[List[str]],
+    task_id: str | None,
+    enabled_tools: list[str] | None,
 ) -> str:
     """Run a script on a remote terminal backend via file-based RPC."""
     cfg = await _load_config()
@@ -1078,7 +1078,7 @@ async def _execute_remote(
     from agent.redact import redact_sensitive_text
     stdout_text = redact_sensitive_text(stdout_text, code_file=True)
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "status": status,
         "output": stdout_text,
         "exit_code": exit_code,
@@ -1213,8 +1213,8 @@ async def _cleanup_local_execution(
 
 async def execute_code(
     code: str,
-    task_id: Optional[str] = None,
-    enabled_tools: Optional[List[str]] = None,
+    task_id: str | None = None,
+    enabled_tools: list[str] | None = None,
 ) -> str:
     """Run a Python script with RPC access to the retained Hermes tools."""
     if not SANDBOX_AVAILABLE:
@@ -1446,7 +1446,7 @@ async def execute_code(
             stdout_text = redact_sensitive_text(stdout_text, code_file=True)
             stderr_text = redact_sensitive_text(stderr_text, code_file=True)
 
-            result: Dict[str, Any] = {
+            result: dict[str, Any] = {
                 "status": status,
                 "output": stdout_text,
                 "exit_code": exit_code,
@@ -1850,8 +1850,8 @@ def _build_execute_code_schema(enabled_sandbox_tools: set, mode: str) -> dict:
     }
 
 
-async def build_execute_code_schema(enabled_sandbox_tools: set = None,
-                                    mode: str = None) -> dict:
+async def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
+                                    mode: str | None = None) -> dict:
     """Build the upstream schema after awaiting configured mode resolution."""
     if enabled_sandbox_tools is None:
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS

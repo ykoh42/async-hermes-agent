@@ -39,7 +39,8 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 import aiofiles.tempfile
 
@@ -173,7 +174,7 @@ ROUTINE_COMPRESSION_STATUS_SAMPLES = (
 )
 
 
-def _builtin_memory_prompt_snapshot(agent: Any) -> Optional[Tuple[str, str]]:
+def _builtin_memory_prompt_snapshot(agent: Any) -> tuple[str, str] | None:
     """Return the built-in memory text that can affect a system prompt.
 
     ``MemoryStore`` freezes this text until ``load_from_disk()``.  Rendering
@@ -291,8 +292,8 @@ async def _restore_compressor_attempt_state(
     compressor: Any,
     snapshot: dict[str, Any],
     *,
-    durable_cooldown_authoritative: Optional[bool] = None,
-    durable_cooldown_state: Optional[dict[str, Any]] = None,
+    durable_cooldown_authoritative: bool | None = None,
+    durable_cooldown_state: dict[str, Any] | None = None,
 ) -> None:
     """Restore one cancelled attempt without retaining partial state."""
     if durable_cooldown_authoritative is True:
@@ -317,7 +318,7 @@ async def _restore_compressor_attempt_state(
 async def _capture_authoritative_cooldown_under_lease(
     compressor: Any,
     attempt_snapshot: dict[str, Any],
-) -> tuple[Optional[bool], Optional[dict[str, Any]]]:
+) -> tuple[bool | None, dict[str, Any] | None]:
     """Refresh and snapshot built-in durable cooldown state under its lease."""
     try:
         from agent.context_compressor import ContextCompressor
@@ -449,7 +450,7 @@ class CompressionCommitFence:
 
 
 def resolve_context_compression_timeouts(
-    compression_cfg: Optional[dict] = None,
+    compression_cfg: dict | None = None,
 ) -> tuple[float, float]:
     """Resolve the inactivity and pre-commit ceilings for compression."""
     idle = 120.0
@@ -476,16 +477,16 @@ def resolve_context_compression_timeouts(
 
 async def run_compress_context_with_progress_timeout(
     *,
-    worker: Callable[[CompressionCommitFence], Awaitable[Tuple[list, str]]],
+    worker: Callable[[CompressionCommitFence], Awaitable[tuple[list, str]]],
     messages: list,
     system_prompt_fallback: Any,
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_timeout: Callable[[float, float, float], Any] | None = None,
     on_commit_overrun: Callable[[float, float], Any] | None = None,
-    fence: Optional[CompressionCommitFence] = None,
+    fence: CompressionCommitFence | None = None,
     telemetry_agent: Any = None,
-) -> Tuple[list, str]:
+) -> tuple[list, str]:
     """Run compression under native async progress and commit fencing.
 
     Timeout budgets cover only the pre-commit phase. Once durable mutation is
@@ -537,7 +538,7 @@ async def run_compress_context_with_progress_timeout(
     )
     started = time.monotonic()
 
-    async def _wait_for_commit() -> Tuple[list, str]:
+    async def _wait_for_commit() -> tuple[list, str]:
         overrun_surfaced = False
         overrun_reports = 0
         while True:
@@ -766,7 +767,7 @@ async def _adopt_live_compression_child(
     agent: Any,
     session_db: Any,
     parent_session_id: str,
-) -> Optional[List[Dict[str, Any]]]:
+) -> list[dict[str, Any]] | None:
     """Move a stale compression contender onto the unique durable child.
 
     Resolve and load first, then mutate the live agent. This ordering keeps the
@@ -835,7 +836,7 @@ async def _adopt_live_compression_child(
 
 async def recover_rotated_compression_session(
     agent: Any,
-) -> Optional[List[Dict[str, Any]]]:
+) -> list[dict[str, Any]] | None:
     """Recover a stale live agent before a new turn writes to its old parent."""
     session_db = (
         agent._session_db
@@ -895,8 +896,8 @@ def _compression_lock_holder(agent: Any) -> str:
 def _supported_compression_kwargs(
     compress_fn: Any,
     *,
-    current_tokens: Optional[int],
-    focus_topic: Optional[str],
+    current_tokens: int | None,
+    focus_topic: str | None,
     force: bool,
     memory_context: str,
 ) -> dict:
@@ -938,7 +939,7 @@ class _CompressionActivityHeartbeat:
         self,
         agent: Any,
         interval_seconds: float | None = None,
-        commit_fence: Optional[CompressionCommitFence] = None,
+        commit_fence: CompressionCommitFence | None = None,
     ) -> None:
         self._agent = agent
         self._commit_fence = commit_fence
@@ -956,7 +957,7 @@ class _CompressionActivityHeartbeat:
         self._interval_seconds = max(0.1, interval_seconds)
         self._task: asyncio.Task | None = None
 
-    def start(self) -> "_CompressionActivityHeartbeat":
+    def start(self) -> _CompressionActivityHeartbeat:
         self._suppressed = False
         self._touch(
             "context compression started",
@@ -1315,8 +1316,8 @@ def replay_compression_warning(agent: Any) -> None:
 def conversation_history_after_compression(
     agent: Any,
     messages: list,
-    previous_history: Optional[list] = None,
-) -> Optional[list]:
+    previous_history: list | None = None,
+) -> list | None:
     """Return the correct flush baseline after a compression boundary.
 
     Legacy compression rotates to a fresh child session. That child has not
@@ -1468,7 +1469,7 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
 def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
     """Insert the latest human turn without breaking role alternation."""
 
-    def _role(msg: Any) -> Optional[str]:
+    def _role(msg: Any) -> str | None:
         return msg.get("role") if isinstance(msg, dict) else None
 
     # Preferred: the summary boundary — before the first assistant message
@@ -1600,13 +1601,13 @@ async def compress_context(
     messages: list,
     system_message: str,
     *,
-    approx_tokens: Optional[int] = None,
+    approx_tokens: int | None = None,
     task_id: str = "default",
-    focus_topic: Optional[str] = None,
+    focus_topic: str | None = None,
     force: bool = False,
     defer_context_engine_notification: bool = False,
-    commit_fence: Optional[CompressionCommitFence] = None,
-) -> Tuple[list, str]:
+    commit_fence: CompressionCommitFence | None = None,
+) -> tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
     Args:
@@ -1639,8 +1640,8 @@ async def compress_context(
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
-    _durable_cooldown_authoritative: Optional[bool] = None
-    _durable_cooldown_state: Optional[dict[str, Any]] = None
+    _durable_cooldown_authoritative: bool | None = None
+    _durable_cooldown_state: dict[str, Any] | None = None
     if (
         defer_context_engine_notification
         and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
@@ -1823,7 +1824,7 @@ async def compress_context(
         else None
     )
     _lock_sid = agent.session_id or ""
-    _lock_holder: Optional[str] = None
+    _lock_holder: str | None = None
     # Clear any stale lock-skip signal from a prior call so this call's
     # outcome alone determines what callers see.  Without this an
     # auto-compress lock-skip followed by a successful manual /compress
@@ -1835,7 +1836,7 @@ async def compress_context(
     except (TypeError, ValueError):
         _lock_ttl = 300.0
     _lock_refresh_interval = getattr(agent, "_compression_lock_refresh_interval", None)
-    _lock_refresh_task: Optional[asyncio.Task] = None
+    _lock_refresh_task: asyncio.Task | None = None
     if _lock_db is not None and _lock_sid:
         _lock_holder = _compression_lock_holder(agent)
         try:
@@ -2046,7 +2047,7 @@ async def compress_context(
         aux_progress_hook,
     )
 
-    _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+    _activity_heartbeat: _CompressionActivityHeartbeat | None = None
     messages_before_compression = None
     _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
 
@@ -2839,12 +2840,12 @@ async def compress_context(
 async def _compress_context_via_codex_app_server(
     agent: Any,
     messages: list,
-    system_message: Optional[str],
+    system_message: str | None,
     *,
-    approx_tokens: Optional[int] = None,
+    approx_tokens: int | None = None,
     task_id: str = "default",
     force: bool = False,
-) -> Tuple[list, str]:
+) -> tuple[list, str]:
     """Compact the provider-owned Codex thread without rewriting history."""
     auto_mode = str(
         getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
@@ -2997,7 +2998,7 @@ async def try_shrink_image_parts_in_messages(
     # actually brought under the target.
     unshrinkable_oversized = 0
 
-    def _decode_pixels(data_url: str) -> Optional[tuple]:
+    def _decode_pixels(data_url: str) -> tuple | None:
         """Return ``(width, height)`` of a base64 data URL, or None on failure.
 
         Soft-depends on Pillow; returns None (caller falls back to a
@@ -3114,7 +3115,7 @@ async def try_shrink_image_parts_in_messages(
             logger.warning("image-shrink recovery: re-encode failed — %s", exc)
             return None, triggered_by is not None
 
-    def _source_to_data_url(source: Any) -> Optional[str]:
+    def _source_to_data_url(source: Any) -> str | None:
         if not isinstance(source, dict) or source.get("type") != "base64":
             return None
         data = source.get("data")

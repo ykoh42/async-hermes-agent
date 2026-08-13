@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ TRIVIAL_PROMPT_RE = re.compile(
 )
 
 
-def is_trivial_prompt(text: Optional[str]) -> bool:
+def is_trivial_prompt(text: str | None) -> bool:
     """Return True if a user prompt is too trivial to warrant memory recall.
 
     Empty/whitespace-only input, slash commands, and bare greetings or
@@ -158,7 +158,7 @@ class MemoryProvider(ABC):
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Persist a completed turn to the backend.
 
@@ -170,7 +170,7 @@ class MemoryProvider(ABC):
         """
 
     @abstractmethod
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Return tool schemas this provider exposes.
 
         Each schema follows the OpenAI function calling format:
@@ -182,7 +182,7 @@ class MemoryProvider(ABC):
     async def handle_tool_call(
         self,
         tool_name: str,
-        args: Dict[str, Any],
+        args: dict[str, Any],
         **kwargs,
     ) -> str:
         """Handle a tool call for one of this provider's tools.
@@ -211,7 +211,7 @@ class MemoryProvider(ABC):
         Providers use what they need; extras are ignored.
         """
 
-    async def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Called when a session ends (explicit exit or timeout).
 
         Use for end-of-session fact extraction, summarization, etc.
@@ -265,7 +265,7 @@ class MemoryProvider(ABC):
         Default is no-op for backward compatibility.
         """
 
-    async def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    async def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Called before context compression discards old messages.
 
         Use to extract insights from messages about to be compressed.
@@ -296,7 +296,7 @@ class MemoryProvider(ABC):
         child_session_id: the subagent's session_id
         """
 
-    def get_config_schema(self) -> List[Dict[str, Any]]:
+    def get_config_schema(self) -> list[dict[str, Any]]:
         """Return config fields this provider needs for setup.
 
         Used by 'hermes memory setup' to walk the user through configuration.
@@ -320,7 +320,7 @@ class MemoryProvider(ABC):
 
     async def save_config(
         self,
-        values: Dict[str, Any],
+        values: dict[str, Any],
         hermes_home: str,
     ) -> None:
         """Write non-secret config to the provider's native location.
@@ -344,7 +344,7 @@ class MemoryProvider(ABC):
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Called when the built-in memory tool writes an entry.
 
@@ -358,7 +358,7 @@ class MemoryProvider(ABC):
         Use to mirror built-in memory writes to your backend.
         """
 
-    def backup_paths(self) -> List[str]:
+    def backup_paths(self) -> list[str]:
         """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
 
         ``hermes backup`` only walks HERMES_HOME, so any provider state kept

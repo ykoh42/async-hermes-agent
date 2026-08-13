@@ -34,7 +34,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -88,12 +88,12 @@ ENTRY_DELIMITER = "\n§\n"
 from tools.threat_patterns import first_threat_message as _first_threat_message
 
 
-def _scan_memory_content(content: str) -> Optional[str]:
+def _scan_memory_content(content: str) -> str | None:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
 
 
-def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
+def _drift_error(path: "Path", bak_path: str) -> dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
     The on-disk memory file contains content that wouldn't round-trip
@@ -130,7 +130,7 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
 _READ_FAILED = object()
 
 
-def _read_failed_error(path: "Path") -> Dict[str, Any]:
+def _read_failed_error(path: "Path") -> dict[str, Any]:
     """Build the error dict returned when the on-disk memory file is unreadable.
 
     A file that exists but cannot be read is NOT an empty store. Reading it as
@@ -168,12 +168,12 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
-        self.memory_entries: List[str] = []
-        self.user_entries: List[str] = []
+        self.memory_entries: list[str] = []
+        self.user_entries: list[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -237,7 +237,7 @@ class MemoryStore:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
         self._consolidation_failures = 0
 
-    def _consolidation_failure(self, response: Dict[str, Any]) -> Dict[str, Any]:
+    def _consolidation_failure(self, response: dict[str, Any]) -> dict[str, Any]:
         """Count an at-capacity consolidation failure and degrade gracefully.
 
         Under the per-turn cap, return ``response`` unchanged (it already tells
@@ -280,7 +280,7 @@ class MemoryStore:
         }
 
     @staticmethod
-    def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
+    def _sanitize_entries_for_snapshot(entries: list[str], filename: str) -> list[str]:
         """Return ``entries`` with any threat-matching entry replaced by a placeholder.
 
         Each entry is scanned with the shared threat-pattern library at the
@@ -294,7 +294,7 @@ class MemoryStore:
         """
         from tools.threat_patterns import scan_for_threats
 
-        sanitized: List[str] = []
+        sanitized: list[str] = []
         for entry in entries:
             if not entry or entry.startswith("[BLOCKED:"):
                 sanitized.append(entry)
@@ -347,12 +347,12 @@ class MemoryStore:
         await aiofiles.os.makedirs(mem_dir, exist_ok=True)
         await self._write_file(self._path_for(target), self._entries_for(target))
 
-    def _entries_for(self, target: str) -> List[str]:
+    def _entries_for(self, target: str) -> list[str]:
         if target == "user":
             return self.user_entries
         return self.memory_entries
 
-    def _set_entries(self, target: str, entries: List[str]):
+    def _set_entries(self, target: str, entries: list[str]):
         if target == "user":
             self.user_entries = entries
         else:
@@ -369,7 +369,7 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    async def add(self, target: str, content: str) -> Dict[str, Any]:
+    async def add(self, target: str, content: str) -> dict[str, Any]:
         """Append one memory entry with native async persistence."""
         content = content.strip()
         if not content:
@@ -409,7 +409,7 @@ class MemoryStore:
         target: str,
         old_text: str,
         new_content: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Native-async replacement with atomic file publication."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -467,7 +467,7 @@ class MemoryStore:
             await self.save_to_disk(target)
         return self._success_response(target, "Entry replaced.")
 
-    async def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    async def remove(self, target: str, old_text: str) -> dict[str, Any]:
         """Native-async removal with the existing ambiguity guard."""
         old_text = old_text.strip()
         if not old_text:
@@ -501,8 +501,8 @@ class MemoryStore:
     async def apply_batch(
         self,
         target: str,
-        operations: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        operations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Apply a batch atomically through the native async file path."""
         if not operations:
             return {"success": False, "error": "operations list is empty."}
@@ -575,7 +575,7 @@ class MemoryStore:
             await self.save_to_disk(target)
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
-    def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
+    def _batch_error(self, target: str, message: str) -> dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
         current = self._char_count(target)
         limit = self._char_limit(target)
@@ -586,7 +586,7 @@ class MemoryStore:
             "usage": f"{current:,}/{limit:,}",
         })
 
-    def format_for_system_prompt(self, target: str) -> Optional[str]:
+    def format_for_system_prompt(self, target: str) -> str | None:
         """
         Return the frozen snapshot for system prompt injection.
 
@@ -602,11 +602,11 @@ class MemoryStore:
     # -- Internal helpers --
 
     @staticmethod
-    def _previews(entries: List[str], width: int = 80) -> List[str]:
+    def _previews(entries: list[str], width: int = 80) -> list[str]:
         """Truncated one-line previews of entries for error feedback."""
         return [e[:width] + ("..." if len(e) > width else "") for e in entries]
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+    def _success_response(self, target: str, message: str | None = None) -> dict[str, Any]:
         # A successful write means the consolidation loop made progress, so the
         # per-turn failure budget resets (the cap counts consecutive failures,
         # not lifetime ones within a turn) (#42405).
@@ -635,7 +635,7 @@ class MemoryStore:
         resp["note"] = "Write saved. This update is complete — do not repeat it."
         return resp
 
-    def _render_block(self, target: str, entries: List[str]) -> str:
+    def _render_block(self, target: str, entries: list[str]) -> str:
         """Render a system prompt block with header and usage indicator."""
         if not entries:
             return ""
@@ -654,18 +654,18 @@ class MemoryStore:
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
-    async def _read_raw_checked(path: Path) -> Tuple[str, bool]:
+    async def _read_raw_checked(path: Path) -> tuple[str, bool]:
         """Read a memory file, distinguishing unreadable from an absent file."""
         if not await aiofiles.os.path.exists(path):
             return "", True
         try:
             async with aiofiles.open(path, encoding="utf-8") as handle:
                 return await handle.read(), True
-        except (OSError, IOError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError):
             return "", False
 
     @staticmethod
-    def _parse_entries(raw: str) -> List[str]:
+    def _parse_entries(raw: str) -> list[str]:
         """Split raw memory-file text into stripped, non-empty entries."""
         if not raw.strip():
             return []
@@ -675,7 +675,7 @@ class MemoryStore:
         return [e for e in entries if e]
 
     @staticmethod
-    async def _read_file(path: Path) -> List[str]:
+    async def _read_file(path: Path) -> list[str]:
         """Read entries without risking a later write after a failed read."""
         raw, read_ok = await MemoryStore._read_raw_checked(path)
         return MemoryStore._parse_entries(raw) if read_ok else []
@@ -683,7 +683,7 @@ class MemoryStore:
         self,
         target: str,
         raw: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Async drift guard used before a native read-modify-write commit."""
         path = self._path_for(target)
         if not raw.strip():
@@ -697,12 +697,12 @@ class MemoryStore:
         try:
             async with aiofiles.open(backup, "w", encoding="utf-8") as handle:
                 await handle.write(raw)
-        except (OSError, IOError):
+        except OSError:
             return str(backup) + " (BACKUP FAILED — file unchanged on disk)"
         return str(backup)
 
     @staticmethod
-    async def _write_file(path: Path, entries: List[str]) -> None:
+    async def _write_file(path: Path, entries: list[str]) -> None:
         """Atomically publish memory with upstream fsync and symlink semantics."""
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         write_path = path
@@ -711,7 +711,7 @@ class MemoryStore:
             if resolved:
                 write_path = Path(resolved)
         temporary = path.with_name(f".mem_{path.name}.{uuid.uuid4().hex}.tmp")
-        write_error: Optional[OSError] = None
+        write_error: OSError | None = None
         replaced = False
         try:
             async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
@@ -785,12 +785,12 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
 
 
 async def memory_tool(
-    action: str = None,
+    action: str | None = None,
     target: str = "memory",
-    content: str = None,
-    old_text: str = None,
-    operations: Optional[List[Dict[str, Any]]] = None,
-    store: Optional[MemoryStore] = None,
+    content: str | None = None,
+    old_text: str | None = None,
+    operations: list[dict[str, Any]] | None = None,
+    store: MemoryStore | None = None,
 ) -> str:
     """Native-async handler for the model-visible memory tool."""
     if store is None:

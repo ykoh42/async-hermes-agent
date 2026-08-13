@@ -252,16 +252,27 @@ redundant-cast = "ignore"
 
 [tool.ruff]
 preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
+target-version = "py311"
 
 [tool.ruff.lint]
-# All other lints are intentionally disabled (see comment history on this
-# file) while we wrangle typechecks — but PLW1514 is too load-bearing to
-# keep off.  Bare open()/read_text()/write_text() in text mode defaults to
-# the system locale encoding on Windows (cp1252 on US-locale installs),
-# which silently corrupts any non-ASCII file content.  We had three
-# separate Windows sandbox regressions in one debug session before
-# adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
+# Keep the encoding rule and the Python 3.11-safe modernization rules enabled.
+# The UP rules below enforce the annotation and stdlib forms used throughout
+# the retained runtime without enabling unrelated style migrations.
+select = [
+  "PLW1514",
+  "UP006",
+  "UP007",
+  "UP017",
+  "UP024",
+  "UP035",
+  "UP037",
+  "UP041",
+  "UP045",
+  "UP028",
+  "UP031",
+  "UP042",
+  "RUF013",
+]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.

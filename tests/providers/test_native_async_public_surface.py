@@ -78,13 +78,13 @@ def test_retained_public_signatures_keep_upstream_arguments() -> None:
         "timeout: 'float' = 8.0) -> 'list[str] | None'"
     )
     assert str(inspect.signature(auxiliary_client.get_text_auxiliary_client)) == (
-        "(task: 'str' = '', *, main_runtime: 'Optional[Dict[str, Any]]' = None) "
-        "-> 'Tuple[Optional[OpenAI], Optional[str]]'"
+        "(task: 'str' = '', *, main_runtime: 'dict[str, Any] | None' = None) "
+        "-> 'tuple[OpenAI | None, str | None]'"
     )
     assert str(inspect.signature(auth.resolve_nous_runtime_credentials)) == (
-        "(*, timeout_seconds: 'float' = 15.0, insecure: 'Optional[bool]' = None, "
-        "ca_bundle: 'Optional[str]' = None, force_refresh: 'bool' = False) "
-        "-> 'Dict[str, Any]'"
+        "(*, timeout_seconds: 'float' = 15.0, insecure: 'bool | None' = None, "
+        "ca_bundle: 'str | None' = None, force_refresh: 'bool' = False) "
+        "-> 'dict[str, Any]'"
     )
 
 

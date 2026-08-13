@@ -24,7 +24,6 @@ import os
 import threading
 import time
 import weakref
-from typing import Optional, Tuple
 
 import aiofiles
 import aiofiles.os
@@ -175,7 +174,7 @@ async def _vertex_config() -> dict:
         return {}
 
 
-async def _resolve_region(explicit: Optional[str] = None) -> str:
+async def _resolve_region(explicit: str | None = None) -> str:
     """Region precedence: explicit arg > VERTEX_REGION env > config.yaml > default."""
     if explicit:
         return explicit
@@ -186,7 +185,7 @@ async def _resolve_region(explicit: Optional[str] = None) -> str:
     return cfg_region or DEFAULT_REGION
 
 
-async def _resolve_project_override() -> Optional[str]:
+async def _resolve_project_override() -> str | None:
     """Project-ID override precedence: VERTEX_PROJECT_ID env > config.yaml.
 
     Returns None when neither is set (the credentials' embedded project_id
@@ -199,7 +198,7 @@ async def _resolve_project_override() -> Optional[str]:
     return cfg_project or None
 
 
-async def _resolve_credentials_path(explicit: Optional[str]) -> Optional[str]:
+async def _resolve_credentials_path(explicit: str | None) -> str | None:
     if explicit and await aiofiles.os.path.exists(explicit):
         return explicit
     # Routed through get_secret (not a raw os.environ read): in a multiplex
@@ -245,7 +244,7 @@ async def _load_credentials_file(path: str):
     )
 
 
-async def _gcloud_project_id() -> Optional[str]:
+async def _gcloud_project_id() -> str | None:
     project_id = (
         _get_secret("GOOGLE_CLOUD_PROJECT")
         or _get_secret("GCLOUD_PROJECT")
@@ -290,7 +289,7 @@ async def _gcloud_project_id() -> Optional[str]:
     return stdout.decode("utf-8", errors="replace").strip() or None
 
 
-async def _metadata_credentials() -> Tuple[Optional[str], Optional[str]]:
+async def _metadata_credentials() -> tuple[str | None, str | None]:
     from agent.ssl_verify import _create_httpx_client
 
     metadata_host = os.getenv("GCE_METADATA_HOST", "metadata.google.internal").strip()
@@ -324,7 +323,7 @@ async def _metadata_credentials() -> Tuple[Optional[str], Optional[str]]:
     return token, project_id
 
 
-async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+async def get_vertex_credentials(credentials_path: str | None = None) -> tuple[str | None, str | None]:
     """Return a (fresh access_token, project_id) pair or (None, None) on failure.
 
     Caches the underlying Credentials object and refreshes it when within
@@ -435,9 +434,9 @@ def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
 
 
 async def get_vertex_config(
-    credentials_path: Optional[str] = None,
-    region: Optional[str] = None,
-) -> Tuple[Optional[str], Optional[str]]:
+    credentials_path: str | None = None,
+    region: str | None = None,
+) -> tuple[str | None, str | None]:
     """Resolve (access_token, base_url) for Vertex AI, or (None, None) on failure."""
     token, project_id = await get_vertex_credentials(credentials_path)
     if not token or not project_id:

@@ -15,7 +15,7 @@ request-assembly surface proposed across #41918, #24949, #47109, and #50053.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,18 +34,18 @@ class _MinimalEngine(ContextEngine):
     def name(self) -> str:
         return "minimal"
 
-    def update_from_response(self, usage: Dict[str, Any]) -> None:
+    def update_from_response(self, usage: dict[str, Any]) -> None:
         pass
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int | None = None) -> bool:
         return False
 
     async def compress(
         self,
-        messages: List[Dict[str, Any]],
-        current_tokens: int = None,
-        focus_topic: str = None,
-    ) -> List[Dict[str, Any]]:
+        messages: list[dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
+    ) -> list[dict[str, Any]]:
         return messages
 
 

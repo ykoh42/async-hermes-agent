@@ -21,14 +21,15 @@ ordinary Hermes tool approval never substitutes for protected consent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Set
+from typing import Any
+from collections.abc import Awaitable, Callable, Iterable
 
 
-ToolCaller = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+ToolCaller = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 ToolProbe = Callable[[str], bool]
 
 
-def _positive_int(value: Any) -> Optional[int]:
+def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     try:
@@ -38,11 +39,11 @@ def _positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
-def _tool_payload(out: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_payload(out: dict[str, Any]) -> dict[str, Any]:
     """Return the structured driver payload without discarding refusals."""
     structured = out.get("structuredContent")
     data = out.get("data")
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     if isinstance(data, dict):
         payload.update(data)
     elif isinstance(data, str) and data:
@@ -54,14 +55,14 @@ def _tool_payload(out: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _ref_map(payload: Dict[str, Any]) -> Dict[str, Set[str]]:
+def _ref_map(payload: dict[str, Any]) -> dict[str, set[str]]:
     """Normalize semantic-v2 action refs to ``ref -> actions``.
 
     cua-driver has emitted both mapping and list representations while the
     semantic snapshot contract evolved.  Accept both without weakening the
     capability rule: a ref with no declared action remains readable only.
     """
-    normalized: Dict[str, Set[str]] = {}
+    normalized: dict[str, set[str]] = {}
     snapshot = payload.get("snapshot")
     # semantic_v2 carries the authoritative action-bearing entries in
     # ``content_refs``; some transitional builds also emitted a ``refs`` list
@@ -72,7 +73,7 @@ def _ref_map(payload: Dict[str, Any]) -> Dict[str, Set[str]]:
     if raw is None and isinstance(snapshot, dict):
         raw = snapshot.get("refs")
     if isinstance(raw, dict):
-        entries: Iterable[tuple[Optional[str], Any]] = raw.items()
+        entries: Iterable[tuple[str | None, Any]] = raw.items()
     elif isinstance(raw, list):
         entries = ((None, item) for item in raw)
     else:
@@ -93,7 +94,7 @@ def _ref_map(payload: Dict[str, Any]) -> Dict[str, Set[str]]:
     return normalized
 
 
-def _continuation(payload: Dict[str, Any]) -> Optional[str]:
+def _continuation(payload: dict[str, Any]) -> str | None:
     direct = payload.get("continuation")
     if isinstance(direct, str) and direct:
         return direct
@@ -105,8 +106,8 @@ def _continuation(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _tab_ids(payload: Dict[str, Any]) -> Set[str]:
-    result: Set[str] = set()
+def _tab_ids(payload: dict[str, Any]) -> set[str]:
+    result: set[str] = set()
     for tab in payload.get("tabs") or []:
         if not isinstance(tab, dict):
             continue
@@ -116,7 +117,7 @@ def _tab_ids(payload: Dict[str, Any]) -> Set[str]:
     return result
 
 
-def _refusal_code(payload: Dict[str, Any]) -> Optional[str]:
+def _refusal_code(payload: dict[str, Any]) -> str | None:
     code = payload.get("code")
     if isinstance(code, str):
         return code
@@ -132,8 +133,8 @@ def _refusal(
     *,
     native_fallback: bool = False,
     **extra: Any,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "ok": False,
         "status": "refused",
         "code": code,
@@ -149,15 +150,15 @@ def _refusal(
 class BrowserRouteState:
     """Capabilities minted for one explicit cua-driver session."""
 
-    pid: Optional[int] = None
-    window_id: Optional[int] = None
-    target_id: Optional[str] = None
-    tab_ids: Set[str] = field(default_factory=set)
-    tab_id: Optional[str] = None
-    binding_quality: Optional[str] = None
+    pid: int | None = None
+    window_id: int | None = None
+    target_id: str | None = None
+    tab_ids: set[str] = field(default_factory=set)
+    tab_id: str | None = None
+    binding_quality: str | None = None
     mutation_allowed: bool = False
-    refs: Dict[str, Set[str]] = field(default_factory=dict)
-    continuation: Optional[str] = None
+    refs: dict[str, set[str]] = field(default_factory=dict)
+    continuation: str | None = None
     verification_required: bool = False
 
     def clear_refs(self) -> None:
@@ -191,14 +192,14 @@ class CuaTypedBrowserRoute:
         self._has_tool = has_tool
         self.state = BrowserRouteState()
 
-    async def _call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         payload = dict(args)
         # The wrapper owns the session capability.  Never let a model-provided
         # id replace it or address another run's target/ref namespace.
         payload["session"] = self._session_id
         return _tool_payload(await self._call_tool(name, payload))
 
-    def _require_tool(self, name: str) -> Optional[Dict[str, Any]]:
+    def _require_tool(self, name: str) -> dict[str, Any] | None:
         if self._has_tool(name):
             return None
         return _refusal(
@@ -212,12 +213,12 @@ class CuaTypedBrowserRoute:
         *,
         pid: Any = None,
         window_id: Any = None,
-        tab_id: Optional[str] = None,
+        tab_id: str | None = None,
         snapshot_format: str = "semantic_v2",
-        query: Optional[str] = None,
-        scope_ref: Optional[str] = None,
-        continuation: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        query: str | None = None,
+        scope_ref: str | None = None,
+        continuation: str | None = None,
+    ) -> dict[str, Any]:
         """Bind an exact native window or snapshot a bound tab."""
         missing = self._require_tool("get_browser_state")
         if missing is not None:
@@ -299,7 +300,7 @@ class CuaTypedBrowserRoute:
                 "scope_ref must come from this session's latest browser snapshot.",
             )
 
-        args: Dict[str, Any] = {
+        args: dict[str, Any] = {
             "target_id": target_id,
             "tab_id": selected_tab,
             "snapshot_format": snapshot_format,
@@ -341,9 +342,9 @@ class CuaTypedBrowserRoute:
         pid: Any,
         window_id: Any = None,
         profile_mode: str,
-        profile_name: Optional[str] = None,
+        profile_name: str | None = None,
         allow_launch: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Run explicit setup through the driver's authoritative mode gate."""
         missing = self._require_tool("browser_prepare")
         if missing is not None:
@@ -382,7 +383,7 @@ class CuaTypedBrowserRoute:
                 "browser_launch_not_approved",
                 "Driver-owned isolated setup requires explicit allow_launch=true.",
             )
-        profile: Dict[str, Any] = {"mode": profile_mode}
+        profile: dict[str, Any] = {"mode": profile_mode}
         if profile_mode == "isolated_named":
             if not isinstance(profile_name, str) or not profile_name:
                 return _refusal(
@@ -390,7 +391,7 @@ class CuaTypedBrowserRoute:
                     "isolated_named requires a non-empty profile name.",
                 )
             profile["name"] = profile_name
-        args: Dict[str, Any] = {
+        args: dict[str, Any] = {
             "pid": exact_pid,
             "allow_launch": True,
             "profile": profile,
@@ -407,9 +408,9 @@ class CuaTypedBrowserRoute:
         self,
         *,
         tool: str,
-        tab_id: Optional[str],
+        tab_id: str | None,
         allow_without_snapshot: bool = False,
-    ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    ) -> tuple[str | None, dict[str, Any] | None]:
         missing = self._require_tool(tool)
         if missing is not None:
             return None, missing
@@ -444,8 +445,8 @@ class CuaTypedBrowserRoute:
         self,
         ref: Any,
         *,
-        actions: Set[str],
-    ) -> Optional[Dict[str, Any]]:
+        actions: set[str],
+    ) -> dict[str, Any] | None:
         if not isinstance(ref, str) or ref not in self.state.refs:
             return _refusal(
                 "browser_ref_stale",
@@ -463,9 +464,9 @@ class CuaTypedBrowserRoute:
         self,
         tool: str,
         *,
-        tab_id: Optional[str] = None,
-        args: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        tab_id: str | None = None,
+        args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Invoke one typed browser tool against current capabilities."""
         call_args = dict(args or {})
         dialog_inspect = (
@@ -500,7 +501,7 @@ class CuaTypedBrowserRoute:
                 "The dom_event trust class requires a current semantic ref.",
             )
 
-        required_actions: Set[str] = set()
+        required_actions: set[str] = set()
         if tool == "browser_click" and ref:
             required_actions = {"click", "pointer"}
         elif tool == "browser_type":

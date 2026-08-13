@@ -63,7 +63,6 @@ import aiofiles
 import aiofiles.os
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from typing import Dict, List, Optional, Set, Tuple
 
 from utils import env_int
 
@@ -168,7 +167,7 @@ _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 # Input validation helpers
 # ---------------------------------------------------------------------------
 
-def _validate_commit_hash(commit_hash: str) -> Optional[str]:
+def _validate_commit_hash(commit_hash: str) -> str | None:
     """Validate a commit hash to prevent git argument injection.
 
     Returns an error string if invalid, None if valid.
@@ -184,7 +183,7 @@ def _validate_commit_hash(commit_hash: str) -> Optional[str]:
     return None
 
 
-async def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
+async def _validate_file_path(file_path: str, working_dir: str) -> str | None:
     """Validate a file path to prevent path traversal outside the working directory.
 
     Returns an error string if invalid, None if valid.
@@ -217,7 +216,7 @@ async def _project_hash(working_dir: str) -> str:
     return hashlib.sha256(abs_path.encode()).hexdigest()[:16]
 
 
-def _store_path(base: Optional[Path] = None) -> Path:
+def _store_path(base: Path | None = None) -> Path:
     """Return the single shared shadow store path."""
     return (base or _checkpoint_base()) / _STORE_DIRNAME
 
@@ -252,7 +251,7 @@ def _project_meta_path(store: Path, dir_hash: str) -> Path:
 async def _git_env(
     store: Path,
     working_dir: str,
-    index_file: Optional[Path] = None,
+    index_file: Path | None = None,
 ) -> dict:
     """Build env dict that redirects git to the shared store.
 
@@ -346,13 +345,13 @@ async def _finish_process_communicate(
 
 
 async def _run_git(
-    args: List[str],
+    args: list[str],
     store: Path,
     working_dir: str,
     timeout: int = _GIT_TIMEOUT,
-    allowed_returncodes: Optional[Set[int]] = None,
-    index_file: Optional[Path] = None,
-) -> Tuple[bool, str, str]:
+    allowed_returncodes: set[int] | None = None,
+    index_file: Path | None = None,
+) -> tuple[bool, str, str]:
     """Run a git command against the shared store.  Returns (ok, stdout, stderr).
 
     ``allowed_returncodes`` suppresses error logging for known/expected non-zero
@@ -441,7 +440,7 @@ async def _run_git(
 # Store initialisation + legacy migration
 # ---------------------------------------------------------------------------
 
-async def _migrate_legacy_store(base: Path) -> Optional[Path]:
+async def _migrate_legacy_store(base: Path) -> Path | None:
     """Move pre-v2 per-project shadow repos into a ``legacy-<ts>/`` dir.
 
     The pre-v2 layout had one shadow git repo per working directory directly
@@ -456,7 +455,7 @@ async def _migrate_legacy_store(base: Path) -> Optional[Path]:
     if not await aiofiles.os.path.exists(base):
         return None
     store = _store_path(base)
-    legacy_root: Optional[Path] = None
+    legacy_root: Path | None = None
     # Reserved top-level entries managed by v2.
     reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME}
     for child_name in await aiofiles.os.listdir(base):
@@ -490,7 +489,7 @@ async def _migrate_legacy_store(base: Path) -> Optional[Path]:
     return legacy_root
 
 
-async def _init_store(store: Path, working_dir: str) -> Optional[str]:
+async def _init_store(store: Path, working_dir: str) -> str | None:
     """Initialise the shared shadow store if needed.  Returns error or None.
 
     Also performs one-time migration of pre-v2 per-directory shadow repos
@@ -586,7 +585,7 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
     return None
 
 
-async def _volume_evidence(workdir: Path) -> Dict:
+async def _volume_evidence(workdir: Path) -> dict:
     """Record the identity of ``workdir``'s parent while the project is live.
 
     ``(st_dev, st_ino)`` of the parent directory, captured at a moment when
@@ -625,7 +624,7 @@ async def _register_project(store: Path, working_dir: str) -> None:
     meta_path = _project_meta_path(store, dir_hash)
     now = time.time()
     normalized_working_dir = await _normalize_path(working_dir)
-    meta: Dict = {"workdir": str(normalized_working_dir),
+    meta: dict = {"workdir": str(normalized_working_dir),
                   "created_at": now, "last_touch": now}
     evidence = await _volume_evidence(normalized_working_dir)
     if evidence:
@@ -686,12 +685,12 @@ async def _touch_project(store: Path, working_dir: str) -> None:
         logger.debug("Could not update project metadata %s: %s", meta_path, exc)
 
 
-async def _list_projects(store: Path) -> List[Dict]:
+async def _list_projects(store: Path) -> list[dict]:
     """Return all registered projects under the store."""
     projects_dir = store / _PROJECTS_DIRNAME
     if not await aiofiles.os.path.exists(projects_dir):
         return []
-    out: List[Dict] = []
+    out: list[dict] = []
     for name in await aiofiles.os.listdir(projects_dir):
         if not name.endswith(".json"):
             continue
@@ -709,7 +708,7 @@ async def _list_projects(store: Path) -> List[Dict]:
     return out
 
 
-async def _pre_v2_shadow_repos(base: Path) -> List[Dict]:
+async def _pre_v2_shadow_repos(base: Path) -> list[dict]:
     """Return pre-v2 per-project shadow repos still directly under ``base``.
 
     Pre-v2 layout kept one shadow git repo per working directory directly
@@ -717,7 +716,7 @@ async def _pre_v2_shadow_repos(base: Path) -> List[Dict]:
     single source of truth for that scan so a preview built from it (e.g.
     ``store_status``) always matches what ``prune_checkpoints`` deletes.
     """
-    out: List[Dict] = []
+    out: list[dict] = []
     if not await aiofiles.os.path.exists(base):
         return out
     for child_name in await aiofiles.os.listdir(base):
@@ -728,7 +727,7 @@ async def _pre_v2_shadow_repos(base: Path) -> List[Dict]:
             continue
         if not await aiofiles.os.path.exists(child / "HEAD"):
             continue
-        workdir: Optional[str] = None
+        workdir: str | None = None
         marker_unreadable = False
         wd_marker = child / "HERMES_WORKDIR"
         if await aiofiles.os.path.exists(wd_marker):
@@ -798,7 +797,7 @@ async def _dir_size_bytes(path: Path) -> int:
 # those markers, but inside the shared store + under ``projects/<hash>.json``.
 # The shim initialises the store and registers the project so the old
 # surface keeps roughly the same shape.
-async def _init_shadow_repo(shadow_repo: Path, working_dir: str) -> Optional[str]:
+async def _init_shadow_repo(shadow_repo: Path, working_dir: str) -> str | None:
     """Backwards-compatible initialiser.
 
     In v1 ``shadow_repo`` was a per-project dir; in v2 it's the shared
@@ -859,8 +858,8 @@ class CheckpointManager:
         self.max_snapshots = max(1, int(max_snapshots))
         self.max_total_size_mb = max(0, int(max_total_size_mb))
         self.max_file_size_mb = max(0, int(max_file_size_mb))
-        self._checkpointed_dirs: Set[str] = set()
-        self._git_available: Optional[bool] = None  # lazy probe
+        self._checkpointed_dirs: set[str] = set()
+        self._git_available: bool | None = None  # lazy probe
         self._checkpoint_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -913,7 +912,7 @@ class CheckpointManager:
                 logger.debug("Checkpoint failed (non-fatal): %s", e)
                 return False
 
-    async def list_checkpoints(self, working_dir: str) -> List[Dict]:
+    async def list_checkpoints(self, working_dir: str) -> list[dict]:
         """List available checkpoints for a directory (most recent first)."""
         abs_dir = str(await _normalize_path(working_dir))
         store = _store_path()
@@ -931,7 +930,7 @@ class CheckpointManager:
         if not ok or not stdout:
             return []
 
-        results: List[Dict] = []
+        results: list[dict] = []
         for line in stdout.splitlines():
             parts = line.split("|", 3)
             if len(parts) == 4:
@@ -955,7 +954,7 @@ class CheckpointManager:
         return results
 
     @staticmethod
-    def _parse_shortstat(stat_line: str, entry: Dict) -> None:
+    def _parse_shortstat(stat_line: str, entry: dict) -> None:
         """Parse git --shortstat output into entry dict."""
         m = re.search(r'(\d+) file', stat_line)
         if m:
@@ -967,7 +966,7 @@ class CheckpointManager:
         if m:
             entry["deletions"] = int(m.group(1))
 
-    async def diff(self, working_dir: str, commit_hash: str) -> Dict:
+    async def diff(self, working_dir: str, commit_hash: str) -> dict:
         """Show diff between a checkpoint and the current working tree."""
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1017,7 +1016,7 @@ class CheckpointManager:
             "diff": diff_out if ok_diff else "",
         }
 
-    async def session_diff(self, working_dir: str) -> Dict:
+    async def session_diff(self, working_dir: str) -> dict:
         """Show the cumulative diff of everything changed in this directory.
 
         This powers ``/diff session``.  It answers "what has Hermes changed
@@ -1053,8 +1052,8 @@ class CheckpointManager:
         self,
         working_dir: str,
         commit_hash: str,
-        file_path: str = None,
-    ) -> Dict:
+        file_path: str | None = None,
+    ) -> dict:
         """Restore files to a checkpoint state."""
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1292,7 +1291,7 @@ class CheckpointManager:
         # whitespace but that leaves NULs alone; rebuild list.
         paths = [p for p in stdout.split("\x00") if p]
         abs_workdir = await _normalize_path(working_dir)
-        oversize: List[str] = []
+        oversize: list[str] = []
         for rel in paths:
             try:
                 size = (await aiofiles.os.stat(abs_workdir / rel)).st_size
@@ -1349,7 +1348,7 @@ class CheckpointManager:
         keep = commits[-self.max_snapshots:]
 
         # Rebuild a linear chain off keep[0]'s tree.
-        new_parent: Optional[str] = None
+        new_parent: str | None = None
         for sha in keep:
             ok_tree, tree_sha, _ = await _run_git(
                 ["rev-parse", f"{sha}^{{tree}}"], store, working_dir,
@@ -1433,7 +1432,7 @@ class CheckpointManager:
                     continue
                 commits = list_out.splitlines()
                 keep = commits[1:]  # drop oldest
-                new_parent: Optional[str] = None
+                new_parent: str | None = None
                 fail = False
                 for sha in keep:
                     ok_tree, tree_sha, _ = await _run_git(
@@ -1479,7 +1478,7 @@ class CheckpointManager:
         await _repair_bare_repo_dirs(store)
 
 
-def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
+def format_checkpoint_list(checkpoints: list[dict], directory: str) -> str:
     """Format checkpoint list for display to user."""
     if not checkpoints:
         return f"No checkpoints found for {directory}"
@@ -1530,8 +1529,8 @@ async def _delete_ref(store: Path, ref: str) -> bool:
 
 async def _workdir_is_observably_gone(
     workdir: str,
-    parent_dev: Optional[int] = None,
-    parent_ino: Optional[int] = None,
+    parent_dev: int | None = None,
+    parent_ino: int | None = None,
     require_parent_identity: bool = True,
 ) -> bool:
     """True only when we can positively observe that ``workdir`` was removed.
@@ -1624,10 +1623,10 @@ async def _dir_has_any_entry(directory: Path) -> bool:
 async def prune_checkpoints(
     retention_days: int = 7,
     delete_orphans: bool = True,
-    checkpoint_base: Optional[Path] = None,
+    checkpoint_base: Path | None = None,
     max_total_size_mb: int = 0,
-    orphan_allowlist: Optional[set] = None,
-) -> Dict[str, int]:
+    orphan_allowlist: set | None = None,
+) -> dict[str, int]:
     """Delete stale/orphan checkpoints and reclaim store space.
 
     A project entry is deleted when either:
@@ -1711,7 +1710,7 @@ async def prune_checkpoints(
     for repo in await _pre_v2_shadow_repos(base):
         child = repo["path"]
         result["scanned"] += 1
-        reason: Optional[str] = None
+        reason: str | None = None
         if (
             delete_orphans
             and not repo["marker_unreadable"]
@@ -1863,7 +1862,7 @@ async def prune_checkpoints(
                         continue
                     commits = lo.splitlines()
                     keep = commits[1:]
-                    new_parent: Optional[str] = None
+                    new_parent: str | None = None
                     fail = False
                     for sha in keep:
                         ok_t, tsha, _ = await _run_git(
@@ -1916,9 +1915,9 @@ async def maybe_auto_prune_checkpoints(
     retention_days: int = 7,
     min_interval_hours: int = 24,
     delete_orphans: bool = True,
-    checkpoint_base: Optional[Path] = None,
+    checkpoint_base: Path | None = None,
     max_total_size_mb: int = 0,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     """Idempotent wrapper around ``prune_checkpoints`` for startup hooks.
 
     Writes ``CHECKPOINT_BASE/.last_prune`` on completion so subsequent
@@ -1928,7 +1927,7 @@ async def maybe_auto_prune_checkpoints(
     "error": optional str}``.
     """
     base = checkpoint_base or _checkpoint_base()
-    out: Dict[str, object] = {"skipped": False}
+    out: dict[str, object] = {"skipped": False}
 
     try:
         if not await aiofiles.os.path.exists(base):
@@ -1985,7 +1984,7 @@ async def maybe_auto_prune_checkpoints(
 # Public helpers for `hermes checkpoints` CLI
 # ---------------------------------------------------------------------------
 
-async def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
+async def store_status(checkpoint_base: Path | None = None) -> dict:
     """Return a summary of the shadow store.
 
     ``{"base": path, "store_size_bytes": N, "legacy_size_bytes": N,
@@ -2000,7 +1999,7 @@ async def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     both layouts.
     """
     base = checkpoint_base or _checkpoint_base()
-    out: Dict = {
+    out: dict = {
         "base": str(base),
         "store_size_bytes": 0,
         "legacy_size_bytes": 0,
@@ -2074,7 +2073,7 @@ async def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     return out
 
 
-async def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+async def clear_all(checkpoint_base: Path | None = None) -> dict[str, int]:
     """Nuke the entire checkpoint base (store + legacy).  Irreversible.
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
@@ -2093,7 +2092,7 @@ async def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     return out
 
 
-async def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+async def clear_legacy(checkpoint_base: Path | None = None) -> dict[str, int]:
     """Delete all ``legacy-*`` archive directories.
 
     Returns ``{"bytes_freed": N, "deleted": count}``.

@@ -498,7 +498,7 @@ class TestWaitForCallbackNoBlocking:
         async def immediate_timeout(awaitable, *, timeout):
             if timeout == 300.0:
                 awaitable.close()
-                raise asyncio.TimeoutError
+                raise TimeoutError
             return await real_wait_for(awaitable, timeout=timeout)
 
         with patch.object(mod.asyncio, "wait_for", immediate_timeout):
@@ -685,7 +685,7 @@ class TestWaitForCallbackPasteIntegration:
         monkeypatch.setattr(mod, "_is_interactive", lambda: True)
         async def timeout(awaitable, **_kwargs):
             awaitable.close()
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
         monkeypatch.setattr(mod.asyncio, "wait_for", timeout)
         monkeypatch.setattr(mod, "_wait_for_pasted_callback", AsyncMock())
@@ -706,7 +706,7 @@ class TestWaitForCallbackPasteIntegration:
 
         async def timeout(awaitable, **_kwargs):
             awaitable.close()
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
         with patch.object(mod.asyncio, "wait_for", timeout):
             with mod.suppress_interactive_oauth():

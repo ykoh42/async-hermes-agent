@@ -25,7 +25,7 @@ import uuid
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -112,8 +112,8 @@ async def _activate_process_scope() -> tuple[_ProcessScopeKey, _ProcessScopeKey]
 
 @dataclass
 class _ProcessRegistryState:
-    running: dict[str, "ProcessSession"] = field(default_factory=dict)
-    finished: dict[str, "ProcessSession"] = field(default_factory=dict)
+    running: dict[str, ProcessSession] = field(default_factory=dict)
+    finished: dict[str, ProcessSession] = field(default_factory=dict)
     completion_consumed: set[str] = field(default_factory=set)
     poll_observed: set[str] = field(default_factory=set)
     checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -364,10 +364,10 @@ class ProcessRegistry:
     async def spawn_local(
         self,
         command: str,
-        cwd: str = None,
+        cwd: str | None = None,
         task_id: str = "",
         session_key: str = "",
-        env_vars: dict = None,
+        env_vars: dict | None = None,
         use_pty: bool = False,
     ) -> ProcessSession:
         """Spawn a local command and start native async output collection."""
@@ -475,7 +475,7 @@ class ProcessRegistry:
         self,
         env: Any,
         command: str,
-        cwd: str = None,
+        cwd: str | None = None,
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
@@ -1063,7 +1063,7 @@ class ProcessRegistry:
     async def wait(
         self,
         session_id: str,
-        timeout: int = None,  # noqa: ASYNC109 - upstream public API
+        timeout: int | None = None,  # noqa: ASYNC109 - upstream public API
     ) -> dict:
         """Wait without blocking the event loop or stopping the process on timeout."""
         from tools.ansi_strip import strip_ansi
@@ -1310,8 +1310,8 @@ class ProcessRegistry:
 
     async def list_sessions(
         self,
-        task_id: str = None,
-        session_key: str = None,
+        task_id: str | None = None,
+        session_key: str | None = None,
     ) -> list:
         await self._activate_profile_state()
         sessions: list[ProcessSession] = []
@@ -1371,7 +1371,7 @@ class ProcessRegistry:
     async def has_active_for_session(
         self,
         session_key: str,
-        max_active_age: Optional[float] = None,
+        max_active_age: float | None = None,
     ) -> bool:
         await self._activate_profile_state()
         for session in tuple(self._running.values()):
@@ -1412,7 +1412,7 @@ class ProcessRegistry:
 
     async def kill_all(
         self,
-        task_id: Optional[str] = None,
+        task_id: str | None = None,
         *,
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
@@ -1625,7 +1625,7 @@ class ProcessRegistry:
         await self._activate_profile_state()
         checkpoint = self._checkpoint_path()
         try:
-            async with aiofiles.open(checkpoint, "r", encoding="utf-8") as handle:
+            async with aiofiles.open(checkpoint, encoding="utf-8") as handle:
                 entries = json.loads(await handle.read())
         except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
             return 0
@@ -1852,7 +1852,7 @@ def _format_async_delegation(evt: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_process_notification(evt: dict) -> "str | None":
+def format_process_notification(evt: dict) -> str | None:
     """Format a queued process event using the upstream reinjection shape."""
     event_type = evt.get("type", "completion")
     session_id = evt.get("session_id", "unknown")

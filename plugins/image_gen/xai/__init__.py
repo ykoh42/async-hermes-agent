@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Model catalog
 # ---------------------------------------------------------------------------
 
-_MODELS: Dict[str, Dict[str, Any]] = {
+_MODELS: dict[str, dict[str, Any]] = {
     "grok-imagine-image": {
         "display": "Grok Imagine Image",
         "speed": "~5-10s",
@@ -89,7 +89,7 @@ DEFAULT_RESOLUTION = "1k"
 # ---------------------------------------------------------------------------
 
 
-async def _load_xai_config() -> Dict[str, Any]:
+async def _load_xai_config() -> dict[str, Any]:
     """Read ``image_gen.xai`` from config.yaml."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -103,7 +103,7 @@ async def _load_xai_config() -> Dict[str, Any]:
         return {}
 
 
-async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
+async def _resolve_model() -> tuple[str, dict[str, Any]]:
     """Decide which model to use and return ``(model_id, meta)``."""
     env_override = get_secret("XAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
@@ -126,7 +126,7 @@ async def _resolve_resolution() -> str:
     return DEFAULT_RESOLUTION
 
 
-async def _xai_image_field(source: str) -> Dict[str, str]:
+async def _xai_image_field(source: str) -> dict[str, str]:
     """Build the xAI ``image`` field for an edit request.
 
     xAI's ``/v1/images/edits`` accepts a public HTTPS URL or a base64 data URI.
@@ -174,7 +174,7 @@ class XAIImageGenProvider(ImageGenProvider):
         creds = await resolve_xai_http_credentials()
         return bool(creds.get("api_key"))
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": model_id,
@@ -185,7 +185,7 @@ class XAIImageGenProvider(ImageGenProvider):
             for model_id, meta in _MODELS.items()
         ]
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         # Auth resolution is delegated to the shared ``xai_grok`` post_setup
         # hook (``hermes_cli/tools_config.py``); identical to the TTS / video
         # gen entries so users see the same OAuth-or-API-key choice for every
@@ -205,7 +205,7 @@ class XAIImageGenProvider(ImageGenProvider):
             "post_setup": "xai_grok",
         }
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         # xAI's /v1/images/edits supports image editing via grok-imagine-image
         # -quality, including up to 3 total source images.
         return {
@@ -219,10 +219,10 @@ class XAIImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Generate an image (text-to-image) or edit a source image (image-to-image).
 
         Routing: when ``image_url`` is provided, POST to ``/v1/images/edits``
@@ -248,7 +248,7 @@ class XAIImageGenProvider(ImageGenProvider):
         resolution = await _resolve_resolution()
         xai_res = resolution if resolution in _XAI_RESOLUTIONS else DEFAULT_RESOLUTION
 
-        source_images: List[str] = []
+        source_images: list[str] = []
         if isinstance(image_url, str) and image_url.strip():
             source_images.append(image_url.strip())
         refs = normalize_reference_images(reference_image_urls)
@@ -298,7 +298,7 @@ class XAIImageGenProvider(ImageGenProvider):
         storage_notice = await maybe_mark_xai_storage_notice_seen("image_gen")
         storage_cfg = await read_xai_imagine_storage_config("image_gen")
 
-        payload: Dict[str, Any]
+        payload: dict[str, Any]
         if is_edit:
             # Editing requires the quality model per xAI docs. The source
             # image may be a public URL or a base64 data URI; local file paths
@@ -464,7 +464,7 @@ class XAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        extra: Dict[str, Any] = {
+        extra: dict[str, Any] = {
             "storage_enabled": bool(storage_cfg["enabled"]),
         }
         if not is_edit:

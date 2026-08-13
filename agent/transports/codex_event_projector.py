@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
@@ -63,7 +63,7 @@ class ProjectionResult:
 
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
-    final_text: Optional[str] = None  # Set when an agentMessage completes
+    final_text: str | None = None  # Set when an agentMessage completes
 
 
 class CodexEventProjector:

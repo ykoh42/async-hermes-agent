@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Any, Dict, Optional, Union
+from typing import Any
 from urllib.parse import urlencode
 
 
@@ -67,7 +67,7 @@ def _normalize_fal_queue_url_format(queue_run_origin: str) -> str:
     return f"{normalized_origin}/"
 
 
-def _extract_http_status(exc: BaseException) -> Optional[int]:
+def _extract_http_status(exc: BaseException) -> int | None:
     """Return an HTTP status code from httpx/FAL exceptions, when present."""
     response = getattr(exc, "response", None)
     if response is not None:
@@ -151,14 +151,14 @@ class _ManagedFalClient:
     async def submit(
         self,
         application: str,
-        arguments: Dict[str, Any],
+        arguments: dict[str, Any],
         *,
         path: str = "",
-        hint: Optional[str] = None,
-        webhook_url: Optional[str] = None,
+        hint: str | None = None,
+        webhook_url: str | None = None,
         priority: Any = None,
-        headers: Optional[Dict[str, str]] = None,
-        start_timeout: Optional[Union[int, float]] = None,
+        headers: dict[str, str] | None = None,
+        start_timeout: int | float | None = None,
     ) -> Any:
         client = await self._ensure_client()
         url = self._queue_url_format + application

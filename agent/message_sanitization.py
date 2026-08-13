@@ -677,7 +677,7 @@ def matches_reasoning_echo_family(
     return any(base_url_host_matches(base_url, host) for host in hosts)
 
 
-def reasoning_echo_family(provider: Any, model: Any, base_url: Any) -> "str | None":
+def reasoning_echo_family(provider: Any, model: Any, base_url: Any) -> str | None:
     """Classify the provider direction for the reasoning_content echo policy.
 
     Returns ``"kimi"``, ``"deepseek"``, or ``"mimo"`` (first match in table

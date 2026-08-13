@@ -15,7 +15,7 @@ import threading
 import aiofiles
 import aiofiles.os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +82,8 @@ def has_incomplete_scratchpad(content: str) -> bool:
     return "<REASONING_SCRATCHPAD>" in content and "</REASONING_SCRATCHPAD>" not in content
 
 
-async def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
-                          completed: bool, filename: str = None):
+async def save_trajectory(trajectory: list[dict[str, Any]], model: str,
+                          completed: bool, filename: str | None = None):
     """Append a trajectory entry to a JSONL file.
 
     Args:

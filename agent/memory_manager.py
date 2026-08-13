@@ -30,7 +30,8 @@ import json
 import logging
 import re
 import inspect
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -64,7 +65,7 @@ async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     return result
 
 
-def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
+def normalize_tool_schema(schema: Any) -> dict[str, Any] | None:
     """Return a function-tool dict with a resolvable top-level ``name``.
 
     Context engines and memory providers expose tool schemas via
@@ -98,8 +99,8 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
 
 
 def memory_provider_tools_enabled(
-    enabled_toolsets: Optional[List[str]],
-    disabled_toolsets: Optional[List[str]] = None,
+    enabled_toolsets: list[str] | None,
+    disabled_toolsets: list[str] | None = None,
     *,
     memory_tool_present: bool = False,
 ) -> bool:
@@ -385,9 +386,9 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
-        self._providers: List[MemoryProvider] = []
-        self._tool_to_provider: Dict[str, MemoryProvider] = {}
+    def __init__(self, *, external_prefetch_timeout: float | None = None) -> None:
+        self._providers: list[MemoryProvider] = []
+        self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
@@ -396,11 +397,11 @@ class MemoryManager:
         )
         if self._external_prefetch_timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
-        self._external_prefetch_tasks: Dict[str, asyncio.Task[str]] = {}
+        self._external_prefetch_tasks: dict[str, asyncio.Task[str]] = {}
         self._background_lock = asyncio.Lock()
-        self._background_tasks: Dict[asyncio.Task[None], str] = {}
+        self._background_tasks: dict[asyncio.Task[None], str] = {}
         self._shutting_down = False
-        self._shutdown_drain_state: Dict[str, Any] = {
+        self._shutdown_drain_state: dict[str, Any] = {
             "status": "not_started",
             "abandoned_writes": 0,
             "abandoned_prefetches": 0,
@@ -505,11 +506,11 @@ class MemoryManager:
         )
 
     @property
-    def providers(self) -> List[MemoryProvider]:
+    def providers(self) -> list[MemoryProvider]:
         """All registered providers in order."""
         return list(self._providers)
 
-    def get_provider(self, name: str) -> Optional[MemoryProvider]:
+    def get_provider(self, name: str) -> MemoryProvider | None:
         """Get a provider by name, or None if not registered."""
         for p in self._providers:
             if p.name == name:
@@ -540,7 +541,7 @@ class MemoryManager:
     # -- Prefetch / recall ---------------------------------------------------
 
     @staticmethod
-    def _strip_skill_scaffolding(text: str) -> Optional[str]:
+    def _strip_skill_scaffolding(text: str) -> str | None:
         """Return memory-worthy user text, or None to skip the turn.
 
         When a user invokes a /skill or /bundle, Hermes expands the turn into
@@ -704,7 +705,7 @@ class MemoryManager:
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Sync a completed turn to all providers.
 
@@ -788,7 +789,7 @@ class MemoryManager:
             )
 
     async def flush_pending(  # noqa: ASYNC109 - upstream public argument
-        self, timeout: Optional[float] = None  # noqa: ASYNC109
+        self, timeout: float | None = None  # noqa: ASYNC109
     ) -> bool:
         """Wait for all work queued before this call to finish."""
         pending = tuple(self._background_tasks)
@@ -799,7 +800,7 @@ class MemoryManager:
 
     # -- Tools ---------------------------------------------------------------
 
-    def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_all_tool_schemas(self) -> list[dict[str, Any]]:
         """Collect tool schemas from all providers.
 
         Reserved core tool names (``clarify``, ``delegate_task``, etc.) are
@@ -845,7 +846,7 @@ class MemoryManager:
         return tool_name in self._tool_to_provider
 
     async def handle_tool_call(
-        self, tool_name: str, args: Dict[str, Any], **kwargs
+        self, tool_name: str, args: dict[str, Any], **kwargs
     ) -> str:
         """Route a tool call to the correct provider.
 
@@ -880,7 +881,7 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    async def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Notify all providers of session end."""
         for provider in self._providers:
             try:
@@ -894,7 +895,7 @@ class MemoryManager:
 
     async def commit_session_boundary_async(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         *,
         new_session_id: str,
         parent_session_id: str = "",
@@ -987,7 +988,7 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    async def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    async def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Notify all providers before context compression.
 
         Returns combined text from providers to include in the compression
@@ -1037,7 +1038,7 @@ class MemoryManager:
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Notify external providers when the built-in memory tool writes.
 
@@ -1091,9 +1092,9 @@ class MemoryManager:
     async def notify_memory_tool_write(
         self,
         tool_result: Any,
-        tool_args: Dict[str, Any],
+        tool_args: dict[str, Any],
         *,
-        build_metadata: Optional[Callable[[], Dict[str, Any]]] = None,
+        build_metadata: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         """Mirror a built-in memory tool call to external providers.
 
@@ -1182,14 +1183,14 @@ class MemoryManager:
                 )
 
     @property
-    def shutdown_drain_state(self) -> Dict[str, Any]:
+    def shutdown_drain_state(self) -> dict[str, Any]:
         """Snapshot of the most recent bounded shutdown drain outcome."""
         return dict(self._shutdown_drain_state)
 
     async def _drain_background_tasks(self) -> None:
         """Give queued FIFO work a bounded chance, then abandon explicitly."""
         self._shutting_down = True
-        tracked: Dict[asyncio.Task[Any], str] = {
+        tracked: dict[asyncio.Task[Any], str] = {
             task: kind
             for task, kind in self._background_tasks.items()
             if not task.done()

@@ -16,7 +16,7 @@ a thin dispatcher that delegates to a platform-provided callback.
 
 import inspect
 import json
-from typing import List, Optional, Callable
+from collections.abc import Callable
 
 
 # Maximum number of predefined choices the agent can offer.
@@ -82,7 +82,7 @@ async def _invoke_callback(callback, question, choices, multi_select):
     return await callback(question, choices)
 
 
-def _parse_multi_select_response(raw_response) -> List[str]:
+def _parse_multi_select_response(raw_response) -> list[str]:
     """Parse a multi-select response into a list of cleaned choice strings.
 
     Handles three forms:
@@ -112,9 +112,9 @@ def _parse_multi_select_response(raw_response) -> List[str]:
 
 async def clarify_tool(
     question: str,
-    choices: Optional[List[str]] = None,
+    choices: list[str] | None = None,
     multi_select: bool = False,
-    callback: Optional[Callable] = None,
+    callback: Callable | None = None,
 ) -> str:
     """Native async implementation of the model-visible clarify tool."""
     if not question or not question.strip():

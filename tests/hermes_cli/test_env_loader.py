@@ -64,8 +64,8 @@ async def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
     assert os.getenv("CJK_LABEL") == "日本語"
     after = env_file.read_bytes()
     assert after.decode("utf-8")  # strict
-    assert "café".encode("utf-8") in after
-    assert "日本語".encode("utf-8") in after
+    assert "café".encode() in after
+    assert "日本語".encode() in after
     assert b"\xef\xbf\xbd" not in after
 
 

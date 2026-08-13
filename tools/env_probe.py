@@ -6,14 +6,13 @@ import asyncio
 import logging
 import os
 import shutil
-from typing import Optional
 from weakref import WeakKeyDictionary
 
 import aiofiles.os
 
 logger = logging.getLogger(__name__)
 
-_CACHED_LINE: Optional[str] = None
+_CACHED_LINE: str | None = None
 _PROBE_TASKS: WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Task[str]
 ] = WeakKeyDictionary()
@@ -112,7 +111,7 @@ async def _run(
     )
 
 
-async def _python_version_of(binary: str) -> Optional[str]:
+async def _python_version_of(binary: str) -> str | None:
     if not await _which(binary):
         return None
     code = "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
@@ -141,7 +140,7 @@ async def _detect_pep668(binary: str) -> bool:
     return returncode == 0 and stdout == "yes"
 
 
-async def _pip_python_version() -> Optional[str]:
+async def _pip_python_version() -> str | None:
     if not await _which("pip"):
         return None
     returncode, stdout, _stderr = await _run(["pip", "--version"])

@@ -42,7 +42,8 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
+from collections.abc import Iterable
 
 from tools.registry import tool_error
 
@@ -98,7 +99,7 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000
 
     @classmethod
-    def from_raw(cls, raw: Any) -> "ToolSearchConfig":
+    def from_raw(cls, raw: Any) -> ToolSearchConfig:
         """Build a config from a raw dict / bool / None.
 
         Accepts the legacy bool shape (``tools.tool_search: true``) and the
@@ -228,15 +229,15 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(tool_defs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
     every core tool, plus any tool we can't classify. ``deferrable`` is the
     candidate set for catalog entry.
     """
-    visible: List[Dict[str, Any]] = []
-    deferrable: List[Dict[str, Any]] = []
+    visible: list[dict[str, Any]] = []
+    deferrable: list[dict[str, Any]] = []
     for td in tool_defs:
         fn = td.get("function") or {}
         name = fn.get("name", "")
@@ -256,7 +257,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def estimate_tokens_from_schemas(tool_defs: Iterable[Dict[str, Any]]) -> int:
+def estimate_tokens_from_schemas(tool_defs: Iterable[dict[str, Any]]) -> int:
     """Estimate the token cost of a tool-defs list via the chars/4 rule.
 
     Cheap and stable across providers. The number doesn't need to be exact —
@@ -276,7 +277,7 @@ def estimate_tokens_from_schemas(tool_defs: Iterable[Dict[str, Any]]) -> int:
 def should_activate(
     config: ToolSearchConfig,
     deferrable_tokens: int,
-    context_length: Optional[int],
+    context_length: int | None,
 ) -> bool:
     """Decide whether tool search should activate for the current assembly.
 
@@ -298,7 +299,7 @@ def should_activate(
 
 def listing_token_budget(
     config: ToolSearchConfig,
-    context_length: Optional[int],
+    context_length: int | None,
 ) -> int:
     """Effective token budget for the embedded catalog listing.
 
@@ -324,24 +325,24 @@ class CatalogEntry:
 
     name: str
     description: str
-    schema: Dict[str, Any]  # The full {"type":"function", "function": {...}} entry.
+    schema: dict[str, Any]  # The full {"type":"function", "function": {...}} entry.
     source: str  # "mcp" | "plugin" | "other"
     source_name: str  # Toolset name, e.g. "mcp-github" or "kanban"
 
     # Pre-tokenized fields for BM25.
-    _tokens: List[str] = field(default_factory=list)
+    _tokens: list[str] = field(default_factory=list)
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
-def _tokenize(text: str) -> List[str]:
+def _tokenize(text: str) -> list[str]:
     if not text:
         return []
     return [t.lower() for t in _TOKEN_RE.findall(text)]
 
 
-def _entry_search_text(td: Dict[str, Any]) -> str:
+def _entry_search_text(td: dict[str, Any]) -> str:
     """Build the search-text blob for a deferrable tool.
 
     Includes the tool name (with underscores broken into words so BM25 can
@@ -359,7 +360,7 @@ def _entry_search_text(td: Dict[str, Any]) -> str:
     return f"{name_words} {desc} {param_names}"
 
 
-def _classify_source(name: str) -> Tuple[str, str]:
+def _classify_source(name: str) -> tuple[str, str]:
     """Return (source_kind, source_name) for a registered tool name."""
     try:
         from tools.registry import registry
@@ -373,13 +374,13 @@ def _classify_source(name: str) -> Tuple[str, str]:
         return ("other", "")
 
 
-def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
+def build_catalog(tool_defs: list[dict[str, Any]]) -> list[CatalogEntry]:
     """Build the deferred-tool catalog from a tool-defs list.
 
     Caller is expected to pass only the deferrable subset (``classify_tools``
     returns it as the second element).
     """
-    catalog: List[CatalogEntry] = []
+    catalog: list[CatalogEntry] = []
     for td in tool_defs:
         fn = td.get("function") or {}
         name = fn.get("name", "")
@@ -399,9 +400,9 @@ def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
     return catalog
 
 
-def _bm25_score(query_tokens: List[str], doc_tokens: List[str],
-                doc_lengths: List[int], avg_dl: float,
-                doc_freq: Dict[str, int], n_docs: int,
+def _bm25_score(query_tokens: list[str], doc_tokens: list[str],
+                doc_lengths: list[int], avg_dl: float,
+                doc_freq: dict[str, int], n_docs: int,
                 k1: float = 1.5, b: float = 0.75) -> float:
     """Standard BM25 score for one query against one document.
 
@@ -414,7 +415,7 @@ def _bm25_score(query_tokens: List[str], doc_tokens: List[str],
     score = 0.0
     dl = len(doc_tokens)
     # Pre-count tokens in the doc.
-    doc_tf: Dict[str, int] = {}
+    doc_tf: dict[str, int] = {}
     for t in doc_tokens:
         doc_tf[t] = doc_tf.get(t, 0) + 1
     for q in query_tokens:
@@ -430,7 +431,7 @@ def _bm25_score(query_tokens: List[str], doc_tokens: List[str],
     return score
 
 
-def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> List[CatalogEntry]:
+def search_catalog(catalog: list[CatalogEntry], query: str, limit: int = 5) -> list[CatalogEntry]:
     """Return the top-``limit`` catalog entries for ``query`` by BM25.
 
     Falls back to a stable name-substring match when BM25 yields no hits
@@ -448,14 +449,14 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     # Precompute doc statistics.
     doc_lengths = [len(e._tokens) for e in catalog]
     avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
-    doc_freq: Dict[str, int] = {}
+    doc_freq: dict[str, int] = {}
     for e in catalog:
         seen = set(e._tokens)
         for t in seen:
             doc_freq[t] = doc_freq.get(t, 0) + 1
     n_docs = len(catalog)
 
-    scored: List[Tuple[float, CatalogEntry]] = []
+    scored: list[tuple[float, CatalogEntry]] = []
     for entry in catalog:
         s = _bm25_score(query_tokens, entry._tokens, doc_lengths, avg_dl,
                         doc_freq, n_docs)
@@ -511,10 +512,10 @@ def _listing_group_label(source_name: str) -> str:
 
 
 def build_catalog_listing(
-    deferrable: List[Dict[str, Any]],
+    deferrable: list[dict[str, Any]],
     *,
     max_tokens: int = 4000,
-) -> Optional[str]:
+) -> str | None:
     """Render a skills-style manifest of the deferred catalog.
 
     One line per tool — ``name: short description`` — grouped under a
@@ -544,10 +545,10 @@ def build_catalog_listing(
 
 
 def build_catalog_listing_with_form(
-    deferrable: List[Dict[str, Any]],
+    deferrable: list[dict[str, Any]],
     *,
     max_tokens: int = 4000,
-) -> Tuple[Optional[str], str]:
+) -> tuple[str | None, str]:
     """Like :func:`build_catalog_listing` but also reports the form used.
 
     Returns ``(text, form)`` where ``form`` is ``"full"`` (names + short
@@ -564,7 +565,7 @@ def build_catalog_listing_with_form(
     if not deferrable:
         return None, "none"
 
-    groups: Dict[str, List[Tuple[str, str]]] = {}
+    groups: dict[str, list[tuple[str, str]]] = {}
     for td in deferrable:
         fn = td.get("function") or {}
         name = fn.get("name", "")
@@ -594,7 +595,7 @@ def build_catalog_listing_with_form(
     header = ("Deferred tool catalog (call schemas via "
               f"`{TOOL_DESCRIBE_NAME}`, invoke via `{TOOL_CALL_NAME}`):")
 
-    def assemble(modes: Dict[str, str]) -> str:
+    def assemble(modes: dict[str, str]) -> str:
         return "\n".join([header] + [render_group(lbl, modes[lbl])
                                      for lbl in sorted(groups)])
 
@@ -628,9 +629,9 @@ def build_catalog_listing_with_form(
 
 def bridge_tool_schemas(
     deferred_count: int,
-    listing: Optional[str] = None,
+    listing: str | None = None,
     listing_form: str = "",
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Build the bridge tool schemas to inject in place of deferred tools.
 
     The schemas are intentionally short — every byte added here is a byte
@@ -757,7 +758,7 @@ def bridge_tool_schemas(
 class AssemblyResult:
     """Outcome of one assembly. Useful for tests and observability."""
 
-    tool_defs: List[Dict[str, Any]]
+    tool_defs: list[dict[str, Any]]
     activated: bool
     deferred_count: int = 0
     deferred_tokens: int = 0
@@ -771,10 +772,10 @@ class AssemblyResult:
 
 
 async def assemble_tool_defs(
-    tool_defs: List[Dict[str, Any]],
+    tool_defs: list[dict[str, Any]],
     *,
-    context_length: Optional[int] = None,
-    config: Optional[ToolSearchConfig] = None,
+    context_length: int | None = None,
+    config: ToolSearchConfig | None = None,
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
@@ -852,7 +853,7 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
-def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+def _format_search_hit(entry: CatalogEntry) -> dict[str, Any]:
     return {
         "name": entry.name,
         "source": entry.source,
@@ -862,7 +863,7 @@ def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
     }
 
 
-def _available_source_summary(catalog: List[CatalogEntry]) -> List[Dict[str, Any]]:
+def _available_source_summary(catalog: list[CatalogEntry]) -> list[dict[str, Any]]:
     """Return a compact, deterministic summary of connected deferred sources.
 
     Included only when search returns no matches. This gives the model enough
@@ -870,7 +871,7 @@ def _available_source_summary(catalog: List[CatalogEntry]) -> List[Dict[str, Any
     miss as proof that the capability is unavailable, without adding anything
     to the fixed per-turn prompt.
     """
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for entry in catalog:
         # _listing_group_label already falls back to "other" for empty
         # source names, matching the listing path's grouping.
@@ -882,10 +883,10 @@ def _available_source_summary(catalog: List[CatalogEntry]) -> List[Dict[str, Any
     ]
 
 
-async def dispatch_tool_search(args: Dict[str, Any],
+async def dispatch_tool_search(args: dict[str, Any],
                                *,
-                               current_tool_defs: List[Dict[str, Any]],
-                               config: Optional[ToolSearchConfig] = None) -> str:
+                               current_tool_defs: list[dict[str, Any]],
+                               config: ToolSearchConfig | None = None) -> str:
     """Execute the ``tool_search`` bridge tool. Returns a JSON string."""
     if config is None:
         config = await load_config()
@@ -902,7 +903,7 @@ async def dispatch_tool_search(args: Dict[str, Any],
     _, deferrable = classify_tools(current_tool_defs)
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "query": query,
         "total_available": len(catalog),
         "matches": [_format_search_hit(h) for h in hits],
@@ -918,9 +919,9 @@ async def dispatch_tool_search(args: Dict[str, Any],
     return json.dumps(result, ensure_ascii=False)
 
 
-def dispatch_tool_describe(args: Dict[str, Any],
+def dispatch_tool_describe(args: dict[str, Any],
                            *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+                           current_tool_defs: list[dict[str, Any]]) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
@@ -944,7 +945,7 @@ def dispatch_tool_describe(args: Dict[str, Any],
     )
 
 
-def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+def scoped_deferrable_names(tool_defs: list[dict[str, Any]]) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
     ``tool_defs`` is expected to be the *pre-assembly* tool list for the
@@ -964,7 +965,7 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     return frozenset(names)
 
 
-def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
+def validate_deferred_call_args(name: str, args: dict[str, Any]) -> str | None:
     """Probe-validate ``tool_call`` arguments against the deferred tool's schema.
 
     A deferred tool's parameter schema is invisible to the model until it
@@ -1017,7 +1018,7 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(args: dict[str, Any]) -> tuple[str | None, dict[str, Any], str | None]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:

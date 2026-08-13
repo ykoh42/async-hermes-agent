@@ -23,7 +23,8 @@ async def test_store_full_text_is_bounded(tmp_path, monkeypatch):
     assert len(huge) > wt.MAX_STORED_TEXT_CHARS
     path = await wt._store_full_text("https://example.com/big", huge)
     assert path is not None
-    stored = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as stored_file:
+        stored = stored_file.read()
     # Stored copy capped (+ short marker), not the full unbounded blob.
     assert len(stored) <= wt.MAX_STORED_TEXT_CHARS + 200
     assert "stored copy truncated" in stored

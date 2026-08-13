@@ -56,7 +56,6 @@ intentional, bounded construct.
 
 from __future__ import annotations
 
-from typing import Tuple
 
 __all__ = ["StreamingThinkScrubber"]
 
@@ -76,7 +75,7 @@ class StreamingThinkScrubber:
         block boundary.
     """
 
-    _OPEN_TAG_NAMES: Tuple[str, ...] = (
+    _OPEN_TAG_NAMES: tuple[str, ...] = (
         "think",
         "thinking",
         "reasoning",
@@ -86,8 +85,8 @@ class StreamingThinkScrubber:
 
     # Materialise literal tag strings so the hot path does string
     # operations, not regex compilation per feed().
-    _OPEN_TAGS: Tuple[str, ...] = tuple(f"<{name}>" for name in _OPEN_TAG_NAMES)
-    _CLOSE_TAGS: Tuple[str, ...] = tuple(f"</{name}>" for name in _OPEN_TAG_NAMES)
+    _OPEN_TAGS: tuple[str, ...] = tuple(f"<{name}>" for name in _OPEN_TAG_NAMES)
+    _CLOSE_TAGS: tuple[str, ...] = tuple(f"</{name}>" for name in _OPEN_TAG_NAMES)
 
     # Pre-compute the longest tag (for partial-tag hold-back bound).
     _MAX_TAG_LEN: int = max(len(tag) for tag in _OPEN_TAGS + _CLOSE_TAGS)
@@ -236,8 +235,8 @@ class StreamingThinkScrubber:
 
     @staticmethod
     def _find_first_tag(
-        buf: str, tags: Tuple[str, ...],
-    ) -> Tuple[int, int]:
+        buf: str, tags: tuple[str, ...],
+    ) -> tuple[int, int]:
         """Return (earliest_index, tag_length) over *tags*, or (-1, 0).
 
         Case-insensitive match.
@@ -263,7 +262,7 @@ class StreamingThinkScrubber:
         earlier wins.
         """
         buf_lower = buf.lower()
-        best: "tuple[int, int] | None" = None
+        best: tuple[int, int] | None = None
         for open_tag, close_tag in zip(self._OPEN_TAGS, self._CLOSE_TAGS):
             open_lower = open_tag.lower()
             close_lower = close_tag.lower()
@@ -282,7 +281,7 @@ class StreamingThinkScrubber:
 
     def _find_open_at_boundary(
         self, buf: str, already_emitted: list[str],
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """Return the earliest block-boundary open-tag (idx, len).
 
         Returns (-1, 0) if no boundary-legal opener is present.
@@ -342,7 +341,7 @@ class StreamingThinkScrubber:
 
     @classmethod
     def _max_partial_suffix(
-        cls, buf: str, tags: Tuple[str, ...],
+        cls, buf: str, tags: tuple[str, ...],
     ) -> int:
         """Return the longest buf-suffix that is a prefix of any tag.
 

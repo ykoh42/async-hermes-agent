@@ -38,7 +38,8 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _hermes_home import get_hermes_home  # noqa: E402
@@ -118,7 +119,7 @@ class _LedgerLock:
         self.timeout = timeout
         self.fd: int | None = None
 
-    def __enter__(self) -> "_LedgerLock":
+    def __enter__(self) -> _LedgerLock:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout
         while True:
@@ -304,8 +305,7 @@ def render_sources(
             key = f"source{s['id']}"
             title = s.get("title") or s["url"]
             lines.append(
-                "@misc{%s,\n  title = {%s},\n  howpublished = {\\url{%s}},\n  note = {Accessed %s}\n}"
-                % (key, title, s["url"], s.get("accessed", ""))
+                f"@misc{{{key},\n  title = {{{title}}},\n  howpublished = {{\\url{{{s['url']}}}}},\n  note = {{Accessed {s.get('accessed', '')}}}\n}}"
             )
         return "\n".join(lines)
     if style == "footnotes":

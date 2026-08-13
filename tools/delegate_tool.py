@@ -32,7 +32,8 @@ import os
 import stat
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import aiofiles
@@ -189,7 +190,7 @@ _spawn_paused: bool = False
 
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
-_active_subagents: Dict[str, Dict[str, Any]] = {}
+_active_subagents: dict[str, dict[str, Any]] = {}
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -207,7 +208,7 @@ def is_spawn_paused() -> bool:
     return _spawn_paused
 
 
-def _register_subagent(record: Dict[str, Any]) -> None:
+def _register_subagent(record: dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
@@ -245,7 +246,7 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
+def list_active_subagents() -> list[dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
@@ -259,11 +260,11 @@ def list_active_subagents() -> List[Dict[str, Any]]:
 
 
 def _extract_output_tail(
-    result: Dict[str, Any],
+    result: dict[str, Any],
     *,
     max_entries: int = 12,
     max_chars: int = 8000,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Pull the last N tool-call results from a child's conversation.
 
     Powers the overlay's "Output" section — the cc-swarm-parity feature.
@@ -276,8 +277,8 @@ def _extract_output_tail(
         return []
 
     # Walk in reverse to build a tail; stop when we have enough.
-    tail: List[Dict[str, Any]] = []
-    pending_call_by_id: Dict[str, str] = {}
+    tail: list[dict[str, Any]] = []
+    pending_call_by_id: dict[str, str] = {}
 
     # First pass (forward): build tool_call_id -> tool_name map
     for msg in messages:
@@ -391,7 +392,7 @@ def _sanitize_tool_target(key: str, value: Any) -> Any:
     return bounded
 
 
-def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
+def _summarize_tool_arguments(arguments: Any) -> dict[str, Any]:
     """Summarize argument names and side-effect targets without raw payloads."""
     if not isinstance(arguments, str):
         return {"argument_keys": [], "targets": {}}
@@ -403,7 +404,7 @@ def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
         return {"argument_keys": [], "targets": {}}
 
     keys = sorted(str(key)[:128] for key in parsed)[:64]
-    targets: Dict[str, Any] = {}
+    targets: dict[str, Any] = {}
     for raw_key, value in parsed.items():
         key = str(raw_key).lower()
         if key not in _TOOL_INPUT_TARGET_KEYS:
@@ -414,7 +415,7 @@ def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
     return {"argument_keys": keys, "targets": targets}
 
 
-def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
+def _sanitize_tool_input_summary(summary: Any) -> dict[str, Any]:
     if not isinstance(summary, dict):
         return {"argument_keys": [], "targets": {}}
     keys = summary.get("argument_keys")
@@ -424,7 +425,7 @@ def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
         else []
     )
     targets = summary.get("targets")
-    safe_targets: Dict[str, Any] = {}
+    safe_targets: dict[str, Any] = {}
     if isinstance(targets, dict):
         for raw_key, value in targets.items():
             key = str(raw_key).lower()
@@ -436,12 +437,12 @@ def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
     return {"argument_keys": safe_keys, "targets": safe_targets}
 
 
-def _subagent_stop_tool_call_history(tool_trace: Any) -> List[Dict[str, Any]]:
+def _subagent_stop_tool_call_history(tool_trace: Any) -> list[dict[str, Any]]:
     """Build a detached, metadata-only tool history for lifecycle hooks."""
     if not isinstance(tool_trace, list):
         return []
 
-    history: List[Dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
     for item in tool_trace:
         if not isinstance(item, dict):
             continue
@@ -502,7 +503,7 @@ def _looks_like_error_output(content: Any) -> bool:
     )
 
 
-def _normalize_role(r: Optional[str]) -> str:
+def _normalize_role(r: str | None) -> str:
     """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
 
     None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
@@ -577,7 +578,7 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
-def _get_child_timeout() -> Optional[float]:
+def _get_child_timeout() -> float | None:
     """Read delegation.child_timeout_seconds from config.
 
     Returns the number of seconds a single child agent is allowed to run
@@ -728,8 +729,8 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
 
 
 def _preserve_parent_mcp_toolsets(
-    child_toolsets: List[str], parent_toolsets: set[str]
-) -> List[str]:
+    child_toolsets: list[str], parent_toolsets: set[str]
+) -> list[str]:
     """Append any parent MCP toolsets that are missing from a narrowed child."""
     preserved = list(child_toolsets)
     for toolset_name in sorted(parent_toolsets):
@@ -756,7 +757,7 @@ _MIN_SUMMARY_CHARS = 2000
 # mid-task. Errors should come from what the child actually does; stuck-child
 # detection lives in the heartbeat staleness monitor below. Users can opt back
 # in via delegation.child_timeout_seconds.
-DEFAULT_CHILD_TIMEOUT: Optional[float] = None
+DEFAULT_CHILD_TIMEOUT: float | None = None
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -776,7 +777,7 @@ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 # ---------------------------------------------------------------------------
 
 
-class DelegateEvent(str, enum.Enum):
+class DelegateEvent(str, enum.Enum):  # noqa: UP042 - preserve legacy str() output
     """Formal event types emitted during delegation progress.
 
     _build_child_progress_callback normalises incoming legacy strings
@@ -799,7 +800,7 @@ class DelegateEvent(str, enum.Enum):
 
 # Legacy event strings → DelegateEvent mapping.
 # Incoming child-agent events use the old names; the callback normalises them.
-_LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
+_LEGACY_EVENT_MAP: dict[str, DelegateEvent] = {
     "_thinking": DelegateEvent.TASK_THINKING,
     "reasoning.available": DelegateEvent.TASK_THINKING,
     "tool.started": DelegateEvent.TASK_TOOL_STARTED,
@@ -815,9 +816,9 @@ def check_delegate_requirements() -> bool:
 
 def _build_child_system_prompt(
     goal: str,
-    context: Optional[str] = None,
+    context: str | None = None,
     *,
-    workspace_path: Optional[str] = None,
+    workspace_path: str | None = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -891,7 +892,7 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-async def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+async def _resolve_workspace_hint(parent_agent) -> str | None:
     """Best-effort local workspace hint for child prompts.
 
     We only inject a path when we have a concrete absolute directory. This avoids
@@ -931,7 +932,7 @@ async def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
-def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
+def _strip_blocked_tools(toolsets: list[str]) -> list[str]:
     """Remove toolsets that contain only blocked tools.
 
     The strip set is derived from DELEGATE_BLOCKED_TOOLS plus the explicit
@@ -951,7 +952,7 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
-def _blocked_toolsets_for_role(role: str) -> List[str]:
+def _blocked_toolsets_for_role(role: str) -> list[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
     ``_strip_blocked_tools`` can remove fully blocked toolsets, but it must keep
@@ -996,13 +997,13 @@ def _build_child_progress_callback(
     parent_agent,
     task_count: int = 1,
     *,
-    subagent_id: Optional[str] = None,
-    parent_id: Optional[str] = None,
-    depth: Optional[int] = None,
-    model: Optional[str] = None,
-    toolsets: Optional[List[str]] = None,
-    session_ref: Optional[Dict[str, Any]] = None,
-) -> Optional[callable]:
+    subagent_id: str | None = None,
+    parent_id: str | None = None,
+    depth: int | None = None,
+    model: str | None = None,
+    toolsets: list[str] | None = None,
+    session_ref: dict[str, Any] | None = None,
+) -> Callable[..., Any] | None:
     """Build a callback that relays child agent tool calls to the parent display.
 
     Two display paths:
@@ -1030,11 +1031,11 @@ def _build_child_progress_callback(
 
     # Gateway: batch tool names, flush periodically
     _BATCH_SIZE = 5
-    _batch: List[str] = []
+    _batch: list[str] = []
     _tool_count = [0]  # per-subagent running counter (list for closure mutation)
 
-    def _identity_kwargs() -> Dict[str, Any]:
-        kw: Dict[str, Any] = {
+    def _identity_kwargs() -> dict[str, Any]:
+        kw: dict[str, Any] = {
             "task_index": task_index,
             "task_count": task_count,
             "goal": goal_label,
@@ -1058,7 +1059,7 @@ def _build_child_progress_callback(
         return kw
 
     def _relay(
-        event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs
+        event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs
     ):
         if not parent_cb:
             return
@@ -1070,7 +1071,7 @@ def _build_child_progress_callback(
             logger.debug("Parent callback failed: %s", e)
 
     def _callback(
-        event_type, tool_name: str = None, preview: str = None, args=None, **kwargs
+        event_type, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs
     ):
         # Lifecycle events emitted by the orchestrator itself — handled
         # before enum normalisation since they are not part of DelegateEvent.
@@ -1195,7 +1196,7 @@ def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
 
-def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> Optional[str]:
+def _inherit_parent_base_url(parent_agent, fallback_base_url: str | None) -> str | None:
     """Return the base URL the parent is actually calling, not a stale attribute.
 
     ``parent_agent.base_url`` can still carry a leftover OpenRouter URL from an
@@ -1232,22 +1233,22 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
 async def _build_child_agent(
     task_index: int,
     goal: str,
-    context: Optional[str],
-    toolsets: Optional[List[str]],
-    model: Optional[str],
+    context: str | None,
+    toolsets: list[str] | None,
+    model: str | None,
     max_iterations: int,
     task_count: int,
     parent_agent,
     # Credential overrides from delegation config (provider:model resolution)
-    override_provider: Optional[str] = None,
-    override_base_url: Optional[str] = None,
-    override_api_key: Optional[str] = None,
-    override_api_mode: Optional[str] = None,
-    override_request_overrides: Optional[Dict[str, Any]] = None,
-    override_max_tokens: Optional[int] = None,
+    override_provider: str | None = None,
+    override_base_url: str | None = None,
+    override_api_key: str | None = None,
+    override_api_mode: str | None = None,
+    override_request_overrides: dict[str, Any] | None = None,
+    override_max_tokens: int | None = None,
     # ACP transport overrides from trusted delegation config.
-    override_acp_command: Optional[str] = None,
-    override_acp_args: Optional[List[str]] = None,
+    override_acp_command: str | None = None,
+    override_acp_args: list[str] | None = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1373,7 +1374,7 @@ async def _build_child_agent(
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
-    child_session_ref: Dict[str, Any] = {}
+    child_session_ref: dict[str, Any] = {}
     child_progress_cb = _build_child_progress_callback(
         task_index,
         goal,
@@ -1532,7 +1533,7 @@ async def _build_child_agent(
         if override_max_tokens is not None
         else getattr(parent_agent, "max_tokens", None)
     )
-    child_optional_kwargs: Dict[str, Any] = {}
+    child_optional_kwargs: dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
@@ -1647,7 +1648,7 @@ async def _build_child_agent(
 
 
 
-async def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
+async def _spill_summary_to_file(task_index: int, summary: str) -> str | None:
     """Write a subagent's full summary to the delegation cache and return path.
 
     Mirrors web_extract's ``_store_full_text``: the file lands in
@@ -1675,7 +1676,7 @@ async def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]
 
 async def _trim_summary_with_footer(
     summary: str, cap: int, task_index: int
-) -> tuple[str, Optional[str]]:
+) -> tuple[str, str | None]:
     """Return (model_text, spill_path) for one over-budget summary.
 
     Mirrors web_extract's ``_truncate_with_footer``: keep a head+tail window
@@ -1728,7 +1729,7 @@ async def _trim_summary_with_footer(
     return model_text, spill_path
 
 
-def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]:
+def _parent_summary_char_budget(parent_agent, n_summaries: int) -> int | None:
     """Per-summary character budget sized against the parent's *remaining*
     context headroom, split across the batch.
 
@@ -1768,7 +1769,7 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         return None
 
 
-async def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
+async def _apply_summary_budget(results: list[dict[str, Any]], parent_agent) -> None:
     """Trim subagent summaries in-place so the batch can't overflow the
     parent's context window, spilling full text to disk so nothing is lost.
 
@@ -1829,7 +1830,7 @@ async def _run_single_child(
     child=None,
     parent_agent=None,
     **_kwargs,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Run a pre-built child agent in the current event loop.
     Returns a structured result dict.
@@ -2135,8 +2136,8 @@ async def _run_single_child(
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
-        tool_trace: list[Dict[str, Any]] = []
-        trace_by_id: Dict[str, Dict[str, Any]] = {}
+        tool_trace: list[dict[str, Any]] = []
+        trace_by_id: dict[str, dict[str, Any]] = {}
         messages = result.get("messages") or []
         if isinstance(messages, list):
             for msg in messages:
@@ -2184,7 +2185,7 @@ async def _run_single_child(
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
 
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             "task_index": task_index,
             "status": status,
             "summary": summary,
@@ -2283,7 +2284,7 @@ async def _run_single_child(
 
         _output_tail = _extract_output_tail(result, max_entries=8, max_chars=600)
 
-        complete_kwargs: Dict[str, Any] = {
+        complete_kwargs: dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
             "status": status,
             "duration_seconds": duration,
@@ -2385,8 +2386,8 @@ async def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
 async def _finalize_child_results(
-    results: List[Dict[str, Any]],
-    children: List[tuple[int, Dict[str, Any], Any]],
+    results: list[dict[str, Any]],
+    children: list[tuple[int, dict[str, Any], Any]],
     parent_agent,
 ) -> None:
     """Apply host-owned summary, hook, and cost contracts once."""
@@ -2476,7 +2477,7 @@ async def _run_child_lifecycle(
     goal: str,
     child=None,
     parent_agent=None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""
     result = await _run_single_child(task_index, goal, child, parent_agent)
     result.setdefault("task_index", task_index)
@@ -2491,12 +2492,12 @@ async def _run_child_lifecycle(
 
 def _format_background_completion(
     delegation_id: str,
-    task_list: List[Dict[str, Any]],
-    combined: Dict[str, Any],
+    task_list: list[dict[str, Any]],
+    combined: dict[str, Any],
     *,
-    context: Optional[str],
+    context: str | None,
     role: str,
-    model: Optional[str],
+    model: str | None,
     dispatched_at: float,
 ) -> str:
     """Build the self-contained completion turn used by upstream delivery."""
@@ -2547,7 +2548,7 @@ def _format_background_completion(
 
 def _recover_tasks_from_json_string(
     tasks: Any,
-) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+) -> tuple[list[dict[str, Any]] | None, str | None]:
     if not isinstance(tasks, str):
         return None, None
     raw = tasks.strip()
@@ -2569,12 +2570,12 @@ def _recover_tasks_from_json_string(
 
 
 async def delegate_task(
-    goal: Optional[str] = None,
-    context: Optional[str] = None,
-    tasks: Optional[List[Dict[str, Any]]] = None,
-    max_iterations: Optional[int] = None,
-    role: Optional[str] = None,
-    background: Optional[bool] = None,
+    goal: str | None = None,
+    context: str | None = None,
+    tasks: list[dict[str, Any]] | None = None,
+    max_iterations: int | None = None,
+    role: str | None = None,
+    background: bool | None = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2745,7 +2746,7 @@ async def delegate_task(
                 )
             )
         else:
-            child_results: dict[int, Dict[str, Any]] = {}
+            child_results: dict[int, dict[str, Any]] = {}
 
             async def _run_and_store(index: int, task: dict, child: Any) -> None:
                 child_results[index] = await _run_single_child(
@@ -2936,9 +2937,9 @@ async def delegate_task(
 
 
 async def _resolve_child_credential_pool(
-    effective_provider: Optional[str],
+    effective_provider: str | None,
     parent_agent,
-    effective_base_url: Optional[str] = None,
+    effective_base_url: str | None = None,
 ):
     """Resolve a credential pool for the child agent.
 

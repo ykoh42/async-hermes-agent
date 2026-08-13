@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import urlparse
 
 import aiofiles
@@ -35,11 +35,11 @@ _DEFAULT_WEBSITE_BLOCKLIST = {
 # Cache: parsed policy + timestamp.  Avoids re-reading config.yaml on every
 # URL check (a multi-URL extract with 50 pages would otherwise mean 51 YAML parses).
 _CACHE_TTL_SECONDS = 30.0
-_cached_policy: Optional[Dict[str, Any]] = None
-_cached_policy_path: Optional[str] = None
+_cached_policy: dict[str, Any] | None = None
+_cached_policy_path: str | None = None
 _cached_policy_time: float = 0.0
-_policy_cache_by_path: Dict[str, Tuple[Dict[str, Any], float]] = {}
-_policy_path_aliases: Dict[str, str] = {}
+_policy_cache_by_path: dict[str, tuple[dict[str, Any], float]] = {}
+_policy_path_aliases: dict[str, str] = {}
 _policy_cache_guard = threading.RLock()
 
 
@@ -55,7 +55,7 @@ def _normalize_host(host: str) -> str:
     return (host or "").strip().lower().rstrip(".")
 
 
-def _normalize_rule(rule: Any) -> Optional[str]:
+def _normalize_rule(rule: Any) -> str | None:
     if not isinstance(rule, str):
         return None
     value = rule.strip().lower()
@@ -109,7 +109,7 @@ async def _canonical_policy_path(path: Path) -> str:
 def _publish_policy_cache(
     cache_key: str,
     display_path: str,
-    policy: Dict[str, Any],
+    policy: dict[str, Any],
     cached_at: float,
 ) -> None:
     """Store one profile policy and update historical private snapshots."""
@@ -146,8 +146,8 @@ def _extract_host_from_urlish(url: str) -> str:
 
 async def check_website_access(
     url: str,
-    config_path: Optional[Path] = None,
-) -> Optional[Dict[str, str]]:
+    config_path: Path | None = None,
+) -> dict[str, str] | None:
     """Async policy check for network-capable tool handlers.
 
     On a cold cache, YAML and optional shared blocklist files are read through
@@ -195,7 +195,7 @@ async def check_website_access(
     return None
 
 
-async def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]:
+async def load_website_blocklist(config_path: Path | None = None) -> dict[str, Any]:
     """Load the website blocklist through native async file I/O."""
     config_path = config_path or _get_default_config_path()
     resolved_path = str(config_path)
@@ -253,8 +253,8 @@ async def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str
     if not isinstance(enabled, bool):
         raise WebsitePolicyError("security.website_blocklist.enabled must be a boolean")
 
-    rules: List[Dict[str, str]] = []
-    seen: set[Tuple[str, str]] = set()
+    rules: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for raw_rule in raw_domains:
         normalized = _normalize_rule(raw_rule)
         if normalized and ("config", normalized) not in seen:

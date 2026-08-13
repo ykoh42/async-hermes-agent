@@ -27,10 +27,11 @@ diff regions.
 from __future__ import annotations
 
 import difflib
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
 
-def build_line_shift(pre_text: str, post_text: str) -> Callable[[int], Optional[int]]:
+def build_line_shift(pre_text: str, post_text: str) -> Callable[[int], int | None]:
     """Build a function mapping pre-edit line numbers to post-edit line numbers.
 
     Lines are 0-indexed to match the LSP wire format
@@ -61,7 +62,7 @@ def build_line_shift(pre_text: str, post_text: str) -> Callable[[int], Optional[
     sm = difflib.SequenceMatcher(a=pre_lines, b=post_lines, autojunk=False)
     opcodes = sm.get_opcodes()
 
-    def shift(line: int) -> Optional[int]:
+    def shift(line: int) -> int | None:
         # Find the opcode region whose i1 <= line < i2.
         # Linear scan is fine — typical opcode count is small (single
         # digits for a typical patch-tool edit).
@@ -88,8 +89,8 @@ def build_line_shift(pre_text: str, post_text: str) -> Callable[[int], Optional[
     return shift
 
 
-def shift_diagnostic_range(diag: Dict[str, Any],
-                           shift: Callable[[int], Optional[int]]) -> Optional[Dict[str, Any]]:
+def shift_diagnostic_range(diag: dict[str, Any],
+                           shift: Callable[[int], int | None]) -> dict[str, Any] | None:
     """Return a copy of ``diag`` with its line range remapped through ``shift``.
 
     Returns ``None`` if the diagnostic's start line maps to ``None``
@@ -133,10 +134,10 @@ def shift_diagnostic_range(diag: Dict[str, Any],
     return shifted
 
 
-def shift_baseline(baseline: List[Dict[str, Any]],
-                   shift: Callable[[int], Optional[int]]) -> List[Dict[str, Any]]:
+def shift_baseline(baseline: list[dict[str, Any]],
+                   shift: Callable[[int], int | None]) -> list[dict[str, Any]]:
     """Apply ``shift`` to every diagnostic in ``baseline``, dropping deleted entries."""
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for d in baseline:
         if not isinstance(d, dict):
             continue

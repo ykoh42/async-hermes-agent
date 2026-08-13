@@ -17,7 +17,8 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 import aiofiles
 import aiofiles.os
@@ -38,7 +39,7 @@ def _state_path() -> str:
     return os.path.join(base, _STATE_SUBDIR, _STATE_FILENAME)
 
 
-def _parse_reset_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float]:
+def _parse_reset_seconds(headers: Mapping[str, str] | None) -> float | None:
     """Extract the best available reset-time estimate from response headers.
 
     Priority:
@@ -72,8 +73,8 @@ def _parse_reset_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float
 
 async def record_nous_rate_limit(
     *,
-    headers: Optional[Mapping[str, str]] = None,
-    error_context: Optional[dict[str, Any]] = None,
+    headers: Mapping[str, str] | None = None,
+    error_context: dict[str, Any] | None = None,
     default_cooldown: float = 300.0,
 ) -> None:
     """Record that Nous Portal is rate-limited.
@@ -140,7 +141,7 @@ async def record_nous_rate_limit(
         logger.debug("Failed to write Nous rate limit state: %s", exc)
 
 
-async def nous_rate_limit_remaining() -> Optional[float]:
+async def nous_rate_limit_remaining() -> float | None:
     """Check if Nous Portal is currently rate-limited.
 
     Returns:
@@ -195,8 +196,8 @@ _MIN_RESET_FOR_BREAKER_SECONDS = 60.0
 
 def is_genuine_nous_rate_limit(
     *,
-    headers: Optional[Mapping[str, str]] = None,
-    last_known_state: Optional[Any] = None,
+    headers: Mapping[str, str] | None = None,
+    last_known_state: Any | None = None,
 ) -> bool:
     """Decide whether a 429 from Nous Portal is a real account rate limit.
 
@@ -249,8 +250,8 @@ def is_genuine_nous_rate_limit(
 
 
 def _parse_buckets_from_headers(
-    headers: Optional[Mapping[str, str]],
-) -> dict[str, tuple[Optional[int], Optional[float]]]:
+    headers: Mapping[str, str] | None,
+) -> dict[str, tuple[int | None, float | None]]:
     """Extract (remaining, reset_seconds) per bucket from x-ratelimit-* headers.
 
     Returns empty dict when no rate-limit headers are present.
@@ -262,7 +263,7 @@ def _parse_buckets_from_headers(
     if not any(k.startswith("x-ratelimit-") for k in lowered):
         return {}
 
-    def _maybe_int(raw: Optional[str]) -> Optional[int]:
+    def _maybe_int(raw: str | None) -> int | None:
         if raw is None:
             return None
         try:
@@ -270,7 +271,7 @@ def _parse_buckets_from_headers(
         except (TypeError, ValueError):
             return None
 
-    def _maybe_float(raw: Optional[str]) -> Optional[float]:
+    def _maybe_float(raw: str | None) -> float | None:
         if raw is None:
             return None
         try:
@@ -278,7 +279,7 @@ def _parse_buckets_from_headers(
         except (TypeError, ValueError):
             return None
 
-    result: dict[str, tuple[Optional[int], Optional[float]]] = {}
+    result: dict[str, tuple[int | None, float | None]] = {}
     for tag in ("requests", "requests-1h", "tokens", "tokens-1h"):
         remaining = _maybe_int(lowered.get(f"x-ratelimit-remaining-{tag}"))
         reset = _maybe_float(lowered.get(f"x-ratelimit-reset-{tag}"))
@@ -288,7 +289,7 @@ def _parse_buckets_from_headers(
 
 
 def _has_exhausted_bucket(
-    buckets: Mapping[str, tuple[Optional[int], Optional[float]]],
+    buckets: Mapping[str, tuple[int | None, float | None]],
 ) -> bool:
     """Return True when any bucket has remaining == 0 AND a meaningful reset window."""
     for remaining, reset in buckets.values():

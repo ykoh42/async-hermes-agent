@@ -9,7 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -59,7 +59,7 @@ class TestWebProviderABCs:
             def supports_search(self) -> bool:
                 return True
 
-            async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+            async def search(self, query: str, limit: int = 5) -> dict[str, Any]:
                 return {"success": True, "data": {"web": []}}
 
         # Should instantiate fine — extract has default supports_*()

@@ -895,7 +895,7 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
-def reset_file_dedup(task_id: str = None):
+def reset_file_dedup(task_id: str | None = None):
     """Clear cached unchanged-read results after context compression."""
     with _read_tracker_lock:
         states = [_read_tracker.get(task_id)] if task_id else list(_read_tracker.values())
@@ -905,7 +905,7 @@ def reset_file_dedup(task_id: str = None):
                 state.setdefault("dedup_hits", {}).clear()
 
 
-def clear_file_ops_cache(task_id: str = None):
+def clear_file_ops_cache(task_id: str | None = None):
     """Release per-task file-tool state when a terminal environment closes.
 
     The async fork no longer keeps the upstream shell-backed ``FileOperations``
@@ -1552,7 +1552,7 @@ async def _write_native_file(path: Path, content: str) -> None:
 async def _verify_native_file(path: Path, expected: str) -> bool:
     """Read back an atomic write and compare the exact persisted text."""
     async with aiofiles.open(
-        path, "r", encoding="utf-8", errors="strict", newline=""
+        path, encoding="utf-8", errors="strict", newline=""
     ) as handle:
         return await handle.read() == expected
 
@@ -1961,7 +1961,7 @@ async def _write_file_native(args, **kw):
 
 async def _read_native_patch_content(path: Path) -> str:
     """Read a complete text file for an atomic native patch transaction."""
-    async with aiofiles.open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+    async with aiofiles.open(path, encoding="utf-8", errors="replace", newline="") as handle:
         return await handle.read()
 
 
@@ -2721,11 +2721,11 @@ async def write_file_tool(
 
 async def patch_tool(
     mode: str = "replace",
-    path: str = None,
-    old_string: str = None,
-    new_string: str = None,
+    path: str | None = None,
+    old_string: str | None = None,
+    new_string: str | None = None,
     replace_all: bool = False,
-    patch: str = None,
+    patch: str | None = None,
     task_id: str = "default",
     cross_profile: bool = False,
     session_id: str | None = None,
@@ -2755,7 +2755,7 @@ async def search_tool(
     pattern: str,
     target: str = "content",
     path: str = ".",
-    file_glob: str = None,
+    file_glob: str | None = None,
     limit: int = 50,
     offset: int = 0,
     output_mode: str = "content",

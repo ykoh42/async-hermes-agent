@@ -64,8 +64,8 @@ import threading
 import time
 from collections.abc import MutableMapping, MutableSet
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple, Union
+from datetime import UTC, datetime
+from typing import Any
 from pathlib import Path
 
 import aiofiles
@@ -458,7 +458,7 @@ _SANE_PATH_DIRS = (
 _SANE_PATH = os.pathsep.join(_SANE_PATH_DIRS)
 
 
-_cached_homebrew_node_dirs: Optional[tuple[str, ...]] = None
+_cached_homebrew_node_dirs: tuple[str, ...] | None = None
 
 
 async def _discover_homebrew_node_dirs() -> tuple[str, ...]:
@@ -549,7 +549,7 @@ MAX_STORED_SNAPSHOT_CHARS = 2_000_000
 # Commands that legitimately return empty stdout (e.g. close, record).
 _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})
 
-_cached_command_timeout: Optional[int] = None
+_cached_command_timeout: int | None = None
 _command_timeout_resolved = False
 
 
@@ -648,7 +648,7 @@ async def _read_command_output_files(
     stdout = stderr = ""
     for path, slot in ((stdout_path, "stdout"), (stderr_path, "stderr")):
         try:
-            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(path, encoding="utf-8") as f:
                 text = (await f.read()).strip()
         except OSError:
             continue
@@ -717,12 +717,12 @@ async def _format_browser_timeout_error(
     return "\n".join(parts)
 
 
-def _get_vision_model() -> Optional[str]:
+def _get_vision_model() -> str | None:
     """Model for browser_vision (screenshot analysis — multimodal)."""
     return (get_secret("AUXILIARY_VISION_MODEL", "") or "").strip() or None
 
 
-def _get_extraction_model() -> Optional[str]:
+def _get_extraction_model() -> str | None:
     """Model for page snapshot text summarization — same as web_extract."""
     return (
         get_secret("AUXILIARY_WEB_EXTRACT_MODEL", "") or ""
@@ -856,7 +856,7 @@ async def _get_cdp_override() -> str:
     return await _resolve_cdp_override(raw)
 
 
-async def _get_dialog_policy_config() -> Tuple[str, float]:
+async def _get_dialog_policy_config() -> tuple[str, float]:
     """Read ``browser.dialog_policy`` + ``browser.dialog_timeout_s`` from config.
 
     Returns a ``(policy, timeout_s)`` tuple, falling back to the supervisor's
@@ -975,22 +975,22 @@ async def _stop_cdp_supervisor(task_id: str) -> None:
 # wins. This keeps the test surface stable while letting third-party
 # plugins drop in under ``~/.hermes/plugins/browser/<vendor>/``.
 
-_PROVIDER_REGISTRY: Dict[str, type] = {}
+_PROVIDER_REGISTRY: dict[str, type] = {}
 # Frozen copy of the import-time _PROVIDER_REGISTRY, used by
 # ``_is_legacy_provider_registry_overridden`` to detect test-time
 # monkeypatching. NEVER mutate this dict.
-_DEFAULT_PROVIDER_REGISTRY: Dict[str, type] = dict(_PROVIDER_REGISTRY)
+_DEFAULT_PROVIDER_REGISTRY: dict[str, type] = dict(_PROVIDER_REGISTRY)
 
-_cached_cloud_provider: Optional[CloudBrowserProvider] = None
+_cached_cloud_provider: CloudBrowserProvider | None = None
 _cloud_provider_resolved = False
 _allow_private_urls_resolved = False
-_cached_allow_private_urls: Optional[bool] = None
-_cached_agent_browser: Optional[str] = None
+_cached_allow_private_urls: bool | None = None
+_cached_agent_browser: str | None = None
 _agent_browser_resolved = False
 
 # Lightpanda engine support — cached like _get_cloud_provider().
 # agent-browser v0.25.3+ supports ``--engine lightpanda`` natively.
-_cached_browser_engine: Optional[str] = None
+_cached_browser_engine: str | None = None
 _browser_engine_resolved = False
 
 
@@ -1044,7 +1044,7 @@ async def _ensure_browser_plugins_loaded() -> None:
         logger.debug("Browser plugin discovery failed (non-fatal): %s", exc)
 
 
-async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
+async def _get_cloud_provider() -> CloudBrowserProvider | None:
     """Return the configured cloud browser provider, or None for local mode.
 
     Reads ``config["browser"]["cloud_provider"]`` once and caches the result
@@ -1070,7 +1070,7 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     elif _cloud_provider_resolved:
         return _cached_cloud_provider
 
-    resolved: Optional[CloudBrowserProvider] = None
+    resolved: CloudBrowserProvider | None = None
     try:
         cfg = await load_config_readonly()
         browser_cfg = cfg.get("browser", {})
@@ -1300,7 +1300,7 @@ async def _get_browser_engine() -> str:
     return value
 
 
-_cached_headed_mode: Optional[bool] = None
+_cached_headed_mode: bool | None = None
 _headed_mode_resolved = False
 
 
@@ -1368,8 +1368,8 @@ async def _using_lightpanda_engine() -> bool:
 
 
 async def _lightpanda_fallback_reason(
-    engine: str, command: str, result: Dict[str, Any]
-) -> Optional[str]:
+    engine: str, command: str, result: dict[str, Any]
+) -> str | None:
     """Return the user-visible reason a Lightpanda result needs Chrome fallback.
 
     ``None`` means no fallback should run.  The returned string is copied into
@@ -1438,15 +1438,15 @@ async def _lightpanda_fallback_reason(
 
 
 async def _needs_lightpanda_fallback(
-    engine: str, command: str, result: Dict[str, Any]
+    engine: str, command: str, result: dict[str, Any]
 ) -> bool:
     """Check if a Lightpanda result should trigger an automatic Chrome fallback."""
     return await _lightpanda_fallback_reason(engine, command, result) is not None
 
 
 def _annotate_lightpanda_fallback(
-    result: Dict[str, Any], reason: str
-) -> Dict[str, Any]:
+    result: dict[str, Any], reason: str
+) -> dict[str, Any]:
     """Add a user-visible Chrome fallback warning to a browser command result."""
     warning = (
         f"⚠ Lightpanda fallback: Chrome was used for this browser action. {reason}"
@@ -1473,8 +1473,8 @@ def _annotate_lightpanda_fallback(
 
 
 def _copy_fallback_warning(
-    target: Dict[str, Any], result: Dict[str, Any]
-) -> Dict[str, Any]:
+    target: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
     """Copy browser fallback metadata from an internal result into a tool response."""
     if result.get("fallback_warning"):
         target["fallback_warning"] = result["fallback_warning"]
@@ -1486,9 +1486,9 @@ def _copy_fallback_warning(
 async def _run_chrome_fallback_command(
     task_id: str,
     command: str,
-    args: List[str],
+    args: list[str],
     timeout: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run a browser command in a temporary Chrome session at the current URL.
 
     agent-browser locks the engine when a named daemon starts. Passing
@@ -1566,7 +1566,7 @@ async def _run_chrome_fallback_command(
             BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000
         )
 
-    async def _run_tmp(cmd: str, cmd_args: List[str]) -> Dict[str, Any]:
+    async def _run_tmp(cmd: str, cmd_args: list[str]) -> dict[str, Any]:
         full = base_args + [cmd] + cmd_args
         # Use temp-file stdout/stderr pattern (same as _run_browser_command)
         # to avoid pipe hang from agent-browser daemon inheriting fds.
@@ -1662,7 +1662,7 @@ async def _run_chrome_fallback_command(
             await _finish_owned_task(cleanup_task)
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
-            async with aiofiles.open(stdout_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(stdout_path, encoding="utf-8") as f:
                 stdout = (await f.read()).strip()
             if stdout:
                 return json.loads(stdout.split("\n")[-1])
@@ -1701,9 +1701,9 @@ async def _run_chrome_fallback_command(
 
 async def _chrome_fallback_screenshot(
     task_id: str,
-    args: List[str],
+    args: list[str],
     timeout: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Take a screenshot using a temporary Chrome session."""
     return await _run_chrome_fallback_command(task_id, "screenshot", args, timeout)
 
@@ -1866,7 +1866,7 @@ def _bare_task_id_for_session_key(session_key: str) -> str:
 
 
 def _session_info_owned_by_task(
-    session_info: Dict[str, Any], task_id: str, session_key: str
+    session_info: dict[str, Any], task_id: str, session_key: str
 ) -> bool:
     """Return whether ``session_info`` still belongs to ``task_id``/``session_key``.
 
@@ -1980,7 +1980,7 @@ async def _socket_safe_tmpdir() -> str:
 # cleanup_browser code paths — the key is opaque to those internals.
 #
 # Stores: session_name (always), bb_session_id + cdp_url (cloud mode only)
-_active_sessions: MutableMapping[str, Dict[str, Any]] = _ScopedBrowserDict(
+_active_sessions: MutableMapping[str, dict[str, Any]] = _ScopedBrowserDict(
     "active_sessions"
 )  # session_key -> {session_name, ...}
 _recording_sessions: MutableSet[str] = _ScopedBrowserSet(
@@ -2032,7 +2032,7 @@ _session_last_activity: MutableMapping[str, float] = _ScopedBrowserDict(
 )
 
 # Background cleanup task state
-_cleanup_task: Optional[asyncio.Task[None]] = None
+_cleanup_task: asyncio.Task[None] | None = None
 _cleanup_running = False
 # Protects browser session maps across coroutine suspension points. Recording
 # transitions use a dedicated lock because starting/stopping invokes the
@@ -2047,7 +2047,7 @@ def _recording_lock_for_profile() -> asyncio.Lock:
     return _browser_state().recording_lock
 
 
-def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
+def _session_expiry_timestamp(session_info: dict[str, Any]) -> float | None:
     """Return a provider-authoritative session expiry as epoch seconds.
 
     Cloud providers may omit ``expires_at``. Unknown or malformed values are
@@ -2069,12 +2069,12 @@ def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
         logger.warning("Ignoring invalid cloud browser session expiry timestamp")
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
 
 
 def _session_has_expired(
-    session_info: Dict[str, Any], *, now: Optional[float] = None
+    session_info: dict[str, Any], *, now: float | None = None
 ) -> bool:
     """Return whether a cached browser session crossed its provider deadline."""
     expires_at = _session_expiry_timestamp(session_info)
@@ -2450,7 +2450,7 @@ async def _reap_orphaned_browser_sessions() -> None:
 
         # Ownership check: prefer owner_pid file (cross-process safe).
         owner_pid_file = os.path.join(socket_dir, f"{session_name}.owner_pid")
-        owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
+        owner_alive: bool | None = None  # None = owner_pid missing/unreadable
         if await aiofiles.os.path.isfile(owner_pid_file):
             try:
                 async with aiofiles.open(owner_pid_file, encoding="utf-8") as handle:
@@ -2771,7 +2771,7 @@ BROWSER_TOOL_SCHEMAS = [
 # ============================================================================
 
 
-def _create_local_session(task_id: str) -> Dict[str, Any]:
+def _create_local_session(task_id: str) -> dict[str, Any]:
     import uuid
 
     session_name = f"h_{uuid.uuid4().hex[:10]}"
@@ -2784,7 +2784,7 @@ def _create_local_session(task_id: str) -> Dict[str, Any]:
     }
 
 
-def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, Any]:
+def _create_cdp_session(task_id: str, cdp_url: str) -> dict[str, Any]:
     """Create a session that connects to a user-supplied CDP endpoint."""
     import uuid
 
@@ -2803,7 +2803,7 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, Any]:
     }
 
 
-async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
+async def _get_session_info(task_id: str | None = None) -> dict[str, Any]:
     """
     Get or create session info for the given session key.
 
@@ -2864,7 +2864,7 @@ async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # Create session outside the lock (network call in cloud mode)
     cdp_override = await _get_cdp_override()
     if cdp_override and not force_local:
-        session_info: Dict[str, Any] = _create_cdp_session(task_id, cdp_override)
+        session_info: dict[str, Any] = _create_cdp_session(task_id, cdp_override)
     elif force_local:
         session_info = _create_local_session(task_id)
     else:
@@ -3068,7 +3068,7 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
     )
 
 
-def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
+def _extract_screenshot_path_from_text(text: str) -> str | None:
     """Extract a screenshot file path from agent-browser human-readable output."""
     if not text:
         return None
@@ -3092,10 +3092,10 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
 async def _run_browser_command(
     task_id: str,
     command: str,
-    args: Optional[List[str]] = None,
-    timeout: Optional[int] = None,
-    _engine_override: Optional[str] = None,
-) -> Dict[str, Any]:
+    args: list[str] | None = None,
+    timeout: int | None = None,
+    _engine_override: str | None = None,
+) -> dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
 
@@ -3367,9 +3367,9 @@ async def _run_browser_command(
             }
             # Fall through to fallback check below
         else:
-            async with aiofiles.open(stdout_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(stdout_path, encoding="utf-8") as f:
                 stdout = await f.read()
-            async with aiofiles.open(stderr_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(stderr_path, encoding="utf-8") as f:
                 stderr = await f.read()
             returncode = proc.returncode
 
@@ -3505,7 +3505,7 @@ async def _run_browser_command(
     return result
 
 
-async def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
+async def _store_full_snapshot(snapshot_text: str) -> str | None:
     """Write a full page snapshot to cache/web and return its absolute path.
 
     Called whenever a snapshot exceeds SNAPSHOT_SUMMARIZE_THRESHOLD and the
@@ -3548,7 +3548,7 @@ async def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
 
 
 async def _extract_relevant_content(
-    snapshot_text: str, user_task: Optional[str] = None
+    snapshot_text: str, user_task: str | None = None
 ) -> str:
     """Use LLM to extract relevant content from a snapshot based on the user's task.
 
@@ -3693,7 +3693,7 @@ def _redact_browser_output(value: Any) -> Any:
 # ============================================================================
 
 
-async def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+async def browser_navigate(url: str, task_id: str | None = None) -> str:
     """
     Navigate to a URL in the browser.
 
@@ -3946,7 +3946,7 @@ async def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
 
 async def browser_snapshot(
-    full: bool = False, task_id: Optional[str] = None, user_task: Optional[str] = None
+    full: bool = False, task_id: str | None = None, user_task: str | None = None
 ) -> str:
     """
     Get a text-based snapshot of the current page's accessibility tree.
@@ -4055,7 +4055,7 @@ async def browser_snapshot(
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-async def browser_click(ref: str, task_id: Optional[str] = None) -> str:
+async def browser_click(ref: str, task_id: str | None = None) -> str:
     """
     Click on an element.
 
@@ -4093,7 +4093,7 @@ async def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-async def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
+async def browser_type(ref: str, text: str, task_id: str | None = None) -> str:
     """
     Type text into an input field.
 
@@ -4154,7 +4154,7 @@ async def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> st
         return json.dumps(response, ensure_ascii=False)
 
 
-async def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
+async def browser_scroll(direction: str, task_id: str | None = None) -> str:
     """
     Scroll the page.
 
@@ -4206,7 +4206,7 @@ async def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-async def browser_back(task_id: Optional[str] = None) -> str:
+async def browser_back(task_id: str | None = None) -> str:
     """
     Navigate back in browser history.
 
@@ -4255,7 +4255,7 @@ async def browser_back(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-async def browser_press(key: str, task_id: Optional[str] = None) -> str:
+async def browser_press(key: str, task_id: str | None = None) -> str:
     """
     Press a keyboard key.
 
@@ -4290,7 +4290,7 @@ async def browser_press(key: str, task_id: Optional[str] = None) -> str:
 
 async def _blocked_private_page_action(
     effective_task_id: str, action: str
-) -> Optional[str]:
+) -> str | None:
     """Return a blocked payload when an unsafe cloud page would receive input."""
     if not await _eval_ssrf_guard_active(effective_task_id):
         return None
@@ -4312,8 +4312,8 @@ async def _blocked_private_page_action(
 
 async def browser_console(
     clear: bool = False,
-    expression: Optional[str] = None,
-    task_id: Optional[str] = None,
+    expression: str | None = None,
+    task_id: str | None = None,
 ) -> str:
     """Get browser console messages and JavaScript errors, or evaluate JS in the page.
 
@@ -4425,7 +4425,7 @@ async def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
 _JS_URL_LITERAL_RE = re.compile(r"""https?://[^\s'"`)\]<>]+""", re.IGNORECASE)
 
 
-async def _expression_targets_private_url(expression: str) -> Optional[str]:
+async def _expression_targets_private_url(expression: str) -> str | None:
     """Return the first private/always-blocked URL literal in a JS expression.
 
     Best-effort: scans for ``http(s)://...`` literals (fetch/XHR/navigation
@@ -4444,7 +4444,7 @@ async def _expression_targets_private_url(expression: str) -> Optional[str]:
     return None
 
 
-async def _current_page_private_url(effective_task_id: str) -> Optional[str]:
+async def _current_page_private_url(effective_task_id: str) -> str | None:
     """Return the current page URL when it targets a private/internal address.
 
     Reads ``window.location.href`` via a low-cost eval and returns it when the
@@ -4592,7 +4592,7 @@ def _decoded_js_string_literals(expression: str) -> list[str]:
     ]
 
 
-def _sensitive_browser_eval_token_reason(expression: str) -> Optional[str]:
+def _sensitive_browser_eval_token_reason(expression: str) -> str | None:
     """Return a risk reason for direct or quoted sensitive browser primitives.
 
     ``browser_console(expression=...)`` executes in the page origin.  A denylist
@@ -4617,7 +4617,7 @@ def _sensitive_browser_eval_token_reason(expression: str) -> Optional[str]:
     return None
 
 
-def _risky_browser_eval_reason(expression: str) -> Optional[str]:
+def _risky_browser_eval_reason(expression: str) -> str | None:
     """Return a human-readable reason if a JS expression uses risky primitives."""
     if not expression:
         return None
@@ -4627,7 +4627,7 @@ def _risky_browser_eval_reason(expression: str) -> Optional[str]:
     return _sensitive_browser_eval_token_reason(expression)
 
 
-async def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
+async def _enforce_browser_eval_policy(expression: str) -> str | None:
     """Block sensitive browser JS evaluation when the opt-in denylist is on.
 
     The denylist is opt-in (``browser.restrict_evaluate: true``) because it
@@ -4653,7 +4653,7 @@ async def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
     )
 
 
-async def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
+async def _browser_eval(expression: str, task_id: str | None = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     effective_task_id = await _resolve_last_session_key(task_id or "default")
 
@@ -4829,7 +4829,7 @@ async def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     )
 
 
-async def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Optional[str]:
+async def _camofox_current_page_private_url(tab_id: str, user_id: str) -> str | None:
     """Return the Camofox page URL when it targets a private/internal address.
 
     Camofox analogue of ``_current_page_private_url`` (evaluate endpoint instead
@@ -4857,7 +4857,7 @@ async def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Option
     return None
 
 
-async def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
+async def _camofox_eval(expression: str, task_id: str | None = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
     from tools.browser_camofox import _ensure_tab, _post
 
@@ -4979,7 +4979,7 @@ async def _maybe_stop_recording(task_id: str) -> None:
             _recording_sessions.discard(task_id)
 
 
-async def browser_get_images(task_id: Optional[str] = None) -> str:
+async def browser_get_images(task_id: str | None = None) -> str:
     """
     Get all images on the current page.
 
@@ -5064,8 +5064,8 @@ async def browser_get_images(task_id: Optional[str] = None) -> str:
 async def browser_vision(
     question: str,
     annotate: bool = False,
-    task_id: Optional[str] = None,
-) -> Union[str, Dict[str, Any]]:
+    task_id: str | None = None,
+) -> str | dict[str, Any]:
     """
     Take a screenshot of the current page for visual inspection.
 
@@ -5100,7 +5100,7 @@ async def browser_vision(
     screenshots_dir = await get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     effective_task_id = await _resolve_last_session_key(task_id or "default")
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
 
     # ── Private-network guard: block vision from eval-navigated private pages ──
     # After any eval (browser_console) that may have changed location.href to a
@@ -5334,11 +5334,11 @@ async def browser_vision(
         except Exception:
             pass
 
-        image_part: Dict[str, Any] = {
+        image_part: dict[str, Any] = {
             "type": "image_url",
             "image_url": {"url": data_url},
         }
-        call_kwargs: Dict[str, Any] = {
+        call_kwargs: dict[str, Any] = {
             "task": "vision",
             "messages": [
                 {
@@ -5386,7 +5386,7 @@ async def browser_vision(
         from agent.redact import redact_sensitive_text
 
         analysis = redact_sensitive_text(analysis)
-        response_data: Dict[str, Any] = {
+        response_data: dict[str, Any] = {
             "success": True,
             "analysis": analysis or "Vision analysis returned no content.",
             "screenshot_path": str(screenshot_path),
@@ -5471,7 +5471,7 @@ async def _cleanup_old_recordings(max_age_hours=72) -> None:
 # ============================================================================
 
 
-async def cleanup_browser(task_id: Optional[str] = None) -> None:
+async def cleanup_browser(task_id: str | None = None) -> None:
     """
     Clean up browser session(s) for a task.
 
@@ -5680,10 +5680,10 @@ async def cleanup_all_browsers() -> None:
 
 
 # Cache for Chromium discovery. Invalidated by _reset_browser_caches.
-_cached_chromium_installed: Optional[bool] = None
+_cached_chromium_installed: bool | None = None
 
 
-def _chromium_search_roots() -> List[str]:
+def _chromium_search_roots() -> list[str]:
     """Directories to scan for a Chromium / headless-shell build.
 
     Order mirrors what agent-browser and Playwright actually probe:
@@ -5695,7 +5695,7 @@ def _chromium_search_roots() -> List[str]:
     4. ``%USERPROFILE%\\AppData\\Local\\ms-playwright`` — Playwright's default
        on Windows.
     """
-    roots: List[str] = []
+    roots: list[str] = []
     env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     if env_path and env_path != "0":
         roots.append(env_path)
@@ -5892,7 +5892,7 @@ async def _running_in_docker() -> bool:
     if await aiofiles.os.path.exists("/.dockerenv"):
         return True
     try:
-        async with aiofiles.open("/proc/1/cgroup", "rt", encoding="utf-8") as fp:
+        async with aiofiles.open("/proc/1/cgroup", encoding="utf-8") as fp:
             return "docker" in await fp.read()
     except OSError:
         return False
@@ -6054,13 +6054,13 @@ from tools.registry import registry, tool_error
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
-async def _handle_browser_navigate(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_navigate(args: dict[str, Any], **context: Any) -> str:
     return await browser_navigate(
         url=args.get("url", ""), task_id=context.get("task_id")
     )
 
 
-async def _handle_browser_snapshot(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_snapshot(args: dict[str, Any], **context: Any) -> str:
     return await browser_snapshot(
         full=args.get("full", False),
         task_id=context.get("task_id"),
@@ -6068,11 +6068,11 @@ async def _handle_browser_snapshot(args: Dict[str, Any], **context: Any) -> str:
     )
 
 
-async def _handle_browser_click(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_click(args: dict[str, Any], **context: Any) -> str:
     return await browser_click(ref=args.get("ref", ""), task_id=context.get("task_id"))
 
 
-async def _handle_browser_type(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_type(args: dict[str, Any], **context: Any) -> str:
     return await browser_type(
         ref=args.get("ref", ""),
         text=args.get("text", ""),
@@ -6080,26 +6080,26 @@ async def _handle_browser_type(args: Dict[str, Any], **context: Any) -> str:
     )
 
 
-async def _handle_browser_scroll(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_scroll(args: dict[str, Any], **context: Any) -> str:
     return await browser_scroll(
         direction=args.get("direction", "down"),
         task_id=context.get("task_id"),
     )
 
 
-async def _handle_browser_back(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_back(args: dict[str, Any], **context: Any) -> str:
     return await browser_back(task_id=context.get("task_id"))
 
 
-async def _handle_browser_press(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_press(args: dict[str, Any], **context: Any) -> str:
     return await browser_press(key=args.get("key", ""), task_id=context.get("task_id"))
 
 
-async def _handle_browser_get_images(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_get_images(args: dict[str, Any], **context: Any) -> str:
     return await browser_get_images(task_id=context.get("task_id"))
 
 
-async def _handle_browser_vision(args: Dict[str, Any], **context: Any):
+async def _handle_browser_vision(args: dict[str, Any], **context: Any):
     return await browser_vision(
         question=args.get("question", ""),
         annotate=args.get("annotate", False),
@@ -6107,7 +6107,7 @@ async def _handle_browser_vision(args: Dict[str, Any], **context: Any):
     )
 
 
-async def _handle_browser_console(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_console(args: dict[str, Any], **context: Any) -> str:
     return await browser_console(
         clear=args.get("clear", False),
         expression=args.get("expression"),

@@ -26,9 +26,9 @@ import logging
 import mimetypes
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 from urllib.parse import quote
 
 import aiofiles
@@ -68,7 +68,7 @@ async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     return result
 
 
-async def _load_retaindb_config() -> Dict[str, Any]:
+async def _load_retaindb_config() -> dict[str, Any]:
     """Return the ``memory.retaindb`` block from config.yaml (empty on error)."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -662,7 +662,7 @@ class _WriteQueue:
         session_id: str,
         messages: list,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         async with self._db_lock:
             if self._shutting_down.is_set():
                 raise RuntimeError("RetainDB write queue is shutting down")
@@ -842,7 +842,7 @@ class RetainDBMemoryProvider(MemoryProvider):
     async def is_available(self) -> bool:
         return bool(get_secret("RETAINDB_API_KEY"))
 
-    def get_config_schema(self) -> List[Dict[str, Any]]:
+    def get_config_schema(self) -> list[dict[str, Any]]:
         return [
             {
                 "key": "api_key",
@@ -1086,7 +1086,7 @@ class RetainDBMemoryProvider(MemoryProvider):
     ) -> None:
         if not self._queue or not user_content:
             return
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._queue.enqueue(
             self._user_id,
             session_id or self._session_id,
@@ -1100,7 +1100,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             ],
         )
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [
             PROFILE_SCHEMA,
             SEARCH_SCHEMA,

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any
 
 from agent.web_search_provider import WebSearchProvider
 from agent.ssl_verify import _create_httpx_client
@@ -33,7 +33,7 @@ from agent.ssl_verify import _create_httpx_client
 logger = logging.getLogger(__name__)
 
 
-async def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _tavily_request(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     """POST to the Tavily API and return the parsed JSON response.
 
     Mirrors :func:`tools.web_tools._tavily_request`. Raises ``ValueError``
@@ -63,7 +63,7 @@ async def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, A
         return response.json()
 
 
-def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_tavily_search_results(response: dict[str, Any]) -> dict[str, Any]:
     """Map Tavily ``/search`` response to ``{success, data: {web: [...]}}``."""
     web_results = []
     for i, result in enumerate(response.get("results", [])):
@@ -79,8 +79,8 @@ def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _normalize_tavily_documents(
-    response: Dict[str, Any], fallback_url: str = ""
-) -> List[Dict[str, Any]]:
+    response: dict[str, Any], fallback_url: str = ""
+) -> list[dict[str, Any]]:
     """Map Tavily ``/extract`` response to standard documents.
 
     Documents follow the legacy LLM post-processing shape::
@@ -90,7 +90,7 @@ def _normalize_tavily_documents(
     Failures (``failed_results``, ``failed_urls``) become result entries
     with an ``error`` field rather than raising.
     """
-    documents: List[Dict[str, Any]] = []
+    documents: list[dict[str, Any]] = []
     for result in response.get("results", []):
         url = result.get("url", fallback_url)
         raw = result.get("raw_content", "") or result.get("content", "")
@@ -152,7 +152,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute a Tavily search."""
         try:
             from tools.interrupt import is_interrupted
@@ -177,7 +177,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
             logger.warning("Tavily search error: %s", exc)
             return {"success": False, "error": f"Tavily search failed: {exc}"}
 
-    async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+    async def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
         """Extract content from one or more URLs via Tavily.
 
         Uses native async HTTP and returns the legacy
@@ -211,7 +211,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 for u in urls
             ]
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Tavily",
             "badge": "paid",

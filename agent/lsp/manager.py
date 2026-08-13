@@ -6,7 +6,8 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
+from collections.abc import Callable
 
 from agent.lsp import eventlog
 from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient
@@ -35,10 +36,10 @@ class LSPService:
         wait_mode: str,
         wait_timeout: float,
         install_strategy: str,
-        binary_overrides: Optional[Dict[str, List[str]]] = None,
-        env_overrides: Optional[Dict[str, Dict[str, str]]] = None,
-        init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
-        disabled_servers: Optional[List[str]] = None,
+        binary_overrides: dict[str, list[str]] | None = None,
+        env_overrides: dict[str, dict[str, str]] | None = None,
+        init_overrides: dict[str, dict[str, Any]] | None = None,
+        disabled_servers: list[str] | None = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     ) -> None:
         self._enabled = enabled
@@ -51,19 +52,19 @@ class LSPService:
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
 
-        self._clients: Dict[Tuple[str, str], LSPClient] = {}
-        self._broken: set[Tuple[str, str]] = set()
-        self._spawning: Dict[Tuple[str, str], asyncio.Future[LSPClient | None]] = {}
+        self._clients: dict[tuple[str, str], LSPClient] = {}
+        self._broken: set[tuple[str, str]] = set()
+        self._spawning: dict[tuple[str, str], asyncio.Future[LSPClient | None]] = {}
         self._spawn_tasks: set[asyncio.Task[Any]] = set()
-        self._last_used: Dict[Tuple[str, str], float] = {}
-        self._idle_reaper_task: Optional[asyncio.Task[None]] = None
-        self._shutdown_task: Optional[asyncio.Task[None]] = None
-        self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+        self._last_used: dict[tuple[str, str], float] = {}
+        self._idle_reaper_task: asyncio.Task[None] | None = None
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._delta_baseline: dict[str, list[dict[str, Any]]] = {}
         self._started = False
         self._closed = False
 
     @classmethod
-    async def create_from_config(cls) -> Optional["LSPService"]:
+    async def create_from_config(cls) -> LSPService | None:
         """Build a service from the async read-only Hermes configuration."""
         try:
             from hermes_cli.config import load_config_readonly
@@ -92,9 +93,9 @@ class LSPService:
 
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled: list[str] = []
-        binary_overrides: Dict[str, List[str]] = {}
-        env_overrides: Dict[str, Dict[str, str]] = {}
-        init_overrides: Dict[str, Dict[str, Any]] = {}
+        binary_overrides: dict[str, list[str]] = {}
+        env_overrides: dict[str, dict[str, str]] = {}
+        init_overrides: dict[str, dict[str, Any]] = {}
         if isinstance(servers_cfg, dict):
             for name, sub in servers_cfg.items():
                 if not isinstance(sub, dict):
@@ -179,9 +180,9 @@ class LSPService:
         file_path: str,
         *,
         delta: bool = True,
-        timeout: Optional[float] = None,
-        line_shift: Optional[Callable[[int], Optional[int]]] = None,
-    ) -> List[Dict[str, Any]]:
+        timeout: float | None = None,
+        line_shift: Callable[[int], int | None] | None = None,
+    ) -> list[dict[str, Any]]:
         """Open ``file_path``, wait for fresh diagnostics, and return them."""
         if not await self.enabled_for(file_path):
             return []
@@ -293,7 +294,7 @@ class LSPService:
         if cancellation is not None:
             raise cancellation
 
-    async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
+    async def _snapshot_async(self, file_path: str) -> list[dict[str, Any]]:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
@@ -316,7 +317,7 @@ class LSPService:
 
     async def _open_and_wait_async(
         self, file_path: str
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
@@ -341,7 +342,7 @@ class LSPService:
             return None
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
-    async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
+    async def _current_diags_async(self, file_path: str) -> list[dict[str, Any]]:
         workspace_root, gated = await resolve_workspace_for_file(file_path)
         server = find_server_for_file(file_path)
         if not (workspace_root and gated and server):
@@ -351,7 +352,7 @@ class LSPService:
             return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
-    async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+    async def _get_or_spawn(self, file_path: str) -> LSPClient | None:
         server = find_server_for_file(file_path)
         if server is None:
             return None
@@ -403,7 +404,7 @@ class LSPService:
 
     async def _spawn_client(
         self,
-        key: Tuple[str, str],
+        key: tuple[str, str],
         server: ServerDef,
         server_root: str,
         spawn_future: asyncio.Future[LSPClient | None],
@@ -529,7 +530,7 @@ class LSPService:
         )
         clear_cache()
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict[str, Any]:
         """Return an in-memory status snapshot."""
         return {
             "enabled": self._enabled,
@@ -550,7 +551,7 @@ class LSPService:
         }
 
 
-def _diag_key(d: Dict[str, Any]) -> str:
+def _diag_key(d: dict[str, Any]) -> str:
     """Content equality key used for cross-edit delta filtering."""
     range_value = d.get("range") or {}
     start = range_value.get("start") or {}

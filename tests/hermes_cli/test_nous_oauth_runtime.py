@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import httpx
@@ -39,10 +39,10 @@ def _state(**overrides):
         "inference_base_url": auth.DEFAULT_NOUS_INFERENCE_URL,
         "token_type": "Bearer",
         "scope": auth.DEFAULT_NOUS_SCOPE,
-        "obtained_at": datetime.now(timezone.utc).isoformat(),
+        "obtained_at": datetime.now(UTC).isoformat(),
         "expires_at": datetime.fromtimestamp(
             time.time() + 3600,
-            tz=timezone.utc,
+            tz=UTC,
         ).isoformat(),
         "tls": {"insecure": False, "ca_bundle": None},
         "label": "Nous account",

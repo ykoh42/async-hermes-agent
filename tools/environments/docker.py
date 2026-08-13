@@ -18,7 +18,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles.os
 
@@ -46,7 +46,7 @@ _DOCKER_SEARCH_PATHS = [
     "/Applications/Docker.app/Contents/Resources/bin/docker",
 ]
 
-_docker_executable: Optional[str] = None  # resolved once, cached
+_docker_executable: str | None = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 
@@ -233,7 +233,7 @@ async def _load_hermes_env_vars() -> dict[str, str]:
         )
 
         async with aiofiles.open(
-            get_env_path(), "r", encoding="utf-8-sig", errors="replace"
+            get_env_path(), encoding="utf-8-sig", errors="replace"
         ) as handle:
             raw_lines = await handle.readlines()
         values: dict[str, str] = {}
@@ -348,7 +348,7 @@ async def reap_orphan_containers(
     # long enough ago.  Doing this per-container (rather than bulk inspect)
     # keeps the failure blast radius to one container at a time.
     import datetime
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     removed = 0
     for cid in candidate_ids:
         finished_at = await _container_finished_at(docker, cid)
@@ -413,7 +413,7 @@ async def _container_finished_at(docker_exe: str, container_id: str):
         return None
 
 
-async def find_docker() -> Optional[str]:
+async def find_docker() -> str | None:
     """Locate the docker (or podman) CLI binary.
 
     Resolution order:
@@ -842,7 +842,7 @@ async def _image_uses_init_entrypoint(docker_exe: str, image: str) -> bool:
     return first in ("/init", "/package/admin/s6-overlay/command/init")
 
 
-def _resolve_host_user_spec() -> Optional[str]:
+def _resolve_host_user_spec() -> str | None:
     """Return ``<uid>:<gid>`` for the current host user, or ``None`` on platforms
     where this is not meaningful (e.g. Windows without posix ids).
 
@@ -860,8 +860,8 @@ def _resolve_host_user_spec() -> Optional[str]:
         return None
 
 
-_storage_opt_ok: Optional[bool] = None  # cached result across instances
-_cgroup_limits_ok: Optional[bool] = None  # cached result across instances
+_storage_opt_ok: bool | None = None  # cached result across instances
+_cgroup_limits_ok: bool | None = None  # cached result across instances
 
 
 async def _cgroup_limits_available(image: str) -> bool:
@@ -1005,14 +1005,14 @@ class DockerEnvironment(BaseEnvironment):
         disk: int = 0,
         persistent_filesystem: bool = False,
         task_id: str = "default",
-        volumes: list = None,  # ty: ignore[invalid-parameter-default]
+        volumes: list | None = None,  # ty: ignore[invalid-parameter-default]
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
-        host_cwd: str = None,  # ty: ignore[invalid-parameter-default]
+        host_cwd: str | None = None,  # ty: ignore[invalid-parameter-default]
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
-        extra_args: list = None,  # ty: ignore[invalid-parameter-default]
+        extra_args: list | None = None,  # ty: ignore[invalid-parameter-default]
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
     ):
@@ -1025,15 +1025,15 @@ class DockerEnvironment(BaseEnvironment):
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
-        self._container_id: Optional[str] = None
+        self._container_id: str | None = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
         self._container_name: str = ""
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
         self._reused_container = False
-        self._workspace_dir: Optional[str] = None
-        self._home_dir: Optional[str] = None
+        self._workspace_dir: str | None = None
+        self._home_dir: str | None = None
         self._initialize_lock = asyncio.Lock()
         self._docker_parameters: dict[str, Any] = {
             "image": image,
@@ -2093,7 +2093,7 @@ class DockerEnvironment(BaseEnvironment):
         logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
         return _storage_opt_ok
 
-    async def _container_network_mode(self, container_id: str) -> Optional[str]:
+    async def _container_network_mode(self, container_id: str) -> str | None:
         """Return the container's ``HostConfig.NetworkMode`` (e.g. ``bridge``,
         ``none``, ``host``), or ``None`` when inspection fails.
 
@@ -2128,7 +2128,7 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
-    ) -> Optional[tuple[str, str]]:
+    ) -> tuple[str, str] | None:
         """Look for an existing container labeled for this (task, profile).
 
         Returns ``(container_id, state)`` on hit, ``None`` on miss / on any

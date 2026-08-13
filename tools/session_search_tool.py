@@ -31,7 +31,7 @@ support.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -81,7 +81,7 @@ _COMPACTION_PREFIXES = (
 )
 
 
-def _format_timestamp(ts: Union[int, float, str, None]) -> str:
+def _format_timestamp(ts: int | float | str | None) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
     Returns "unknown" for None, str(ts) if conversion fails.
@@ -175,7 +175,7 @@ async def _is_compression_ended(db, session_id: str) -> bool:
         return False
 
 
-async def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
+async def _get_message_storage_state(db, message_id) -> dict[str, Any] | None:
     """Return the owning session and visibility flags for *message_id*."""
     if not message_id:
         return None
@@ -209,7 +209,7 @@ async def _is_compacted_message(db, message_id) -> bool:
     return state is not None and state["active"] == 0 and state["compacted"] == 1
 
 
-async def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
+async def _annotate_rebuild_status(db, payload: dict[str, Any]) -> None:
     """Add a rebuild-progress note when the deferred FTS backfill (schema
     v23) is still running, so the agent can tell the user why older results
     may be incomplete/slower instead of treating a thin result set as
@@ -231,7 +231,7 @@ async def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
     }
 
 
-def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _order_for_recall(raw_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Stable-sort FTS rows so interactive sessions rank above automation.
 
     Within each class (interactive vs demoted) the original BM25 ``rank``
@@ -249,10 +249,10 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 def _shape_message(
-    m: Dict[str, Any],
-    anchor_id: Optional[int] = None,
-    max_content_len: Optional[int] = None,
-) -> Dict[str, Any]:
+    m: dict[str, Any],
+    anchor_id: int | None = None,
+    max_content_len: int | None = None,
+) -> dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty.
 
     When *max_content_len* is set, ``content`` is truncated to that many
@@ -322,7 +322,7 @@ async def _resolve_profile_db(profile: str):
     return SessionDB(profile_dir / "state.db", read_only=True)
 
 
-async def _session_link(session_id: str, profile: str = None) -> str:
+async def _session_link(session_id: str, profile: str | None = None) -> str:
     """The reference the agent writes to point the user at a session.
 
     Same value the desktop composer emits when a session is dragged into a
@@ -400,7 +400,7 @@ async def _locate_session_db(session_id: str):
     return None, None
 
 
-async def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str = None) -> str:
+async def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str | None = None) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -450,7 +450,7 @@ async def _read_session(db, session_id: str, head: int = 20, tail: int = 10, lin
     return json.dumps(response, ensure_ascii=False)
 
 
-async def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+async def _list_recent_sessions(db, limit: int, current_session_id: str | None = None, link_profile: str | None = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = await db.list_sessions_rich(
@@ -503,7 +503,7 @@ async def _scroll(
     session_id: str,
     around_message_id: int,
     window: int = 5,
-    current_session_id: str = None,
+    current_session_id: str | None = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -645,8 +645,8 @@ def _normalize_title_query(query: str) -> str:
 async def _title_match_result(
     db,
     query: str,
-    current_lineage_root: Optional[str],
-) -> Optional[Dict[str, Any]]:
+    current_lineage_root: str | None,
+) -> dict[str, Any] | None:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
     if not title_query:
@@ -712,11 +712,11 @@ async def _title_match_result(
 async def _discover(
     db,
     query: str,
-    role_filter: Optional[List[str]],
+    role_filter: list[str] | None,
     limit: int,
-    sort: Optional[str],
-    current_session_id: str = None,
-    link_profile: str = None,
+    sort: str | None,
+    current_session_id: str | None = None,
+    link_profile: str | None = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -873,18 +873,18 @@ async def _discover(
 
 async def session_search(
     query: str = "",
-    role_filter: str = None,
+    role_filter: str | None = None,
     limit: int = 3,
     db=None,
-    current_session_id: str = None,
+    current_session_id: str | None = None,
     # Scroll shape
-    session_id: str = None,
-    around_message_id: int = None,
+    session_id: str | None = None,
+    around_message_id: int | None = None,
     window: int = 5,
     # Discovery shape
-    sort: str = None,
+    sort: str | None = None,
     # Cross-profile (any shape)
-    profile: str = None,
+    profile: str | None = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -981,12 +981,12 @@ async def session_search(
             )
 
         # Parse role_filter
-        role_list: Optional[List[str]] = None
+        role_list: list[str] | None = None
         if isinstance(role_filter, str) and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
         # Normalise sort
-        sort_norm: Optional[str] = None
+        sort_norm: str | None = None
         if isinstance(sort, str):
             candidate = sort.strip().lower()
             if candidate in ("newest", "oldest"):

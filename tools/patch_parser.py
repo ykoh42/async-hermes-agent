@@ -31,7 +31,7 @@ Usage:
 import difflib
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 from enum import Enum
 
 if TYPE_CHECKING:
@@ -55,8 +55,8 @@ class HunkLine:
 @dataclass
 class Hunk:
     """A group of changes within a file."""
-    context_hint: Optional[str] = None
-    lines: List[HunkLine] = field(default_factory=list)
+    context_hint: str | None = None
+    lines: list[HunkLine] = field(default_factory=list)
 
 
 @dataclass
@@ -64,12 +64,12 @@ class PatchOperation:
     """A single operation in a V4A patch."""
     operation: OperationType
     file_path: str
-    new_path: Optional[str] = None  # For move operations
-    hunks: List[Hunk] = field(default_factory=list)
-    content: Optional[str] = None  # For add file operations
+    new_path: str | None = None  # For move operations
+    hunks: list[Hunk] = field(default_factory=list)
+    content: str | None = None  # For add file operations
 
 
-def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[str]]:
+def parse_v4a_patch(patch_content: str) -> tuple[list[PatchOperation], str | None]:
     """
     Parse a V4A format patch.
 
@@ -87,7 +87,7 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
     # LF target file (and the anchored ``...\s*$`` Begin/End markers would fail
     # to match because of the trailing ``\r``).
     lines = [ln[:-1] if ln.endswith('\r') else ln for ln in patch_content.split('\n')]
-    operations: List[PatchOperation] = []
+    operations: list[PatchOperation] = []
 
     # Find patch boundaries. Markers must occupy the whole line at column 0:
     # content lines like "+*** End Patch" or " *** End Patch" (e.g. docs
@@ -113,8 +113,8 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
 
     # Parse operations between boundaries
     i = start_idx + 1
-    current_op: Optional[PatchOperation] = None
-    current_hunk: Optional[Hunk] = None
+    current_op: PatchOperation | None = None
+    current_hunk: Hunk | None = None
 
     while i < end_idx:
         line = lines[i]
@@ -221,7 +221,7 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
         # Empty patch is not an error — callers get [] and can decide
         return operations, None
 
-    parse_errors: List[str] = []
+    parse_errors: list[str] = []
     for op in operations:
         if not op.file_path:
             parse_errors.append("Operation with empty file path")
@@ -250,9 +250,9 @@ def _count_occurrences(text: str, pattern: str) -> int:
 
 
 async def _validate_operations(
-    operations: List[PatchOperation],
+    operations: list[PatchOperation],
     file_ops: Any,
-) -> List[str]:
+) -> list[str]:
     """Validate all operations without writing any files.
 
     Returns a list of error strings; an empty list means all operations
@@ -264,7 +264,7 @@ async def _validate_operations(
     # Deferred import: breaks the patch_parser ↔ fuzzy_match circular dependency
     from tools.fuzzy_match import fuzzy_find_and_replace
 
-    errors: List[str] = []
+    errors: list[str] = []
     real_change_count = 0
 
     # Virtual filesystem overlay so inter-op state (notably a MOVE creating the
@@ -393,7 +393,7 @@ async def _validate_operations(
     return errors
 
 
-async def apply_v4a_operations(operations: List[PatchOperation],
+async def apply_v4a_operations(operations: list[PatchOperation],
                                file_ops: Any) -> 'PatchResult':
     """Apply V4A patch operations using a file operations interface.
 
@@ -433,7 +433,7 @@ async def apply_v4a_operations(operations: List[PatchOperation],
     # write_file and patch_replace use, so without explicit propagation
     # the LSP tier's output gets silently dropped — see
     # ``PatchResult.lsp_diagnostics`` aggregation below.
-    lsp_blocks: List[str] = []
+    lsp_blocks: list[str] = []
     errors = []
 
     for op in operations:
@@ -517,7 +517,7 @@ async def apply_v4a_operations(operations: List[PatchOperation],
     )
 
 
-async def _apply_add(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optional[str]]:
+async def _apply_add(op: PatchOperation, file_ops: Any) -> tuple[bool, str, str | None]:
     """Apply an add file operation.
 
     Returns ``(success, diff_or_error, lsp_diagnostics)``.  The third
@@ -545,7 +545,7 @@ async def _apply_add(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Opti
     return True, diff, getattr(result, "lsp_diagnostics", None)
 
 
-async def _apply_delete(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
+async def _apply_delete(op: PatchOperation, file_ops: Any) -> tuple[bool, str]:
     """Apply a delete file operation."""
     # Read before deleting so we can produce a real unified diff.
     # Validation already confirmed existence; this guards against races.
@@ -566,7 +566,7 @@ async def _apply_delete(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
     return True, diff or f"# Deleted: {op.file_path}"
 
 
-async def _apply_move(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
+async def _apply_move(op: PatchOperation, file_ops: Any) -> tuple[bool, str]:
     """Apply a move file operation."""
     result = await file_ops.move_file(op.file_path, op.new_path)
     if result.error:
@@ -576,7 +576,7 @@ async def _apply_move(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
     return True, diff
 
 
-async def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optional[str]]:
+async def _apply_update(op: PatchOperation, file_ops: Any) -> tuple[bool, str, str | None]:
     """Apply an update file operation.
 
     Returns ``(success, diff_or_error, lsp_diagnostics)`` — see

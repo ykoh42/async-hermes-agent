@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, List
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+async def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Invoke native-async plugin hooks from the agent runtime."""
     from hermes_cli import plugins
 

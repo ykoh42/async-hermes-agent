@@ -41,6 +41,11 @@ class StubSource(SecretSource):
         return frozenset(self._protected)
 
 
+def test_error_kind_preserves_legacy_stringification():
+    assert str(ErrorKind.TIMEOUT) == "ErrorKind.TIMEOUT"
+    assert ErrorKind.TIMEOUT.value == "timeout"
+
+
 @pytest.fixture(autouse=True)
 def _empty_registry(monkeypatch):
     registry._reset_registry_for_tests()

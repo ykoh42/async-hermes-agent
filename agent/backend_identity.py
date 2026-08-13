@@ -34,7 +34,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -67,20 +66,20 @@ _REASON_SCOPES = {
 }
 
 
-def classify_failure_scope(reason: Optional[str]) -> FailureScope:
+def classify_failure_scope(reason: str | None) -> FailureScope:
     """Map a human-readable failure reason to the identity axis it kills."""
     return _REASON_SCOPES.get((reason or "").strip().lower(), FailureScope.MODEL)
 
 
-def _norm_provider(value: Optional[str]) -> str:
+def _norm_provider(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
-def _norm_model(value: Optional[str]) -> str:
+def _norm_model(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
-def _norm_base_url(value: Optional[str]) -> str:
+def _norm_base_url(value: str | None) -> str:
     return (value or "").strip().rstrip("/").lower()
 
 
@@ -100,10 +99,10 @@ class BackendIdentity:
     @classmethod
     def build(
         cls,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
-    ) -> "BackendIdentity":
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+    ) -> BackendIdentity:
         return cls(
             provider=_norm_provider(provider),
             model=_norm_model(model),

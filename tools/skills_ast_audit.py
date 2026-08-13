@@ -14,24 +14,23 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import List, Tuple
 
 import aiofiles
 import aiofiles.os
 
 # (file, line, pattern_id, description)
-Finding = Tuple[str, int, str, str]
+Finding = tuple[str, int, str, str]
 
 _IGNORED_DIRS = {"__pycache__", ".venv", "venv", "node_modules"}
 
 
-def _scan_source(content: str, rel_path: str) -> List[Finding]:
+def _scan_source(content: str, rel_path: str) -> list[Finding]:
     try:
         tree = ast.parse(content)
     except (SyntaxError, ValueError, RecursionError):
         return []
 
-    findings: List[Finding] = []
+    findings: list[Finding] = []
 
     class V(ast.NodeVisitor):
         def visit_Call(self, node):
@@ -104,7 +103,7 @@ async def _iter_python_files(root: Path):
             yield candidate
 
 
-async def ast_scan_path(path: Path) -> List[Finding]:
+async def ast_scan_path(path: Path) -> list[Finding]:
     """Scan a single .py file or recursively scan all .py under a directory.
 
     Returns a list of (file, line, pattern_id, description) tuples. Empty for
@@ -125,7 +124,7 @@ async def ast_scan_path(path: Path) -> List[Finding]:
     if not await aiofiles.os.path.isdir(path):
         return []
 
-    out: List[Finding] = []
+    out: list[Finding] = []
     async for py in _iter_python_files(path):
         try:
             async with aiofiles.open(
@@ -142,7 +141,7 @@ async def ast_scan_path(path: Path) -> List[Finding]:
     return out
 
 
-def format_ast_report(findings: List[Finding], skill_name: str = "") -> str:
+def format_ast_report(findings: list[Finding], skill_name: str = "") -> str:
     """Plain-text report (Rich-markup-free) grouped by file."""
     header = f"AST deep scan: {skill_name}" if skill_name else "AST deep scan"
     if not findings:

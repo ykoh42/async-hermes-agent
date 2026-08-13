@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 from tools.registry import registry, tool_error
 
@@ -99,8 +99,8 @@ async def _browser_cdp_private_guard(
     *,
     task_id: str,
     method: str,
-    params: Dict[str, Any],
-) -> Optional[str]:
+    params: dict[str, Any],
+) -> str | None:
     """Apply the browser SSRF/private-page guard to raw CDP calls.
 
     ``browser_cdp`` is intentionally an escape hatch, but it still shares the
@@ -159,10 +159,10 @@ async def _browser_cdp_private_guard(
 async def _cdp_call(
     ws_url: str,
     method: str,
-    params: Dict[str, Any],
-    target_id: Optional[str],
+    params: dict[str, Any],
+    target_id: str | None,
     timeout: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Make a single CDP call, optionally attaching to a target first.
 
     When ``target_id`` is provided, we call ``Target.attachToTarget`` with
@@ -180,7 +180,7 @@ async def _cdp_call(
         ping_interval=None,  # CDP server doesn't expect pings
     ) as ws:
         next_id = 1
-        session_id: Optional[str] = None
+        session_id: str | None = None
 
         # --- Step 1: attach to target if requested ---
         if target_id:
@@ -216,7 +216,7 @@ async def _cdp_call(
         # --- Step 2: dispatch the real method ---
         call_id = next_id
         next_id += 1
-        req: Dict[str, Any] = {
+        req: dict[str, Any] = {
             "id": call_id,
             "method": method,
             "params": params or {},
@@ -248,7 +248,7 @@ async def _browser_cdp_via_supervisor(
     task_id: str,
     frame_id: str,
     method: str,
-    params: Optional[Dict[str, Any]],
+    params: dict[str, Any] | None,
     timeout: float,
 ) -> str:
     """Route a CDP call through the live supervisor session for an OOPIF frame.
@@ -278,7 +278,7 @@ async def _browser_cdp_via_supervisor(
     snap = supervisor.snapshot()
     # Search both the top frame and the children for the requested id.
     top = snap.frame_tree.get("top")
-    frame_info: Optional[Dict[str, Any]] = None
+    frame_info: dict[str, Any] | None = None
     if top and top.get("frame_id") == frame_id:
         frame_info = top
     else:
@@ -330,7 +330,7 @@ async def _browser_cdp_via_supervisor(
             cdp_docs=CDP_DOCS_URL,
         )
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "success": True,
         "method": method,
         "frame_id": frame_id,
@@ -342,11 +342,11 @@ async def _browser_cdp_via_supervisor(
 
 async def browser_cdp(
     method: str,
-    params: Optional[Dict[str, Any]] = None,
-    target_id: Optional[str] = None,
-    frame_id: Optional[str] = None,
+    params: dict[str, Any] | None = None,
+    target_id: str | None = None,
+    frame_id: str | None = None,
     timeout: float = 30.0,
-    task_id: Optional[str] = None,
+    task_id: str | None = None,
 ) -> str:
     """Send a raw CDP command.  See ``CDP_DOCS_URL`` for method documentation.
 
@@ -418,7 +418,7 @@ async def browser_cdp(
             "browser is actually listening on the debug port."
         )
 
-    call_params: Dict[str, Any] = params or {}
+    call_params: dict[str, Any] = params or {}
     if not isinstance(call_params, dict):
         return tool_error(
             f"'params' must be an object/dict, got {type(call_params).__name__}"
@@ -440,7 +440,7 @@ async def browser_cdp(
 
     try:
         result = await _cdp_call(endpoint, method, call_params, target_id, safe_timeout)
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         return tool_error(
             f"CDP call timed out after {safe_timeout}s: {exc}",
             method=method,
@@ -462,7 +462,7 @@ async def browser_cdp(
             method=method,
         )
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "success": True,
         "method": method,
         "result": _redact_cdp_output(result),
@@ -477,7 +477,7 @@ async def browser_cdp(
 # ---------------------------------------------------------------------------
 
 
-BROWSER_CDP_SCHEMA: Dict[str, Any] = {
+BROWSER_CDP_SCHEMA: dict[str, Any] = {
     "name": "browser_cdp",
     "description": (
         "Send a raw Chrome DevTools Protocol (CDP) command. Escape hatch for "
@@ -606,7 +606,7 @@ async def _browser_cdp_check() -> bool:
     return bool(await _get_cdp_override_raw())
 
 
-async def _handle_browser_cdp(args: Dict[str, Any], **context: Any) -> str:
+async def _handle_browser_cdp(args: dict[str, Any], **context: Any) -> str:
     """Adapt registry arguments to the public browser CDP function."""
     return await browser_cdp(
         method=args.get("method", ""),

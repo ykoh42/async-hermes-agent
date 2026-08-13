@@ -600,7 +600,7 @@ async def test_mcp_lifecycle_contexts_exit_in_owner_task(monkeypatch):
 
 async def test_native_subprocess_timeout_kills_and_reaps():
     started = asyncio.get_running_loop().time()
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(TimeoutError):
         await _run_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             timeout=0.05,
@@ -624,7 +624,7 @@ async def test_mcp_tool_timeout_cancels_native_call():
     session = _CuaDriverSession()
     session._session = Client()
     session._started = True
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(TimeoutError):
         await session.call_tool("slow", {}, timeout=0.01)
     assert entered.is_set()
     assert cancelled.is_set()

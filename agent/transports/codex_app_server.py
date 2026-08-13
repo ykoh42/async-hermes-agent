@@ -21,7 +21,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from tools.environments.local import hermes_subprocess_env
 
@@ -36,7 +36,7 @@ class CodexAppServerError(RuntimeError):
 
     code: int
     message: str
-    data: Optional[Any] = None
+    data: Any | None = None
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return f"codex app-server error {self.code}: {self.message}"
@@ -96,9 +96,9 @@ class CodexAppServerClient:
     def __init__(
         self,
         codex_bin: str = "codex",
-        codex_home: Optional[str] = None,
-        extra_args: Optional[list[str]] = None,
-        env: Optional[dict[str, str]] = None,
+        codex_home: str | None = None,
+        extra_args: list[str] | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -125,7 +125,7 @@ class CodexAppServerClient:
         self._cmd = cmd
         self._spawn_env: dict[str, str] | None = None
         self._creationflags = windows_hide_flags()
-        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._proc: asyncio.subprocess.Process | None = None
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._notifications: asyncio.Queue[dict] = asyncio.Queue()
@@ -135,8 +135,8 @@ class CodexAppServerClient:
         self._start_lock = asyncio.Lock()
         self._closed = False
         self._initialized = False
-        self._reader: Optional[asyncio.Task[None]] = None
-        self._stderr_reader: Optional[asyncio.Task[None]] = None
+        self._reader: asyncio.Task[None] | None = None
+        self._stderr_reader: asyncio.Task[None] | None = None
 
     # ---------- lifecycle ----------
 
@@ -145,7 +145,7 @@ class CodexAppServerClient:
         client_name: str = "hermes",
         client_title: str = "Hermes Agent",
         client_version: str = "0.1",
-        capabilities: Optional[dict] = None,
+        capabilities: dict | None = None,
         timeout: float = 10.0,
     ) -> dict:
         """Send `initialize` + `initialized` handshake. Returns the server's
@@ -206,7 +206,7 @@ class CodexAppServerClient:
         self._stderr_reader = None
         self._proc = None
 
-    async def __aenter__(self) -> "CodexAppServerClient":
+    async def __aenter__(self) -> CodexAppServerClient:
         await self._start()
         return self
 
@@ -218,7 +218,7 @@ class CodexAppServerClient:
     async def request(
         self,
         method: str,
-        params: Optional[dict] = None,
+        params: dict | None = None,
         timeout: float = 30.0,
     ) -> dict:
         """Send a JSON-RPC request and await the response. Returns `result`,
@@ -247,7 +247,7 @@ class CodexAppServerClient:
             )
         return msg.get("result", {})
 
-    async def notify(self, method: str, params: Optional[dict] = None) -> None:
+    async def notify(self, method: str, params: dict | None = None) -> None:
         """Send a JSON-RPC notification (no id, no response expected)."""
         await self._start()
         await self._send({"method": method, "params": params or {}})
@@ -257,7 +257,7 @@ class CodexAppServerClient:
         await self._send({"id": request_id, "result": result})
 
     async def respond_error(
-        self, request_id: Any, code: int, message: str, data: Optional[Any] = None
+        self, request_id: Any, code: int, message: str, data: Any | None = None
     ) -> None:
         """Reply to a server-initiated request with an error."""
         err: dict[str, Any] = {"code": code, "message": message}
@@ -265,7 +265,7 @@ class CodexAppServerClient:
             err["data"] = data
         await self._send({"id": request_id, "error": err})
 
-    async def take_notification(self, timeout: float = 0.0) -> Optional[dict]:
+    async def take_notification(self, timeout: float = 0.0) -> dict | None:
         """Pop the next streaming notification, or return None on timeout.
 
         timeout=0.0 means non-blocking. Use small positive timeouts inside the
@@ -280,7 +280,7 @@ class CodexAppServerClient:
         except TimeoutError:
             return None
 
-    async def take_server_request(self, timeout: float = 0.0) -> Optional[dict]:
+    async def take_server_request(self, timeout: float = 0.0) -> dict | None:
         """Pop the next server-initiated request (e.g. exec/applyPatch approval)."""
         if timeout <= 0:
             try:
@@ -424,7 +424,7 @@ class CodexAppServerClient:
             pass
 
 
-def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
+def parse_codex_version(output: str) -> tuple[int, int, int] | None:
     """Parse `codex --version` output. Returns (major, minor, patch) or None."""
     # Output format: "codex-cli 0.130.0" possibly followed by metadata.
     import re

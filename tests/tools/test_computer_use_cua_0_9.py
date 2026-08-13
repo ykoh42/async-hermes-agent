@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiofiles
@@ -34,10 +34,10 @@ async def _fixture():
 class _FakeSession:
     def __init__(
         self,
-        out: Optional[Dict[str, Any]] = None,
+        out: dict[str, Any] | None = None,
         *,
-        input_properties: Optional[Dict[str, set[str]]] = None,
-        tools: Optional[set[str]] = None,
+        input_properties: dict[str, set[str]] | None = None,
+        tools: set[str] | None = None,
     ) -> None:
         self.out = out or {
             "isError": False,
@@ -46,16 +46,16 @@ class _FakeSession:
         }
         self.input_properties = input_properties or {}
         self.tools = tools or {"bring_to_front", *self.input_properties}
-        self.calls: list[tuple[str, Dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def call_tool(
-        self, name: str, args: Dict[str, Any], timeout: float = 30.0
+        self, name: str, args: dict[str, Any], timeout: float = 30.0
     ):
         self.calls.append((name, dict(args)))
         return self.out
 
     def supports_capability(
-        self, capability: str, tool: Optional[str] = None
+        self, capability: str, tool: str | None = None
     ) -> bool:
         return False
 
@@ -78,7 +78,7 @@ def _make_backend(session: _FakeSession):
     return backend
 
 
-def _driver_result(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _driver_result(payload: dict[str, Any]) -> dict[str, Any]:
     return {"isError": False, "data": {}, "structuredContent": payload}
 
 
@@ -363,10 +363,10 @@ async def test_persistent_focus_has_a_separate_approval_scope():
 
 class _BrowserDriver:
     def __init__(self, *, mutation_allowed: bool = True) -> None:
-        self.calls: list[tuple[str, Dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
         self.mutation_allowed = mutation_allowed
         self.snapshot = 0
-        self.responses: Dict[str, Dict[str, Any]] = {}
+        self.responses: dict[str, dict[str, Any]] = {}
 
     def has_tool(self, name: str) -> bool:
         return name in {
@@ -381,7 +381,7 @@ class _BrowserDriver:
             "browser_download",
         }
 
-    async def call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((name, dict(args)))
         if name in self.responses:
             return _driver_result(self.responses[name])

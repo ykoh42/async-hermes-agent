@@ -11,7 +11,8 @@ import logging
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List
+from typing import Any
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +43,15 @@ class RequestMiddlewareResult:
     payload: Any
     original_payload: Any
     changed: bool = False
-    trace: List[Dict[str, Any]] = field(default_factory=list)
+    trace: list[dict[str, Any]] = field(default_factory=list)
 
 
-def observer_payload(**kwargs: Any) -> Dict[str, Any]:
+def observer_payload(**kwargs: Any) -> dict[str, Any]:
     kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
     return kwargs
 
 
-def middleware_payload(**kwargs: Any) -> Dict[str, Any]:
+def middleware_payload(**kwargs: Any) -> dict[str, Any]:
     kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
     kwargs.setdefault("middleware_schema_version", MIDDLEWARE_SCHEMA_VERSION)
     return kwargs
@@ -76,7 +77,7 @@ def _safe_copy(payload: Any) -> Any:
 
 
 async def apply_llm_request_middleware(
-    request: Dict[str, Any],
+    request: dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
     """Apply native-async LLM request middleware.
@@ -95,7 +96,7 @@ async def apply_llm_request_middleware(
 
     original_request = _safe_copy(request)
     current_request = _safe_copy(original_request)
-    trace: List[Dict[str, Any]] = []
+    trace: list[dict[str, Any]] = []
 
     for result in await _invoke_middleware(
         LLM_REQUEST_MIDDLEWARE,
@@ -123,7 +124,7 @@ async def apply_llm_request_middleware(
 
 async def apply_tool_request_middleware(
     tool_name: str,
-    args: Dict[str, Any],
+    args: dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
     """Apply native-async tool request middleware.
@@ -135,7 +136,7 @@ async def apply_tool_request_middleware(
     """
     original_args = _safe_copy(args)
     current_args = _safe_copy(original_args)
-    trace: List[Dict[str, Any]] = []
+    trace: list[dict[str, Any]] = []
 
     if not _has_middleware(TOOL_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
@@ -169,7 +170,7 @@ async def apply_tool_request_middleware(
 
 
 async def apply_api_request_middleware(
-    request: Dict[str, Any],
+    request: dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
     """Preserve the upstream API-named alias on the native async path."""
@@ -177,8 +178,8 @@ async def apply_api_request_middleware(
 
 
 async def run_llm_execution_middleware(
-    request: Dict[str, Any],
-    next_call: Callable[[Dict[str, Any]], Any],
+    request: dict[str, Any],
+    next_call: Callable[[dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
     """Async execution chain for the coroutine-native agent loop.
@@ -204,8 +205,8 @@ async def run_llm_execution_middleware(
 
 async def run_tool_execution_middleware(
     tool_name: str,
-    args: Dict[str, Any],
-    next_call: Callable[[Dict[str, Any]], Any],
+    args: dict[str, Any],
+    next_call: Callable[[dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
     """Run a tool through coroutine-native execution middleware.
@@ -229,8 +230,8 @@ async def run_tool_execution_middleware(
 
 
 async def run_api_execution_middleware(
-    request: Dict[str, Any],
-    next_call: Callable[[Dict[str, Any]], Any],
+    request: dict[str, Any],
+    next_call: Callable[[dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
     """Preserve the upstream API-named alias on the native async path."""
@@ -241,7 +242,7 @@ class _MiddlewareContractError(RuntimeError):
     """Raised when a synchronous plugin callback reaches the async agent."""
 
 
-async def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
+async def _invoke_middleware(kind: str, **kwargs: Any) -> list[Any]:
     """Invoke middleware callbacks without a sync fallback or worker bridge."""
     from hermes_cli.plugins import invoke_middleware
 
@@ -254,7 +255,7 @@ def _has_middleware(kind: str) -> bool:
     return has_middleware(kind)
 
 
-def _get_middleware_callbacks(kind: str) -> List[Callable]:
+def _get_middleware_callbacks(kind: str) -> list[Callable]:
     from hermes_cli.plugins import get_plugin_manager
 
     return list(get_plugin_manager()._middleware.get(kind, []))
@@ -262,7 +263,7 @@ def _get_middleware_callbacks(kind: str) -> List[Callable]:
 
 async def _run_execution_chain(
     kind: str,
-    callbacks: List[Callable],
+    callbacks: list[Callable],
     terminal_call: Callable[[Any], Any],
     **kwargs: Any,
 ) -> Any:
@@ -332,8 +333,8 @@ async def _run_execution_chain(
     return await call_at(0, kwargs[payload_key])
 
 
-def _trace_entry(result: Dict[str, Any]) -> Dict[str, Any]:
-    entry: Dict[str, Any] = {}
+def _trace_entry(result: dict[str, Any]) -> dict[str, Any]:
+    entry: dict[str, Any] = {}
     for key in ("source", "reason", "name"):
         value = result.get(key)
         if isinstance(value, str) and value:

@@ -24,7 +24,8 @@ import os
 import re
 import ssl
 import time
-from typing import Any, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import Mock as _Mock
 
 from agent import system_prompt as _system_prompt
@@ -131,7 +132,7 @@ _API_CALL_MODULES = frozenset({
 })
 
 
-def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
+def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
     Incomplete provider reasoning blocks are not valid replay items (Anthropic
@@ -196,7 +197,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             {"role": "user", "content": text, "api_content": correction}
         )
     else:
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             "role": "assistant",
             "content": visible or checkpoint,
             "api_content": checkpoint,
@@ -225,7 +226,7 @@ def _is_copilot_provider(agent: Any) -> bool:
 
 
 def _is_stale_copilot_credential_error(
-    status_code: Optional[int], error_message: str
+    status_code: int | None, error_message: str
 ) -> bool:
     """Detect a Copilot 400 caused by a stale or degraded credential."""
     lowered = (error_message or "").lower()
@@ -240,7 +241,7 @@ def _is_stale_copilot_credential_error(
     )
 
 
-def _image_error_max_dimension(error: Exception) -> Optional[int]:
+def _image_error_max_dimension(error: Exception) -> int | None:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
     for value in (
@@ -269,7 +270,7 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return None
 
 
-def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
+def _ollama_context_limit_error(agent: Any, request_tokens: int) -> str | None:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
         return None
@@ -432,7 +433,7 @@ async def _billing_or_entitlement_message(
     return "\n".join(lines)
 
 
-def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]:
+def _billing_block_dict(provider, base_url, model, message="") -> dict | None:
     """Best-effort structured billing descriptor (None if billing_links is unavailable)."""
     try:
         from agent.billing_links import build_billing_block
@@ -688,7 +689,7 @@ async def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     return True
 
 
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: list[str] | None = None) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
@@ -747,7 +748,7 @@ _CONTENT_POLICY_RECOVERY_HINT = (
 
 # Tool-call arguments are canonicalized on every model request. A bounded
 # value-keyed memo avoids repeatedly parsing the unchanged historical calls.
-_CANON_ARGS_CACHE: Dict[str, str] = {}
+_CANON_ARGS_CACHE: dict[str, str] = {}
 _CANON_ARGS_CACHE_MAX = 4096
 _CANON_ARGS_CACHE_MAX_BYTES = 32 * 1024 * 1024
 _canon_args_cache_bytes = 0
@@ -839,12 +840,12 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
 
 
 def _content_policy_blocked_result(
-    messages: List[Dict],
+    messages: list[dict],
     api_call_count: int,
     *,
     final_response: str,
     error_detail: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the terminal turn result for a content-policy block.
 
     A content-policy refusal is deterministic for the unchanged prompt, so the
@@ -865,9 +866,9 @@ def _content_policy_blocked_result(
 
 def _compression_deferred_result(
     agent,
-    messages: List[Dict],
+    messages: list[dict],
     api_call_count: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the soft turn result for a lock-contended compression defer.
 
     Another path (a sibling turn, a background review fork, a manual
@@ -992,9 +993,9 @@ async def _ensure_cached_system_prompt_static(agent, system_message=None) -> Non
 
 
 def _peel_moa_guidance(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     guidance: Any,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Remove MoA reference guidance previously attached by ``_attach_reference_guidance``.
 
     Thin wrapper over :func:`agent.moa_loop.peel_reference_guidance` (kept
@@ -1008,11 +1009,11 @@ def _peel_moa_guidance(
 
 async def _redecorate_prompt_cache_for_provider(
     agent,
-    api_messages: List[Dict[str, Any]],
+    api_messages: list[dict[str, Any]],
     *,
     system_message=None,
-    moa_prepared: Optional[Dict[str, Any]] = None,
-    tools_for_api: Optional[List[Dict[str, Any]]] = None,
+    moa_prepared: dict[str, Any] | None = None,
+    tools_for_api: list[dict[str, Any]] | None = None,
 ):
     """Strip and re-apply cache_control for the *current* provider policy.
 
@@ -1028,7 +1029,7 @@ async def _redecorate_prompt_cache_for_provider(
     then ``rebase_prepared_request`` re-attaches guidance outside the cached
     span.
     """
-    messages: List[Dict[str, Any]] = [
+    messages: list[dict[str, Any]] = [
         dict(m) if isinstance(m, dict) else m for m in (api_messages or [])
     ]
     prepared = moa_prepared
@@ -1077,12 +1078,12 @@ async def _redecorate_prompt_cache_for_provider(
 
 async def _apply_context_engine_selection(
     agent: Any,
-    api_messages: List[Dict[str, Any]],
-    conversation_messages: List[Dict[str, Any]],
-    incoming_message: Optional[Dict[str, Any]],
+    api_messages: list[dict[str, Any]],
+    conversation_messages: list[dict[str, Any]],
+    incoming_message: dict[str, Any] | None,
     *,
     logger: Any,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Run the optional per-turn ``ContextEngine.select_context()`` hook.
 
     Returns the (possibly replaced) request message list. The hook is for
@@ -1159,9 +1160,9 @@ async def _apply_context_engine_selection(
 
 async def _notify_context_engine_turn_complete(
     agent: Any,
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     *,
-    usage: Optional[Dict[str, Any]] = None,
+    usage: dict[str, Any] | None = None,
     logger: Any,
     **meta: Any,
 ) -> None:
@@ -1227,12 +1228,12 @@ async def _finalize_boundary_cancellation(
     agent: Any,
     *,
     user_message: Any,
-    conversation_history: Optional[List[Dict[str, Any]]],
-    task_id: Optional[str],
-    persist_user_message: Optional[Any],
-    persist_user_timestamp: Optional[float],
-    persist_user_display_kind: Optional[str],
-    persist_user_display_metadata: Optional[Dict[str, Any]],
+    conversation_history: list[dict[str, Any]] | None,
+    task_id: str | None,
+    persist_user_message: Any | None,
+    persist_user_timestamp: float | None,
+    persist_user_display_kind: str | None,
+    persist_user_display_metadata: dict[str, Any] | None,
 ) -> None:
     """Finalize a cancellation that escaped a narrower loop handler.
 
@@ -1263,7 +1264,7 @@ async def _finalize_boundary_cancellation(
     )
     if not current_row_is_staged:
         partial_messages = list(conversation_history or [])
-        user_row: Dict[str, Any] = {
+        user_row: dict[str, Any] = {
             "role": "user",
             "content": finalizer_user_message,
         }
@@ -1317,23 +1318,23 @@ async def _finalize_boundary_cancellation(
 async def run_conversation(
     agent,
     user_message: Any,
-    system_message: str = None,
-    conversation_history: List[Dict[str, Any]] = None,
-    task_id: str = None,
-    stream_callback: Optional[callable] = None,
-    persist_user_message: Optional[Any] = None,
-    persist_user_timestamp: Optional[float] = None,
-    persist_user_display_kind: Optional[str] = None,
-    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
-    moa_config: Optional[dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    system_message: str | None = None,
+    conversation_history: list[dict[str, Any]] | None = None,
+    task_id: str | None = None,
+    stream_callback: Callable[..., Any] | None = None,
+    persist_user_message: Any | None = None,
+    persist_user_timestamp: float | None = None,
+    persist_user_display_kind: str | None = None,
+    persist_user_display_metadata: dict[str, Any] | None = None,
+    moa_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
 
     Args:
         user_message (str): The user's message/question
         system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
-        conversation_history (List[Dict]): Previous conversation messages (optional)
+        conversation_history (list[dict]): Previous conversation messages (optional)
         task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
         stream_callback: Optional callback invoked with each text delta during streaming.
             Used by the TTS pipeline to start audio generation before the full response.
@@ -1445,7 +1446,7 @@ async def run_conversation(
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
-    truncated_response_parts: List[str] = []
+    truncated_response_parts: list[str] = []
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
@@ -1454,7 +1455,7 @@ async def run_conversation(
     # agent_init); default 3 preserves the prior hardcoded behavior for
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
-    _last_preflight_pressure: Optional[int] = None
+    _last_preflight_pressure: int | None = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If

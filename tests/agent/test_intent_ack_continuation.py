@@ -12,7 +12,6 @@ gates relate, not snapshots of the marker lists.
 """
 
 from types import SimpleNamespace
-from typing import Union
 
 from agent.agent_runtime_helpers import (
     intent_ack_continuation_enabled,
@@ -22,7 +21,7 @@ from agent.agent_runtime_helpers import (
 
 
 def _agent(
-    mode: Union[str, bool, list] = "auto",
+    mode: str | bool | list = "auto",
     api_mode="chat_completions",
     model="anthropic/claude-sonnet-4",
 ):

@@ -53,7 +53,7 @@ import aiofiles
 import aiofiles.os
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from hermes_constants import get_hermes_home
 from tools.computer_use.backend import (
@@ -316,7 +316,7 @@ _BLOCKED_TYPE_PATTERNS = [
 ]
 
 
-def _is_blocked_type(text: str) -> Optional[str]:
+def _is_blocked_type(text: str) -> str | None:
     for pat in _BLOCKED_TYPE_PATTERNS:
         if pat.search(text):
             return pat.pattern
@@ -330,10 +330,10 @@ def _is_blocked_type(text: str) -> Optional[str]:
 # Per-Hermes-session cached backends. Each backend owns its own target,
 # typed-browser route, grant namespace, and lifecycle. The dict-compatible
 # views preserve upstream private test hooks while routing state by profile.
-_AUX_VISION_ROUTE_CACHE: MutableMapping[Tuple[str, str], bool] = (
+_AUX_VISION_ROUTE_CACHE: MutableMapping[tuple[str, str], bool] = (
     _ScopedComputerUseDict("aux_vision_route_cache")
 )
-_backend: Optional[ComputerUseBackend] = None
+_backend: ComputerUseBackend | None = None
 _backends: MutableMapping[str, ComputerUseBackend] = _ScopedComputerUseDict(
     "backends"
 )
@@ -395,8 +395,8 @@ async def _get_backend(session_id: str = "") -> ComputerUseBackend:
             # stale backend may race a policy edge, and upstream deliberately
             # resolves that edge before constructing the replacement.
             permission_mode = _cua_permission_mode(sid)
-            stale_backend: Optional[ComputerUseBackend] = None
-            stale_call_lock: Optional[asyncio.Lock] = None
+            stale_backend: ComputerUseBackend | None = None
+            stale_call_lock: asyncio.Lock | None = None
 
             async with _backend_lock_for_profile():
                 if (
@@ -542,7 +542,7 @@ async def _shutdown_all_backends() -> None:
             if scope[0] is loop
         )
 
-    unique: Dict[int, Tuple[ComputerUseBackend, Optional[asyncio.Lock]]] = {}
+    unique: dict[int, tuple[ComputerUseBackend, asyncio.Lock | None]] = {}
     seen_states: set[int] = set()
     for state in states:
         if id(state) in seen_states:
@@ -578,7 +578,7 @@ async def _shutdown_all_backends() -> None:
 
     async def _stop_one(
         backend: ComputerUseBackend,
-        call_lock: Optional[asyncio.Lock],
+        call_lock: asyncio.Lock | None,
     ) -> None:
         try:
             if call_lock is not None:
@@ -623,7 +623,7 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     """Test/CI stub. Records calls; returns trivial results."""
 
     def __init__(self) -> None:
-        self.calls: List[Tuple[str, Dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
         self._started = False
 
     async def start(self) -> None: self._started = True
@@ -633,9 +633,9 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     async def capture(
         self,
         mode: str = "som",
-        app: Optional[str] = None,
-        pid: Optional[int] = None,
-        window_id: Optional[int] = None,
+        app: str | None = None,
+        pid: int | None = None,
+        window_id: int | None = None,
     ) -> CaptureResult:
         self.calls.append((
             "capture",
@@ -664,11 +664,11 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("key", {"keys": keys, **kw}))
         return ActionResult(ok=True, action="key")
 
-    async def list_apps(self) -> List[Dict[str, Any]]:
+    async def list_apps(self) -> list[dict[str, Any]]:
         self.calls.append(("list_apps", {}))
         return []
 
-    async def list_windows(self) -> List[Dict[str, Any]]:
+    async def list_windows(self) -> list[dict[str, Any]]:
         self.calls.append(("list_windows", {}))
         return []
 
@@ -676,7 +676,7 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("focus_app", {"app": app, "raise": raise_window}))
         return ActionResult(ok=True, action="focus_app")
 
-    async def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
+    async def set_value(self, value: str, element: int | None = None) -> ActionResult:
         self.calls.append(("set_value", {"value": value, "element": element}))
         return ActionResult(ok=True, action="set_value")
 
@@ -685,7 +685,7 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 # Dispatch
 # ---------------------------------------------------------------------------
 
-async def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+async def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     """Main entry point — dispatched by tools.registry.
 
     Returns either a JSON string (text-only) or a dict marked `_multimodal`
@@ -760,8 +760,8 @@ async def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         return json.dumps({"error": f"{action} failed: {e}"})
 
 
-async def _request_approval(action: str, args: Dict[str, Any],
-                      session_id: str = "") -> Optional[str]:
+async def _request_approval(action: str, args: dict[str, Any],
+                      session_id: str = "") -> str | None:
     """Return None if approved, or a JSON error string if denied.
 
     Approval is scoped by (action, delivery_mode) AND by session_id.
@@ -813,7 +813,7 @@ async def _request_approval(action: str, args: Dict[str, Any],
     return json.dumps({"error": "denied by user", "action": action})
 
 
-def _summarize_action(action: str, args: Dict[str, Any]) -> str:
+def _summarize_action(action: str, args: dict[str, Any]) -> str:
     fg = " [FOREGROUND — briefly raises the window / changes focus]" \
         if args.get("delivery_mode") == "foreground" else ""
     if action in {"click", "double_click", "right_click", "middle_click"}:
@@ -839,14 +839,14 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
     return action + fg
 
 
-async def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
+async def _dispatch(backend: ComputerUseBackend, action: str, args: dict[str, Any]) -> Any:
     capture_after = bool(args.get("capture_after"))
 
     if action == "capture":
         mode = str(args.get("mode", "som"))
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
-        capture_kwargs: Dict[str, Any] = {"mode": mode, "app": args.get("app")}
+        capture_kwargs: dict[str, Any] = {"mode": mode, "app": args.get("app")}
         if args.get("pid") is not None or args.get("window_id") is not None:
             capture_kwargs.update({
                 "pid": args.get("pid"),
@@ -880,7 +880,7 @@ async def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, An
     # The backend owns the opaque driver session, target, tab and ref state;
     # none of those capabilities can be supplied across Hermes sessions.
     if action == "cua_browser_state":
-        state_args: Dict[str, Any] = {}
+        state_args: dict[str, Any] = {}
         for public, internal in (
             ("pid", "pid"),
             ("window_id", "window_id"),
@@ -914,7 +914,7 @@ async def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, An
     }
     driver_tool = browser_tools.get(action)
     if driver_tool is not None:
-        call_args: Dict[str, Any] = {}
+        call_args: dict[str, Any] = {}
         allowed_fields = {
             "browser_navigate": ("url",),
             "browser_click": ("ref", "input_route", "x", "y"),
@@ -1044,7 +1044,7 @@ async def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, An
 # Response shaping
 # ---------------------------------------------------------------------------
 
-def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
+def _classify_action_result(res: ActionResult) -> dict[str, Any]:
     """Choose the next ladder step from semantic evidence, in precedence order.
 
     An escalation recommendation is advisory. It never overrides a confirmed
@@ -1056,7 +1056,7 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     if res.effect == "unverifiable":
         return {"decision": "verify_fresh_state"}
     if res.effect == "suspected_noop" or not res.ok or res.code is not None:
-        decision: Dict[str, Any] = {"decision": "escalate"}
+        decision: dict[str, Any] = {"decision": "escalate"}
         if isinstance(res.escalation, dict):
             decision["recommended"] = res.escalation.get("recommended")
         return decision
@@ -1064,8 +1064,8 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     return {"decision": "verify_fresh_state"}
 
 
-def _action_payload(res: ActionResult) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"ok": res.ok, "action": res.action}
+def _action_payload(res: ActionResult) -> dict[str, Any]:
+    payload: dict[str, Any] = {"ok": res.ok, "action": res.action}
     if res.message:
         payload["message"] = res.message
     # Surface cua-driver's structured verdict additively so the model can
@@ -1108,7 +1108,7 @@ _MAX_ALLOWED_MAX_ELEMENTS = 1000
 _MIN_PROVIDER_IMAGE_DIMENSION = 8
 
 
-def _image_dimensions_from_b64(image_b64: str) -> Optional[Tuple[int, int]]:
+def _image_dimensions_from_b64(image_b64: str) -> tuple[int, int] | None:
     """Return (width, height) for common inline screenshot formats.
 
     Some providers reject images below 8x8 before the model sees the tool
@@ -1299,7 +1299,7 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
             f"raise max_elements or pass app= to narrow)"
         )
     summary = "\n".join(summary_lines)
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "mode": cap.mode,
         "width": response_width,
         "height": response_height,
@@ -1401,7 +1401,7 @@ async def _capture_after_mode() -> str:
 async def _route_capture_through_aux_vision(
     cap: CaptureResult,
     summary: str,
-) -> Optional[str]:
+) -> str | None:
     """Pre-analyse the captured PNG via ``vision_analyze`` and return a text result.
 
     The captured base64 PNG is materialised to ``$HERMES_HOME/cache/vision/``
@@ -1545,8 +1545,8 @@ async def _maybe_follow_capture(
     return json.dumps(data)
 
 
-def _format_elements(elements: List[UIElement], max_lines: int = 40) -> List[str]:
-    out: List[str] = []
+def _format_elements(elements: list[UIElement], max_lines: int = 40) -> list[str]:
+    out: list[str] = []
     for e in elements[:max_lines]:
         label = e.label.replace("\n", " ")[:60]
         out.append(f"  #{e.index} {e.role} {label!r} @ {e.bounds}"
@@ -1556,7 +1556,7 @@ def _format_elements(elements: List[UIElement], max_lines: int = 40) -> List[str
     return out
 
 
-def _element_to_dict(e: UIElement) -> Dict[str, Any]:
+def _element_to_dict(e: UIElement) -> dict[str, Any]:
     return {
         "index": e.index,
         "role": e.role,
@@ -1586,6 +1586,6 @@ async def check_computer_use_requirements() -> bool:
     return await cua_driver_binary_available()
 
 
-def get_computer_use_schema() -> Dict[str, Any]:
+def get_computer_use_schema() -> dict[str, Any]:
     from tools.computer_use.schema import COMPUTER_USE_SCHEMA
     return COMPUTER_USE_SCHEMA

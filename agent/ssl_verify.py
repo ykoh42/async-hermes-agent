@@ -10,7 +10,7 @@ import ssl
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -151,7 +151,7 @@ async def _preload_client_cert_files(cert: Any) -> None:
 
 async def resolve_httpx_verify(
     *,
-    ca_bundle: Optional[str] = None,
+    ca_bundle: str | None = None,
     ssl_verify: Any = None,
     base_url: str = "",
 ) -> bool | ssl.SSLContext:
@@ -197,7 +197,7 @@ async def resolve_httpx_verify(
 
 async def _resolve_httpx_client_verify(
     *,
-    ca_bundle: Optional[str] = None,
+    ca_bundle: str | None = None,
     ssl_verify: Any = None,
     base_url: str = "",
     trust_env: bool = True,

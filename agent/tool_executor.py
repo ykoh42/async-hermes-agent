@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles.os
 
@@ -104,7 +104,7 @@ def _budget_for_agent(agent) -> BudgetConfig:
         return DEFAULT_BUDGET
 
 
-def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
+def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, str | None]:
     """Parse model-emitted arguments without repairing or coercing them."""
     try:
         arguments = json.loads(raw_arguments)
@@ -143,7 +143,7 @@ async def _emit_terminal_post_tool_call(
     status: str | None = None,
     error_type: str | None = None,
     error_message: str | None = None,
-    middleware_trace: Optional[list[dict[str, Any]]] = None,
+    middleware_trace: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
         from model_tools import _emit_post_tool_call_hook
@@ -223,7 +223,7 @@ async def _emit_cancelled_terminal_post_tool_call(
     start_time: float,
     reason: str = "user interrupt",
     error_type: str = "keyboard_interrupt",
-    middleware_trace: Optional[list[dict[str, Any]]] = None,
+    middleware_trace: list[dict[str, Any]] | None = None,
 ) -> str:
     result = _cancelled_tool_result(reason)
     await _emit_terminal_post_tool_call(

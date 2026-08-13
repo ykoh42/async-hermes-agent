@@ -1,14 +1,14 @@
 """Side-effect-free validation for ``platform_toolsets`` configuration."""
 
-from typing import Callable, List
+from collections.abc import Callable
 
 
 def validate_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
-) -> List[str]:
+) -> list[str]:
     """Return warnings for unknown names or a zero-tool resolution."""
-    warnings: List[str] = []
+    warnings: list[str] = []
     if not isinstance(platform_toolsets, dict) or not platform_toolsets:
         return warnings
 

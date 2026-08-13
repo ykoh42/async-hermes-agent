@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any
 
 import httpx
 
@@ -56,7 +56,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
 
     async def _get_config_or_none(
         self, *, refresh_token: bool = True
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         del refresh_token
         api_key = get_secret("BROWSER_USE_API_KEY")
         if api_key:
@@ -66,7 +66,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
             }
         return None
 
-    async def _get_config(self) -> Dict[str, Any]:
+    async def _get_config(self) -> dict[str, Any]:
         config = await self._get_config_or_none()
         if config is None:
             raise ValueError(
@@ -78,13 +78,13 @@ class BrowserUseBrowserProvider(BrowserProvider):
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def _headers(self, config: Dict[str, Any]) -> Dict[str, str]:
+    def _headers(self, config: dict[str, Any]) -> dict[str, str]:
         return {
             "Content-Type": "application/json",
             "X-Browser-Use-API-Key": config["api_key"],
         }
 
-    async def create_session(self, task_id: str) -> Dict[str, object]:
+    async def create_session(self, task_id: str) -> dict[str, object]:
         config = await self._get_config()
         headers = self._headers(config)
 
@@ -176,7 +176,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
                 "Emergency cleanup failed for Browser Use session %s: %s", session_id, e
             )
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Browser Use",
             "badge": "paid",

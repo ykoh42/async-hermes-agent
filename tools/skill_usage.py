@@ -11,14 +11,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import errno
 import json
 import logging
 import os
 from pathlib import Path
 import stat
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any
+from collections.abc import Callable
 import uuid
 
 import aiofiles
@@ -43,7 +44,7 @@ STATE_ACTIVE = "active"
 STATE_STALE = "stale"
 STATE_ARCHIVED = "archived"
 _VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
-PROTECTED_BUILTIN_SKILLS: Set[str] = {"plan"}
+PROTECTED_BUILTIN_SKILLS: set[str] = {"plan"}
 
 _os_open = aiofiles.os.wrap(os.open)
 _os_close = aiofiles.os.wrap(os.close)
@@ -70,10 +71,10 @@ def _archive_dir() -> Path:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
-def _parse_iso_timestamp(value: Any) -> Optional[datetime]:
+def _parse_iso_timestamp(value: Any) -> datetime | None:
     if not value:
         return None
     try:
@@ -81,14 +82,14 @@ def _parse_iso_timestamp(value: Any) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
-def latest_activity_at(record: Dict[str, Any]) -> Optional[str]:
+def latest_activity_at(record: dict[str, Any]) -> str | None:
     """Return the newest use, view, or patch timestamp."""
-    latest_dt: Optional[datetime] = None
-    latest_raw: Optional[str] = None
+    latest_dt: datetime | None = None
+    latest_raw: str | None = None
     for key in ("last_used_at", "last_viewed_at", "last_patched_at"):
         raw = record.get(key)
         parsed = _parse_iso_timestamp(raw)
@@ -98,7 +99,7 @@ def latest_activity_at(record: Dict[str, Any]) -> Optional[str]:
     return latest_raw
 
 
-def activity_count(record: Dict[str, Any]) -> int:
+def activity_count(record: dict[str, Any]) -> int:
     total = 0
     for key in ("use_count", "view_count", "patch_count"):
         try:
@@ -108,7 +109,7 @@ def activity_count(record: Dict[str, Any]) -> int:
     return total
 
 
-def _empty_record() -> Dict[str, Any]:
+def _empty_record() -> dict[str, Any]:
     return {
         "created_by": None,
         "use_count": 0,
@@ -181,13 +182,13 @@ async def _acquire_platform_lock(fd: int) -> None:
 
 async def _release_platform_lock(fd: int) -> None:
     if fcntl is not None:
-        with contextlib.suppress(OSError, IOError):
+        with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
     elif msvcrt is not None:  # pragma: no cover - Windows
         try:
             await _os_lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        except (OSError, IOError):
+        except OSError:
             pass
 
 
@@ -220,7 +221,7 @@ async def _usage_file_lock():
         )
 
 
-async def load_usage() -> Dict[str, Dict[str, Any]]:
+async def load_usage() -> dict[str, dict[str, Any]]:
     """Read the entire usage map, returning an empty map when absent/corrupt."""
     path = _usage_file()
     try:
@@ -238,7 +239,7 @@ async def load_usage() -> Dict[str, Dict[str, Any]]:
     }
 
 
-async def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
+async def save_usage(data: dict[str, dict[str, Any]]) -> None:
     """Atomically persist the usage map; failures remain best-effort."""
     path = _usage_file()
     temporary: Path | None = None
@@ -279,7 +280,7 @@ async def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
         )
 
 
-async def get_record(skill_name: str) -> Dict[str, Any]:
+async def get_record(skill_name: str) -> dict[str, Any]:
     record = (await load_usage()).get(skill_name)
     if not isinstance(record, dict):
         return _empty_record()
@@ -290,7 +291,7 @@ async def get_record(skill_name: str) -> Dict[str, Any]:
 
 async def _mutate(
     skill_name: str,
-    mutator: Callable[[Dict[str, Any]], None],
+    mutator: Callable[[dict[str, Any]], None],
     *,
     require_curation_eligible: bool = False,
 ) -> None:
@@ -314,7 +315,7 @@ async def _mutate(
 
 
 async def bump_view(skill_name: str) -> None:
-    def apply(record: Dict[str, Any]) -> None:
+    def apply(record: dict[str, Any]) -> None:
         record["view_count"] = int(record.get("view_count") or 0) + 1
         record["last_viewed_at"] = _now_iso()
 
@@ -322,7 +323,7 @@ async def bump_view(skill_name: str) -> None:
 
 
 async def bump_use(skill_name: str) -> None:
-    def apply(record: Dict[str, Any]) -> None:
+    def apply(record: dict[str, Any]) -> None:
         record["use_count"] = int(record.get("use_count") or 0) + 1
         record["last_used_at"] = _now_iso()
 
@@ -330,7 +331,7 @@ async def bump_use(skill_name: str) -> None:
 
 
 async def bump_patch(skill_name: str) -> None:
-    def apply(record: Dict[str, Any]) -> None:
+    def apply(record: dict[str, Any]) -> None:
         record["patch_count"] = int(record.get("patch_count") or 0) + 1
         record["last_patched_at"] = _now_iso()
 
@@ -357,7 +358,7 @@ async def set_state(skill_name: str, state: str) -> None:
     if state not in _VALID_STATES:
         return
 
-    def apply(record: Dict[str, Any]) -> None:
+    def apply(record: dict[str, Any]) -> None:
         record["state"] = state
         if state == STATE_ARCHIVED:
             record["archived_at"] = _now_iso()
@@ -415,7 +416,7 @@ async def is_curator_managed(skill_name: str) -> bool:
     return _is_curator_managed_record((await load_usage()).get(skill_name))
 
 
-async def _read_bundled_manifest_names() -> Set[str]:
+async def _read_bundled_manifest_names() -> set[str]:
     try:
         async with aiofiles.open(
             _skills_dir() / ".bundled_manifest",
@@ -431,7 +432,7 @@ async def _read_bundled_manifest_names() -> Set[str]:
     }
 
 
-async def _read_hub_installed_names() -> Set[str]:
+async def _read_hub_installed_names() -> set[str]:
     try:
         async with aiofiles.open(
             _skills_dir() / ".hub" / "lock.json",
@@ -487,7 +488,7 @@ def _suppressed_file() -> Path:
     return _skills_dir() / ".curator_suppressed"
 
 
-async def read_suppressed_names() -> Set[str]:
+async def read_suppressed_names() -> set[str]:
     path = _suppressed_file()
     try:
         async with aiofiles.open(path, encoding="utf-8") as handle:
@@ -502,7 +503,7 @@ async def read_suppressed_names() -> Set[str]:
     }
 
 
-async def _write_suppressed_names(names: Set[str]) -> None:
+async def _write_suppressed_names(names: set[str]) -> None:
     path = _suppressed_file()
     temporary = path.parent / f".curator_suppressed_{uuid.uuid4().hex}.tmp"
     data = "\n".join(sorted(names)) + ("\n" if names else "")
@@ -622,12 +623,12 @@ async def _find_local_skill_dir(skill_name: str) -> Path | None:
     return None
 
 
-async def _find_skill_dir(skill_name: str) -> Optional[Path]:
+async def _find_skill_dir(skill_name: str) -> Path | None:
     """Compatibility name for local skill discovery."""
     return await _find_local_skill_dir(skill_name)
 
 
-async def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
+async def _find_external_skill_dir(skill_name: str) -> Path | None:
     from agent.skill_utils import (
         get_all_skills_dirs,
         is_excluded_skill_path,
@@ -758,7 +759,7 @@ def _external_read_only_message(skill_name: str) -> str:
 
 async def is_curation_eligible(
     skill_name: str,
-    skill_path: Optional[Path] = None,
+    skill_path: Path | None = None,
 ) -> bool:
     from agent.skill_utils import is_external_skill_path
 
@@ -778,7 +779,7 @@ async def is_curation_eligible(
     return True
 
 
-async def list_agent_created_skill_names() -> List[str]:
+async def list_agent_created_skill_names() -> list[str]:
     from agent.skill_utils import is_excluded_skill_path, is_external_skill_path, iter_skill_index_files
 
     base = _skills_dir()
@@ -788,7 +789,7 @@ async def list_agent_created_skill_names() -> List[str]:
     bundled = await _read_bundled_manifest_names()
     prune_builtins = await _prune_builtins_enabled()
     usage = await load_usage()
-    names: List[str] = []
+    names: list[str] = []
     async for skill_md in iter_skill_index_files(base, "SKILL.md"):
         if await is_excluded_skill_path(skill_md, root=base):
             continue
@@ -806,7 +807,7 @@ async def list_agent_created_skill_names() -> List[str]:
     return sorted(set(names))
 
 
-async def list_archived_skill_names() -> List[str]:
+async def list_archived_skill_names() -> list[str]:
     archive_root = _archive_dir()
     if not await aiofiles.os.path.isdir(archive_root):
         return []
@@ -817,7 +818,7 @@ async def list_archived_skill_names() -> List[str]:
     return sorted(set(names))
 
 
-async def list_unmanaged_skill_names() -> List[str]:
+async def list_unmanaged_skill_names() -> list[str]:
     from agent.skill_utils import is_excluded_skill_path, is_external_skill_path, iter_skill_index_files
 
     base = _skills_dir()
@@ -826,7 +827,7 @@ async def list_unmanaged_skill_names() -> List[str]:
     hub = await _read_hub_installed_names()
     bundled = await _read_bundled_manifest_names()
     usage = await load_usage()
-    names: List[str] = []
+    names: list[str] = []
     async for skill_md in iter_skill_index_files(base, "SKILL.md"):
         if await is_excluded_skill_path(skill_md, root=base):
             continue
@@ -842,9 +843,9 @@ async def list_unmanaged_skill_names() -> List[str]:
     return sorted(set(names))
 
 
-async def unmanaged_report() -> List[Dict[str, Any]]:
+async def unmanaged_report() -> list[dict[str, Any]]:
     usage = await load_usage()
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for name in await list_unmanaged_skill_names():
         raw = usage.get(name)
         record = dict(raw) if isinstance(raw, dict) else _empty_record()
@@ -908,7 +909,7 @@ async def _archive_skill_owned(skill_name: str) -> tuple[bool, str]:
             return False, f"failed to create archive dir: {exc}"
         destination = archive_root / skill_dir.name
         if await aiofiles.os.path.exists(destination):
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             destination = archive_root / f"{skill_dir.name}-{stamp}"
         try:
             await _move_tree(skill_dir, destination)
@@ -1004,7 +1005,7 @@ async def _iter_archive_dirs(root: Path):
                 yield descendant
 
 
-async def _restore_skill_owned(skill_name: str) -> Tuple[bool, str]:
+async def _restore_skill_owned(skill_name: str) -> tuple[bool, str]:
     if await is_hub_installed(skill_name):
         return False, (
             f"skill '{skill_name}' is now hub-installed; restore would "
@@ -1088,7 +1089,7 @@ async def _restore_skill_owned(skill_name: str) -> Tuple[bool, str]:
     return True, f"restored to {destination}"
 
 
-async def restore_skill(skill_name: str) -> Tuple[bool, str]:
+async def restore_skill(skill_name: str) -> tuple[bool, str]:
     return await _finish_owned_task(
         asyncio.create_task(_restore_skill_owned(skill_name))
     )
@@ -1102,9 +1103,9 @@ async def provenance(skill_name: str) -> str:
     return "agent"
 
 
-async def curated_report() -> List[Dict[str, Any]]:
+async def curated_report() -> list[dict[str, Any]]:
     data = await load_usage()
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for name in await list_agent_created_skill_names():
         raw = data.get(name)
         persisted = isinstance(raw, dict)
@@ -1119,20 +1120,20 @@ async def curated_report() -> List[Dict[str, Any]]:
     return rows
 
 
-async def agent_created_report() -> List[Dict[str, Any]]:
+async def agent_created_report() -> list[dict[str, Any]]:
     """Compatibility alias for :func:`curated_report`."""
     return await curated_report()
 
 
-async def usage_report() -> List[Dict[str, Any]]:
+async def usage_report() -> list[dict[str, Any]]:
     from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
 
     base = _skills_dir()
     if not await aiofiles.os.path.isdir(base):
         return []
     data = await load_usage()
-    rows: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
     async for skill_md in iter_skill_index_files(base, "SKILL.md"):
         if await is_excluded_skill_path(skill_md, root=base):
             continue

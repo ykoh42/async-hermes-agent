@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,8 +18,8 @@ class _CDPServer:
     """Tiny same-event-loop CDP-over-WebSocket server."""
 
     def __init__(self) -> None:
-        self._handlers: Dict[str, Any] = {}
-        self._responses: List[Dict[str, Any]] = []
+        self._handlers: dict[str, Any] = {}
+        self._responses: list[dict[str, Any]] = []
         self._server: Any = None
         self._host = "127.0.0.1"
         self._port = 0
@@ -73,7 +73,7 @@ class _CDPServer:
             self._server.close()
             await self._server.wait_closed()
 
-    def received(self) -> List[Dict[str, Any]]:
+    def received(self) -> list[dict[str, Any]]:
         return list(self._responses)
 
 

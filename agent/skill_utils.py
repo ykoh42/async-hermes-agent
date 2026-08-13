@@ -11,7 +11,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -72,7 +72,7 @@ ORG_PROVENANCE_FILE = ".org-provenance.json"
 ORG_BASELINE_FILE = ".org-baseline.json"
 
 
-async def read_active_org_id(skills_dir: Path) -> Optional[str]:
+async def read_active_org_id(skills_dir: Path) -> str | None:
     """The org id whose mirror may resolve, or None (no org skills load)."""
     try:
         marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
@@ -96,7 +96,7 @@ async def is_org_mirror_path(path, skills_dir: Path) -> bool:
     return bool(rel.parts) and rel.parts[0] == ORG_MIRROR_DIR_NAME
 
 
-async def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
+async def org_id_of_path(path, skills_dir: Path) -> str | None:
     """The ``<org_id>`` segment for a path under ``_org/<org_id>/...``."""
     try:
         rel = Path(await _realpath(path)).relative_to(
@@ -109,7 +109,7 @@ async def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     return None
 
 
-async def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+async def is_excluded_skill_path(path, *, root: Path | None = None) -> bool:
     """True if *path* should be skipped by active skill scanners.
 
     Use this on every ``SKILL.md`` path produced by direct ``rglob`` scans to
@@ -129,7 +129,7 @@ async def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     )
 
 
-async def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
+async def is_skill_support_path(path, *, root: Path | None = None) -> bool:
     """True if *path* is under a support dir of an actual skill root.
 
     ``references/``, ``templates/``, ``assets/``, and ``scripts/`` are
@@ -181,7 +181,7 @@ def yaml_load(content: str):
 # ── Frontmatter parsing ──────────────────────────────────────────────────
 
 
-def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     """Parse YAML frontmatter from a markdown string.
 
     Uses yaml with CSafeLoader for full YAML support (nested metadata, lists)
@@ -198,7 +198,7 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     Returns:
         (frontmatter_dict, remaining_body)
     """
-    frontmatter: Dict[str, Any] = {}
+    frontmatter: dict[str, Any] = {}
 
     # Strip only a leading BOM; a BOM mid-content is data, not a marker.
     if content.startswith("\ufeff"):
@@ -258,7 +258,7 @@ def skill_matches_platform_list(platforms: Any) -> bool:
     return False
 
 
-def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
+def skill_matches_platform(frontmatter: dict[str, Any]) -> bool:
     """Return True when the skill is compatible with the current OS.
 
     Skills declare platform requirements via a top-level ``platforms`` list
@@ -293,7 +293,7 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
 # Detection is cached for the process lifetime via ``_ENV_DETECT_CACHE``.
 _KNOWN_ENVIRONMENTS = frozenset({"docker", "s6"})
 
-_ENV_DETECT_CACHE: Dict[str, bool] = {}
+_ENV_DETECT_CACHE: dict[str, bool] = {}
 
 
 async def _detect_environment(env: str) -> bool:
@@ -338,7 +338,7 @@ async def _detect_environment(env: str) -> bool:
     return result
 
 
-async def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
+async def skill_matches_environment(frontmatter: dict[str, Any]) -> bool:
     """Return True when the skill is relevant to the current runtime environment.
 
     Skills may declare an ``environments`` list in their YAML frontmatter::
@@ -379,7 +379,7 @@ async def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -387,7 +387,7 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-async def _load_raw_config() -> Dict[str, Any]:
+async def _load_raw_config() -> dict[str, Any]:
     """Read config.yaml with a shared mtime+size keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
@@ -423,7 +423,7 @@ async def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
-async def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
+async def get_disabled_skill_names(platform: str | None = None) -> set[str]:
     """Read disabled skill names from config.yaml.
 
     Args:
@@ -461,7 +461,7 @@ async def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
-def _normalize_string_set(values) -> Set[str]:
+def _normalize_string_set(values) -> set[str]:
     if values is None:
         return set()
     if isinstance(values, str):
@@ -477,7 +477,7 @@ def _normalize_string_set(values) -> Set[str]:
 # which becomes the dominant cost of ``hermes`` startup when ~120 skills
 # each trigger a category lookup during banner construction (10+ seconds
 # of pure waste).
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+_EXTERNAL_DIRS_CACHE: dict[tuple[str, int], list[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -486,7 +486,7 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-async def get_external_skills_dirs() -> List[Path]:
+async def get_external_skills_dirs() -> list[Path]:
     """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
@@ -506,7 +506,7 @@ async def get_external_skills_dirs() -> List[Path]:
     # the full YAML parse, so the fast path is nearly free.
     try:
         stat = await aiofiles.os.stat(config_path)
-        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
+        cache_key: tuple[str, int] = (str(config_path), stat.st_mtime_ns)
     except OSError:
         cache_key = None  # type: ignore[assignment]
 
@@ -526,7 +526,7 @@ async def get_external_skills_dirs() -> List[Path]:
 
     raw_dirs = skills_cfg.get("external_dirs")
     if not raw_dirs:
-        result: List[Path] = []
+        result: list[Path] = []
         if cache_key is not None:
             _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
         return result
@@ -539,7 +539,7 @@ async def get_external_skills_dirs() -> List[Path]:
 
     hermes_home = get_hermes_home()
     local_skills = Path(await _realpath(get_skills_dir()))
-    seen: Set[Path] = set()
+    seen: set[Path] = set()
     result = []
 
     for entry in raw_dirs:
@@ -568,7 +568,7 @@ async def get_external_skills_dirs() -> List[Path]:
     return result
 
 
-async def get_all_skills_dirs() -> List[Path]:
+async def get_all_skills_dirs() -> list[Path]:
     """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
 
     The local dir is always first (and always included even if it doesn't exist
@@ -677,7 +677,7 @@ async def is_external_skill_path(path) -> bool:
 # ── Condition extraction ──────────────────────────────────────────────────
 
 
-def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
+def extract_skill_conditions(frontmatter: dict[str, Any]) -> dict[str, list]:
     """Extract conditional activation fields from parsed frontmatter."""
     metadata = frontmatter.get("metadata")
     # Handle cases where metadata is not a dict (e.g., a string from malformed YAML)
@@ -697,7 +697,7 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
 # ── Skill config extraction ───────────────────────────────────────────────
 
 
-def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any]]:
+def extract_skill_config_vars(frontmatter: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract config variable declarations from parsed frontmatter.
 
     Skills declare config.yaml settings they need via::
@@ -727,7 +727,7 @@ def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any
     if not isinstance(raw, list):
         return []
 
-    result: List[Dict[str, Any]] = []
+    result: list[dict[str, Any]] = []
     seen: set = set()
     for item in raw:
         if not isinstance(item, dict):
@@ -739,7 +739,7 @@ def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any
         desc = str(item.get("description", "")).strip()
         if not desc:
             continue
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             "key": key,
             "description": desc,
         }
@@ -756,7 +756,7 @@ def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any
     return result
 
 
-async def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
+async def discover_all_skill_config_vars() -> list[dict[str, Any]]:
     """Scan all enabled skills and collect their config variable declarations.
 
     Walks every skills directory, parses each SKILL.md frontmatter, and returns
@@ -765,7 +765,7 @@ async def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
 
     Disabled and platform-incompatible skills are excluded.
     """
-    all_vars: List[Dict[str, Any]] = []
+    all_vars: list[dict[str, Any]] = []
     seen_keys: set = set()
 
     disabled = await get_disabled_skill_names()
@@ -802,7 +802,7 @@ async def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
 SKILL_CONFIG_PREFIX = "skills.config"
 
 
-def _resolve_dotpath(config: Dict[str, Any], dotted_key: str):
+def _resolve_dotpath(config: dict[str, Any], dotted_key: str):
     """Walk a nested dict following a dotted key.  Returns None if any part is missing."""
     parts = dotted_key.split(".")
     current = config
@@ -815,8 +815,8 @@ def _resolve_dotpath(config: Dict[str, Any], dotted_key: str):
 
 
 async def resolve_skill_config_values(
-    config_vars: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    config_vars: list[dict[str, Any]],
+) -> dict[str, Any]:
     """Resolve current values for skill config vars from config.yaml.
 
     Skill config is stored under ``skills.config.<key>`` in config.yaml.
@@ -826,7 +826,7 @@ async def resolve_skill_config_values(
     """
     config = await _load_raw_config()
 
-    resolved: Dict[str, Any] = {}
+    resolved: dict[str, Any] = {}
     for var in config_vars:
         logical_key = var["key"]
         storage_key = f"{SKILL_CONFIG_PREFIX}.{logical_key}"
@@ -849,13 +849,13 @@ async def resolve_skill_config_values(
 SKILL_PROMPT_DESC_LIMIT = 60
 
 
-def _normalize_skill_description(frontmatter: Dict[str, Any]) -> str:
+def _normalize_skill_description(frontmatter: dict[str, Any]) -> str:
     """Normalize a skill's description field for comparison/truncation."""
     raw_desc = frontmatter.get("description", "")
     return str(raw_desc).strip().strip("'\"") if raw_desc else ""
 
 
-def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
+def extract_skill_description(frontmatter: dict[str, Any]) -> str:
     """Extract a system-prompt-length description from parsed frontmatter."""
     desc = _normalize_skill_description(frontmatter)
     if not desc:
@@ -865,7 +865,7 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
     return desc
 
 
-def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bool:
+def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bool:
     """True when the description will be truncated in the system prompt skill index."""
     desc = _normalize_skill_description(frontmatter)
     return len(desc) > SKILL_PROMPT_DESC_LIMIT
@@ -940,7 +940,7 @@ async def iter_skill_index_files(skills_dir: Path, filename: str):
 _NAMESPACE_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
-def parse_qualified_name(name: str) -> Tuple[Optional[str], str]:
+def parse_qualified_name(name: str) -> tuple[str | None, str]:
     """Split ``'namespace:skill-name'`` into ``(namespace, bare_name)``.
 
     Returns ``(None, name)`` when there is no ``':'``.
@@ -950,7 +950,7 @@ def parse_qualified_name(name: str) -> Tuple[Optional[str], str]:
     return tuple(name.split(":", 1))  # type: ignore[return-value]
 
 
-def is_valid_namespace(candidate: Optional[str]) -> bool:
+def is_valid_namespace(candidate: str | None) -> bool:
     """Check whether *candidate* is a valid namespace (``[a-zA-Z0-9_-]+``)."""
     if not candidate:
         return False

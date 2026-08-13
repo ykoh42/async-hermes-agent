@@ -22,7 +22,6 @@ import uuid
 import weakref
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import aiofiles
 import aiofiles.os
@@ -43,15 +42,15 @@ _utime = aiofiles.os.wrap(os.utime)
 
 # Session-scoped list of credential files to mount. ContextVar prevents one
 # concurrently served profile/session from seeing another session's entries.
-_registered_files_var: ContextVar[Dict[str, str]] = ContextVar("_registered_files")
+_registered_files_var: ContextVar[dict[str, str]] = ContextVar("_registered_files")
 
 
-def _get_registered() -> Dict[str, str]:
+def _get_registered() -> dict[str, str]:
     """Get or create this context's registered credential-file mapping."""
     try:
         return _registered_files_var.get()
     except LookupError:
-        value: Dict[str, str] = {}
+        value: dict[str, str] = {}
         _registered_files_var.set(value)
         return value
 
@@ -60,8 +59,8 @@ def _get_registered() -> Dict[str, str]:
 # canonical Hermes profile.  A process may serve multiple profiles on one
 # event loop, so a single process-global list would mount profile A's
 # credentials into profile B's sandbox.
-_config_files: List[Dict[str, str]] | None = None
-_config_files_by_home: dict[str, List[Dict[str, str]]] = {}
+_config_files: list[dict[str, str]] | None = None
+_config_files_by_home: dict[str, list[dict[str, str]]] = {}
 _config_files_cache_guard = threading.RLock()
 _config_file_locks_guard = threading.RLock()
 _config_file_locks: weakref.WeakKeyDictionary[
@@ -97,7 +96,7 @@ def _config_file_lock(profile_key: str) -> asyncio.Lock:
         return lock
 
 
-def _cached_config_files(profile_key: str) -> List[Dict[str, str]] | None:
+def _cached_config_files(profile_key: str) -> list[dict[str, str]] | None:
     """Return this profile's cache while honoring the legacy reset hook."""
     global _config_files
     with _config_files_cache_guard:
@@ -114,8 +113,8 @@ def _cached_config_files(profile_key: str) -> List[Dict[str, str]] | None:
 
 def _store_config_files(
     profile_key: str,
-    result: List[Dict[str, str]],
-) -> List[Dict[str, str]]:
+    result: list[dict[str, str]],
+) -> list[dict[str, str]]:
     global _config_files
     with _config_files_cache_guard:
         cached = _config_files_by_home.setdefault(profile_key, result)
@@ -204,9 +203,9 @@ async def register_credential_file(
 async def register_credential_files(
     entries: list,
     container_base: str = "/root/.hermes",
-) -> List[str]:
+) -> list[str]:
     """Register skill frontmatter entries and return unavailable paths."""
-    missing: List[str] = []
+    missing: list[str] = []
     for entry in entries:
         if isinstance(entry, str):
             relative_path = entry.strip()
@@ -221,7 +220,7 @@ async def register_credential_files(
     return missing
 
 
-async def _load_config_files() -> List[Dict[str, str]]:
+async def _load_config_files() -> list[dict[str, str]]:
     """Load ``terminal.credential_files`` once for the active profile."""
     profile_key = await _config_profile_key()
     cached = _cached_config_files(profile_key)
@@ -233,7 +232,7 @@ async def _load_config_files() -> List[Dict[str, str]]:
         if cached is not None:
             return cached
 
-        result: List[Dict[str, str]] = []
+        result: list[dict[str, str]] = []
         try:
             from hermes_cli.config import read_user_config_raw
 
@@ -280,9 +279,9 @@ async def _load_config_files() -> List[Dict[str, str]]:
         return _store_config_files(profile_key, result)
 
 
-async def get_credential_file_mounts() -> List[Dict[str, str]]:
+async def get_credential_file_mounts() -> list[dict[str, str]]:
     """Return existing skill-registered and user-configured mount entries."""
-    mounts: Dict[str, str] = {}
+    mounts: dict[str, str] = {}
 
     for container_path, host_path in _get_registered().items():
         if await aiofiles.os.path.isfile(host_path):
@@ -440,9 +439,9 @@ async def _safe_skills_path(skills_dir: Path) -> str:
 
 async def get_skills_directory_mount(
     container_base: str = "/root/.hermes",
-) -> list[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Return local and external skill-directory mount entries."""
-    mounts: list[Dict[str, str]] = []
+    mounts: list[dict[str, str]] = []
     hermes_home = _resolve_hermes_home()
     skills_dir = hermes_home / "skills"
     if await aiofiles.os.path.isdir(skills_dir):
@@ -474,9 +473,9 @@ async def get_skills_directory_mount(
 
 async def iter_skills_files(
     container_base: str = "/root/.hermes",
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Return regular skill files, excluding every symlink."""
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     hermes_home = _resolve_hermes_home()
     skills_dir = hermes_home / "skills"
     if await aiofiles.os.path.isdir(skills_dir):
@@ -527,7 +526,7 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 # Path translation is intentionally synchronous and pure. Awaited mount
 # discovery refreshes this profile/base-keyed table before a remote backend
 # exposes those paths to the agent.
-_cache_mounts_by_scope: dict[tuple[str, str], tuple[Dict[str, str], ...]] = {}
+_cache_mounts_by_scope: dict[tuple[str, str], tuple[dict[str, str], ...]] = {}
 
 
 def _cache_mount_scope(container_base: str) -> tuple[str, str]:
@@ -536,11 +535,11 @@ def _cache_mount_scope(container_base: str) -> tuple[str, str]:
 
 async def get_cache_directory_mounts(
     container_base: str = "/root/.hermes",
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Return existing cache-directory bind mount entries."""
     from hermes_constants import get_hermes_dir
 
-    mounts: List[Dict[str, str]] = []
+    mounts: list[dict[str, str]] = []
     for new_subpath, old_name in _CACHE_DIRS:
         host_dir = await get_hermes_dir(new_subpath, old_name)
         if await aiofiles.os.path.isdir(host_dir):
@@ -556,14 +555,14 @@ async def get_cache_directory_mounts(
     return mounts
 
 
-def _known_cache_mounts(container_base: str) -> tuple[Dict[str, str], ...]:
+def _known_cache_mounts(container_base: str) -> tuple[dict[str, str], ...]:
     return _cache_mounts_by_scope.get(_cache_mount_scope(container_base), ())
 
 
 def map_cache_path_to_container(
     host_path: str,
     container_base: str = "/root/.hermes",
-) -> Optional[str]:
+) -> str | None:
     """Purely map a host cache path using the latest awaited mount discovery."""
     path = Path(host_path)
     for mount in _known_cache_mounts(container_base):
@@ -610,9 +609,9 @@ def to_agent_visible_cache_path(
 
 async def iter_cache_files(
     container_base: str = "/root/.hermes",
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Return regular files below all existing cache directories."""
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     for mount in await get_cache_directory_mounts(container_base):
         host_dir = Path(mount["host_path"])
         _directories, files, _symlinks = await _walk_tree(host_dir)

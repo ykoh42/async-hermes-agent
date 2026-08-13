@@ -12,9 +12,9 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -285,7 +285,7 @@ def _detect_category(text: str) -> str:
 def _format_relative_time(iso_timestamp: str) -> str:
     try:
         dt = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         seconds = (now - dt).total_seconds()
         if seconds < 1800:
             return "just now"
@@ -412,7 +412,7 @@ class _SupermemoryClient:
         self._http_client = http_client
         self._client = client
 
-    def _merge_metadata(self, metadata: Optional[dict]) -> dict:
+    def _merge_metadata(self, metadata: dict | None) -> dict:
         # sm_source routes Hermes writes into the "Hermes" Space in the Supermemory
         # app so the user can filter / bulk-manage them per source agent. This is a
         # functional routing key for the user, not vendor telemetry.
@@ -422,9 +422,9 @@ class _SupermemoryClient:
             merged["type"] = str(legacy_source)
         return merged
 
-    async def add_memory(self, content: str, metadata: Optional[dict] = None, *,
-                         entity_context: str = "", container_tag: Optional[str] = None,
-                         custom_id: Optional[str] = None) -> dict:
+    async def add_memory(self, content: str, metadata: dict | None = None, *,
+                         entity_context: str = "", container_tag: str | None = None,
+                         custom_id: str | None = None) -> dict:
         tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = {
             "content": content.strip(),
@@ -440,8 +440,8 @@ class _SupermemoryClient:
         return {"id": getattr(result, "id", "")}
 
     async def search_memories(self, query: str, *, limit: int = 5,
-                              container_tag: Optional[str] = None,
-                              search_mode: Optional[str] = None) -> list[dict]:
+                              container_tag: str | None = None,
+                              search_mode: str | None = None) -> list[dict]:
         tag = container_tag or self._container_tag
         mode = search_mode or self._search_mode
         kwargs: dict[str, Any] = {"q": query, "container_tag": tag, "limit": limit}
@@ -459,8 +459,8 @@ class _SupermemoryClient:
             })
         return results
 
-    async def get_profile(self, query: Optional[str] = None, *,
-                          container_tag: Optional[str] = None) -> dict:
+    async def get_profile(self, query: str | None = None, *,
+                          container_tag: str | None = None) -> dict:
         tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = {"container_tag": tag}
         if query:
@@ -484,11 +484,11 @@ class _SupermemoryClient:
                     })
         return {"static": static, "dynamic": dynamic, "search_results": search_results}
 
-    async def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> None:
+    async def forget_memory(self, memory_id: str, *, container_tag: str | None = None) -> None:
         tag = container_tag or self._container_tag
         await self._client.memories.forget(container_tag=tag, id=memory_id)
 
-    async def forget_by_query(self, query: str, *, container_tag: Optional[str] = None) -> dict:
+    async def forget_by_query(self, query: str, *, container_tag: str | None = None) -> dict:
         results = await self.search_memories(query, limit=5, container_tag=container_tag)
         if not results:
             return {"success": False, "message": "No matching memory found to forget."}
@@ -678,7 +678,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def __init__(self):
         self._config = _default_config()
         self._api_key = ""
-        self._client: Optional[_SupermemoryClient] = None
+        self._client: _SupermemoryClient | None = None
         self._container_tag = _DEFAULT_CONTAINER_TAG
         self._session_id = ""
         self._turn_count = 0
@@ -696,10 +696,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._active = False
         # Multi-container support
         self._enable_custom_containers = False
-        self._custom_containers: List[str] = []
+        self._custom_containers: list[str] = []
         self._custom_container_instructions = ""
-        self._allowed_containers: List[str] = []
-        self._session_turns: List[Dict[str, str]] = []
+        self._allowed_containers: list[str] = []
+        self._session_turns: list[dict[str, str]] = []
 
     @property
     def name(self) -> str:
@@ -765,7 +765,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._active = bool(self._api_key)
         self._client = None
         if self._active:
-            client: Optional[_SupermemoryClient] = None
+            client: _SupermemoryClient | None = None
             try:
                 client = _SupermemoryClient(
                     api_key=self._api_key,
@@ -865,7 +865,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         # Buffer every turn for the single full-session document written at end/switch/shutdown
         self._session_turns.append({"user": clean_user, "assistant": clean_assistant})
 
-    async def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if not self._active or not self._write_enabled or not self._client or not self._session_id:
             return
         cleaned = []
@@ -1023,7 +1023,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if close_error is not None:
             raise close_error
 
-    def _resolve_tool_container_tag(self, args: dict) -> Optional[str]:
+    def _resolve_tool_container_tag(self, args: dict) -> str | None:
         """Validate and resolve container_tag from tool call args.
 
         Returns None (use primary) if multi-container is disabled or no tag provided.
@@ -1043,8 +1043,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             )
         return sanitized
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        def with_kebab_aliases(schemas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
+        def with_kebab_aliases(schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
             aliases = {
                 "supermemory_store": "supermemory-save",
                 "supermemory_search": "supermemory-search",
@@ -1187,7 +1187,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     async def handle_tool_call(
         self,
         tool_name: str,
-        args: Dict[str, Any],
+        args: dict[str, Any],
         **kwargs,
     ) -> str:
         if not self._active or not self._client:

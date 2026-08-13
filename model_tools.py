@@ -36,7 +36,7 @@ import aiofiles.os
 # not call a blocking cwd helper from the event-loop thread.
 import httpx as _httpx_bootstrap  # noqa: F401
 from contextvars import ContextVar
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any
 
 from tools.registry import (
     CHECK_FN_CACHE_BYPASS,
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Per-dispatch state that is not part of Hermes' public
 # ``handle_function_call`` signature. ContextVar keeps concurrent agents and
 # TaskGroup tool calls isolated while preserving the upstream call contract.
-_TOOL_HANDLER_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+_TOOL_HANDLER_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "tool_handler_context",
     default=None,
 )
@@ -99,9 +99,9 @@ async def _ensure_builtin_tools_discovered() -> None:
 # Backward-compat constants  (built once after discovery)
 # =============================================================================
 
-TOOL_TO_TOOLSET_MAP: Dict[str, str] = registry.get_tool_to_toolset_map()
+TOOL_TO_TOOLSET_MAP: dict[str, str] = registry.get_tool_to_toolset_map()
 
-TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
+TOOLSET_REQUIREMENTS: dict[str, dict] = registry.get_toolset_requirements()
 
 # =============================================================================
 # Legacy toolset name mapping  (old _tools-suffixed names -> tool name lists)
@@ -139,7 +139,7 @@ _LEGACY_TOOLSET_MAP = {
 # which bumps on register() / deregister() / register_toolset_alias(). The
 # inner check_fn TTL cache in registry.py handles environment drift (Docker
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
-_tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_tool_defs_cache: dict[tuple, list[dict[str, Any]]] = {}
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived embedding
 # process sees many distinct toolset/config fingerprints over its lifetime;
@@ -155,11 +155,11 @@ def _clear_tool_defs_cache() -> None:
 
 
 async def get_tool_definitions(
-    enabled_toolsets: Optional[List[str]] = None,
-    disabled_toolsets: Optional[List[str]] = None,
+    enabled_toolsets: list[str] | None = None,
+    disabled_toolsets: list[str] | None = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
 
@@ -238,11 +238,11 @@ async def get_tool_definitions(
 
 
 async def _compute_tool_definitions(
-    enabled_toolsets: Optional[List[str]] = None,
-    disabled_toolsets: Optional[List[str]] = None,
+    enabled_toolsets: list[str] | None = None,
+    disabled_toolsets: list[str] | None = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
     tools_to_include: set = set()
@@ -498,7 +498,7 @@ def _sanitize_tool_error(error_msg: str) -> str:
 # Tool argument type coercion
 # =========================================================================
 
-def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+def coerce_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Coerce tool call arguments to match their JSON Schema types.
 
     LLMs frequently return numbers as strings (``"42"`` instead of ``42``)
@@ -816,7 +816,7 @@ def _coerce_boolean(value: str):
     return value
 
 
-def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optional[str]]:
+def _tool_result_observer_fields(result: Any) -> tuple[str, str | None, str | None]:
     try:
         parsed_result = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed_result, dict) and parsed_result.get("error"):
@@ -829,18 +829,18 @@ def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optio
 async def _emit_post_tool_call_hook(
     *,
     function_name: str,
-    function_args: Dict[str, Any],
+    function_args: dict[str, Any],
     result: Any,
-    task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    tool_call_id: Optional[str] = None,
-    turn_id: Optional[str] = None,
-    api_request_id: Optional[str] = None,
+    task_id: str | None = None,
+    session_id: str | None = None,
+    tool_call_id: str | None = None,
+    turn_id: str | None = None,
+    api_request_id: str | None = None,
     duration_ms: int = 0,
-    status: Optional[str] = None,
-    error_type: Optional[str] = None,
-    error_message: Optional[str] = None,
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    status: str | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    middleware_trace: list[dict[str, Any]] | None = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
@@ -879,20 +879,20 @@ async def _emit_post_tool_call_hook(
 
 async def handle_function_call(
     function_name: str,
-    function_args: Dict[str, Any],
-    task_id: Optional[str] = None,
-    tool_call_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    turn_id: Optional[str] = None,
-    api_request_id: Optional[str] = None,
-    user_task: Optional[str] = None,
-    enabled_tools: Optional[List[str]] = None,
+    function_args: dict[str, Any],
+    task_id: str | None = None,
+    tool_call_id: str | None = None,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+    api_request_id: str | None = None,
+    user_task: str | None = None,
+    enabled_tools: list[str] | None = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False,
-    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-    enabled_toolsets: Optional[List[str]] = None,
-    disabled_toolsets: Optional[List[str]] = None,
+    tool_request_middleware_trace: list[dict[str, Any]] | None = None,
+    enabled_toolsets: list[str] | None = None,
+    disabled_toolsets: list[str] | None = None,
 ) -> str | dict:
     """Dispatch one tool through the native async plugin lifecycle.
 
@@ -1044,7 +1044,7 @@ async def handle_function_call(
         except Exception:
             logger.debug("file-read loop reset failed", exc_info=True)
 
-    async def dispatch(next_args: Dict[str, Any]) -> str | dict:
+    async def dispatch(next_args: dict[str, Any]) -> str | dict:
         return await registry.dispatch(
             function_name,
             next_args,
@@ -1151,31 +1151,31 @@ async def handle_function_call(
 # Backward-compat wrapper functions
 # =============================================================================
 
-async def get_all_tool_names() -> List[str]:
+async def get_all_tool_names() -> list[str]:
     """Return all registered tool names."""
     await _ensure_builtin_tools_discovered()
     return registry.get_all_tool_names()
 
 
-async def get_toolset_for_tool(tool_name: str) -> Optional[str]:
+async def get_toolset_for_tool(tool_name: str) -> str | None:
     """Return the toolset a tool belongs to."""
     await _ensure_builtin_tools_discovered()
     return registry.get_toolset_for_tool(tool_name)
 
 
-async def get_available_toolsets() -> Dict[str, dict]:
+async def get_available_toolsets() -> dict[str, dict]:
     """Return toolset availability info for UI display."""
     await _ensure_builtin_tools_discovered()
     return await registry.get_available_toolsets()
 
 
-async def check_toolset_requirements() -> Dict[str, bool]:
+async def check_toolset_requirements() -> dict[str, bool]:
     """Return {toolset: available_bool} for every registered toolset."""
     await _ensure_builtin_tools_discovered()
     return await registry.check_toolset_requirements()
 
 
-async def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
+async def check_tool_availability(quiet: bool = False) -> tuple[list[str], list[dict]]:
     """Return (available_toolsets, unavailable_info)."""
     await _ensure_builtin_tools_discovered()
     return await registry.check_tool_availability(quiet=quiet)

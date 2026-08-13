@@ -8,7 +8,7 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 from urllib.parse import urlparse
 
 import yaml
@@ -88,7 +88,7 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
-def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
+def atomic_replace(tmp_path: str | Path, target: str | Path) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
     ``os.replace(tmp, target)`` atomically swaps ``tmp`` into place at
@@ -137,7 +137,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
 
 
 def atomic_write_text(
-    path: Union[str, Path],
+    path: str | Path,
     content: str,
     *,
     encoding: str = "utf-8",
@@ -172,7 +172,7 @@ def atomic_write_text(
 
 
 def atomic_json_write(
-    path: Union[str, Path],
+    path: str | Path,
     data: Any,
     *,
     indent: int = 2,
@@ -244,7 +244,7 @@ def atomic_json_write(
 
 
 def warn_if_credential_file_broadly_readable(
-    path: Union[str, Path],
+    path: str | Path,
     *,
     label: str = "",
     log: logging.Logger | None = None,
@@ -301,7 +301,7 @@ class IndentDumper(yaml.SafeDumper):
 
 
 def atomic_yaml_write(
-    path: Union[str, Path],
+    path: str | Path,
     data: Any,
     *,
     default_flow_style: bool = False,

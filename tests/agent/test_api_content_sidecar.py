@@ -466,6 +466,7 @@ async def wire_env():
 
     db = SessionDB(db_path=Path(test_home) / "state.db")
     sid = "sess-wire"
+    agents = []
 
     def make_agent():
         agent = AIAgent(
@@ -477,6 +478,7 @@ async def wire_env():
             session_db=db, session_id=sid,
         )
         agent.valid_tool_names = {"read_file"}
+        agents.append(agent)
         return agent
 
     async def _invoke_hook(hook, **_kwargs):
@@ -489,7 +491,11 @@ async def wire_env():
         ):
             yield make_agent, _MockHandler, db, sid
     finally:
+        for agent in agents:
+            await agent.close()
         srv.shutdown()
+        srv.server_close()
+        t.join(timeout=1)
         await db.close()
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:

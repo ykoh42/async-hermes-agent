@@ -7,7 +7,7 @@ Memory implementations and telemetry setup.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import json
 
 # ---------------------------------------------------------------------------
@@ -557,7 +557,7 @@ def _format_new_messages(new_messages):
 def _resolve_dates(current_date=None, observation_date=None):
     """Resolve current and observation dates, defaulting to today."""
     if current_date is None:
-        current_date = datetime.now(timezone.utc).date().isoformat()
+        current_date = datetime.now(UTC).date().isoformat()
     if observation_date is None:
         observation_date = current_date
     return current_date, observation_date

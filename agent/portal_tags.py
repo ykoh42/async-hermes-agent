@@ -30,7 +30,6 @@ version can change at runtime (editable installs, hot-reload tooling), and
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import List, Optional
 
 # ── Ambient conversation context ─────────────────────────────────────────────
 #
@@ -46,12 +45,12 @@ from typing import List, Optional
 # ContextVar (not a module global) so concurrent agents in one process —
 # delegate_task subagents and batch runners — never see each other's
 # conversation id. Child asyncio tasks inherit the active context.
-_conversation_id: ContextVar[Optional[str]] = ContextVar(
+_conversation_id: ContextVar[str | None] = ContextVar(
     "nous_portal_conversation_id", default=None
 )
 
 
-def set_conversation_context(conversation_id: Optional[str]):
+def set_conversation_context(conversation_id: str | None):
     """Publish the active conversation id for ambient Portal tagging.
 
     Called by the agent loop at turn entry with the conversation's stable
@@ -72,7 +71,7 @@ def reset_conversation_context(token) -> None:
         _conversation_id.set(None)
 
 
-def get_conversation_context() -> Optional[str]:
+def get_conversation_context() -> str | None:
     """Return the ambient conversation id, or ``None`` when unset."""
     return _conversation_id.get()
 
@@ -113,7 +112,7 @@ def conversation_tag(session_id: str) -> str:
     return f"conversation={session_id}"
 
 
-def nous_portal_tags(session_id: str | None = None) -> List[str]:
+def nous_portal_tags(session_id: str | None = None) -> list[str]:
     """Return the canonical list of Nous Portal product tags.
 
     Always returns a fresh list so callers can mutate it freely

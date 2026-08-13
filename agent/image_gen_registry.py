@@ -23,15 +23,14 @@ from __future__ import annotations
 import logging
 import inspect
 import sys
-from typing import Dict, List, Optional
 
 from agent.image_gen_provider import ImageGenProvider
 
 logger = logging.getLogger(__name__)
 
 
-_providers: Dict[str, ImageGenProvider] = {}
-_plugin_providers: Dict[object, Dict[str, ImageGenProvider]] = {}
+_providers: dict[str, ImageGenProvider] = {}
+_plugin_providers: dict[object, dict[str, ImageGenProvider]] = {}
 
 
 def _plugin_scope(
@@ -47,7 +46,7 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> Dict[str, ImageGenProvider]:
+def _provider_snapshot() -> dict[str, ImageGenProvider]:
     providers = dict(_providers)
     scope = _plugin_scope()
     if scope is not None:
@@ -97,20 +96,20 @@ def register_provider(provider: ImageGenProvider) -> None:
         logger.debug("Registered image gen provider '%s' (%s)", name, type(provider).__name__)
 
 
-def list_providers() -> List[ImageGenProvider]:
+def list_providers() -> list[ImageGenProvider]:
     """Return all registered providers, sorted by name."""
     items = list(_provider_snapshot().values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> Optional[ImageGenProvider]:
+def get_provider(name: str) -> ImageGenProvider | None:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
     return _provider_snapshot().get(name.strip())
 
 
-async def get_active_provider() -> Optional[ImageGenProvider]:
+async def get_active_provider() -> ImageGenProvider | None:
     """Resolve the currently-active provider.
 
     Reads ``image_gen.provider`` from config.yaml; falls back per the
@@ -127,7 +126,7 @@ async def get_active_provider() -> Optional[ImageGenProvider]:
       ``is_available()`` so we don't pick a provider the user has no
       credentials for.
     """
-    configured: Optional[str] = None
+    configured: str | None = None
     try:
         from hermes_cli.config import load_config_readonly
 

@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any
 
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
@@ -140,7 +140,7 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
-def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
+def _validated_openrouter_provider_sort(raw_sort: Any) -> str | None:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
         return None
@@ -157,9 +157,9 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
-def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
+def _provider_preferences_for_agent(agent) -> dict[str, Any]:
     """Build the validated provider-routing object shared by request paths."""
-    preferences: Dict[str, Any] = {}
+    preferences: dict[str, Any] = {}
     if agent.providers_allowed:
         preferences["only"] = agent.providers_allowed
     if agent.providers_ignored:
@@ -260,7 +260,7 @@ def _codex_wait_notice_recovery(
     stale_timeout: float,
     ttfb_enabled: bool,
     ttfb_timeout: float,
-    last_event_ts: Optional[float],
+    last_event_ts: float | None,
     call_start: float,
     idle_enabled: bool,
     idle_timeout: float,
@@ -1324,7 +1324,7 @@ async def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     return _timeout
 
 
-def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
+def _bedrock_reasoning_stale_floor(model_id: object) -> float | None:
     """Map a Bedrock inference-profile id to its reasoning stale-timeout floor.
 
     Bedrock carries the model as a dotted, region-prefixed id such as
@@ -1955,7 +1955,7 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
-async def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+async def try_activate_fallback(agent, reason: FailoverReason | None = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the

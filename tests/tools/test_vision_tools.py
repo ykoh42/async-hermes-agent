@@ -7,7 +7,7 @@ import logging
 import os
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Awaitable
+from collections.abc import Awaitable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

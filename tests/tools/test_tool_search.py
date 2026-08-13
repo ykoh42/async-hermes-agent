@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import List, Dict, Any
+from typing import Any
 
 import pytest
 
@@ -20,7 +20,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-def _td(name: str, description: str = "", properties: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _td(name: str, description: str = "", properties: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {

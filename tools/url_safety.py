@@ -31,7 +31,7 @@ import logging
 import os
 import socket
 import re
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
 from hermes_constants import get_hermes_home_override
@@ -134,7 +134,7 @@ _SENSITIVE_QUERY_PARAM_NAMES = frozenset({
 })
 
 
-def sensitive_query_param_name(url: str) -> Optional[str]:
+def sensitive_query_param_name(url: str) -> str | None:
     """Return the first sensitive query parameter name in ``url``, if any.
 
     Used before handing URLs to third-party fetch/browser backends. Prefix-based
@@ -684,7 +684,7 @@ async def create_ssrf_safe_client(**kwargs: Any) -> Any:
     return client
 
 
-def redirect_target_from_response(response: Any) -> Optional[str]:
+def redirect_target_from_response(response: Any) -> str | None:
     """Return the redirect target visible from inside an httpx response hook.
 
     In ``httpx.AsyncClient`` response event hooks, ``response.next_request`` is

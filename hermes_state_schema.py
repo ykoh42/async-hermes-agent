@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from typing import Any, Optional
+from typing import Any
 
 import aiosqlite
 
@@ -93,7 +93,7 @@ class SessionSchemaMixin:
         return int(row[0])
 
     @staticmethod
-    def _fts_update_trigger_needs_narrowing(sql: Optional[str]) -> bool:
+    def _fts_update_trigger_needs_narrowing(sql: str | None) -> bool:
         """True when trigger SQL is missing AFTER UPDATE OF (still broad)."""
         if not sql:
             return False
@@ -289,7 +289,7 @@ class SessionSchemaMixin:
         self,
         cursor: Any,
         table_name: str,
-    ) -> Optional[bool]:
+    ) -> bool | None:
         try:
             probe_cursor = await cursor.execute(
                 f"SELECT * FROM {table_name} LIMIT 0"

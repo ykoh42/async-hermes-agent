@@ -34,7 +34,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, MutableMapping, Optional
+from collections.abc import MutableMapping
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 
 # Ordered registry: name → source instance.  Python dicts preserve
 # insertion order, which doubles as the default apply order.
-_SOURCES: Dict[str, SecretSource] = {}
-_PLUGIN_SOURCES: Dict[object, Dict[str, SecretSource]] = {}
+_SOURCES: dict[str, SecretSource] = {}
+_PLUGIN_SOURCES: dict[object, dict[str, SecretSource]] = {}
 _BUILTINS_LOADED = False
 
 
@@ -68,7 +68,7 @@ def _plugin_scope(
     return scope
 
 
-def _source_snapshot() -> Dict[str, SecretSource]:
+def _source_snapshot() -> dict[str, SecretSource]:
     sources = dict(_SOURCES)
     scope = _plugin_scope()
     if scope is not None:
@@ -97,20 +97,20 @@ class SourceReport:
     name: str
     label: str
     result: FetchResult
-    applied: List[str] = field(default_factory=list)
-    skipped_existing: List[str] = field(default_factory=list)  # .env/shell won
-    skipped_claimed: List[str] = field(default_factory=list)  # earlier source won
-    skipped_protected: List[str] = field(default_factory=list)  # bootstrap-auth guard
-    skipped_invalid: List[str] = field(default_factory=list)  # bad env-var name
+    applied: list[str] = field(default_factory=list)
+    skipped_existing: list[str] = field(default_factory=list)  # .env/shell won
+    skipped_claimed: list[str] = field(default_factory=list)  # earlier source won
+    skipped_protected: list[str] = field(default_factory=list)  # bootstrap-auth guard
+    skipped_invalid: list[str] = field(default_factory=list)  # bad env-var name
 
 
 @dataclass
 class ApplyReport:
     """Merged outcome of one orchestrated apply pass."""
 
-    sources: List[SourceReport] = field(default_factory=list)
-    provenance: Dict[str, AppliedVar] = field(default_factory=dict)
-    conflicts: List[str] = field(default_factory=list)  # human-readable warnings
+    sources: list[SourceReport] = field(default_factory=list)
+    provenance: dict[str, AppliedVar] = field(default_factory=dict)
+    conflicts: list[str] = field(default_factory=list)  # human-readable warnings
 
     @property
     def applied_any(self) -> bool:
@@ -191,12 +191,12 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
     return True
 
 
-def get_source(name: str) -> Optional[SecretSource]:
+def get_source(name: str) -> SecretSource | None:
     _ensure_builtin_sources()
     return _source_snapshot().get(name)
 
 
-def list_sources() -> List[SecretSource]:
+def list_sources() -> list[SecretSource]:
     _ensure_builtin_sources()
     return list(_source_snapshot().values())
 
@@ -288,7 +288,7 @@ async def _fetch_with_timeout(
     return result
 
 
-def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
+def _ordered_enabled_sources(secrets_cfg: dict) -> list[SecretSource]:
     """Resolve which sources run, in which order.
 
     Order: the optional ``secrets.sources`` list wins; sources not named
@@ -300,7 +300,7 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
     sources = _source_snapshot()
 
     explicit = secrets_cfg.get("sources")
-    order: List[str] = []
+    order: list[str] = []
     if isinstance(explicit, list):
         for entry in explicit:
             if isinstance(entry, str) and entry in sources and entry not in order:
@@ -316,7 +316,7 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
         if name not in order:
             order.append(name)
 
-    enabled: List[SecretSource] = []
+    enabled: list[SecretSource] = []
     for name in order:
         source = sources[name]
         cfg = secrets_cfg.get(name)
@@ -331,7 +331,7 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
     return enabled
 
 
-def _active_profile_name(home_path: Optional[Path]) -> str:
+def _active_profile_name(home_path: Path | None) -> str:
     """Best-effort active profile name for profile-scoped secret aliases.
 
     A named profile's HERMES_HOME is ``~/.hermes/profiles/<name>``; the
@@ -353,7 +353,7 @@ def _active_profile_name(home_path: Optional[Path]) -> str:
 _ALIAS_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD")
 
 
-def _profile_alias_target(var: str, profile: str) -> Optional[str]:
+def _profile_alias_target(var: str, profile: str) -> str | None:
     """Map ``FOO_<PROFILE>`` to ``FOO`` for the active profile when safe."""
     if not profile:
         return None
@@ -371,7 +371,7 @@ def _profile_alias_target(var: str, profile: str) -> Optional[str]:
 async def apply_all(
     secrets_cfg: dict,
     home_path: Path,
-    environ: Optional[MutableMapping[str, str]] = None,
+    environ: MutableMapping[str, str] | None = None,
 ) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
@@ -425,8 +425,8 @@ async def apply_all(
     ]
 
     # Fetch phase.
-    fetches: List[tuple[SecretSource, dict, FetchResult]] = []
-    protected: Dict[str, str] = {}  # var → source that protects it
+    fetches: list[tuple[SecretSource, dict, FetchResult]] = []
+    protected: dict[str, str] = {}  # var → source that protects it
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
@@ -446,7 +446,7 @@ async def apply_all(
             supplied_directly.update(v for v in result.secrets if isinstance(v, str))
 
     # Apply phase — sequential, first-wins, fully attributed.
-    claimed: Dict[str, str] = {}  # var → source name that won it
+    claimed: dict[str, str] = {}  # var → source name that won it
     for source, cfg, result in fetches:
         sr = SourceReport(
             name=source.name, label=source.label or source.name, result=result

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any
 
 import httpx
 
@@ -66,7 +66,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     # Config resolution
     # ------------------------------------------------------------------
 
-    def _get_config_or_none(self) -> Optional[Dict[str, Any]]:
+    def _get_config_or_none(self) -> dict[str, Any] | None:
         api_key = get_secret("BROWSERBASE_API_KEY")
         project_id = get_secret("BROWSERBASE_PROJECT_ID")
         if api_key and project_id:
@@ -81,7 +81,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             }
         return None
 
-    def _get_config(self) -> Dict[str, Any]:
+    def _get_config(self) -> dict[str, Any]:
         config = self._get_config_or_none()
         if config is None:
             raise ValueError(
@@ -94,7 +94,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    async def create_session(self, task_id: str) -> Dict[str, object]:
+    async def create_session(self, task_id: str) -> dict[str, object]:
         config = self._get_config()
 
         # Optional env-var knobs
@@ -120,7 +120,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             "custom_timeout": False,
         }
 
-        session_config: Dict[str, object] = {"projectId": config["project_id"]}
+        session_config: dict[str, object] = {"projectId": config["project_id"]}
 
         if enable_keep_alive:
             session_config["keepAlive"] = True
@@ -283,7 +283,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                 "Emergency cleanup failed for Browserbase session %s: %s", session_id, e
             )
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Browserbase",
             "badge": "paid",

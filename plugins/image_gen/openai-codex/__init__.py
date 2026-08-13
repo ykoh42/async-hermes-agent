@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
@@ -87,7 +87,7 @@ def _summarize_error_body(body: str) -> str:
 
 API_MODEL = "gpt-image-2"
 
-_MODELS: Dict[str, Dict[str, Any]] = {
+_MODELS: dict[str, dict[str, Any]] = {
     "gpt-image-2-low": {
         "display": "GPT Image 2 (Low)",
         "speed": "~15s",
@@ -142,7 +142,7 @@ _ACCEPTED_INPUT_MIME = frozenset(
 # ---------------------------------------------------------------------------
 
 
-async def _load_image_gen_config() -> Dict[str, Any]:
+async def _load_image_gen_config() -> dict[str, Any]:
     """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -155,7 +155,7 @@ async def _load_image_gen_config() -> Dict[str, Any]:
         return {}
 
 
-async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
+async def _resolve_model() -> tuple[str, dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
     env_override = get_secret("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
@@ -163,7 +163,7 @@ async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
 
     cfg = await _load_image_gen_config()
     sub = cfg.get("openai-codex") if isinstance(cfg.get("openai-codex"), dict) else {}
-    candidate: Optional[str] = None
+    candidate: str | None = None
     if isinstance(sub, dict):
         value = sub.get("model")
         if isinstance(value, str) and value in _MODELS:
@@ -179,7 +179,7 @@ async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
 
 
-async def _read_codex_access_token() -> Optional[str]:
+async def _read_codex_access_token() -> str | None:
     """Return a usable Codex OAuth token, or None.
 
     Delegates to the canonical reader in ``agent.auxiliary_client`` so token
@@ -197,7 +197,7 @@ async def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _sniff_image_mime(raw: bytes) -> Optional[str]:
+def _sniff_image_mime(raw: bytes) -> str | None:
     """Return a safe raster image MIME from magic bytes (not filename labels).
 
     Delegates magic-byte detection to the shared sniffer in
@@ -268,7 +268,7 @@ async def _local_image_to_data_url(value: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-async def _to_input_image_part(value: str) -> Dict[str, str]:
+async def _to_input_image_part(value: str) -> dict[str, str]:
     """Convert a URL/data URL/local path into a Responses input_image part."""
     candidate = (value or "").strip()
     if not candidate:
@@ -284,11 +284,11 @@ async def _to_input_image_part(value: str) -> Dict[str, str]:
 
 
 async def _normalize_input_images(
-    image_url: Optional[str],
-    reference_image_urls: Optional[List[str]],
-) -> List[Dict[str, str]]:
+    image_url: str | None,
+    reference_image_urls: list[str] | None,
+) -> list[dict[str, str]]:
     """Collect primary + reference images as ordered Responses content parts."""
-    values: List[str] = []
+    values: list[str] = []
     if isinstance(image_url, str) and image_url.strip():
         values.append(image_url.strip())
     for ref in (normalize_reference_images(reference_image_urls) or []):
@@ -302,10 +302,10 @@ def _build_responses_payload(
     prompt: str,
     size: str,
     quality: str,
-    input_images: Optional[List[Dict[str, str]]] = None,
-) -> Dict[str, Any]:
+    input_images: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Build the Codex Responses request body for an image_generation call."""
-    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     if input_images:
         content.extend(input_images)
     return {
@@ -339,9 +339,9 @@ def _build_responses_payload(
     }
 
 
-def _extract_image_b64(value: Any) -> Optional[str]:
+def _extract_image_b64(value: Any) -> str | None:
     """Return the newest image b64 embedded in a Responses event payload."""
-    found: Optional[str] = None
+    found: str | None = None
     if isinstance(value, dict):
         if value.get("type") == "image_generation_call":
             result = value.get("result")
@@ -369,8 +369,8 @@ async def _iter_sse_json(response: Any):
     pinned Python SDK understands. Parsing raw SSE keeps this provider tolerant
     of those event-shape changes.
     """
-    event_name: Optional[str] = None
-    data_lines: List[str] = []
+    event_name: str | None = None
+    data_lines: list[str] = []
 
     def flush():
         nonlocal event_name, data_lines
@@ -415,8 +415,8 @@ async def _collect_image_b64(
     prompt: str,
     size: str,
     quality: str,
-    input_images: Optional[List[Dict[str, str]]] = None,
-) -> Optional[str]:
+    input_images: list[dict[str, str]] | None = None,
+) -> str | None:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     import httpx
     from agent.auxiliary_client import _codex_cloudflare_headers
@@ -435,7 +435,7 @@ async def _collect_image_b64(
     )
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
-    image_b64: Optional[str] = None
+    image_b64: str | None = None
     async with (
         await _create_httpx_client(timeout=timeout, headers=headers)
     ) as http:
@@ -489,7 +489,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             return False
         return True
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": model_id,
@@ -501,10 +501,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             for model_id, meta in _MODELS.items()
         ]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return DEFAULT_MODEL
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "OpenAI (Codex auth)",
             "badge": "free",
@@ -516,7 +516,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             ),
         }
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         # The Codex Responses image_generation tool accepts source/reference
         # images as `input_image` message content parts. Keep this capability
         # honest so the dynamic `image_generate` schema encourages identity-
@@ -528,10 +528,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
 

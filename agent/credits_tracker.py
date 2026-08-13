@@ -37,7 +37,8 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 from utils import is_truthy_value
 
@@ -80,7 +81,7 @@ def _safe_int(value: Any) -> Any:
 
 
 
-def _validate_usd(value: Optional[str]) -> bool:
+def _validate_usd(value: str | None) -> bool:
     """Return True iff value is a non-None string matching ^-?\\d+\\.\\d{2}$."""
     if value is None:
         return False
@@ -99,8 +100,8 @@ class CreditsState:
     remaining_usd: str = ""
     subscription_micros: int = 0  # SIGNED — may be negative (debt). ONLY field allowed negative.
     subscription_usd: str = ""
-    subscription_limit_micros: Optional[int] = None  # PAIRED + OPTIONAL (only when subscription_cap)
-    subscription_limit_usd: Optional[str] = None
+    subscription_limit_micros: int | None = None  # PAIRED + OPTIONAL (only when subscription_cap)
+    subscription_limit_usd: str | None = None
     rollover_micros: int = 0
     purchased_micros: int = 0
     purchased_usd: str = ""
@@ -108,7 +109,7 @@ class CreditsState:
     tool_pool_gated_off: bool = False
     denominator_kind: str = "none"  # "subscription_cap" | "none"
     paid_access: bool = True  # depletion keys off THIS == False, NEVER remaining==0
-    disabled_reason: Optional[str] = None  # header omitted entirely when null
+    disabled_reason: str | None = None  # header omitted entirely when null
     as_of_ms: int = 0
     captured_at: float = 0.0  # time.time() when this was captured
     from_header: bool = False  # True only when populated by parse_credits_headers()
@@ -134,7 +135,7 @@ class CreditsState:
         return not self.paid_access
 
     @property
-    def used_fraction(self) -> Optional[float]:
+    def used_fraction(self) -> float | None:
         """Fraction of the subscription cap consumed, in [0.0, 1.0].
 
         Computable only when ``subscription_limit_micros`` is a truthy (non-zero,
@@ -210,9 +211,9 @@ class AgentNotice:
     text: str
     level: str = "info"            # info | warn | error | success
     kind: str = "sticky"           # sticky | ttl
-    ttl_ms: Optional[int] = None   # honored only when kind == "ttl"
-    key: Optional[str] = None      # dedupe / fired-once-latch / clear key
-    id: Optional[str] = None
+    ttl_ms: int | None = None   # honored only when kind == "ttl"
+    key: str | None = None      # dedupe / fired-once-latch / clear key
+    id: str | None = None
 
 
 # ── is_free_tier_model (local-data-only free-model check) ────────────────────
@@ -271,7 +272,7 @@ def evaluate_credits_notices(
 ) -> tuple[list[AgentNotice], list[str]]:
     """Reconcile credits notices against the latch. Mutates ``latch`` IN PLACE.
 
-    latch = {"active": set[str], "seen_below_90": bool, "usage_band": Optional[int],
+    latch = {"active": set[str], "seen_below_90": bool, "usage_band": int | None,
     "seen_grant_unspent": bool}.
 
     ``model_is_free``: True when the session's active model is a Nous free-tier
@@ -315,7 +316,7 @@ def evaluate_credits_notices(
 
     # ── Conditions ───────────────────────────────────────────────────────────
     # Highest band whose threshold the current usage has reached (None below all).
-    current_band: Optional[tuple[float, str, int]] = None
+    current_band: tuple[float, str, int] | None = None
     if uf is not None:
         for band in CREDITS_USAGE_BANDS:  # ascending → last match wins = highest
             if uf >= band[0]:
@@ -444,7 +445,7 @@ def evaluate_credits_notices(
 def parse_credits_headers(
     headers: Mapping[str, str],
     provider: str = "",
-) -> Optional[CreditsState]:
+) -> CreditsState | None:
     """Parse x-nous-credits-* (and x-nous-tool-pool-*) headers into a CreditsState.
 
     Returns None (miss) on ANY of:
@@ -560,8 +561,8 @@ def parse_credits_headers(
         sub_limit_micros_raw = lowered.get("x-nous-credits-subscription-limit-micros")
         sub_limit_usd_raw = lowered.get("x-nous-credits-subscription-limit-usd")
 
-        subscription_limit_micros: Optional[int] = None
-        subscription_limit_usd: Optional[str] = None
+        subscription_limit_micros: int | None = None
+        subscription_limit_usd: str | None = None
 
         if sub_limit_micros_raw is not None and sub_limit_usd_raw is not None:
             # Both present — validate both; any invalid → return None (bad data)
@@ -697,7 +698,7 @@ _DEV_FIXTURES: dict[str, dict] = {
 }
 
 
-def dev_fixture_credits_state() -> Optional[CreditsState]:
+def dev_fixture_credits_state() -> CreditsState | None:
     """Return a fixture CreditsState for HERMES_DEV_CREDITS_FIXTURE, or None.
 
     The env value is a state name. Unknown name / "clear" / "none" / unset
@@ -726,7 +727,7 @@ def dev_fixture_credits_state() -> Optional[CreditsState]:
     return CreditsState(**merged, from_header=True, captured_at=time.time())
 
 
-def _credits_state_from_account(info) -> Optional[CreditsState]:
+def _credits_state_from_account(info) -> CreditsState | None:
     """Map a NousPortalAccountInfo into a header-shaped CreditsState for the seed.
 
     Float account dollars → micros (plus a DISPLAY *_usd string — allowed, since

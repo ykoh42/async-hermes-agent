@@ -1120,7 +1120,7 @@ async def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
 
 
 async def _refresh_cached_oauth(
-    client: "Honcho",
+    client: Honcho,
     config: HonchoClientConfig | None,
     state: _HonchoClientState,
 ) -> None:
@@ -1189,7 +1189,7 @@ async def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             )
 
         # Build inside the singleton factory so racing callers share one client.
-        async def _build() -> "Honcho":
+        async def _build() -> Honcho:
             global _cached_timeout
             # Lazy dependency failures fall through to the canonical import error.
             try:

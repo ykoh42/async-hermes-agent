@@ -233,7 +233,7 @@ class TestSSEClientCert:
                         }),
                         timeout=2.0,
                     )
-                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                except (TimeoutError, StopAsyncIteration, Exception):
                     pass
 
         asyncio.run(drive())
@@ -264,7 +264,7 @@ class TestSSEClientCert:
                         }),
                         timeout=2.0,
                     )
-                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                except (TimeoutError, StopAsyncIteration, Exception):
                     pass
 
         asyncio.run(drive())
@@ -332,7 +332,7 @@ class TestSSEClientCert:
                         }),
                         timeout=2.0,
                     )
-                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                except (TimeoutError, StopAsyncIteration, Exception):
                     pass
 
         asyncio.run(drive())

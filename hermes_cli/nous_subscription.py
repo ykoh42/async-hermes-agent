@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Set
+from collections.abc import Iterable
 
 import aiofiles.os
 
@@ -39,7 +39,7 @@ _DEFAULT_PLATFORM_TOOLSETS = {
 }
 
 
-async def _get_env_value(key: str) -> Optional[str]:
+async def _get_env_value(key: str) -> str | None:
     """Read a credential in upstream scope order without blocking on dotenv."""
     try:
         from agent.secret_scope import UnscopedSecretError, get_secret
@@ -86,8 +86,8 @@ class NousSubscriptionFeatures:
     subscribed: bool
     nous_auth_present: bool
     provider_is_nous: bool
-    features: Dict[str, NousFeatureState]
-    account_info: Optional[NousPortalAccountInfo] = None
+    features: dict[str, NousFeatureState]
+    account_info: NousPortalAccountInfo | None = None
 
     @property
     def web(self) -> NousFeatureState:
@@ -123,7 +123,7 @@ class NousSubscriptionFeatures:
             yield self.features[key]
 
 
-def _model_config_dict(config: Dict[str, object]) -> Dict[str, object]:
+def _model_config_dict(config: dict[str, object]) -> dict[str, object]:
     model_cfg = config.get("model")
     if isinstance(model_cfg, dict):
         return dict(model_cfg)
@@ -132,7 +132,7 @@ def _model_config_dict(config: Dict[str, object]) -> Dict[str, object]:
     return {}
 
 
-def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
+def _toolset_enabled(config: dict[str, object], toolset_key: str) -> bool:
     from toolsets import resolve_toolset
 
     platform_toolsets = config.get("platform_toolsets")
@@ -154,7 +154,7 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
             if default_toolset:
                 toolset_names = [default_toolset]
 
-        available_tools: Set[str] = set()
+        available_tools: set[str] = set()
         for toolset_name in toolset_names:
             if not isinstance(toolset_name, str) or not toolset_name:
                 continue
@@ -341,7 +341,7 @@ def _resolve_browser_feature_state(
 
 
 async def get_nous_subscription_features(
-    config: Optional[Dict[str, object]] = None,
+    config: dict[str, object] | None = None,
     *,
     force_fresh: bool = False,
 ) -> NousSubscriptionFeatures:

@@ -34,7 +34,7 @@ import sys
 import threading
 import weakref
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import aiofiles.os
 
@@ -52,7 +52,7 @@ logger = logging.getLogger("agent.lsp.install")
 #     ``pkg`` in the same node_modules tree.  Used when an LSP server
 #     has a runtime peer dependency that npm doesn't auto-pull (e.g.
 #     typescript-language-server needs ``typescript``).
-INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
+INSTALL_RECIPES: dict[str, dict[str, Any]] = {
     # Python
     "pyright": {"strategy": "npm", "pkg": "pyright", "bin": "pyright-langserver"},
     # JS/TS family
@@ -116,11 +116,11 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
 
 _install_locks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
-    dict[str, Dict[str, weakref.ReferenceType[asyncio.Lock]]],
+    dict[str, dict[str, weakref.ReferenceType[asyncio.Lock]]],
 ] = weakref.WeakKeyDictionary()
 _install_results: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
-    dict[str, Dict[str, Optional[str]]],
+    dict[str, dict[str, str | None]],
 ] = weakref.WeakKeyDictionary()
 _install_state_guard = threading.RLock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
@@ -180,7 +180,7 @@ async def _which(name: str) -> str | None:
     return await aiofiles.os.wrap(shutil.which)(name)
 
 
-async def _existing_binary(name: str) -> Optional[str]:
+async def _existing_binary(name: str) -> str | None:
     """Probe the staging dir and PATH for a binary named ``name``."""
     staging = await hermes_lsp_bin_dir()
     for candidate in _native_binary_candidates(staging / name):
@@ -202,8 +202,8 @@ async def _existing_binary(name: str) -> Optional[str]:
 def _profile_install_state(
     scope: tuple[asyncio.AbstractEventLoop, str],
 ) -> tuple[
-    Dict[str, weakref.ReferenceType[asyncio.Lock]],
-    Dict[str, Optional[str]],
+    dict[str, weakref.ReferenceType[asyncio.Lock]],
+    dict[str, str | None],
 ]:
     loop, profile = scope
     with _install_state_guard:
@@ -219,7 +219,7 @@ def _profile_install_state(
 
 def _get_lock(
     pkg: str,
-    locks: Dict[str, weakref.ReferenceType[asyncio.Lock]],
+    locks: dict[str, weakref.ReferenceType[asyncio.Lock]],
 ) -> asyncio.Lock:
     with _install_state_guard:
         lock_ref = locks.get(pkg)
@@ -230,7 +230,7 @@ def _get_lock(
         return lock
 
 
-async def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
+async def try_install(pkg: str, strategy: str = "auto") -> str | None:
     """Install ``pkg`` once and return its binary path when available."""
     from agent.lsp import _activate_lsp_scope
 
@@ -319,7 +319,7 @@ async def _run_install(
     return process.returncode or 0, stderr.decode("utf-8", errors="replace")
 
 
-async def _do_install(pkg: str) -> Optional[str]:
+async def _do_install(pkg: str) -> str | None:
     recipe = INSTALL_RECIPES.get(pkg)
     if recipe is None:
         return await _which(pkg)
@@ -361,8 +361,8 @@ async def _link_or_copy(source: Path, destination: Path) -> str:
 async def _install_npm(
     pkg: str,
     bin_name: str,
-    extra_pkgs: Optional[list] = None,
-) -> Optional[str]:
+    extra_pkgs: list | None = None,
+) -> str | None:
     npm = await _existing_binary("npm")
     if npm is None:
         logger.info("[install] cannot install %s: no usable npm found", pkg)
@@ -395,7 +395,7 @@ async def _install_npm(
     return None
 
 
-async def _install_go(pkg: str, bin_name: str) -> Optional[str]:
+async def _install_go(pkg: str, bin_name: str) -> str | None:
     go = await _which("go")
     if go is None:
         logger.info("[install] cannot install %s: go not on PATH", pkg)
@@ -422,7 +422,7 @@ async def _install_go(pkg: str, bin_name: str) -> Optional[str]:
     return str(bin_path) if await aiofiles.os.path.exists(bin_path) else None
 
 
-async def _install_pip(pkg: str, bin_name: str) -> Optional[str]:
+async def _install_pip(pkg: str, bin_name: str) -> str | None:
     pip_target = (await hermes_lsp_bin_dir()).parent / "python-packages"
     await aiofiles.os.makedirs(pip_target, exist_ok=True)
     try:

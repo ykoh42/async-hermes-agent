@@ -10,7 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import json
-from typing import Any, Dict
+from typing import Any
 
 from agent import gemini_native_adapter as _gemini_native_adapter
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -110,7 +110,7 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
     if effort == "none":
         return {"includeThoughts": False}
 
-    thinking_config: Dict[str, Any] = {"includeThoughts": True}
+    thinking_config: dict[str, Any] = {"includeThoughts": True}
 
     # Gemini 2.5 accepts thinkingBudget; don't guess a budget from Hermes'
     # coarse effort levels. ``includeThoughts`` alone is enough to surface
@@ -145,7 +145,7 @@ def _snake_case_gemini_thinking_config(config: dict | None) -> dict | None:
     if not isinstance(config, dict) or not config:
         return None
 
-    translated: Dict[str, Any] = {}
+    translated: dict[str, Any] = {}
     if isinstance(config.get("includeThoughts"), bool):
         translated["include_thoughts"] = config["includeThoughts"]
     if isinstance(config.get("thinkingLevel"), str) and config["thinkingLevel"].strip():
@@ -360,7 +360,7 @@ class ChatCompletionsTransport(ProviderTransport):
             timeout: float — API call timeout
             max_tokens: int | None — user-configured max tokens
             ephemeral_max_output_tokens: int | None — one-shot override
-            max_tokens_param_fn: callable — returns {max_tokens: N} or {max_completion_tokens: N}
+            max_tokens_param_fn: Callable[..., Any] — returns {max_tokens: N} or {max_completion_tokens: N}
             reasoning_config: dict | None
             request_overrides: dict | None
             session_id: str | None
@@ -384,8 +384,8 @@ class ChatCompletionsTransport(ProviderTransport):
             # Provider routing
             provider_preferences: dict | None
             # Qwen-specific
-            qwen_prepare_fn: callable | None — runs AFTER codex sanitization
-            qwen_prepare_inplace_fn: callable | None — in-place variant for deepcopied lists
+            qwen_prepare_fn: Callable[..., Any] | None — runs AFTER codex sanitization
+            qwen_prepare_inplace_fn: Callable[..., Any] | None — in-place variant for deepcopied lists
             qwen_session_metadata: dict | None
             # Temperature
             fixed_temperature: Any — from _fixed_temperature_for_model()
@@ -804,7 +804,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
                 reasoning_content = model_extra["reasoning_content"]
 
-        provider_data: Dict[str, Any] = {}
+        provider_data: dict[str, Any] = {}
         if reasoning_content is not None:
             provider_data["reasoning_content"] = reasoning_content
         rd = getattr(msg, "reasoning_details", None)

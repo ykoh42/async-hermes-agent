@@ -3,7 +3,7 @@
 import json
 import pytest
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any
 from unittest.mock import AsyncMock
 
 from agent.context_engine import ContextEngine
@@ -35,22 +35,22 @@ class StubEngine(ContextEngine):
         self.context_length = context_length
         self.threshold_tokens = int(context_length * 0.20)
 
-    def update_from_response(self, usage: Dict[str, Any]) -> None:
+    def update_from_response(self, usage: dict[str, Any]) -> None:
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", 0)
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int | None = None) -> bool:
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         return tokens >= self.threshold_tokens
 
-    async def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
+    async def compress(self, messages: list[dict[str, Any]], current_tokens: int | None = None) -> list[dict[str, Any]]:
         self._compress_called = True
         self.compression_count += 1
         # Trivial: just return as-is
         return messages
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": "stub_search",
@@ -59,7 +59,7 @@ class StubEngine(ContextEngine):
             }
         ]
 
-    async def handle_tool_call(self, name: str, args: Dict[str, Any]) -> str:
+    async def handle_tool_call(self, name: str, args: dict[str, Any]) -> str:
         self._tools_called.append(name)
         return json.dumps({"ok": True, "tool": name})
 

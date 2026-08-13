@@ -53,7 +53,6 @@ Fixes #52217.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 
 # (slug, floor_seconds).  Each slug is matched as a discrete
@@ -160,7 +159,7 @@ _SORTED_REASONING_FLOORS: list[tuple[str, float, re.Pattern[str]]] = [
 ]
 
 
-def _match_any(model_lower: str) -> Optional[float]:
+def _match_any(model_lower: str) -> float | None:
     """Return the floor for the first matching slug, else None.
 
     Each table entry is matched as a start-of-slug prefix with the
@@ -174,7 +173,7 @@ def _match_any(model_lower: str) -> Optional[float]:
     return None
 
 
-def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
+def get_reasoning_stale_timeout_floor(model: object) -> float | None:
     """Return the stale-timeout floor (seconds) for a known reasoning model.
 
     Returns ``None`` when the model is not in the allowlist or the

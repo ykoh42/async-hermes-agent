@@ -17,7 +17,8 @@ import uuid
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, TypeVar
+from typing import Any, TypeVar
+from collections.abc import Awaitable, Callable, Coroutine
 
 import aiofiles
 import aiofiles.os
@@ -51,9 +52,9 @@ class _DelegationScopeState:
     """Runtime state owned by one event loop and canonical Hermes home."""
 
     profile_home: str
-    records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    tasks: Dict[str, asyncio.Task[None]] = field(default_factory=dict)
-    monitor_task: Optional[asyncio.Task[None]] = None
+    records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    monitor_task: asyncio.Task[None] | None = None
     restored_queues: set[tuple[int, str]] = field(default_factory=set)
     db_lock: asyncio.Lock | None = None
     db_lock_users: int = 0
@@ -76,13 +77,13 @@ _legacy_scope = _DelegationScopeState("")
 # Private compatibility projections for older tests and integrations. Runtime
 # code resolves its scope explicitly; these names only reflect the last scope
 # activated in the current process and must not be used for ownership decisions.
-_records: Dict[str, Dict[str, Any]] = _legacy_scope.records
-_tasks: Dict[str, asyncio.Task[None]] = _legacy_scope.tasks
-_monitor_task: Optional[asyncio.Task[None]] = None
+_records: dict[str, dict[str, Any]] = _legacy_scope.records
+_tasks: dict[str, asyncio.Task[None]] = _legacy_scope.tasks
+_monitor_task: asyncio.Task[None] | None = None
 _restored_queues: set[tuple[int, str]] = _legacy_scope.restored_queues
 _db_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 _restore_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
-_process_start_times: dict[int, Optional[int]] = {}
+_process_start_times: dict[int, int | None] = {}
 _DeliveryResult = TypeVar("_DeliveryResult")
 
 
@@ -264,10 +265,10 @@ async def _transaction():
         await conn.close()
 
 
-async def _safe_process_start_time(pid: int) -> Optional[int]:
+async def _safe_process_start_time(pid: int) -> int | None:
     if pid in _process_start_times:
         return _process_start_times[pid]
-    started_at: Optional[int] = None
+    started_at: int | None = None
     if sys.platform.startswith("linux"):
         try:
             async with aiofiles.open(f"/proc/{pid}/stat", "rb") as handle:
@@ -364,7 +365,7 @@ async def _safe_process_start_time(pid: int) -> Optional[int]:
     return started_at
 
 
-async def _persist_dispatch(record: Dict[str, Any]) -> None:
+async def _persist_dispatch(record: dict[str, Any]) -> None:
     now = time.time()
     owner_started_at = await _safe_process_start_time(os.getpid())
     task_payload = {
@@ -446,7 +447,7 @@ async def _prune_durable_records() -> None:
                 )
 
 
-async def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+async def _persist_completion(event: dict[str, Any], result: dict[str, Any]) -> None:
     now = time.time()
     async with _db_lock():
         async with _transaction() as conn:
@@ -656,8 +657,8 @@ async def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 async def claim_event_delivery(
-    evt: Dict[str, Any], consumer: str
-) -> Optional[str]:
+    evt: dict[str, Any], consumer: str
+) -> str | None:
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
@@ -744,14 +745,14 @@ async def complete_completion_delivery(delegation_id: str, claim_id: str) -> boo
     )
 
 
-async def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+async def complete_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         await complete_completion_delivery(
             str(evt.get("delegation_id") or ""), claim_id
         )
 
 
-async def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+async def release_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         await release_completion_delivery(
             str(evt.get("delegation_id") or ""), claim_id
@@ -760,7 +761,7 @@ async def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
 async def get_durable_delegation(
     delegation_id: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -818,7 +819,7 @@ def active_task_count() -> int:
 
 
 def _matches_session_selectors(
-    record: Dict[str, Any],
+    record: dict[str, Any],
     *,
     session_key: str = "",
     origin_ui_session_id: str = "",
@@ -890,7 +891,7 @@ def _current_origin_session_id() -> str:
         return ""
 
 
-async def _await_runner(runner: Callable[[], Awaitable[Dict[str, Any]]]):
+async def _await_runner(runner: Callable[[], Awaitable[dict[str, Any]]]):
     if not inspect.iscoroutinefunction(runner):
         raise TypeError("Async delegation runner must be a native async callable")
     result = runner()
@@ -902,19 +903,19 @@ async def _await_runner(runner: Callable[[], Awaitable[Dict[str, Any]]]):
 async def dispatch_async_delegation(
     *,
     goal: str,
-    context: Optional[str],
-    toolsets: Optional[List[str]],
+    context: str | None,
+    toolsets: list[str] | None,
     role: str,
-    model: Optional[str],
+    model: str | None,
     session_key: str,
-    parent_session_id: Optional[str] = None,
-    runner: Callable[[], Dict[str, Any]],
+    parent_session_id: str | None = None,
+    runner: Callable[[], dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
-    interrupt_fn: Optional[Callable[[], None]] = None,
+    interrupt_fn: Callable[[], None] | None = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
-    progress_fn: Optional[Callable[[], tuple]] = None,
-) -> Dict[str, Any]:
+    progress_fn: Callable[[], tuple] | None = None,
+) -> dict[str, Any]:
     return await _dispatch(
         goal=goal,
         goals=None,
@@ -937,21 +938,21 @@ async def dispatch_async_delegation(
 
 async def dispatch_async_delegation_batch(
     *,
-    goals: List[str],
-    context: Optional[str],
-    toolsets: Optional[List[str]],
+    goals: list[str],
+    context: str | None,
+    toolsets: list[str] | None,
     role: str,
-    model: Optional[str],
+    model: str | None,
     session_key: str,
-    parent_session_id: Optional[str] = None,
-    runner: Callable[[], Dict[str, Any]],
+    parent_session_id: str | None = None,
+    runner: Callable[[], dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
-    interrupt_fn: Optional[Callable[[], None]] = None,
+    interrupt_fn: Callable[[], None] | None = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
-    delegation_id: Optional[str] = None,
-    progress_fn: Optional[Callable[[], tuple]] = None,
-) -> Dict[str, Any]:
+    delegation_id: str | None = None,
+    progress_fn: Callable[[], tuple] | None = None,
+) -> dict[str, Any]:
     combined_goal = (
         goals[0]
         if len(goals) == 1
@@ -981,22 +982,22 @@ async def dispatch_async_delegation_batch(
 async def _dispatch(
     *,
     goal: str,
-    goals: Optional[List[str]],
-    context: Optional[str],
-    toolsets: Optional[List[str]],
+    goals: list[str] | None,
+    context: str | None,
+    toolsets: list[str] | None,
     role: str,
-    model: Optional[str],
+    model: str | None,
     session_key: str,
-    parent_session_id: Optional[str],
-    runner: Callable[[], Awaitable[Dict[str, Any]]],
+    parent_session_id: str | None,
+    runner: Callable[[], Awaitable[dict[str, Any]]],
     origin_ui_session_id: str,
     origin_session_id: str,
-    interrupt_fn: Optional[Callable[[], None]],
+    interrupt_fn: Callable[[], None] | None,
     max_async_children: int,
-    progress_fn: Optional[Callable[[], tuple]],
-    delegation_id: Optional[str],
+    progress_fn: Callable[[], tuple] | None,
+    delegation_id: str | None,
     is_batch: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not inspect.iscoroutinefunction(runner):
         return {
             "status": "rejected",
@@ -1025,7 +1026,7 @@ async def _dispatch(
                 f"Wait for one to finish (its result will re-enter the chat), {suffix}"
             ),
         }
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
         "context": context,
@@ -1071,12 +1072,12 @@ async def _dispatch(
 async def _run_dispatch(
     state: _DelegationScopeState,
     delegation_id: str,
-    runner: Callable[[], Awaitable[Dict[str, Any]]],
+    runner: Callable[[], Awaitable[dict[str, Any]]],
     is_batch: bool,
 ) -> None:
     record = state.records.get(delegation_id) or {}
     dispatched_at = record.get("dispatched_at") or time.time()
-    result: Dict[str, Any]
+    result: dict[str, Any]
     status = "error"
     cancellation: asyncio.CancelledError | None = None
     try:
@@ -1144,7 +1145,7 @@ async def _run_dispatch(
 
 def _begin_finalization(
     state: _DelegationScopeState, delegation_id: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     record = state.records.get(delegation_id)
     if record is None or record.get("status") not in {"running", "stalling"}:
         return None
@@ -1159,7 +1160,7 @@ def _begin_finalization(
 async def _finalize(
     state: _DelegationScopeState,
     delegation_id: str,
-    result: Dict[str, Any],
+    result: dict[str, Any],
     status: str,
     *,
     is_batch: bool,
@@ -1180,8 +1181,8 @@ async def _finalize(
 
 async def _push_completion_event(
     state: _DelegationScopeState,
-    record: Dict[str, Any],
-    result: Dict[str, Any],
+    record: dict[str, Any],
+    result: dict[str, Any],
     status: str,
 ) -> None:
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -1215,8 +1216,8 @@ async def _push_completion_event(
 
 async def _push_batch_completion_event(
     state: _DelegationScopeState,
-    record: Dict[str, Any],
-    combined: Dict[str, Any],
+    record: dict[str, Any],
+    combined: dict[str, Any],
     status: str,
 ) -> None:
     event = {
@@ -1245,7 +1246,7 @@ async def _push_batch_completion_event(
     await _publish_completion(state, event, combined)
 
 
-def _copy_stall_metadata(source: Dict[str, Any], event: Dict[str, Any]) -> None:
+def _copy_stall_metadata(source: dict[str, Any], event: dict[str, Any]) -> None:
     for key in (
         "stalled_after_quiet_seconds",
         "stall_threshold_seconds",
@@ -1258,8 +1259,8 @@ def _copy_stall_metadata(source: Dict[str, Any], event: Dict[str, Any]) -> None:
 
 async def _publish_completion(
     state: _DelegationScopeState,
-    event: Dict[str, Any],
-    result: Dict[str, Any],
+    event: dict[str, Any],
+    result: dict[str, Any],
 ) -> None:
     home_token = set_hermes_home_override(state.profile_home)
     scope_token = _active_scope.set((_lexical_profile_identity(), state))
@@ -1421,15 +1422,15 @@ async def _finalize_stalled(
 
 def _children_activity_from_token(
     token: Any, now: float
-) -> Optional[List[Optional[Dict[str, Any]]]]:
+) -> list[dict[str, Any] | None] | None:
     try:
         parts = list(token)
     except TypeError:
         return None
-    output: List[Optional[Dict[str, Any]]] = []
+    output: list[dict[str, Any] | None] = []
     for part in parts:
         if isinstance(part, (list, tuple)) and len(part) >= 2:
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "api_calls": part[0],
                 "current_tool": part[1],
             }
@@ -1443,10 +1444,10 @@ def _children_activity_from_token(
     return output
 
 
-def list_async_delegations() -> List[Dict[str, Any]]:
+def list_async_delegations() -> list[dict[str, Any]]:
     state = _current_scope_state()
     now = time.time()
-    items: List[Dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     for record in list(state.records.values()):
         item = {
             key: value
@@ -1484,7 +1485,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 
 async def _interrupt_records(
     state: _DelegationScopeState,
-    records: list[Dict[str, Any]],
+    records: list[dict[str, Any]],
     reason: str,
 ) -> int:
     if not records:

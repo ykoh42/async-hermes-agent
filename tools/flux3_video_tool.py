@@ -33,7 +33,6 @@ import json
 import logging
 import re
 import time
-from typing import Optional
 
 import aiofiles
 import aiofiles.os
@@ -110,7 +109,7 @@ def _display_path(path: str) -> str:
 # Gateway transport
 # ---------------------------------------------------------------------------
 
-def _endpoints() -> Optional[dict]:
+def _endpoints() -> dict | None:
     """Absolute URLs for the managed BFL routes, or None when unreachable."""
     return managed_vendor_endpoints(_VENDOR)
 
@@ -118,8 +117,8 @@ def _endpoints() -> Optional[dict]:
 async def _call_gateway(
     method: str,
     url: str,
-    json_body: Optional[dict] = None,
-    read_timeout: Optional[float] = None,
+    json_body: dict | None = None,
+    read_timeout: float | None = None,
 ) -> str:
     """One REST round trip, rendered as this tool's result.
 
@@ -270,7 +269,7 @@ def _poll_is_finished(raw: str) -> bool:
     return not isinstance(status, str) or status in _TERMINAL_POLL_STATUSES
 
 
-def _retry_after_seconds(raw: str) -> Optional[float]:
+def _retry_after_seconds(raw: str) -> float | None:
     """How long the gateway asked us to wait, when a refusal is a throttle.
 
     A throttle is the one refusal worth absorbing here rather than handing
@@ -337,7 +336,7 @@ async def _warm_nous_token() -> None:
         logger.debug("Nous token warm-up failed before parallel uploads: %s", exc)
 
 
-async def _prepare_media(args: dict, task_id: Optional[str]) -> dict:
+async def _prepare_media(args: dict, task_id: str | None) -> dict:
     """Replace local paths with upload references in every media field.
 
     Deliberately covers all media fields rather than the one this mode
@@ -375,7 +374,7 @@ def _without_media(args: dict) -> dict:
     return {k: v for k, v in dict(args or {}).items() if k not in _MEDIA_FIELDS}
 
 
-async def _deliver_media(value, permitted: tuple, task_id: Optional[str]):
+async def _deliver_media(value, permitted: tuple, task_id: str | None):
     """Replace a local path with a ``nous-upload:`` reference; pass URLs through.
 
     Raises ``ValueError`` with a model-readable sentence when the file cannot
@@ -770,7 +769,7 @@ async def _handle_get_result(args: dict, **kwargs) -> str:
         return await asyncio.wait_for(
             _poll_until_done(url, save_to, started), timeout=_CALL_BACKSTOP_SECONDS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return _still_generating(job_id)
 
 

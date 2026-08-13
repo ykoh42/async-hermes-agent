@@ -22,7 +22,7 @@ import threading
 import uuid
 import weakref
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -127,7 +127,7 @@ async def _guard_agent_created_enabled() -> bool:
         return False
 
 
-async def _security_scan_skill(skill_dir: Path) -> Optional[str]:
+async def _security_scan_skill(skill_dir: Path) -> str | None:
     """Scan an agent-created skill after write and return a block error."""
     if not _GUARD_AVAILABLE or not await _guard_agent_created_enabled():
         return None
@@ -151,7 +151,7 @@ async def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     return None
 
 
-async def _pinned_guard(name: str) -> Optional[str]:
+async def _pinned_guard(name: str) -> str | None:
     """Refuse only irreversible foreground deletion of a pinned skill."""
     try:
         from tools import skill_usage
@@ -173,7 +173,7 @@ async def _background_review_write_guard(
     name: str,
     skill_dir: Path,
     action: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Restrict autonomous writes to local, curator-managed skills."""
     try:
         from tools.skill_provenance import is_background_review
@@ -280,7 +280,7 @@ async def _background_review_read_before_write_guard(
     target: Path,
     action: str,
     file_label: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     try:
         from tools.skill_provenance import is_background_review
 
@@ -306,7 +306,7 @@ async def _background_review_read_before_write_guard(
 async def _background_review_preflight(
     action: str,
     name: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Run the upstream ownership guard before validating write arguments."""
     if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
@@ -318,8 +318,8 @@ async def _background_review_preflight(
 
 def _curator_consolidation_delete_guard(
     name: str,
-    absorbed_into: Optional[str],
-) -> Optional[Dict[str, Any]]:
+    absorbed_into: str | None,
+) -> dict[str, Any] | None:
     from tools.skill_provenance import is_background_review
 
     if not is_background_review() or (
@@ -366,7 +366,7 @@ async def _active_skill_write_lock() -> asyncio.Lock:
         return lock
 
 
-def _validate_name(name: str) -> Optional[str]:
+def _validate_name(name: str) -> str | None:
     """Validate a skill name. Return an error message or ``None``."""
     if not name:
         return "Skill name is required."
@@ -380,7 +380,7 @@ def _validate_name(name: str) -> Optional[str]:
     return None
 
 
-def _validate_category(category: Optional[str]) -> Optional[str]:
+def _validate_category(category: str | None) -> str | None:
     """Validate an optional category as one safe directory component."""
     if category is None:
         return None
@@ -400,7 +400,7 @@ def _validate_category(category: Optional[str]) -> Optional[str]:
     return None
 
 
-def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[str]:
+def _validate_frontmatter(content: str, *, new_skill: bool = False) -> str | None:
     """Validate the upstream ``SKILL.md`` frontmatter contract."""
     if not content.strip():
         return "Content cannot be empty."
@@ -446,7 +446,7 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     return None
 
 
-def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
+def _validate_content_size(content: str, label: str = "SKILL.md") -> str | None:
     if len(content) <= MAX_SKILL_CONTENT_CHARS:
         return None
     return (
@@ -456,7 +456,7 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
     )
 
 
-def _validate_file_path(file_path: str) -> Optional[str]:
+def _validate_file_path(file_path: str) -> str | None:
     """Validate a supporting-file path without resolving untrusted parents."""
     from tools.path_security import has_traversal_component
 
@@ -550,7 +550,7 @@ async def _read_text(path: Path) -> str:
         return await handle.read()
 
 
-async def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+async def _find_skill(name: str) -> dict[str, Any] | None:
     """Find a local or configured external skill by its directory name."""
     for skills_root in await get_all_skills_dirs():
         if not await aiofiles.os.path.isdir(skills_root):
@@ -566,7 +566,7 @@ async def _find_skill(name: str) -> Optional[Dict[str, Any]]:
 async def _resolve_skill_target(
     skill_dir: Path,
     file_path: str,
-) -> Tuple[Optional[Path], Optional[str]]:
+) -> tuple[Path | None, str | None]:
     target = skill_dir / file_path
     try:
         resolved_skill = Path(await _realpath(skill_dir))
@@ -587,7 +587,7 @@ async def _is_path_redirect(path: Path) -> bool:
         return True
 
 
-async def _containing_skills_root(skill_dir: Path) -> Optional[Path]:
+async def _containing_skills_root(skill_dir: Path) -> Path | None:
     resolved_skill = Path(await _realpath(skill_dir))
     for root in await get_all_skills_dirs():
         try:
@@ -600,7 +600,7 @@ async def _containing_skills_root(skill_dir: Path) -> Optional[Path]:
     return None
 
 
-async def _validate_delete_target(skill_dir: Path) -> Tuple[Optional[Path], Optional[str]]:
+async def _validate_delete_target(skill_dir: Path) -> tuple[Path | None, str | None]:
     if await _is_path_redirect(skill_dir):
         return None, (
             f"Refusing to delete '{skill_dir}': the skill directory is a "
@@ -671,7 +671,7 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
     )
 
 
-def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> None:
+def _add_description_prompt_preview(result: dict[str, Any], content: str) -> None:
     frontmatter, _ = _parse_frontmatter(content)
     if is_skill_description_truncated_for_prompt(frontmatter):
         result["system_prompt_preview"] = (
@@ -684,8 +684,8 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
 async def _create_skill(
     name: str,
     content: str,
-    category: str = None,
-) -> Dict[str, Any]:
+    category: str | None = None,
+) -> dict[str, Any]:
     if error := _validate_name(name):
         return {"success": False, "error": error}
     if error := _validate_category(category):
@@ -723,7 +723,7 @@ async def _create_skill(
     except Exception:
         pass
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "success": True,
         "message": f"Skill '{name}' created.",
         "path": str(skill_dir.relative_to(local_root)),
@@ -742,7 +742,7 @@ async def _create_skill(
     return result
 
 
-async def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+async def _edit_skill(name: str, content: str) -> dict[str, Any]:
     if error := _validate_frontmatter(content):
         return {"success": False, "error": error}
     if error := _validate_content_size(content):
@@ -806,9 +806,9 @@ async def _patch_skill(
     name: str,
     old_string: str,
     new_string: str,
-    file_path: str = None,
+    file_path: str | None = None,
     replace_all: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     existing = await _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
@@ -887,8 +887,8 @@ async def _patch_skill(
 
 async def _delete_skill(
     name: str,
-    absorbed_into: Optional[str] = None,
-) -> Dict[str, Any]:
+    absorbed_into: str | None = None,
+) -> dict[str, Any]:
     existing = await _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
@@ -961,7 +961,7 @@ async def _write_file(
     name: str,
     file_path: str,
     file_content: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if error := _validate_file_path(file_path):
         return {"success": False, "error": error}
     content_bytes = len(file_content.encode("utf-8"))
@@ -1051,7 +1051,7 @@ async def _list_supporting_files(skill_dir: Path) -> list[str]:
     return sorted(files)
 
 
-async def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
+async def _remove_file(name: str, file_path: str) -> dict[str, Any]:
     if error := _validate_file_path(file_path):
         return {"success": False, "error": error}
     existing = await _find_skill(name)
@@ -1089,14 +1089,14 @@ async def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 async def skill_manage(
     action: str,
     name: str,
-    content: str = None,
-    category: str = None,
-    file_path: str = None,
-    file_content: str = None,
-    old_string: str = None,
-    new_string: str = None,
+    content: str | None = None,
+    category: str | None = None,
+    file_path: str | None = None,
+    file_content: str | None = None,
+    old_string: str | None = None,
+    new_string: str | None = None,
     replace_all: bool = False,
-    absorbed_into: str = None,
+    absorbed_into: str | None = None,
 ) -> str:
     """Manage user skills and return the upstream JSON result shape."""
     preflight = await _background_review_preflight(action, name)

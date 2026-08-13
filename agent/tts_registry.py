@@ -31,7 +31,6 @@ from __future__ import annotations
 import logging
 import inspect
 import sys
-from typing import Dict, List, Optional
 
 from agent.tts_provider import TTSProvider
 
@@ -61,8 +60,8 @@ _BUILTIN_NAMES = frozenset({
 })
 
 
-_providers: Dict[str, TTSProvider] = {}
-_plugin_providers: Dict[object, Dict[str, TTSProvider]] = {}
+_providers: dict[str, TTSProvider] = {}
+_plugin_providers: dict[object, dict[str, TTSProvider]] = {}
 
 
 def _plugin_scope(
@@ -78,7 +77,7 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> Dict[str, TTSProvider]:
+def _provider_snapshot() -> dict[str, TTSProvider]:
     providers = dict(_providers)
     scope = _plugin_scope()
     if scope is not None:
@@ -152,13 +151,13 @@ def register_provider(provider: TTSProvider) -> None:
         )
 
 
-def list_providers() -> List[TTSProvider]:
+def list_providers() -> list[TTSProvider]:
     """Return all registered providers, sorted by name."""
     items = list(_provider_snapshot().values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> Optional[TTSProvider]:
+def get_provider(name: str) -> TTSProvider | None:
     """Return the provider registered under *name*, or None.
 
     Name matching is case-insensitive and whitespace-tolerant — mirrors

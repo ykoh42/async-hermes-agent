@@ -723,7 +723,7 @@ def _make_callback_handler():
                 + payload
             )
             await writer.drain()
-        except (OSError, UnicodeError, asyncio.TimeoutError):
+        except (TimeoutError, OSError, UnicodeError):
             logger.debug("OAuth callback connection failed", exc_info=True)
         finally:
             writer.close()
@@ -924,7 +924,7 @@ def _make_callback_waiter(port: int):
 
         try:
             await asyncio.wait_for(result["ready"].wait(), timeout=300.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         finally:
             async def _cleanup_callback_resources() -> None:

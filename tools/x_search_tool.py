@@ -45,8 +45,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from datetime import UTC, date, datetime
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import httpx
@@ -84,7 +84,7 @@ MAX_HANDLES = 10
 # ---------------------------------------------------------------------------
 
 
-async def _load_x_search_config() -> Dict[str, Any]:
+async def _load_x_search_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -98,7 +98,7 @@ async def _get_x_search_model() -> str:
     return str(cfg.get("model") or "").strip() or DEFAULT_X_SEARCH_MODEL
 
 
-async def _get_x_search_reasoning_effort() -> Optional[str]:
+async def _get_x_search_reasoning_effort() -> str | None:
     cfg = await _load_x_search_config()
     raw_value = cfg.get("reasoning_effort")
     if raw_value is None or not str(raw_value).strip():
@@ -137,7 +137,7 @@ async def _get_x_search_retries() -> int:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_xai_bearer() -> Tuple[str, str, str]:
+async def _resolve_xai_bearer() -> tuple[str, str, str]:
     """Return ``(api_key, base_url, source)``.
 
     ``source`` is one of ``"xai-oauth"`` or ``"xai"`` so callers (and tests)
@@ -178,8 +178,8 @@ async def check_x_search_requirements() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_handles(handles: Optional[List[str]], field_name: str) -> List[str]:
-    cleaned: List[str] = []
+def _normalize_handles(handles: list[str] | None, field_name: str) -> list[str]:
+    cleaned: list[str] = []
     for handle in handles or []:
         normalized = str(handle or "").strip().lstrip("@")
         if normalized:
@@ -217,8 +217,8 @@ def _validate_date_range(from_date: str, to_date: str) -> None:
         to return zero citations. ``to_date`` in the future is allowed
         (callers may legitimately set "from yesterday to tomorrow").
     """
-    parsed_from: Optional[date] = None
-    parsed_to: Optional[date] = None
+    parsed_from: date | None = None
+    parsed_to: date | None = None
     if from_date.strip():
         parsed_from = _parse_iso_date(from_date, "from_date")
     if to_date.strip():
@@ -229,7 +229,7 @@ def _validate_date_range(from_date: str, to_date: str) -> None:
             f"to_date ({parsed_to.isoformat()})"
         )
     if parsed_from is not None:
-        today_utc = datetime.now(timezone.utc).date()
+        today_utc = datetime.now(UTC).date()
         if parsed_from > today_utc:
             raise ValueError(
                 f"from_date ({parsed_from.isoformat()}) is in the future; "
@@ -238,12 +238,12 @@ def _validate_date_range(from_date: str, to_date: str) -> None:
             )
 
 
-def _extract_response_text(payload: Dict[str, Any]) -> str:
+def _extract_response_text(payload: dict[str, Any]) -> str:
     output_text = str(payload.get("output_text") or "").strip()
     if output_text:
         return output_text
 
-    parts: List[str] = []
+    parts: list[str] = []
     for item in payload.get("output", []) or []:
         if item.get("type") != "message":
             continue
@@ -256,8 +256,8 @@ def _extract_response_text(payload: Dict[str, Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _extract_inline_citations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    citations: List[Dict[str, Any]] = []
+def _extract_inline_citations(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    citations: list[dict[str, Any]] = []
     for item in payload.get("output", []) or []:
         if item.get("type") != "message":
             continue
@@ -307,8 +307,8 @@ def _http_error_message(exc: httpx.HTTPStatusError) -> str:
 
 async def x_search_tool(
     query: str,
-    allowed_x_handles: Optional[List[str]] = None,
-    excluded_x_handles: Optional[List[str]] = None,
+    allowed_x_handles: list[str] | None = None,
+    excluded_x_handles: list[str] | None = None,
     from_date: str = "",
     to_date: str = "",
     enable_image_understanding: bool = False,
@@ -341,7 +341,7 @@ async def x_search_tool(
         except ValueError as exc:
             return tool_error(str(exc))
 
-        tool_def: Dict[str, Any] = {"type": "x_search"}
+        tool_def: dict[str, Any] = {"type": "x_search"}
         if allowed:
             tool_def["allowed_x_handles"] = allowed
         if excluded:
@@ -355,7 +355,7 @@ async def x_search_tool(
         if enable_video_understanding:
             tool_def["enable_video_understanding"] = True
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model": await _get_x_search_model(),
             "input": [
                 {
@@ -371,7 +371,7 @@ async def x_search_tool(
 
         timeout_seconds = await _get_x_search_timeout_seconds()
         max_retries = await _get_x_search_retries()
-        response: Optional[httpx.Response] = None
+        response: httpx.Response | None = None
         # ``requests.post`` followed redirects in upstream. Keep that behavior
         # explicit because httpx defaults to not following them.
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -440,7 +440,7 @@ async def x_search_tool(
         # any narrowing filter is active AND both citation channels came back
         # empty, mark the response as degraded so callers can decide to
         # broaden filters, retry, or fall back to a different source.
-        active_filters: List[str] = []
+        active_filters: list[str] = []
         if allowed:
             active_filters.append("allowed_x_handles")
         if excluded:

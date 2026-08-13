@@ -12,15 +12,15 @@ Pure functions -- no class state, no AIAgent dependency.
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any
 
 
 @dataclass(frozen=True)
 class PromptCachePlan:
     """Request-local message and tool sections with their cache markers."""
 
-    messages: List[Dict[str, Any]]
-    tools: List[Dict[str, Any]]
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
 
     @property
     def marker_count(self) -> int:
@@ -93,9 +93,9 @@ def _can_carry_marker(msg: dict, native_anthropic: bool) -> bool:
     return isinstance(content, str)
 
 
-def _build_marker(ttl: str) -> Dict[str, str]:
+def _build_marker(ttl: str) -> dict[str, str]:
     """Build a cache_control marker dict for the given TTL ('5m' or '1h')."""
-    marker: Dict[str, str] = {"type": "ephemeral"}
+    marker: dict[str, str] = {"type": "ephemeral"}
     if ttl == "1h":
         marker["ttl"] = "1h"
     return marker
@@ -164,8 +164,8 @@ def _apply_system_cache_markers(
 
 
 def strip_anthropic_cache_control(
-    api_messages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    api_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Remove ``cache_control`` markers and undo decoration-produced list shapes.
 
     Used before re-applying decoration after a mid-turn provider failover so
@@ -216,7 +216,7 @@ def strip_anthropic_cache_control(
     return api_messages
 
 
-def strip_anthropic_tool_cache_control(tools: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+def strip_anthropic_tool_cache_control(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Return copied tools without request-local Anthropic cache markers."""
     cleaned = copy.deepcopy(tools or [])
     for tool in cleaned:
@@ -225,7 +225,7 @@ def strip_anthropic_tool_cache_control(tools: List[Dict[str, Any]] | None) -> Li
     return cleaned
 
 
-def _count_cache_markers(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> int:
+def _count_cache_markers(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
     """Count the wire-visible cache markers in a request-local plan."""
     count = sum(
         1
@@ -245,10 +245,10 @@ def _count_cache_markers(messages: List[Dict[str, Any]], tools: List[Dict[str, A
 
 
 def _completed_transaction_endpoint_indexes(
-    messages: List[Dict[str, Any]], *, native_anthropic: bool,
-) -> List[int]:
+    messages: list[dict[str, Any]], *, native_anthropic: bool,
+) -> list[int]:
     """Select legal ends of completed tool runs and ordinary turns."""
-    endpoints: List[int] = []
+    endpoints: list[int] = []
     index = 0
     while index < len(messages):
         message = messages[index]
@@ -297,8 +297,8 @@ def _completed_transaction_endpoint_indexes(
 
 
 def build_prompt_cache_plan(
-    api_messages: List[Dict[str, Any]],
-    tools: List[Dict[str, Any]] | None,
+    api_messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
     *,
     cache_ttl: str = "5m",
     native_anthropic: bool = False,
@@ -346,11 +346,11 @@ def build_prompt_cache_plan(
 
 
 def apply_anthropic_cache_control(
-    api_messages: List[Dict[str, Any]],
+    api_messages: list[dict[str, Any]],
     cache_ttl: str = "5m",
     native_anthropic: bool = False,
     static_system_prefix: str | None = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Apply Anthropic cache-control markers to API messages.
 
     When ``static_system_prefix`` exactly matches the beginning of a string

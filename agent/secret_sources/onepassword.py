@@ -45,7 +45,6 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import aiofiles.os
 
@@ -119,8 +118,8 @@ _OP_ENV_ALLOWLIST = (
 # isolated without duplicating one physical profile's entries.  The disk
 # layer omits home from its serialized key because the file already lives
 # under the home dir (see _disk_key_str).
-_CacheKey = Tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
-_CACHE: Dict[_CacheKey, CachedFetch] = {}
+_CacheKey = tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
+_CACHE: dict[_CacheKey, CachedFetch] = {}
 
 _DISK_CACHE_BASENAME = "op_cache.json"
 
@@ -139,7 +138,7 @@ def _disk_key_str(cache_key: _CacheKey) -> str:
 _DISK_CACHE: DiskCache = DiskCache(_DISK_CACHE_BASENAME, key_serializer=_disk_key_str)
 
 
-def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
+def _disk_cache_path(home_path: Path | None = None) -> Path:
     """Path to the on-disk cache (exposed for tests and direct callers)."""
     return _DISK_CACHE.path(home_path)
 
@@ -150,16 +149,16 @@ def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
 
 
 def _validate_references(
-    references: Optional[Dict[str, str]],
-) -> Tuple[Dict[str, str], List[str]]:
+    references: dict[str, str] | None,
+) -> tuple[dict[str, str], list[str]]:
     """Return ``(valid_refs, warnings)`` from an ``env`` mapping.
 
     A reference is kept only if its target env-var name is a valid POSIX
     name and the value is a stripped ``op://…`` reference string.  Everything
     else produces a warning and is dropped (never fatal).
     """
-    valid: Dict[str, str] = {}
-    warnings: List[str] = []
+    valid: dict[str, str] = {}
+    warnings: list[str] = []
     for name, ref in (references or {}).items():
         if not is_valid_env_name(name):
             warnings.append(f"Skipping {name!r}: not a valid env-var name")
@@ -189,7 +188,7 @@ def _auth_fingerprint(token_env: str) -> str:
     displayed; the raw token never leaves this hash.
     """
     source_env = get_source_environment()
-    parts: List[str] = [
+    parts: list[str] = [
         f"token={source_env.get(token_env, '')}",
         f"account={source_env.get('OP_ACCOUNT', '')}",
         f"connect_host={source_env.get('OP_CONNECT_HOST', '')}",
@@ -202,7 +201,7 @@ def _auth_fingerprint(token_env: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-def _refs_fingerprint(references: Dict[str, str]) -> str:
+def _refs_fingerprint(references: dict[str, str]) -> str:
     """SHA-256 prefix over the configured name→reference mapping."""
     material = "\n".join(f"{name}={references[name]}" for name in sorted(references))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -213,7 +212,7 @@ def _refs_fingerprint(references: Dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def find_op(binary_path: str = "") -> Optional[Path]:
+async def find_op(binary_path: str = "") -> Path | None:
     """Resolve a usable ``op`` binary, or None.
 
     When ``binary_path`` is set it is used verbatim and PATH is NOT consulted
@@ -256,10 +255,10 @@ def _scrub(text: str) -> str:
     return strip_ansi(text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
+def _op_child_env(token_value: str) -> dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
     source_env = get_source_environment()
-    env: Dict[str, str] = {}
+    env: dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
         val = source_env.get(key)
         if val is not None:
@@ -289,7 +288,7 @@ async def _run_op_read(
     with empty output, which would otherwise silently clobber a good
     ``.env``/shell credential with ``""``.
     """
-    cmd: List[str] = [str(op), "read"]
+    cmd: list[str] = [str(op), "read"]
     if account:
         cmd += ["--account", account]
     # `--` terminates option parsing so a reference can never be mis-parsed as
@@ -338,15 +337,15 @@ async def _run_op_read(
 
 async def fetch_onepassword_secrets(
     *,
-    references: Dict[str, str],
+    references: dict[str, str],
     account: str = "",
     token_env: str = _DEFAULT_TOKEN_ENV,
-    binary: Optional[Path] = None,
+    binary: Path | None = None,
     binary_path: str = "",
     use_cache: bool = True,
     cache_ttl_seconds: float = 300,
-    home_path: Optional[Path] = None,
-) -> Tuple[Dict[str, str], List[str]]:
+    home_path: Path | None = None,
+) -> tuple[dict[str, str], list[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
     Raises :class:`RuntimeError` only when no ``op`` binary is available — a
@@ -392,7 +391,7 @@ async def fetch_onepassword_secrets(
             "secrets.onepassword.binary_path to its absolute location."
         )
 
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
     read_errors = 0
     for name in sorted(valid):
         try:
@@ -424,13 +423,13 @@ async def fetch_onepassword_secrets(
 async def apply_onepassword_secrets(
     *,
     enabled: bool,
-    env: Optional[Dict[str, str]] = None,
+    env: dict[str, str] | None = None,
     account: str = "",
     service_account_token_env: str = _DEFAULT_TOKEN_ENV,
     binary_path: str = "",
     override_existing: bool = True,
     cache_ttl_seconds: float = 300,
-    home_path: Optional[Path] = None,
+    home_path: Path | None = None,
 ) -> FetchResult:
     """Resolve configured ``op://`` references and set them on ``os.environ``.
 
@@ -453,7 +452,7 @@ async def apply_onepassword_secrets(
     result.warnings.extend(warnings)
 
     # Skip-before-fetch: never resolve a reference we'd only throw away.
-    refs_to_fetch: Dict[str, str] = {}
+    refs_to_fetch: dict[str, str] = {}
     for name, ref in valid.items():
         if name == service_account_token_env:
             # Never let a resolved secret clobber the very token used to auth.
@@ -700,7 +699,7 @@ def _classify_op_error(message: str) -> ErrorKind:
 # ---------------------------------------------------------------------------
 
 
-async def clear_caches(home_path: Optional[Path] = None) -> None:
+async def clear_caches(home_path: Path | None = None) -> None:
     """Drop in-process AND disk caches.
 
     Used after a token rotation (`hermes secrets onepassword token`) so
@@ -711,7 +710,7 @@ async def clear_caches(home_path: Optional[Path] = None) -> None:
     await _DISK_CACHE.clear(home_path)
 
 
-async def _reset_cache_for_tests(home_path: Optional[Path] = None) -> None:
+async def _reset_cache_for_tests(home_path: Path | None = None) -> None:
     """Clear in-process AND disk caches.
 
     Tests can pass ``home_path`` to scope the disk cleanup to a tmpdir.

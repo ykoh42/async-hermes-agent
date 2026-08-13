@@ -55,7 +55,7 @@ import uuid
 import aiofiles
 import aiofiles.os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,10 @@ logger = logging.getLogger(__name__)
 # Common aspect ratios across providers (Veo / Kling / xAI / Pixverse). The
 # tool schema advertises this set as an enum hint, but providers may accept
 # a narrower or wider set — they are responsible for clamping.
-COMMON_ASPECT_RATIOS: Tuple[str, ...] = ("16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3")
+COMMON_ASPECT_RATIOS: tuple[str, ...] = ("16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3")
 DEFAULT_ASPECT_RATIO = "16:9"
 
-COMMON_RESOLUTIONS: Tuple[str, ...] = ("480p", "540p", "720p", "1080p")
+COMMON_RESOLUTIONS: tuple[str, ...] = ("480p", "540p", "720p", "1080p")
 DEFAULT_RESOLUTION = "720p"
 
 
@@ -103,7 +103,7 @@ class VideoGenProvider(abc.ABC):
         """
         return True
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         """Return catalog entries for ``hermes tools`` model picker.
 
         Each entry represents a **model family** that supports text-to-video
@@ -122,7 +122,7 @@ class VideoGenProvider(abc.ABC):
         """
         return []
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         """Return provider metadata for the ``hermes tools`` picker."""
         return {
             "name": self.display_name,
@@ -131,14 +131,14 @@ class VideoGenProvider(abc.ABC):
             "env_vars": [],
         }
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         """Return the default model id, or None if not applicable."""
         models = await self.list_models()
         if models:
             return models[0].get("id")
         return None
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         """Return what this provider supports.
 
         Returned dict (all keys optional)::
@@ -173,17 +173,17 @@ class VideoGenProvider(abc.ABC):
         self,
         prompt: str,
         *,
-        model: Optional[str] = None,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
-        duration: Optional[int] = None,
+        model: str | None = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
+        duration: int | None = None,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         resolution: str = DEFAULT_RESOLUTION,
-        negative_prompt: Optional[str] = None,
-        audio: Optional[bool] = None,
-        seed: Optional[int] = None,
+        negative_prompt: str | None = None,
+        audio: bool | None = None,
+        seed: int | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Generate a video from a prompt (text-to-video) or animate an image
         (image-to-video).
 
@@ -335,15 +335,15 @@ def success_response(
     aspect_ratio: str = "",
     duration: int = 0,
     provider: str,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a uniform success response dict.
 
     ``video`` may be an HTTP URL or an absolute filesystem path.
     ``modality`` is ``"text"`` (text-to-video) or ``"image"`` (image-to-video) —
     indicates which endpoint was actually hit, useful for diagnostics.
     """
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "success": True,
         "video": video,
         "model": model,
@@ -367,7 +367,7 @@ def error_response(
     model: str = "",
     prompt: str = "",
     aspect_ratio: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a uniform error response dict."""
     return {
         "success": False,
@@ -450,7 +450,7 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
     async def is_available(self) -> bool:
         return bool(self._api_key())
 
-    async def _create_and_poll(self, client: Any, call_kwargs: Dict[str, Any]) -> Any:
+    async def _create_and_poll(self, client: Any, call_kwargs: dict[str, Any]) -> Any:
         """Create the video job and poll to completion with a hard deadline.
 
         Replaces ``client.videos.create_and_poll`` (unbounded 1/s loop) with a
@@ -486,17 +486,17 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
         self,
         prompt: str,
         *,
-        model: Optional[str] = None,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
-        duration: Optional[int] = None,
+        model: str | None = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
+        duration: int | None = None,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         resolution: str = DEFAULT_RESOLUTION,
-        negative_prompt: Optional[str] = None,
-        audio: Optional[bool] = None,
-        seed: Optional[int] = None,
+        negative_prompt: str | None = None,
+        audio: bool | None = None,
+        seed: int | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if not prompt or not prompt.strip():
             return error_response(
                 error="prompt is required", error_type="invalid_request", provider=self.name
@@ -536,7 +536,7 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
             }.items()
             if v is not None
         }
-        call_kwargs: Dict[str, Any] = {"model": model_id, "prompt": prompt}
+        call_kwargs: dict[str, Any] = {"model": model_id, "prompt": prompt}
         if duration:
             call_kwargs["seconds"] = str(duration)
         if resolution:

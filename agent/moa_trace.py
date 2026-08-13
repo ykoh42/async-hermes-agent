@@ -27,7 +27,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -37,7 +37,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
-async def _traces_enabled_and_dir() -> Optional[Path]:
+async def _traces_enabled_and_dir() -> Path | None:
     """Return the trace directory if ``moa.save_traces`` is on, else None.
 
     Reads config lazily per call (config is cheap to load and this only runs on
@@ -60,7 +60,7 @@ async def _traces_enabled_and_dir() -> Optional[Path]:
     return base
 
 
-def _sanitize_session_id(session_id: Optional[str]) -> str:
+def _sanitize_session_id(session_id: str | None) -> str:
     """Make a session id safe as a filename component."""
     if not session_id:
         return "unknown-session"
@@ -99,15 +99,15 @@ def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
 
 async def save_moa_turn(
     *,
-    session_id: Optional[str],
+    session_id: str | None,
     preset_name: str,
     reference_outputs: list[tuple[str, str, Any]],
     aggregator_label: str,
-    aggregator_model: Optional[str],
-    aggregator_provider: Optional[str],
+    aggregator_model: str | None,
+    aggregator_provider: str | None,
     aggregator_temperature: Any,
     aggregator_input_messages: Any,
-    aggregator_output: Optional[str],
+    aggregator_output: str | None,
     aggregator_streamed: bool,
 ) -> None:
     """Append one full MoA turn record to the session's trace JSONL, if enabled.

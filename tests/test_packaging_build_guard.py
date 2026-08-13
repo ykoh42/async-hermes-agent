@@ -21,10 +21,7 @@ def test_artifact_build_succeeds(kind: str, artifact_glob: str, tmp_path: Path):
             [
                 sys.executable,
                 "-c",
-                "from setuptools.build_meta import build_{kind}; build_{kind}(r'{out}')".format(
-                    kind=kind,
-                    out=tmp_path,
-                ),
+                f"from setuptools.build_meta import build_{kind}; build_{kind}(r'{tmp_path}')",
             ],
             cwd=PROJECT_ROOT,
             text=True,

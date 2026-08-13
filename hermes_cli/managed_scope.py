@@ -22,7 +22,6 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Dict, Optional
 
 import yaml
 
@@ -34,8 +33,8 @@ _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
 # path_key -> (mtime_ns, size, parsed)
-_CONFIG_CACHE: Dict[str, tuple] = {}
-_ENV_CACHE: Dict[str, tuple] = {}
+_CONFIG_CACHE: dict[str, tuple] = {}
+_ENV_CACHE: dict[str, tuple] = {}
 
 
 def _under_pytest() -> bool:
@@ -49,7 +48,7 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
-def _managed_dir_candidate() -> Optional[Path]:
+def _managed_dir_candidate() -> Path | None:
     """Choose the managed-scope path without touching the filesystem."""
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
@@ -59,7 +58,7 @@ def _managed_dir_candidate() -> Optional[Path]:
     return _DEFAULT_MANAGED_DIR
 
 
-def get_managed_dir() -> Optional[Path]:
+def get_managed_dir() -> Path | None:
     """Resolve the managed-scope directory, or None when no scope is present.
 
     Resolution (highest priority first):
@@ -83,7 +82,7 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+def _cached_read(path: Path, cache: dict[str, tuple], parse):
     """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
 
     Returns ``None`` when the file is absent or fails to parse (fail-open). A
@@ -130,7 +129,7 @@ def load_managed_config() -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def load_managed_env() -> Dict[str, str]:
+def load_managed_env() -> dict[str, str]:
     """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
     managed_dir = get_managed_dir()
     if managed_dir is None:
@@ -182,8 +181,8 @@ def apply_managed_overlay(config: dict) -> dict:
         return config
 
 
-def _parse_env(f) -> Dict[str, str]:
-    out: Dict[str, str] = {}
+def _parse_env(f) -> dict[str, str]:
+    out: dict[str, str] = {}
     for line in f:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:

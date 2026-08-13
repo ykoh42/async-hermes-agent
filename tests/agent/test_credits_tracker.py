@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 import pytest
 
 from agent.credits_tracker import CreditsState, parse_credits_headers
@@ -488,7 +487,7 @@ class TestUsdValidation:
         assert state.remaining_usd == "18.00"
 
     def test_usd_one_decimal_returns_none(self):
-        """'18.0' does not match ^-?\d+\.\d{2}$"""
+        r"""'18.0' does not match ^-?\d+\.\d{2}$"""
         headers = _base_headers(**{"x-nous-credits-remaining-usd": "18.0"})
         assert parse_credits_headers(headers) is None
 
@@ -697,5 +696,4 @@ class TestUsedFraction:
             captured_at=time.time(),
         )
         assert state.used_fraction == pytest.approx(1.0)
-
 

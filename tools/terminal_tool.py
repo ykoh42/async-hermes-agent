@@ -20,7 +20,8 @@ import time
 import weakref
 from collections.abc import MutableMapping
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
 import aiofiles
 import aiofiles.os
@@ -999,7 +1000,7 @@ def _rewrite_compound_background(command: str) -> str:
     return result
 
 
-def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
+def resolve_task_overrides(task_id: str | None) -> dict[str, Any]:
     raw_key = task_id or "default"
     return dict(
         _task_env_overrides.get(raw_key)
@@ -1008,7 +1009,7 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     )
 
 
-def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
+def register_task_env_overrides(task_id: str, overrides: dict[str, Any]):
     key = str(task_id or "default")
     _task_env_overrides[key] = dict(overrides or {})
     cwd = _task_env_overrides[key].get("cwd")
@@ -1030,7 +1031,7 @@ def clear_task_env_overrides(task_id: str) -> None:
     clear_session_cwd(key)
 
 
-def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
+def get_session_cwd(session_key: str | None) -> str | None:
     """Return the recorded working directory for a session, if any."""
     key = str(session_key or "default")
     with _env_lock:
@@ -1038,7 +1039,7 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
 
 
 def record_session_cwd(
-    session_key: Optional[str], cwd: Optional[str]
+    session_key: str | None, cwd: str | None
 ) -> None:
     if not isinstance(cwd, str) or not cwd.strip():
         return
@@ -1504,14 +1505,14 @@ async def cleanup_all_environments() -> int:  # noqa: ASYNC124 - lifecycle API
 async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
     command: str,
     background: bool = False,
-    timeout: Optional[int] = None,  # noqa: ASYNC109 - upstream public API
-    task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
+    timeout: int | None = None,  # noqa: ASYNC109 - upstream public API
+    task_id: str | None = None,
+    session_id: str | None = None,
     force: bool = False,
-    workdir: Optional[str] = None,
+    workdir: str | None = None,
     pty: bool = False,
     notify_on_complete: bool = False,
-    watch_patterns: Optional[List[str]] = None,
+    watch_patterns: list[str] | None = None,
 ) -> str:
     """Run a local command asynchronously and preserve Hermes' JSON result contract."""
     if not isinstance(command, str):

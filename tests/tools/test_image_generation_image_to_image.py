@@ -14,7 +14,7 @@ tool routes to a provider's edit endpoint when ``image_url`` /
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -166,13 +166,13 @@ class TestFalRouting:
 
 class _EditCapableProvider(ImageGenProvider):
     def __init__(self):
-        self.received: Dict[str, Any] = {}
+        self.received: dict[str, Any] = {}
 
     @property
     def name(self) -> str:
         return "editcap"
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         return {"modalities": ["text", "image"], "max_reference_images": 4}
 
     async def generate(self, prompt, aspect_ratio="landscape", *, image_url=None,
@@ -236,10 +236,10 @@ class _PluginBothProvider(ImageGenProvider):
     async def is_available(self) -> bool:
         return True
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return "both-v1"
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         return {"modalities": ["text", "image"], "max_reference_images": 5}
 
     async def generate(self, prompt, aspect_ratio="landscape", *, image_url=None,

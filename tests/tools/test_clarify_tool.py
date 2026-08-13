@@ -1,7 +1,6 @@
 """Tests for tools/clarify_tool.py - Interactive clarifying questions."""
 
 import json
-from typing import List, Optional
 
 import pytest
 
@@ -20,7 +19,7 @@ class TestClarifyToolBasics:
     @pytest.mark.asyncio
     async def test_simple_question_with_callback(self):
         """Should return user response for simple question."""
-        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: list[str] | None) -> str:
             assert question == "What color?"
             assert choices is None
             return "blue"
@@ -47,7 +46,7 @@ class TestClarifyToolChoicesValidation:
         """Should trim choices to MAX_CHOICES."""
         choices_passed = []
 
-        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: list[str] | None) -> str:
             choices_passed.extend(choices or [])
             return "picked"
 
@@ -62,7 +61,7 @@ class TestClarifyToolChoicesValidation:
         """Non-string choices should be converted to strings."""
         choices_received = []
 
-        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: list[str] | None) -> str:
             choices_received.extend(choices or [])
             return "answer"
 
@@ -76,7 +75,7 @@ class TestClarifyToolCallbackHandling:
     @pytest.mark.asyncio
     async def test_callback_exception_returns_error(self):
         """Should return error if callback raises exception."""
-        async def failing_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def failing_callback(question: str, choices: list[str] | None) -> str:
             raise RuntimeError("User cancelled")
 
         result = json.loads(await clarify_tool("Question?", callback=failing_callback))
@@ -88,7 +87,7 @@ class TestClarifyToolCallbackHandling:
     @pytest.mark.asyncio
     async def test_user_response_stripped(self):
         """User response should be stripped of whitespace."""
-        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: list[str] | None) -> str:
             return "  response with spaces  \n"
 
         result = json.loads(await clarify_tool("Q?", callback=mock_callback))

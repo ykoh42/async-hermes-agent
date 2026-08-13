@@ -86,7 +86,7 @@ class TestStdioInitializeTimeout:
                 # whole suite. With the fix, the inner connect_timeout (0.2s)
                 # fires first; the elapsed assertion below is what actually
                 # distinguishes "bounded" (fixed) from "hung" (regressed).
-                with pytest.raises(asyncio.TimeoutError):
+                with pytest.raises(TimeoutError):
                     await asyncio.wait_for(server._run_stdio(config), timeout=5.0)
                 return time.monotonic() - start
 

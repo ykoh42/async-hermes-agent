@@ -33,9 +33,8 @@ import fnmatch
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import List, Tuple
 
 import aiofiles
 import aiofiles.os
@@ -97,7 +96,7 @@ class ScanResult:
     source: str
     trust_level: str    # "builtin" | "trusted" | "community"
     verdict: str        # "safe" | "caution" | "dangerous"
-    findings: List[Finding] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
     scanned_at: str = ""
     summary: str = ""
     scan_provenance: dict = field(default_factory=dict)
@@ -602,7 +601,7 @@ async def _iter_tree(root: Path):
                 yield descendant
 
 
-async def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
+async def scan_file(file_path: Path, rel_path: str = "") -> list[Finding]:
     """
     Scan a single file for threat patterns and invisible unicode characters.
 
@@ -695,7 +694,7 @@ async def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     skill_name = skill_path.name
     trust_level = _resolve_trust_level(source)
 
-    all_findings: List[Finding] = []
+    all_findings: list[Finding] = []
 
     if await aiofiles.os.path.isdir(skill_path):
         ignore = await _load_skill_ignore(skill_path)
@@ -722,7 +721,7 @@ async def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
         trust_level=trust_level,
         verdict=verdict,
         findings=all_findings,
-        scanned_at=datetime.now(timezone.utc).isoformat(),
+        scanned_at=datetime.now(UTC).isoformat(),
         summary=summary,
     )
 
@@ -761,11 +760,11 @@ async def scan_skill_cached(
     *,
     source_url: str = "",
     cache_dir: Path | None = None,
-) -> Tuple[ScanResult, dict]:
+) -> tuple[ScanResult, dict]:
     """Return a scan plus attestation, caching only exact current content."""
     bundle_hash = await full_content_hash(skill_path)
     cache_root = cache_dir or skill_path.parent / ".scan-cache"
-    source_identity = hashlib.sha256(f"{source}\0{source_url}".encode("utf-8")).hexdigest()[:16]
+    source_identity = hashlib.sha256(f"{source}\0{source_url}".encode()).hexdigest()[:16]
     cache_file = cache_root / f"{bundle_hash.split(':', 1)[1]}-{source_identity}.json"
     try:
         async with aiofiles.open(cache_file, encoding="utf-8") as handle:
@@ -843,7 +842,7 @@ async def _finish_owned_task(task: asyncio.Task) -> object:
     return result
 
 
-def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool, str]:
+def should_allow_install(result: ScanResult, force: bool = False) -> tuple[bool, str]:
     """
     Determine whether a skill should be installed based on scan result and trust.
 
@@ -941,7 +940,7 @@ async def content_hash(skill_path: Path) -> str:
 # Structural checks
 # ---------------------------------------------------------------------------
 
-async def _check_structure(skill_dir: Path, ignore=None) -> List[Finding]:
+async def _check_structure(skill_dir: Path, ignore=None) -> list[Finding]:
     """
     Check the skill directory for structural anomalies:
     - Too many files
@@ -1124,7 +1123,7 @@ async def _load_skill_ignore(skill_dir: Path):
     anchors a pattern to the skill root. The ignore files themselves are
     always excluded; ``SKILL.md`` can never be excluded.
     """
-    patterns: List[str] = []
+    patterns: list[str] = []
     for name in _SKILL_IGNORE_FILENAMES:
         ig = skill_dir / name
         try:
@@ -1213,7 +1212,7 @@ def _resolve_trust_level(source: str) -> str:
     return "community"
 
 
-def _determine_verdict(findings: List[Finding]) -> str:
+def _determine_verdict(findings: list[Finding]) -> str:
     """Determine the overall verdict from a list of findings."""
     if not findings:
         return "safe"
@@ -1229,7 +1228,7 @@ def _determine_verdict(findings: List[Finding]) -> str:
     return "safe"
 
 
-def _build_summary(name: str, source: str, trust: str, verdict: str, findings: List[Finding]) -> str:
+def _build_summary(name: str, source: str, trust: str, verdict: str, findings: list[Finding]) -> str:
     """Build a one-line summary of the scan result."""
     if not findings:
         return f"{name}: clean scan, no threats detected"

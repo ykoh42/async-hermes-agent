@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
@@ -74,7 +74,7 @@ _SIZES = {
 }
 
 
-async def _load_deepinfra_image_config() -> Dict[str, Any]:
+async def _load_deepinfra_image_config() -> dict[str, Any]:
     """Read ``image_gen.deepinfra`` from config.yaml."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -88,7 +88,7 @@ async def _load_deepinfra_image_config() -> Dict[str, Any]:
         return {}
 
 
-async def _live_models() -> Optional[List[Dict[str, Any]]]:
+async def _live_models() -> list[dict[str, Any]] | None:
     """Fetch ``image-gen``-tagged models from the DeepInfra catalog."""
     try:
         from hermes_cli.models import _fetch_deepinfra_models_by_tag
@@ -98,7 +98,7 @@ async def _live_models() -> Optional[List[Dict[str, Any]]]:
     return await _fetch_deepinfra_models_by_tag("image-gen")
 
 
-def _format_catalog_row(item: Dict[str, Any]) -> Dict[str, Any]:
+def _format_catalog_row(item: dict[str, Any]) -> dict[str, Any]:
     """Format a catalog item into the picker row shape."""
     mid = item.get("id", "")
     metadata = item.get("metadata") or {}
@@ -109,7 +109,7 @@ def _format_catalog_row(item: Dict[str, Any]) -> Dict[str, Any]:
             price = f"${float(pricing['per_image_unit']):.4f}/image"
         except (TypeError, ValueError):
             price = ""
-    row: Dict[str, Any] = {
+    row: dict[str, Any] = {
         "id": mid,
         "display": mid.split("/", 1)[-1] if "/" in mid else mid,
         "strengths": metadata.get("description", "") if isinstance(metadata, dict) else "",
@@ -123,7 +123,7 @@ def _format_catalog_row(item: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
-def _resolve_model(catalog: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Optional[str]:
+def _resolve_model(catalog: list[dict[str, Any]], cfg: dict[str, Any]) -> str | None:
     """Pick the model id (env > config > first live result, else None).
 
     Takes the already-loaded ``image_gen.deepinfra`` config so ``generate()``
@@ -160,23 +160,23 @@ class DeepInfraImageGenProvider(ImageGenProvider):
     async def is_available(self) -> bool:
         return bool((get_secret("DEEPINFRA_API_KEY", "") or "").strip())
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         live = await _live_models()
         if not live:
             return []
         return [_format_catalog_row(item) for item in live]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         rows = await self.list_models()
         if rows:
             return rows[0].get("id")
         return None
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         """DeepInfra's OpenAI-compatible generation surface is text-only."""
         return {"modalities": ["text"], "max_reference_images": 0}
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "DeepInfra",
             "badge": "paid",
@@ -195,7 +195,7 @@ class DeepInfraImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
 

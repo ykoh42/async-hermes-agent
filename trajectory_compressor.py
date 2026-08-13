@@ -45,7 +45,7 @@ import aiofiles.os
 import aiofiles.tempfile
 import httpx
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -104,10 +104,10 @@ class _KimiTokenizer:
                     current_length = 1
         yield text[start:]
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         if type(text) is not str:
             raise TypeError("Kimi tokenizer input must be str")
-        token_ids: List[int] = []
+        token_ids: list[int] = []
         for chunk_start in range(0, len(text), 400_000):
             chunk = text[chunk_start : chunk_start + 400_000]
             for substring in self._split_whitespace_runs(chunk, 25_000):
@@ -123,18 +123,18 @@ class _FastTokenizer:
     def __init__(self, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         return self._tokenizer.encode(text, add_special_tokens=True).ids
 
 
 def _generate_sentencepiece_bpe_merges(
-    vocab: Dict[str, int],
-    scores: Dict[str, float],
-) -> List[Tuple[str, str]]:
+    vocab: dict[str, int],
+    scores: dict[str, float],
+) -> list[tuple[str, str]]:
     """Reconstruct the BPE merge order encoded by a SentencePiece model."""
-    ranked: List[Tuple[str, str, float]] = []
+    ranked: list[tuple[str, str, float]] = []
     for merged_piece, score in scores.items():
-        candidates: List[Tuple[str, str, float]] = []
+        candidates: list[tuple[str, str, float]] = []
         for index in range(1, len(merged_piece)):
             left = merged_piece[:index]
             right = merged_piece[index:]
@@ -149,9 +149,9 @@ def _generate_sentencepiece_bpe_merges(
     return [(left, right) for left, right, _score in ranked]
 
 
-def _parse_tiktoken_ranks(model_bytes: bytes) -> Dict[bytes, int]:
+def _parse_tiktoken_ranks(model_bytes: bytes) -> dict[bytes, int]:
     """Parse the public ``tiktoken.model`` format without synchronous I/O."""
-    ranks: Dict[bytes, int] = {}
+    ranks: dict[bytes, int] = {}
     for raw_line in model_bytes.splitlines():
         if not raw_line:
             continue
@@ -232,10 +232,10 @@ def _offline_mode_enabled() -> bool:
 
 
 def _complete_cached_assets(
-    cached: Dict[str, bytes | None],
-    filenames: Tuple[str, ...],
-) -> Dict[str, bytes] | None:
-    complete: Dict[str, bytes] = {}
+    cached: dict[str, bytes | None],
+    filenames: tuple[str, ...],
+) -> dict[str, bytes] | None:
+    complete: dict[str, bytes] = {}
     for name in filenames:
         content = cached.get(name)
         if content is None:
@@ -269,10 +269,10 @@ def _validate_hf_repo_id(repo_id: str) -> None:
 
 async def _load_hf_tokenizer_assets(
     tokenizer_name: str,
-    filenames: Tuple[str, ...],
+    filenames: tuple[str, ...],
     *,
     revision: str = "main",
-) -> Dict[str, bytes]:
+) -> dict[str, bytes]:
     """Load tokenizer files through native async local or Hub I/O."""
     local_directory = Path(tokenizer_name)
     if await aiofiles.os.path.isdir(local_directory):
@@ -317,8 +317,8 @@ async def _load_hf_tokenizer_assets(
     if token:
         common_headers["Authorization"] = f"Bearer {token}"
 
-    refreshed: Dict[str, bytes] = {}
-    etags: Dict[str, str] = {}
+    refreshed: dict[str, bytes] = {}
+    etags: dict[str, str] = {}
     try:
         from agent.ssl_verify import _create_httpx_client
 
@@ -373,7 +373,7 @@ async def _load_hf_tokenizer_assets(
     return refreshed
 
 
-async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
+async def _load_kimi_tokenizer_assets() -> tuple[bytes, bytes]:
     """Load Kimi tokenizer files through an async, conditional HTTP cache."""
     assets = await _load_hf_tokenizer_assets(
         _KIMI_TOKENIZER_NAME,
@@ -385,7 +385,7 @@ async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
 
 async def _load_fast_tokenizer_assets(
     tokenizer_name: str,
-) -> Tuple[bytes, bytes]:
+) -> tuple[bytes, bytes]:
     """Load a standard Hugging Face tokenizer.json and its configuration."""
     assets = await _load_hf_tokenizer_assets(
         tokenizer_name,
@@ -405,7 +405,7 @@ def _is_missing_tokenizer_asset(exc: BaseException) -> bool:
 
 async def _load_custom_tokenizer_assets(
     tokenizer_name: str,
-) -> Tuple[str, bytes, bytes]:
+) -> tuple[str, bytes, bytes]:
     """Load a tokenizer.json pipeline or a supported SentencePiece model."""
     try:
         config_bytes, tokenizer_bytes = await _load_fast_tokenizer_assets(
@@ -543,7 +543,7 @@ def _build_sentencepiece_tokenizer(
             prepend_scheme="first",
             split=False,
         )
-        decoder_steps: List[Any] = [
+        decoder_steps: list[Any] = [
             decoders.Replace("▁", " "),
             decoders.ByteFallback(),
             decoders.Fuse(),
@@ -552,8 +552,8 @@ def _build_sentencepiece_tokenizer(
             decoder_steps.append(decoders.Strip(content=" ", left=1))
         tokenizer.decoder = decoders.Sequence(decoder_steps)
 
-        special_tokens: List[AddedToken] = []
-        template_tokens: List[Tuple[str, int]] = []
+        special_tokens: list[AddedToken] = []
+        template_tokens: list[tuple[str, int]] = []
         for key, fallback in (
             ("unk_token", "<unk>"),
             ("bos_token", "<s>"),
@@ -580,7 +580,7 @@ def _build_sentencepiece_tokenizer(
         eos_content, eos_id = template_tokens[1]
         single_parts = ["$A"]
         pair_parts = ["$A"]
-        post_specials: List[Tuple[str, int]] = []
+        post_specials: list[tuple[str, int]] = []
         if add_bos_token:
             single_parts.insert(0, bos_content)
             pair_parts.insert(0, bos_content)
@@ -679,7 +679,7 @@ async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     return result
 
 
-async def _list_jsonl_files(directory: Path) -> List[Path]:
+async def _list_jsonl_files(directory: Path) -> list[Path]:
     """Return JSONL files without blocking the event loop on directory I/O."""
     try:
         names = await aiofiles.os.listdir(directory)
@@ -696,8 +696,8 @@ async def _list_jsonl_files(directory: Path) -> List[Path]:
 def _effective_temperature_for_model(
     model: str,
     requested_temperature: float,
-    base_url: Optional[str] = None,
-) -> Optional[float]:
+    base_url: str | None = None,
+) -> float | None:
     """Apply fixed model temperature contracts to direct client calls.
 
     Returns ``None`` when the model manages temperature server-side (Kimi);
@@ -762,7 +762,7 @@ class CompressionConfig:
     @classmethod
     async def from_yaml(cls, yaml_path: str) -> "CompressionConfig":
         """Load configuration from YAML file."""
-        async with aiofiles.open(yaml_path, "r", encoding="utf-8") as source:
+        async with aiofiles.open(yaml_path, encoding="utf-8") as source:
             data = yaml.safe_load(await source.read()) or {}
 
         config = cls()
@@ -839,7 +839,7 @@ class TrajectoryMetrics:
     summarization_api_calls: int = 0
     summarization_errors: int = 0
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "original_tokens": self.original_tokens,
             "compressed_tokens": self.compressed_tokens,
@@ -882,9 +882,9 @@ class AggregateMetrics:
     total_summarization_errors: int = 0
     
     # Distribution stats
-    compression_ratios: List[float] = field(default_factory=list)
-    tokens_saved_list: List[int] = field(default_factory=list)
-    turns_removed_list: List[int] = field(default_factory=list)
+    compression_ratios: list[float] = field(default_factory=list)
+    tokens_saved_list: list[int] = field(default_factory=list)
+    turns_removed_list: list[int] = field(default_factory=list)
     
     processing_start_time: str = ""
     processing_end_time: str = ""
@@ -914,7 +914,7 @@ class AggregateMetrics:
         if metrics.still_over_limit:
             self.trajectories_still_over_limit += 1
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         avg_compression_ratio = (
             sum(self.compression_ratios) / len(self.compression_ratios) 
             if self.compression_ratios else 1.0
@@ -1154,7 +1154,7 @@ class TrajectoryCompressor:
         return self._count_tokens_initialized(text)
 
     async def count_trajectory_tokens(
-        self, trajectory: List[Dict[str, str]]
+        self, trajectory: list[dict[str, str]]
     ) -> int:
         """Count total tokens in a trajectory."""
         await self._initialize()
@@ -1164,8 +1164,8 @@ class TrajectoryCompressor:
         )
 
     async def count_turn_tokens(
-        self, trajectory: List[Dict[str, str]]
-    ) -> List[int]:
+        self, trajectory: list[dict[str, str]]
+    ) -> list[int]:
         """Count tokens for each turn in a trajectory."""
         await self._initialize()
         return [
@@ -1173,7 +1173,7 @@ class TrajectoryCompressor:
             for turn in trajectory
         ]
     
-    def _find_protected_indices(self, trajectory: List[Dict[str, str]]) -> Tuple[set, int, int]:
+    def _find_protected_indices(self, trajectory: list[dict[str, str]]) -> tuple[set, int, int]:
         """
         Find indices of protected turns.
         
@@ -1222,7 +1222,7 @@ class TrajectoryCompressor:
         return protected, compressible_start, compressible_end
 
     @staticmethod
-    def _is_boundary_clean(trajectory: List[Dict[str, str]], idx: int) -> bool:
+    def _is_boundary_clean(trajectory: list[dict[str, str]], idx: int) -> bool:
         """Return True if a region boundary at ``idx`` does not split a turn pair.
 
         In the from/value trajectory format a ``tool`` turn (carrying
@@ -1237,7 +1237,7 @@ class TrajectoryCompressor:
     @classmethod
     def _snap_boundary(
         cls,
-        trajectory: List[Dict[str, str]],
+        trajectory: list[dict[str, str]],
         idx: int,
         min_idx: int,
         max_idx: int,
@@ -1260,7 +1260,7 @@ class TrajectoryCompressor:
             backward -= 1
         return backward
 
-    def _extract_turn_content_for_summary(self, trajectory: List[Dict[str, str]], start: int, end: int) -> str:
+    def _extract_turn_content_for_summary(self, trajectory: list[dict[str, str]], start: int, end: int) -> str:
         """
         Extract content from turns to be summarized.
         
@@ -1373,8 +1373,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
     
     async def compress_trajectory(
         self,
-        trajectory: List[Dict[str, str]]
-    ) -> Tuple[List[Dict[str, str]], TrajectoryMetrics]:
+        trajectory: list[dict[str, str]]
+    ) -> tuple[list[dict[str, str]], TrajectoryMetrics]:
         """
         Compress a single trajectory to fit within the target token budget.
         """
@@ -1495,7 +1495,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         
         return compressed, metrics
     
-    async def process_entry(self, entry: Dict[str, Any]) -> Tuple[Dict[str, Any], TrajectoryMetrics]:
+    async def process_entry(self, entry: dict[str, Any]) -> tuple[dict[str, Any], TrajectoryMetrics]:
         """
         Process a single JSONL entry.
         """
@@ -1585,7 +1585,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         # Track timeouts separately
         timeout_count = 0
         
-        async def process_single(file_path: Path, entry_idx: int, entry: Dict, 
+        async def process_single(file_path: Path, entry_idx: int, entry: dict,
                                   progress, main_task, status_task):
             """Process a single entry with semaphore rate limiting and timeout."""
             nonlocal compressed_count, skipped_count, api_calls, in_flight, timeout_count
@@ -1623,7 +1623,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                             description=f"[dim]✅ {compressed_count} compressed | ⏭️ {skipped_count} skipped | ⏱️ {timeout_count} timeout | 🔄 {api_calls} API calls | ⚡ {in_flight} in-flight[/dim]"
                         )
                 
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self.logger.warning(f"Timeout processing entry from {file_path}:{entry_idx} (>{self.config.per_trajectory_timeout}s)")
                     
                     async with progress_lock:
@@ -1831,11 +1831,11 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
 async def main(
     input: str,
-    output: str = None,
+    output: str | None = None,
     config: str = "configs/trajectory_compression.yaml",
-    target_max_tokens: int = None,
-    tokenizer: str = None,
-    sample_percent: float = None,
+    target_max_tokens: int | None = None,
+    tokenizer: str | None = None,
+    sample_percent: float | None = None,
     seed: int = 42,
     dry_run: bool = False,
 ):
@@ -1913,7 +1913,7 @@ async def main(
         
         # Load entries from the single file
         entries = []
-        async with aiofiles.open(input_path, "r", encoding="utf-8") as source:
+        async with aiofiles.open(input_path, encoding="utf-8") as source:
             line_num = 0
             async for line in source:
                 line_num += 1
@@ -1970,7 +1970,7 @@ async def main(
             ) as output_file:
                 for jsonl_file in await _list_jsonl_files(temp_output_dir):
                     async with aiofiles.open(
-                        jsonl_file, "r", encoding="utf-8"
+                        jsonl_file, encoding="utf-8"
                     ) as input_file:
                         async for line in input_file:
                             await output_file.write(line)
@@ -2014,7 +2014,7 @@ async def main(
                 for jsonl_file in await _list_jsonl_files(input_path):
                     entries = []
                     async with aiofiles.open(
-                        jsonl_file, "r", encoding="utf-8"
+                        jsonl_file, encoding="utf-8"
                     ) as source:
                         async for line in source:
                             line = line.strip()

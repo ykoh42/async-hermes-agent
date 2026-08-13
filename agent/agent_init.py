@@ -29,7 +29,8 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 # These retained modules are imported dynamically below so their attributes
@@ -85,7 +86,7 @@ _transports_bootstrap._discover_transports()
 logger = logging.getLogger("run_agent")
 
 
-def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
+def _apply_runtime_config(agent: Any, config: dict[str, Any]) -> None:
     """Apply the async-loaded configuration snapshot to runtime state.
 
     This function is intentionally synchronous: it only mutates in-memory
@@ -677,7 +678,7 @@ def _custom_provider_runtime_ids(value: Any) -> set[str]:
 
 
 def _moa_aggregator_context_length(
-    config: Dict[str, Any],
+    config: dict[str, Any],
     preset_name: str,
     custom_providers: list[dict[str, Any]],
 ) -> int | None:
@@ -726,7 +727,7 @@ def _moa_aggregator_context_length(
 
 
 def _build_codex_gpt5_autoraise_notice(
-    autoraise: Dict[str, Any], context_length: Optional[int] = None
+    autoraise: dict[str, Any], context_length: int | None = None
 ) -> str:
     """Build the one-time notice shown when Codex gpt-5.x raises compaction.
 
@@ -759,11 +760,11 @@ def _build_codex_gpt5_autoraise_notice(
 
 def _resolve_compression_threshold(
     global_threshold: float,
-    model_cthresh: Optional[float],
+    model_cthresh: float | None,
     *,
-    model: Optional[str] = None,
+    model: str | None = None,
     is_codex_autoraise: bool,
-) -> tuple[float, Optional[Dict[str, Any]]]:
+) -> tuple[float, dict[str, Any] | None]:
     """Combine the user's global compaction threshold with a per-model override.
 
     Returns ``(effective_threshold, autoraise_notice)``. ``autoraise_notice`` is
@@ -802,7 +803,7 @@ def _codex_gpt55_autoraise_notice_marker():
     return get_hermes_home() / ".codex_gpt55_autoraise_notice"
 
 
-def _codex_gpt55_autoraise_notice_state(autoraise: Dict[str, Any]) -> str:
+def _codex_gpt55_autoraise_notice_state(autoraise: dict[str, Any]) -> str:
     """Stable identity for one autoraise notice, keyed on what it displays.
 
     Uses the model slug plus the same from→to percentages the notice text
@@ -816,7 +817,7 @@ def _codex_gpt55_autoraise_notice_state(autoraise: Dict[str, Any]) -> str:
     return f"{model}:{from_pct}:{to_pct}"
 
 
-async def _codex_gpt55_autoraise_notice_seen(autoraise: Dict[str, Any]) -> bool:
+async def _codex_gpt55_autoraise_notice_seen(autoraise: dict[str, Any]) -> bool:
     """True if this exact autoraise notice was already shown for this profile.
 
     A missing/unreadable marker (or one recording a different threshold) reads
@@ -834,7 +835,7 @@ async def _codex_gpt55_autoraise_notice_seen(autoraise: Dict[str, Any]) -> bool:
         return False
 
 
-async def _record_codex_gpt55_autoraise_notice(autoraise: Dict[str, Any]) -> None:
+async def _record_codex_gpt55_autoraise_notice(autoraise: dict[str, Any]) -> None:
     """Persist that the autoraise notice was shown for this profile/config state.
 
     Best-effort: a read-only or missing ``$HERMES_HOME`` just means the notice
@@ -858,7 +859,7 @@ def _normalized_custom_base_url(value: Any) -> str:
     return value.strip().rstrip("/")
 
 
-def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
+def _custom_provider_model_matches(agent_model: str, entry: dict[str, Any]) -> bool:
     agent_model_norm = str(agent_model or "").strip().lower()
     # Multi-model entries (v12+ `providers.<name>.models` mapping / legacy
     # `models:` list): the agent's model matching ANY catalog entry counts.
@@ -868,7 +869,7 @@ def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> b
     # session at the wrong tier (July 2026 sweeper incident: flex config
     # ignored, ~2.3x overbilling).
     models = entry.get("models")
-    catalog: List[str] = []
+    catalog: list[str] = []
     if isinstance(models, dict):
         catalog = [str(k).strip().lower() for k in models.keys()]
     elif isinstance(models, (list, tuple)):
@@ -886,8 +887,8 @@ def _custom_provider_extra_body_for_agent(
     provider: str,
     model: str,
     base_url: str,
-    custom_providers: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+    custom_providers: list[dict[str, Any]],
+) -> dict[str, Any] | None:
     provider_norm = (provider or "").strip().lower()
     if provider_norm == "custom":
         provider_key_filter = ""
@@ -900,7 +901,7 @@ def _custom_provider_extra_body_for_agent(
     if not target_url:
         return None
 
-    fallback: Optional[Dict[str, Any]] = None
+    fallback: dict[str, Any] | None = None
     for entry in custom_providers or []:
         if not isinstance(entry, dict):
             continue
@@ -926,7 +927,7 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
+def _merge_custom_provider_extra_body(agent, custom_providers: list[dict[str, Any]]) -> None:
     extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
         model=agent.model,
@@ -947,77 +948,77 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
 
 def init_agent(
     agent,
-    base_url: str = None,
-    api_key: str = None,
-    provider: str = None,
-    api_mode: str = None,
-    acp_command: str = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    provider: str | None = None,
+    api_mode: str | None = None,
+    acp_command: str | None = None,
     acp_args: list[str] | None = None,
-    command: str = None,
+    command: str | None = None,
     args: list[str] | None = None,
     model: str = "",
     max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
-    enabled_toolsets: List[str] = None,
-    disabled_toolsets: List[str] = None,
+    enabled_toolsets: list[str] | None = None,
+    disabled_toolsets: list[str] | None = None,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
     tool_progress_mode: str = "all",
-    ephemeral_system_prompt: str = None,
+    ephemeral_system_prompt: str | None = None,
     log_prefix_chars: int = 100,
     log_prefix: str = "",
-    providers_allowed: List[str] = None,
-    providers_ignored: List[str] = None,
-    providers_order: List[str] = None,
-    provider_sort: str = None,
+    providers_allowed: list[str] | None = None,
+    providers_ignored: list[str] | None = None,
+    providers_order: list[str] | None = None,
+    provider_sort: str | None = None,
     provider_require_parameters: bool = False,
-    provider_data_collection: str = None,
-    openrouter_min_coding_score: Optional[float] = None,
-    session_id: str = None,
-    tool_progress_callback: callable = None,
-    tool_start_callback: callable = None,
-    tool_complete_callback: callable = None,
-    thinking_callback: callable = None,
-    reasoning_callback: callable = None,
-    clarify_callback: callable = None,
-    read_terminal_callback: callable = None,
-    step_callback: callable = None,
-    stream_delta_callback: callable = None,
-    interim_assistant_callback: callable = None,
-    tool_gen_callback: callable = None,
-    status_callback: callable = None,
-    notice_callback: callable = None,
-    notice_clear_callback: callable = None,
-    event_callback: Optional[Callable[[str, dict], None]] = None,
-    reaction_callback: Optional[Callable[[str], None]] = None,
-    max_tokens: int = None,
-    reasoning_config: Dict[str, Any] = None,
-    service_tier: str = None,
-    request_overrides: Dict[str, Any] = None,
-    prefill_messages: List[Dict[str, Any]] = None,
-    platform: str = None,
-    user_id: str = None,
-    user_id_alt: str = None,
-    user_name: str = None,
-    chat_id: str = None,
-    chat_name: str = None,
-    chat_type: str = None,
-    thread_id: str = None,
-    gateway_session_key: str = None,
+    provider_data_collection: str | None = None,
+    openrouter_min_coding_score: float | None = None,
+    session_id: str | None = None,
+    tool_progress_callback: Callable[..., Any] | None = None,
+    tool_start_callback: Callable[..., Any] | None = None,
+    tool_complete_callback: Callable[..., Any] | None = None,
+    thinking_callback: Callable[..., Any] | None = None,
+    reasoning_callback: Callable[..., Any] | None = None,
+    clarify_callback: Callable[..., Any] | None = None,
+    read_terminal_callback: Callable[..., Any] | None = None,
+    step_callback: Callable[..., Any] | None = None,
+    stream_delta_callback: Callable[..., Any] | None = None,
+    interim_assistant_callback: Callable[..., Any] | None = None,
+    tool_gen_callback: Callable[..., Any] | None = None,
+    status_callback: Callable[..., Any] | None = None,
+    notice_callback: Callable[..., Any] | None = None,
+    notice_clear_callback: Callable[..., Any] | None = None,
+    event_callback: Callable[[str, dict], None] | None = None,
+    reaction_callback: Callable[[str], None] | None = None,
+    max_tokens: int | None = None,
+    reasoning_config: dict[str, Any] | None = None,
+    service_tier: str | None = None,
+    request_overrides: dict[str, Any] | None = None,
+    prefill_messages: list[dict[str, Any]] | None = None,
+    platform: str | None = None,
+    user_id: str | None = None,
+    user_id_alt: str | None = None,
+    user_name: str | None = None,
+    chat_id: str | None = None,
+    chat_name: str | None = None,
+    chat_type: str | None = None,
+    thread_id: str | None = None,
+    gateway_session_key: str | None = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
     session_db=None,
-    parent_session_id: str = None,
-    iteration_budget: "IterationBudget" = None,
-    fallback_model: Dict[str, Any] = None,
+    parent_session_id: str | None = None,
+    iteration_budget: IterationBudget = None,
+    fallback_model: dict[str, Any] | None = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
-    requested_provider: str = None,
+    requested_provider: str | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -1030,17 +1031,17 @@ def init_agent(
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
-        enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
-        disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
+        enabled_toolsets (list[str]): Only enable tools from these toolsets (optional)
+        disabled_toolsets (list[str]): Disable tools from these toolsets (optional)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
         verbose_logging (bool): Enable verbose logging for debugging (default: False)
         quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
         ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
         log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 100)
         log_prefix (str): Prefix to add to all log messages for identification in parallel processing (default: "")
-        providers_allowed (List[str]): OpenRouter providers to allow (optional)
-        providers_ignored (List[str]): OpenRouter providers to ignore (optional)
-        providers_order (List[str]): OpenRouter providers to try in order (optional)
+        providers_allowed (list[str]): OpenRouter providers to allow (optional)
+        providers_ignored (list[str]): OpenRouter providers to ignore (optional)
+        providers_order (list[str]): OpenRouter providers to try in order (optional)
         provider_sort (str): Sort providers by price/throughput/latency (optional)
         openrouter_min_coding_score (float): Coding-score floor (0.0-1.0) for the
             openrouter/pareto-code router. Only applied when model == "openrouter/pareto-code".
@@ -1050,9 +1051,9 @@ def init_agent(
         clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
-        reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
+        reasoning_config (dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
             If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
-        prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
+        prefill_messages (list[dict]): Messages to prepend to conversation history as prefilled context.
             Useful for injecting a few-shot example or priming the model's response style.
             Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
             NOTE: Anthropic Sonnet 4.6+ and Opus 4.6+ reject a conversation that ends on an
@@ -1278,13 +1279,13 @@ def init_agent(
     # last tool result's content so the model sees it on its next
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
-    agent._pending_steer: Optional[str] = None
+    agent._pending_steer: str | None = None
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn
     # prefix, cancel only the in-flight model request, and rebuild its tail with
     # the correction. The loop drains this slot at a role-safe boundary.
-    agent._pending_redirect: Optional[str] = None
+    agent._pending_redirect: str | None = None
 
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
@@ -1449,7 +1450,7 @@ def init_agent(
     # Cache anthropic image-to-text fallbacks per image payload/URL so a
     # single tool loop does not repeatedly re-run auxiliary vision on the
     # same image history.
-    agent._anthropic_image_fallback_cache: Dict[str, str] = {}
+    agent._anthropic_image_fallback_cache: dict[str, str] = {}
 
     # Initialize LLM client via centralized provider router.
     # The router handles auth resolution, base URL, headers, and
@@ -1783,7 +1784,7 @@ def init_agent(
     agent._session_json_enabled = False
     # Mutable so a turn that begins before deferred config loading observes
     # the values published by ``_apply_runtime_config`` in that same task.
-    agent._session_runtime_config: Dict[str, Any] = {}
+    agent._session_runtime_config: dict[str, Any] = {}
     try:
         _sess_cfg = (_agent_cfg.get("sessions") or {})
         agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
@@ -1793,7 +1794,7 @@ def init_agent(
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
     
     # Track conversation messages for session logging
-    agent._session_messages: List[Dict[str, Any]] = []
+    agent._session_messages: list[dict[str, Any]] = []
     # Responses encrypted reasoning replay state.  Some OpenAI-compatible
     # routes accept GPT-5 Responses requests but later reject replayed
     # encrypted reasoning blobs (HTTP 400 ``invalid_encrypted_content``).
@@ -1805,10 +1806,10 @@ def init_agent(
     agent._memory_write_context = "foreground"
     
     # Cached system prompt -- built once per session, only rebuilt on compression
-    agent._cached_system_prompt: Optional[str] = None
+    agent._cached_system_prompt: str | None = None
     # Cross-session-stable prefix of the cached prompt. It remains separate
     # from the persisted string and is used only to place an early cache marker.
-    agent._cached_system_prompt_static: Optional[str] = None
+    agent._cached_system_prompt_static: str | None = None
 
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager
@@ -2830,7 +2831,7 @@ def init_agent(
 
 async def _select_context_engine(
     agent: Any,
-    config_snapshot: Dict[str, Any],
+    config_snapshot: dict[str, Any],
 ) -> None:
     """Select and validate the configured engine before transport startup."""
     if getattr(agent, "_context_engine_selected", False):
@@ -2926,7 +2927,7 @@ async def _select_context_engine(
 
 async def _initialize_context_engine(
     agent: Any,
-    config_snapshot: Dict[str, Any],
+    config_snapshot: dict[str, Any],
 ) -> None:
     """Configure and start the selected context engine exactly once."""
     if getattr(agent, "_context_engine_started", False):
@@ -3072,7 +3073,7 @@ async def _initialize_context_engine(
 
 async def _initialize_memory_manager(
     agent: Any,
-    config_snapshot: Dict[str, Any],
+    config_snapshot: dict[str, Any],
 ) -> None:
     """Load and initialize the configured memory provider once."""
     if getattr(agent, "_memory_manager_started", False):
@@ -3109,7 +3110,7 @@ async def _initialize_memory_manager(
             return
         manager.add_provider(provider)
 
-        init_kwargs: Dict[str, Any] = {
+        init_kwargs: dict[str, Any] = {
             "platform": agent.platform or "cli",
             "hermes_home": str(get_hermes_home()),
             "agent_context": "primary",

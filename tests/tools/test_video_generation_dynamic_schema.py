@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pytest
 import yaml
@@ -38,13 +38,13 @@ class _BothModalitiesProvider(VideoGenProvider):
     async def is_available(self) -> bool:
         return True
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [{"id": "family-a", "modalities": ["text", "image"]}]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return "family-a"
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         return {
             "modalities": ["text", "image"],
             "aspect_ratios": ["16:9", "9:16"],
@@ -70,13 +70,13 @@ class _ImageOnlyProvider(VideoGenProvider):
     async def is_available(self) -> bool:
         return True
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [{"id": "img-only-v1", "modalities": ["image"]}]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return "img-only-v1"
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         return {"modalities": ["image"], "min_duration": 1, "max_duration": 10}
 
     async def generate(self, prompt, **kwargs):

@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
+from collections.abc import Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
@@ -77,10 +78,10 @@ class ToolCallGuardrailConfig:
     no_progress_block_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
-    loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
+    loop_caps: LoopCapConfig = field(default_factory=lambda: LoopCapConfig())
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> ToolCallGuardrailConfig:
         """Build config from the `tool_loop_guardrails` config.yaml section."""
         if not isinstance(data, Mapping):
             return cls()
@@ -156,7 +157,7 @@ class LoopCapConfig:
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> LoopCapConfig:
         """Build config from the ``tool_loop_guardrails.loop_caps`` section."""
         if not isinstance(data, Mapping):
             return cls()
@@ -179,7 +180,7 @@ class ToolCallSignature:
     args_hash: str
 
     @classmethod
-    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
+    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> ToolCallSignature:
         canonical = canonical_tool_args(args or {})
         return cls(tool_name=tool_name, args_hash=_sha256(canonical))
 

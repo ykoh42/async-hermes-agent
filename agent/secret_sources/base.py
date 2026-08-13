@@ -45,13 +45,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, List, MutableMapping, Optional, Sequence
+from collections.abc import MutableMapping, Sequence
 
 # v2 makes the required fetch contract native async. Additive optional hooks
 # must still ship with defaults and must not bump this version.
 SECRET_SOURCE_API_VERSION = 2
 
-_SOURCE_ENVIRONMENT: ContextVar[Optional[MutableMapping[str, str]]]
+_SOURCE_ENVIRONMENT: ContextVar[MutableMapping[str, str] | None]
 _SOURCE_ENVIRONMENT = ContextVar("hermes_secret_source_environment", default=None)
 
 
@@ -134,7 +134,7 @@ async def _communicate_subprocess(
     raise RuntimeError(timeout_message) from timeout_error
 
 
-class ErrorKind(str, Enum):
+class ErrorKind(str, Enum):  # noqa: UP042 - preserve legacy str() output
     """Machine-readable failure taxonomy for :class:`FetchResult.error`.
 
     A fixed vocabulary keeps startup warnings and ``hermes secrets status``
@@ -165,15 +165,15 @@ class FetchResult:
     conforming ``fetch()`` implementations.
     """
 
-    secrets: Dict[str, str] = field(default_factory=dict)
-    applied: List[str] = field(default_factory=list)
-    skipped: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
-    error: Optional[str] = None
-    error_kind: Optional[ErrorKind] = None
+    secrets: dict[str, str] = field(default_factory=dict)
+    applied: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: str | None = None
+    error_kind: ErrorKind | None = None
     # Path of the helper binary used, when the source is CLI-driven.
     # Surfaced by status commands; None for SDK/API-driven sources.
-    binary_path: Optional[Path] = None
+    binary_path: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -211,7 +211,7 @@ class SecretSource(ABC):
     name: str = ""
     label: str = ""
     shape: str = "mapped"  # "mapped" | "bulk"
-    scheme: Optional[str] = None
+    scheme: str | None = None
 
     # -- required ----------------------------------------------------------
 
@@ -239,7 +239,7 @@ class SecretSource(ABC):
         """
         return bool(isinstance(cfg, dict) and cfg.get("override_existing", False))
 
-    def protected_env_vars(self, cfg: dict) -> FrozenSet[str]:
+    def protected_env_vars(self, cfg: dict) -> frozenset[str]:
         """Env vars the orchestrator must never let ANY source overwrite.
 
         Typically the source's own bootstrap-auth var (e.g.
@@ -267,7 +267,7 @@ class SecretSource(ABC):
         """
         return {}
 
-    def remediation(self, kind: Optional["ErrorKind"], cfg: dict) -> str:
+    def remediation(self, kind: ErrorKind | None, cfg: dict) -> str:
         """One-line, actionable next step for a failed fetch.
 
         Called by the startup status printer (and ``hermes secrets ...
@@ -337,7 +337,7 @@ async def run_secret_cli(
     argv: Sequence[str],
     *,
     allow_env: Sequence[str] = (),
-    extra_env: Optional[Dict[str, str]] = None,
+    extra_env: dict[str, str] | None = None,
     timeout: float = DEFAULT_CLI_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess:
     """Run a secret-manager helper CLI with a minimal, allowlisted env.
@@ -372,7 +372,7 @@ async def run_secret_cli(
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
     )
-    env: Dict[str, str] = {}
+    env: dict[str, str] = {}
     for key in (*base_keep, *allow_env):
         val = os.environ.get(key)
         if val is not None:
