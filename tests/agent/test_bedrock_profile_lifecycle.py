@@ -511,6 +511,13 @@ async def test_cancelled_discovery_waiter_does_not_cancel_sibling(
     first = discover()
     sibling = discover()
     await started.wait()
+    state = await _under_profile(profile, bedrock._activate_bedrock_scope)
+    # The discovery-start event only proves that the shared operation began.
+    # Profile canonicalization is independent async file I/O, so wait until
+    # both callers have registered before exercising the waiter invariant.
+    async with asyncio.timeout(5):
+        while sum(state.discovery_waiters.values()) < 2:
+            await asyncio.sleep(0)
     first.cancel()
     allow.set()
     with pytest.raises(asyncio.CancelledError):
@@ -519,7 +526,6 @@ async def test_cancelled_discovery_waiter_does_not_cancel_sibling(
     assert len(models) == 1
     assert len(built) == 1
     assert built[0].closed == 1
-    state = await _under_profile(profile, bedrock._activate_bedrock_scope)
     assert not state.discovery_tasks
     assert not state.discovery_waiters
 

@@ -5,6 +5,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import aiofiles.os
 import pytest
 import pytest_asyncio
 from blockbuster import BlockBuster
@@ -170,6 +171,9 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
         # Warm the allowed aiosqlite worker before overlapping detectors; cold
         # SessionDB startup is covered by test_session_lifecycle_does_not_block_or_leak.
         await database.session_count()
+        # Warm aiofiles' default executor before BlockBuster instruments
+        # threading internals; profile-root lookup still runs under both guards.
+        await aiofiles.os.getcwd()
         async with (
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),
