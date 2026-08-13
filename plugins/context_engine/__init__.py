@@ -28,7 +28,7 @@ from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import aiofiles
 import aiofiles.os
-from hermes_cli.async_source_loader import load_source_package
+from hermes_cli.async_source_loader import _load_source_package
 
 if TYPE_CHECKING:
     from agent.context_engine import ContextEngine
@@ -168,7 +168,7 @@ async def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                             pass
 
         try:
-            mod = await load_source_package(module_name, init_file)
+            mod = await _load_source_package(module_name, init_file)
         except asyncio.CancelledError:
             sys.modules.pop(module_name, None)
             for loaded_name in tuple(sys.modules):

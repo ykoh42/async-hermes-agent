@@ -57,6 +57,9 @@ from agent.secret_sources._cache import (
     CachedFetch as _CachedFetch,
     DiskCache,
     FetchResult,
+    _canonical_cache_home,
+    _finish_owned_cache_cleanup,
+    _remove_owned_cache_temp,
     is_valid_env_name as _is_valid_env_name,
 )
 from agent.secret_sources.base import (
@@ -90,7 +93,8 @@ _BWS_RUN_TIMEOUT = 30
 
 # In-process cache so repeated load_hermes_dotenv() calls (CLI startup,
 # gateway hot-reload, test suites) don't re-fetch from BSM.
-_CacheKey = Tuple[str, str, str]  # (access_token_fingerprint, project_id, server_url)
+_CacheKey = Tuple[str, str, str, str]
+# (access_token_fingerprint, project_id, server_url, canonical_home)
 _CACHE: Dict[_CacheKey, _CachedFetch] = {}
 
 # Disk-persisted cache so back-to-back CLI invocations (e.g. `hermes chat -q ...`
@@ -112,7 +116,7 @@ _ENCRYPTED_CACHE_INFO = b"hermes-bws-encrypted-cache-v1"
 
 def _cache_key_str(cache_key: _CacheKey) -> str:
     """Serialize a cache key to a stable string for JSON storage."""
-    token_fp, project_id, server_url = cache_key
+    token_fp, project_id, server_url, _home = cache_key
     return f"{token_fp}|{project_id}|{server_url}"
 
 
@@ -483,11 +487,21 @@ async def _write_encrypted_disk_cache(
                 pass
             except OSError:
                 pass
-        except BaseException:
-            try:
-                await aiofiles.os.remove(tmp)
-            except OSError:
-                pass
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                _remove_owned_cache_temp(tmp),
+                name="bws-encrypted-cache-staging-cleanup",
+            )
+            await _finish_owned_cache_cleanup(cleanup)
+            raise
+        except BaseException as error:
+            cleanup = asyncio.create_task(
+                _remove_owned_cache_temp(tmp),
+                name="bws-encrypted-cache-staging-cleanup",
+            )
+            cancellation = await _finish_owned_cache_cleanup(cleanup)  # noqa: ASYNC120 - cleanup shields cancellation
+            if cancellation is not None:
+                raise cancellation from error
             raise
     except Exception:  # noqa: BLE001 — best-effort cache only
         return
@@ -581,7 +595,13 @@ async def fetch_bitwarden_secrets(
     if not project_id:
         raise RuntimeError("Bitwarden project_id is empty")
 
-    cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
+    home_key, cache_home = await _canonical_cache_home(home_path)
+    cache_key = (
+        _token_fingerprint(access_token),
+        project_id,
+        server_url or "",
+        home_key,
+    )
     if use_cache and cache_ttl_seconds > 0:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
@@ -592,11 +612,11 @@ async def fetch_bitwarden_secrets(
                 cache_key=cache_key,
                 access_token=access_token,
                 max_age_seconds=cache_ttl_seconds,
-                home_path=home_path,
+                home_path=cache_home,
             )
         else:
             disk_cached = await _DISK_CACHE.read(
-                cache_key, cache_ttl_seconds, home_path
+                cache_key, cache_ttl_seconds, cache_home
             )
         if disk_cached is not None:
             # Promote into in-process cache so subsequent fetches in the
@@ -649,7 +669,7 @@ async def fetch_bitwarden_secrets(
                     cache_key=cache_key,
                     access_token=access_token,
                     max_age_seconds=encrypted_cache_max_stale_seconds,
-                    home_path=home_path,
+                    home_path=cache_home,
                 )
                 if stale is not None:
                     age = max(0.0, time.time() - stale.fetched_at)
@@ -659,7 +679,11 @@ async def fetch_bitwarden_secrets(
                         f"stale ENCRYPTED disk cache ({int(age)}s old)"
                     ]
             elif cache_ttl_seconds > 0:
-                stale = await _DISK_CACHE.read(cache_key, float("inf"), home_path)
+                stale = await _DISK_CACHE.read(
+                    cache_key,
+                    float("inf"),
+                    cache_home,
+                )
                 if stale is not None:
                     age = max(0.0, time.time() - stale.fetched_at)
                     _CACHE[cache_key] = stale
@@ -680,10 +704,15 @@ async def fetch_bitwarden_secrets(
                 cache_key=cache_key,
                 access_token=access_token,
                 entry=entry,
-                home_path=home_path,
+                home_path=cache_home,
             )
         elif cache_ttl_seconds > 0:
-            await _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
+            await _DISK_CACHE.write(
+                cache_key,
+                entry,
+                cache_ttl_seconds,
+                cache_home,
+            )
     return secrets, warnings
 
 

@@ -50,6 +50,11 @@ from agent.model_metadata import (
     is_local_endpoint,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.secret_scope import (
+    current_secret_scope,
+    get_secret,
+    is_multiplex_active,
+)
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.stream_single_writer import _STREAM_WRITER_TASK_TOKENS
@@ -99,10 +104,24 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
 
     sessions = config.get("sessions", {}) or {}
     agent._session_json_enabled = bool(sessions.get("write_json_snapshots", False))
-    if "cjk_fts" in sessions:
-        os.environ["HERMES_CJK_FTS"] = str(sessions["cjk_fts"])
-    if "search_slow_ms" in sessions:
-        os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions["search_slow_ms"])
+    runtime_sessions = getattr(agent, "_session_runtime_config", None)
+    if not isinstance(runtime_sessions, dict):
+        runtime_sessions = {}
+        agent._session_runtime_config = runtime_sessions
+    runtime_sessions.clear()
+    for name in ("cjk_fts", "search_slow_ms"):
+        if name in sessions:
+            runtime_sessions[name] = sessions[name]
+    # These environment variables are an upstream process-startup bridge.
+    # Preserve that legacy behavior for a single-profile application, but do
+    # not let one multiplexed agent overwrite another agent's later DB work.
+    if not is_multiplex_active():
+        if "cjk_fts" in runtime_sessions:
+            os.environ["HERMES_CJK_FTS"] = str(runtime_sessions["cjk_fts"])
+        if "search_slow_ms" in runtime_sessions:
+            os.environ["HERMES_SEARCH_SLOW_MS"] = str(
+                runtime_sessions["search_slow_ms"]
+            )
 
     display = config.get("display", {}) or {}
     agent.show_commentary = bool(display.get("show_commentary", True))
@@ -431,6 +450,25 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
                 ),
             }
         )
+
+
+def _constructor_terminal_cwd() -> str | None:
+    """Snapshot cwd state only when construction already has an owner scope."""
+    if is_multiplex_active() and current_secret_scope() is None:
+        return None
+    return get_secret("TERMINAL_CWD") or None
+
+
+async def _bind_subdirectory_hint_cwd(agent: Any) -> None:
+    """Bind deferred cwd state at the first profile-scoped async boundary."""
+    tracker = getattr(agent, "_subdirectory_hints", None)
+    if tracker is None or tracker.working_dir is not None:
+        return
+    if is_multiplex_active() and current_secret_scope() is None:
+        return
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    tracker.working_dir = await resolve_agent_cwd()
 
 
 def _ra():
@@ -951,7 +989,7 @@ def init_agent(
     notice_callback: callable = None,
     notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
-    reaction_callback: Optional[Callable[..., None]] = None,
+    reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
@@ -1691,6 +1729,7 @@ def init_agent(
     agent._mcp_discovery_started = False
     agent._mcp_lifecycle_retained = False
     agent._lsp_lifecycle_retained = False
+    agent._parallel_lifecycle_retained = False
 
     # Tool availability and dynamic schemas may require async config or
     # provider checks. The first turn prologue builds the complete snapshot
@@ -1742,6 +1781,9 @@ def init_agent(
     # is canonical — the snapshot is only useful for external tooling that
     # reads the JSON files directly.  See run_agent._save_session_log.
     agent._session_json_enabled = False
+    # Mutable so a turn that begins before deferred config loading observes
+    # the values published by ``_apply_runtime_config`` in that same task.
+    agent._session_runtime_config: Dict[str, Any] = {}
     try:
         _sess_cfg = (_agent_cfg.get("sessions") or {})
         agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
@@ -2632,7 +2674,7 @@ def init_agent(
     agent._context_engine_started = False
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=_constructor_terminal_cwd(),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).
@@ -2891,19 +2933,37 @@ async def _initialize_context_engine(
         return
     await _select_context_engine(agent, config_snapshot)
 
-    if getattr(agent, "_context_engine_is_plugin", False):
-        from agent.model_metadata import get_model_context_length
+    # ``AIAgent`` always installs an engine during normal construction, but
+    # preserve the historical no-engine behavior for lightweight embedded
+    # instances that deliberately set ``context_compressor = None``.
+    if getattr(agent, "context_compressor", None) is None:
+        return
 
-        plugin_context_length = await get_model_context_length(
+    from agent.model_metadata import get_model_context_length
+
+    resolved_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    configured_context_length = getattr(agent, "_config_context_length", None)
+    resolved_context_length = None
+    if provider == "lmstudio":
+        resolved_context_length = agent._effective_lmstudio_context_length(
+            configured_context_length,
+            getattr(agent, "_lmstudio_runtime_context_length", None),
+        )
+    if resolved_context_length is None:
+        resolved_context_length = await get_model_context_length(
             agent.model,
             base_url=agent.base_url,
-            api_key=(
-                agent.api_key if isinstance(agent.api_key, str) else ""
+            api_key=resolved_api_key,
+            config_context_length=(
+                None if provider == "lmstudio" else configured_context_length
             ),
-            config_context_length=getattr(agent, "_config_context_length", None),
             provider=agent.provider,
             custom_providers=getattr(agent, "_custom_providers", None),
         )
+
+    is_plugin_engine = getattr(agent, "_context_engine_is_plugin", False)
+    if is_plugin_engine:
         compression_config = config_snapshot.get("compression", {})
         raw_thresholds = (
             compression_config.get("model_thresholds", {})
@@ -2917,16 +2977,38 @@ async def _initialize_context_engine(
                 if isinstance(value, (int, float))
                 and not isinstance(value, bool)
             }
-        agent.context_compressor.update_model(
-            model=agent.model,
-            context_length=plugin_context_length,
-            base_url=agent.base_url,
-            api_key=(
-                agent.api_key if isinstance(agent.api_key, str) else ""
-            ),
-            provider=agent.provider,
-            api_mode=agent.api_mode,
+
+    agent.context_compressor.update_model(
+        model=agent.model,
+        context_length=resolved_context_length,
+        base_url=agent.base_url,
+        api_key=resolved_api_key if is_plugin_engine else agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+    allow_lmstudio_explicit_below_floor = (
+        provider == "lmstudio"
+        and isinstance(configured_context_length, int)
+        and not isinstance(configured_context_length, bool)
+        and configured_context_length > 0
+    )
+    if (
+        resolved_context_length
+        and resolved_context_length < MINIMUM_CONTEXT_LENGTH
+        and not allow_lmstudio_explicit_below_floor
+    ):
+        raise ValueError(
+            f"Model {agent.model} has a context window of "
+            f"{resolved_context_length:,} tokens, which is below the minimum "
+            f"{MINIMUM_CONTEXT_LENGTH:,} required by Hermes Agent.  Choose a "
+            f"model with at least {MINIMUM_CONTEXT_LENGTH // 1000}K context.  "
+            "If your server reports a window smaller than the model's true "
+            "window, set model.context_length in config.yaml to the real value "
+            f"(this must be at least {MINIMUM_CONTEXT_LENGTH // 1000}K)."
         )
+
+    if is_plugin_engine:
         if not agent.quiet_mode:
             logger.info("Using context engine: %s", agent.context_compressor.name)
 
@@ -3097,6 +3179,19 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
     ``AIAgent.__init__`` deliberately avoids credential file access and OAuth
     refresh. This function performs that work at the first awaited boundary.
     """
+    # Rehydrate durable background-delegation completions at an awaited
+    # runtime boundary. The registry constructor remains state-only, while
+    # the durable queue is available before this agent starts accepting turns.
+    from tools.async_delegation import restore_undelivered_completions
+    from tools.process_registry import process_registry
+
+    try:
+        await restore_undelivered_completions(process_registry.completion_queue)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Could not restore async delegation completions: %s", exc)
+
     # Provider profile discovery scans plugin directories and executes their
     # registration modules.  Keep that first filesystem boundary awaited so
     # subsequent profile lookups are in-memory and cannot block this turn.
@@ -3129,6 +3224,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
         agent._provider_init_lock = lock
 
     async with lock:
+        await _bind_subdirectory_hint_cwd(agent)
         pending = getattr(agent, "_deferred_provider_runtime", None)
         if not pending and getattr(agent, "_runtime_config_loaded", False):
             config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
@@ -3139,12 +3235,16 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             return False
 
         if not getattr(agent, "_dotenv_loaded", False):
-            from hermes_cli.env_loader import load_hermes_dotenv
+            loaded_env_paths: list[Path] = []
+            # Multiplex callers install a context-local profile secret scope;
+            # this legacy loader writes dotenv values into shared os.environ.
+            if not is_multiplex_active():
+                from hermes_cli.env_loader import load_hermes_dotenv
 
-            loaded_env_paths = await load_hermes_dotenv(
-                hermes_home=get_hermes_home(),
-                project_env=Path(__file__).parent.parent / ".env",
-            )
+                loaded_env_paths = await load_hermes_dotenv(
+                    hermes_home=get_hermes_home(),
+                    project_env=Path(__file__).parent.parent / ".env",
+                )
             agent._dotenv_loaded = True
             for env_path in loaded_env_paths:
                 logger.info("Loaded environment variables from %s", env_path)
@@ -3221,7 +3321,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             and requested == "custom"
             and explicit_base_url
         ):
-            explicit_api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+            explicit_api_key = str(get_secret("OPENAI_API_KEY") or "").strip()
 
         if explicit_api_key and explicit_base_url:
             direct_provider = "openrouter" if requested in {"", "auto"} else requested
@@ -3595,13 +3695,12 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             agent._anthropic_prompt_cache_policy()
         )
         compressor = getattr(agent, "context_compressor", None)
-        # A newly selected plugin is initialized below after its real context
-        # window is resolved. Updating it here would first publish the class
-        # default (usually zero) and execute plugin side effects twice. An
-        # already-started plugin still needs this route refresh on rehydration.
-        if compressor is not None and (
-            not getattr(agent, "_context_engine_is_plugin", False)
-            or getattr(agent, "_context_engine_started", False)
+        # Initial engine startup resolves the live context window below. An
+        # already-started engine still needs this route refresh on rehydration.
+        if (
+            compressor is not None
+            and getattr(agent, "_context_engine_started", False)
+            and not pending.get("skip_context_engine_update", False)
         ):
             context_length = getattr(compressor, "context_length", None)
             if provider == "lmstudio":
@@ -3609,13 +3708,34 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                     getattr(agent, "_config_context_length", None),
                     agent._lmstudio_runtime_context_length,
                 )
-                if context_length is None:
-                    context_length = _get_static_context_length(
-                        agent.model,
-                        base_url=agent.base_url,
-                        provider=agent.provider,
-                        custom_providers=getattr(agent, "_custom_providers", None),
-                    )
+            compressor_route_changed = (
+                str(getattr(compressor, "model", "") or "") != agent.model
+                or str(getattr(compressor, "provider", "") or "").strip().lower()
+                != provider
+                or _normalize_route_base_url(
+                    str(getattr(compressor, "base_url", "") or "")
+                )
+                != _normalize_route_base_url(agent.base_url)
+            )
+            if context_length is None or (
+                provider != "lmstudio" and compressor_route_changed
+            ):
+                from agent.model_metadata import get_model_context_length
+
+                context_length = await get_model_context_length(
+                    agent.model,
+                    base_url=agent.base_url,
+                    api_key=(
+                        agent.api_key if isinstance(agent.api_key, str) else ""
+                    ),
+                    provider=agent.provider,
+                    config_context_length=(
+                        None
+                        if provider == "lmstudio"
+                        else getattr(agent, "_config_context_length", None)
+                    ),
+                    custom_providers=getattr(agent, "_custom_providers", None),
+                )
             compressor.update_model(
                 model=agent.model,
                 context_length=context_length,
@@ -3642,6 +3762,30 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 "use_prompt_caching": agent._use_prompt_caching,
                 "use_native_cache_layout": agent._use_native_cache_layout,
             })
+            active_compressor = getattr(agent, "context_compressor", None)
+            if active_compressor is not None:
+                primary.update(
+                    {
+                        "compressor_model": getattr(
+                            active_compressor, "model", agent.model
+                        ),
+                        "compressor_base_url": getattr(
+                            active_compressor, "base_url", agent.base_url
+                        ),
+                        "compressor_api_key": getattr(
+                            active_compressor, "api_key", ""
+                        ),
+                        "compressor_provider": getattr(
+                            active_compressor, "provider", agent.provider
+                        ),
+                        "compressor_context_length": getattr(
+                            active_compressor, "context_length", None
+                        ),
+                        "compressor_threshold_tokens": getattr(
+                            active_compressor, "threshold_tokens", None
+                        ),
+                    }
+                )
             if agent.api_mode == "anthropic_messages":
                 primary.update({
                     "anthropic_api_key": agent._anthropic_api_key,

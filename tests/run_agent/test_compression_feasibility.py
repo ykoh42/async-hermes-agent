@@ -8,6 +8,7 @@ Two-phase design:
      status_callback (gateway platforms)
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -71,7 +72,11 @@ def _make_agent(
 # ── Core warning logic ──────────────────────────────────────────────
 
 
-@patch("agent.model_metadata._get_static_context_length", return_value=80_000)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    new_callable=AsyncMock,
+    return_value=80_000,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_client, mock_ctx_len):
     """Auto-correction: aux >= 64K floor but < threshold → lower threshold
@@ -112,9 +117,21 @@ async def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get
     # configured 20%, and larger real-world mismatches can make the tail's 1.5x
     # soft ceiling wider than the entire compression trigger.
     assert agent.context_compressor.tail_token_budget == 16_000
+    mock_ctx_len.assert_awaited_once_with(
+        "google/gemini-3-flash-preview",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-aux",
+        config_context_length=None,
+        provider="openrouter",
+        custom_providers=[],
+    )
 
 
-@patch("agent.model_metadata._get_static_context_length", return_value=32_768)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    new_callable=AsyncMock,
+    return_value=32_768,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
     """Hard floor: aux context < MINIMUM_CONTEXT_LENGTH (64K) → session
@@ -137,6 +154,28 @@ async def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
     assert "below the minimum" in err
 
 
+async def test_live_context_resolution_cancellation_propagates():
+    agent = _make_agent(main_context=200_000, threshold_percent=0.50)
+    mock_client = MagicMock()
+    mock_client.base_url = "https://openrouter.ai/api/v1"
+    mock_client.api_key = "sk-aux"
+
+    with (
+        patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            new_callable=AsyncMock,
+            return_value=(mock_client, "aux-model"),
+        ),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await agent._check_compression_model_feasibility()
+
+
 
 
 async def test_feasibility_check_passes_live_main_runtime():
@@ -153,7 +192,11 @@ async def test_feasibility_check_passes_live_main_runtime():
     mock_client.api_key = "codex-token"
 
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(mock_client, "gpt-5.4")) as mock_get_client, \
-         patch("agent.model_metadata._get_static_context_length", return_value=200_000):
+         patch(
+             "agent.model_metadata.get_model_context_length",
+             new_callable=AsyncMock,
+             return_value=200_000,
+         ):
         agent._emit_status = lambda msg: None
         await agent._check_compression_model_feasibility()
 
@@ -170,11 +213,15 @@ async def test_feasibility_check_passes_live_main_runtime():
     )
 
 
-@patch("agent.model_metadata._get_static_context_length", return_value=1_000_000)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    new_callable=AsyncMock,
+    return_value=1_000_000,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ctx_len):
     """auxiliary.compression.context_length from config is forwarded to
-    _get_static_context_length so custom endpoints that lack /models still
+    get_model_context_length so custom endpoints that lack /models still
     report the correct context window (fixes #8499)."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.85)
     agent._aux_compression_context_length_config = 1_000_000
@@ -186,9 +233,10 @@ async def test_feasibility_check_passes_config_context_length(mock_get_client, m
     agent._emit_status = lambda msg: None
     await agent._check_compression_model_feasibility()
 
-    mock_ctx_len.assert_called_once_with(
+    mock_ctx_len.assert_awaited_once_with(
         "custom/big-model",
         base_url="http://custom-endpoint:8080/v1",
+        api_key="sk-custom",
         config_context_length=1_000_000,
         provider="openrouter",
         custom_providers=[],
@@ -242,7 +290,11 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
         patch("run_agent.OpenAI"),
         patch("run_agent.ContextCompressor", new=_StubCompressor),
         patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(mock_client, "custom/big-model")),
-        patch("agent.model_metadata._get_static_context_length", return_value=1_000_000) as mock_ctx_len,
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            new_callable=AsyncMock,
+            return_value=1_000_000,
+        ) as mock_ctx_len,
     ):
         agent = AIAgent(
             api_key="test-key-1234567890",
@@ -262,9 +314,10 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
         # to validate the call shape still forwards the override correctly.
         await agent._check_compression_model_feasibility()
 
-    mock_ctx_len.assert_any_call(
+    mock_ctx_len.assert_any_await(
         "custom/big-model",
         base_url="http://custom-endpoint:8080/v1",
+        api_key="sk-custom",
         config_context_length=1_000_000,
         provider="openrouter",
         custom_providers=[],
@@ -307,7 +360,8 @@ async def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
         "agent.auxiliary_client._try_configured_fallback_for_unavailable_client",
         return_value=(fallback_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)"),
     ) as mock_fallback, patch(
-        "agent.model_metadata._get_static_context_length",
+        "agent.model_metadata.get_model_context_length",
+        new_callable=AsyncMock,
         return_value=200_000,
     ) as mock_ctx_len:
         await agent._check_compression_model_feasibility()
@@ -315,9 +369,9 @@ async def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
     assert messages == []
     assert agent._compression_warning is None
     mock_fallback.assert_called_once_with("compression", "ollama-cloud")
-    mock_ctx_len.assert_called_once()
-    assert mock_ctx_len.call_args.args == ("gpt-5.4-mini",)
-    assert mock_ctx_len.call_args.kwargs["provider"] == "openai-codex"
+    mock_ctx_len.assert_awaited_once()
+    assert mock_ctx_len.await_args.args == ("gpt-5.4-mini",)
+    assert mock_ctx_len.await_args.kwargs["provider"] == "openai-codex"
 
 
 
@@ -331,7 +385,11 @@ async def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
 # ── Two-phase: __init__ + run_conversation replay ───────────────────
 
 
-@patch("agent.model_metadata._get_static_context_length", return_value=80_000)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    new_callable=AsyncMock,
+    return_value=80_000,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     """__init__ stores the warning; _replay sends it through status_callback."""
@@ -360,7 +418,11 @@ async def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     )
 
 
-@patch("agent.model_metadata._get_static_context_length", return_value=200_000)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    new_callable=AsyncMock,
+    return_value=200_000,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_no_replay_when_no_warning(mock_get_client, mock_ctx_len):
     """_replay_compression_warning is a no-op when there's no stored warning."""
@@ -391,7 +453,11 @@ async def test_no_replay_when_no_warning(mock_get_client, mock_ctx_len):
 
 
 
-@patch("agent.model_metadata._get_static_context_length", return_value=300_000)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    new_callable=AsyncMock,
+    return_value=300_000,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_threshold_suggestion_kept_for_large_context_main(mock_get_client, mock_ctx_len):
     """Main window >= 512K has no floor — any suggestion is honored, so the

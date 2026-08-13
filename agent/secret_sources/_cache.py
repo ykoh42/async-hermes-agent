@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import aiofiles
 import aiofiles.os
+import asyncio
 import json
 import os
 import time
@@ -88,7 +89,46 @@ def resolve_cache_home(home_path: Optional[Path] = None) -> Path:
     return home_path
 
 
+async def _canonical_cache_home(
+    home_path: Optional[Path] = None,
+) -> tuple[str, Path]:
+    """Return the physical profile identity and its cache path.
+
+    L1 caches need the physical path in their key so direct callers that omit
+    ``home_path`` and callers using a symlink alias cannot share or duplicate
+    another profile's secret values.  Resolve it at the already-awaited cache
+    boundary rather than doing filesystem work in ``resolve_cache_home()``.
+    """
+    resolved = resolve_cache_home(home_path)
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical = os.path.normcase(str(await realpath(str(resolved))))
+    return canonical, Path(canonical)
+
+
 K = TypeVar("K")
+
+
+async def _remove_owned_cache_temp(path: Path) -> None:
+    try:
+        await aiofiles.os.remove(path)
+    except OSError:
+        pass
+
+
+async def _finish_owned_cache_cleanup(
+    task: asyncio.Task[None],
+) -> asyncio.CancelledError | None:
+    """Finish an owned temp-file deletion through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            return cancellation
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - caller re-raises
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
 
 
 class DiskCache(Generic[K]):
@@ -199,11 +239,21 @@ class DiskCache(Generic[K]):
                     await file.write(json.dumps(payload))
                     await file.flush()
                 await aiofiles.os.replace(tmp, path)
-            except BaseException:
-                try:
-                    await aiofiles.os.remove(tmp)
-                except OSError:
-                    pass
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(
+                    _remove_owned_cache_temp(tmp),
+                    name="secret-cache-staging-cleanup",
+                )
+                await _finish_owned_cache_cleanup(cleanup)
+                raise
+            except BaseException as error:
+                cleanup = asyncio.create_task(
+                    _remove_owned_cache_temp(tmp),
+                    name="secret-cache-staging-cleanup",
+                )
+                cancellation = await _finish_owned_cache_cleanup(cleanup)  # noqa: ASYNC120 - cleanup shields cancellation
+                if cancellation is not None:
+                    raise cancellation from error
                 raise
         except OSError:
             pass  # best-effort — a disk-cache miss next invocation is fine

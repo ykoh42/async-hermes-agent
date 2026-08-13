@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,26 @@ from tools.fal_common import (
     _extract_http_status,
     _normalize_fal_queue_url_format,
 )
+
+
+@pytest.mark.asyncio
+async def test_import_fal_client_never_cold_imports_on_running_loop(monkeypatch):
+    from tools.fal_common import import_fal_client
+
+    monkeypatch.delitem(sys.modules, "fal_client", raising=False)
+
+    with pytest.raises(ImportError, match="before the async runtime starts"):
+        import_fal_client()
+
+
+@pytest.mark.asyncio
+async def test_import_fal_client_returns_preloaded_module(monkeypatch):
+    from tools.fal_common import import_fal_client
+
+    preloaded = SimpleNamespace(AsyncClient=object)
+    monkeypatch.setitem(sys.modules, "fal_client", preloaded)
+
+    assert import_fal_client() is preloaded
 
 
 class _FakeFALClient:

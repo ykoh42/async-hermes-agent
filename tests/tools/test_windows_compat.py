@@ -86,12 +86,32 @@ class TestKillpgGuarded:
         if not filepath.exists():
             pytest.skip(f"{relpath} not found")
         source = filepath.read_text(encoding="utf-8")
-        lines = source.splitlines()
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if "os.killpg" in stripped or "os.getpgid" in stripped:
-                # Check that there's an _IS_WINDOWS guard in the surrounding context
-                context = "\n".join(lines[max(0, i - 15):i + 1])
-                assert "_IS_WINDOWS" in context or "os.name" in context or "else:" in context, (
-                    f"{relpath}:{i + 1} has unguarded os.killpg/os.getpgid call"
-                )
+        tree = ast.parse(source, filename=str(filepath))
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr in {"killpg", "getpgid"}
+            ):
+                continue
+
+            guards: list[str] = []
+            ancestor = parents.get(node)
+            while ancestor is not None:
+                if isinstance(ancestor, ast.If):
+                    guards.append(ast.unparse(ancestor.test))
+                ancestor = parents.get(ancestor)
+            assert any(
+                "_IS_WINDOWS" in guard or "os.name" in guard
+                for guard in guards
+            ), (
+                f"{relpath}:{node.lineno} has no platform guard around "
+                f"os.{node.func.attr}"
+            )

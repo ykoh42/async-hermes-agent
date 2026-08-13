@@ -12,6 +12,7 @@ import pytest
 
 from agent import agent_runtime_helpers as _helpers
 from agent.agent_runtime_helpers import note_turn_start, note_turn_persisted
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
 class _FakeAgent:
@@ -69,6 +70,30 @@ def test_distinct_sessions_never_cross_warn(caplog):
     assert not caplog.records
 
 
+def test_same_session_id_isolated_across_profiles(caplog, tmp_path):
+    """Independent profile databases may legitimately reuse a session id."""
+    agent_a, agent_b = _FakeAgent(), _FakeAgent()
+    token_a = set_hermes_home_override(tmp_path / "profile-a")
+    try:
+        note_turn_start(agent_a, "s1:t1:aaaa")
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(tmp_path / "profile-b")
+    try:
+        with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
+            assert note_turn_start(agent_b, "s1:t2:bbbb") is None
+        note_turn_persisted(agent_b)
+    finally:
+        reset_hermes_home_override(token_b)
+
+    # Persist may execute after a downstream scope reset; it must clear the
+    # exact profile slot stamped at turn start rather than the current scope.
+    note_turn_persisted(agent_a)
+    assert _helpers._INFLIGHT_TURNS_BY_SESSION == {}
+    assert not caplog.records
+
+
 
 
 
@@ -91,4 +116,3 @@ def test_persist_disabled_fork_neither_registers_nor_warns(caplog):
         note_turn_start(fork, "s1:tr:gggg")
         assert note_turn_start(parent, "s1:t2:bbbb") is None
     assert not caplog.records
-

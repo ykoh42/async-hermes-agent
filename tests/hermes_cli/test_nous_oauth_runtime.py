@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import auth
 
 
@@ -71,6 +72,41 @@ def nous_auth_store(tmp_path, monkeypatch):
         auth_file.write_text(json.dumps(payload))
 
     return auth_file, shared_home / auth.NOUS_SHARED_STORE_FILENAME, write
+
+
+@pytest.mark.asyncio
+async def test_access_token_cache_is_scoped_to_active_profile(tmp_path, monkeypatch):
+    auth._RESOLVE_TOKEN_CACHE = None
+
+    async def no_shared_store():
+        return None
+
+    monkeypatch.setattr(auth, "_nous_shared_store_path", no_shared_store)
+    token_a = _jwt() + "a"
+    token_b = _jwt() + "b"
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    for home, access_token in ((home_a, token_a), (home_b, token_b)):
+        home.mkdir()
+        (home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "active_provider": "nous",
+                    "providers": {"nous": _state(access_token=access_token)},
+                }
+            )
+        )
+
+    async def resolve(home):
+        profile_token = set_hermes_home_override(home)
+        try:
+            return await auth.resolve_nous_access_token()
+        finally:
+            reset_hermes_home_override(profile_token)
+
+    assert await resolve(home_a) == token_a
+    assert await resolve(home_b) == token_b
 
 
 @pytest.mark.asyncio

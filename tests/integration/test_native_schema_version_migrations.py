@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 
@@ -12,8 +13,9 @@ from pyleak import no_task_leaks
 from pyleak.eventloop import LeakAction
 
 from hermes_state import SCHEMA_VERSION, SessionDB
-from hermes_state_common import FTS_STORAGE_VERSION
+from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_SQL
 from hermes_state_schema import SessionSchemaMixin
+from tools import async_delegation
 
 
 pytestmark = pytest.mark.asyncio
@@ -32,6 +34,76 @@ async def _fetchone(connection, sql: str, params=()):
 async def _fetchall(connection, sql: str, params=()):
     async with connection.execute(sql, params) as cursor:
         return await cursor.fetchall()
+
+
+async def test_core_schema_sql_matches_upstream_v2026_8_3():
+    assert hashlib.sha256(SCHEMA_SQL.encode()).hexdigest() == (
+        "bbef4ef91fa1e1aba8572ff6ee71c497255033b188711422aae5e93a6d1fef15"
+    )
+
+
+async def test_fresh_schema_preserves_async_delegation_table_and_index(tmp_path):
+    path = tmp_path / "fresh-delegation.db"
+    database = SessionDB(path)
+    try:
+        connection = await database._get_connection()
+        columns = await _fetchall(
+            connection,
+            "PRAGMA table_info(async_delegations)",
+        )
+        assert [row["name"] for row in columns] == [
+            "delegation_id",
+            "origin_session",
+            "origin_ui_session_id",
+            "parent_session_id",
+            "state",
+            "dispatched_at",
+            "completed_at",
+            "updated_at",
+            "event_json",
+            "result_json",
+            "delivery_state",
+            "delivery_attempts",
+            "delivered_at",
+            "owner_pid",
+            "owner_started_at",
+            "task_json",
+            "delivery_claim",
+            "delivery_claimed_at",
+        ]
+        assert await _fetchone(
+            connection,
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_async_delegations_delivery'",
+        )
+    finally:
+        await database.close()
+
+
+async def test_lazy_delegation_schema_migrates_existing_session_db(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "existing-delegation.db"
+    database = SessionDB(path)
+    await database.session_count()
+    await database.close()
+
+    monkeypatch.setattr(async_delegation, "_db_path", lambda: path)
+    connection = await async_delegation._connect()
+    try:
+        columns = await _fetchall(
+            connection,
+            "PRAGMA table_info(async_delegations)",
+        )
+        assert "origin_session_id" in {row[1] for row in columns}
+        assert await _fetchone(
+            connection,
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_async_delegations_delivery'",
+        )
+    finally:
+        await connection.close()
 
 
 async def test_v15_migration_tags_existing_ephemeral_subagent_children(tmp_path):

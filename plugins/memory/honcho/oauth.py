@@ -16,7 +16,9 @@ import json
 import logging
 import os
 import asyncio
+import threading
 import time
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +40,32 @@ _REFRESH_SKEW_SECONDS = 120
 # on the path to a memory call, and a stalled auth server must not hang it.
 _REFRESH_TIMEOUT_SECONDS = 15.0
 
-# Serializes refresh across threads sharing one process's config. Re-checked
+# Serializes refresh within one event loop for each physical config. Re-checked
 # under the lock (double-checked) so racing callers don't replay a rotated
-# refresh token and trip reuse detection.
-_refresh_lock = asyncio.Lock()
+# refresh token and trip reuse detection. Cross-process serialization remains
+# owned by ``_config_refresh_lock`` below.
+_refresh_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, weakref.ReferenceType[asyncio.Lock]],
+] = weakref.WeakKeyDictionary()
+_refresh_locks_guard = threading.RLock()
+_realpath = aiofiles.os.wrap(os.path.realpath)
+
+
+async def _refresh_lock(path: Path) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = os.path.normcase(str(await _realpath(path)))
+    with _refresh_locks_guard:
+        for candidate in tuple(_refresh_locks):
+            if candidate.is_closed():
+                _refresh_locks.pop(candidate, None)
+        locks = _refresh_locks.setdefault(loop, {})
+        lock_ref = locks.get(key)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = weakref.ref(lock)
+        return lock
 
 
 @asynccontextmanager
@@ -352,7 +376,7 @@ async def ensure_fresh_token(
     if not cred.is_expired(now=now):
         return cred.access_token, False
 
-    async with _refresh_lock, _config_refresh_lock(path):
+    async with await _refresh_lock(path), _config_refresh_lock(path):
         # Re-read under both locks: another thread or process may have just
         # rotated the token — adopt theirs instead of replaying the old one.
         fresh_block = ((await _read_config(path)).get("hosts") or {}).get(host) or {}

@@ -24,7 +24,7 @@ _DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
 _DEFAULT_TOOL_GATEWAY_SCHEME = "https"
 _NOUS_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
-TokenReader = Callable[[], Optional[str] | Awaitable[Optional[str]]]
+_TokenReader = Callable[[], Optional[str] | Awaitable[Optional[str]]]
 
 
 @dataclass(frozen=True)
@@ -84,14 +84,15 @@ def _access_token_is_expiring(expires_at: object, skew_seconds: int) -> bool:
 def _read_user_token_override() -> Optional[str]:
     """Read the gateway token from the active secret scope or process env."""
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
-
-        try:
-            explicit = get_secret("TOOL_GATEWAY_USER_TOKEN")
-        except UnscopedSecretError:
-            explicit = os.getenv("TOOL_GATEWAY_USER_TOKEN")
-    except Exception:
+        from agent.secret_scope import get_secret
+    except ImportError:  # pragma: no cover - secret_scope ships in this package
         explicit = os.getenv("TOOL_GATEWAY_USER_TOKEN")
+    else:
+        # ``get_secret`` retains the legacy process-env lookup outside
+        # multiplex mode and deliberately raises when multiplexing lacks an
+        # active scope.  Never turn that isolation failure into a foreign
+        # process-token fallback.
+        explicit = get_secret("TOOL_GATEWAY_USER_TOKEN")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     return None
@@ -162,7 +163,7 @@ def build_vendor_gateway_url(vendor: str) -> str:
     return f"{shared_scheme}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
 
 
-async def _read_token(token_reader: TokenReader) -> Optional[str]:
+async def _read_token(token_reader: _TokenReader) -> Optional[str]:
     token = token_reader()
     if inspect.isawaitable(token):
         token = await token
@@ -172,7 +173,7 @@ async def _read_token(token_reader: TokenReader) -> Optional[str]:
 async def resolve_managed_tool_gateway(
     vendor: str,
     gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[TokenReader] = None,
+    token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[ManagedToolGatewayConfig]:
     """Resolve shared managed-tool gateway config for a vendor."""
     if not await managed_nous_tools_enabled():
@@ -196,7 +197,7 @@ async def resolve_managed_tool_gateway(
 async def is_managed_tool_gateway_ready(
     vendor: str,
     gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[TokenReader] = None,
+    token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> bool:
     """Return whether the gateway URL and a cached token are available."""
     return await resolve_managed_tool_gateway(
@@ -260,7 +261,7 @@ def is_managed_nous_gateway_url(
 async def managed_gateway_auth_headers(
     url: object,
     gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[TokenReader] = None,
+    token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> dict:
     """Return fresh auth headers for a managed gateway URL."""
     if not is_managed_nous_gateway_url(url, gateway_builder):
@@ -320,8 +321,8 @@ def build_managed_media_uploader(
     server_url: object,
     upload_path: object,
     gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[TokenReader] = None,
-) -> Optional[Callable[[bytes, str], Awaitable[str]]]:
+    token_reader: Optional[Callable[[], Optional[str]]] = None,
+) -> Optional[Callable]:
     """Build the upstream managed-media presign/upload coroutine."""
     if not is_managed_nous_gateway_url(server_url, gateway_builder):
         return None

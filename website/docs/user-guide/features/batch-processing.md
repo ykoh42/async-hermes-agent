@@ -60,7 +60,9 @@ asyncio.run(main())
 
 Each batch processes its prompts sequentially, preserving shard order. Up to
 `num_workers` batches overlap model and tool I/O through asyncio tasks and a
-semaphore. `num_workers` does not create processes or worker threads.
+semaphore. `num_workers` itself does not create a batch worker pool. Checkpoint
+and shard file operations use the package's current `aiofiles` layer and can
+therefore use its executor-backed regular-file implementation.
 
 Cancellation cancels and awaits sibling batch tasks. If cancellation arrives
 after a shard-row append has started, that single append completes before

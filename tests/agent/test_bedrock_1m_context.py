@@ -64,7 +64,10 @@ class TestBedrockContext1MBeta:
         )
         with (
             patch.object(adapter, "_anthropic_sdk", fake_sdk),
-            patch("aiobotocore.session.get_session", return_value=session),
+            patch(
+                "agent.bedrock_adapter._aiobotocore_get_session",
+                return_value=session,
+            ),
             patch.object(
                 adapter,
                 "_build_anthropic_default_http_client",
@@ -106,7 +109,10 @@ class TestBedrockContext1MBeta:
         )
         session = MagicMock(get_credentials=AsyncMock(return_value=credentials))
         monkeypatch.setattr(adapter, "_anthropic_sdk", anthropic)
-        monkeypatch.setattr("aiobotocore.session.get_session", lambda: session)
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._aiobotocore_get_session",
+            lambda: session,
+        )
 
         client = await adapter.build_anthropic_bedrock_client("us-west-2")
         try:

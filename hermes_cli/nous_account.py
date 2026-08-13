@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import asyncio
+import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
@@ -34,16 +36,24 @@ TOOL_COVERAGE_CATEGORIES = (
 
 _ACCOUNT_INFO_CACHE_TTL = 60
 _account_info_cache: tuple[str, float, "NousPortalAccountInfo"] | None = None
-_ACCOUNT_INFO_CACHE_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
+_ACCOUNT_INFO_CACHE_LOCKS: WeakKeyDictionary[
+    Any, weakref.ReferenceType[asyncio.Lock]
+] = WeakKeyDictionary()
+_ACCOUNT_INFO_CACHE_LOCKS_GUARD = threading.RLock()
 
 
 def _account_info_cache_lock() -> asyncio.Lock:
     loop = asyncio.get_running_loop()
-    lock = _ACCOUNT_INFO_CACHE_LOCKS.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        _ACCOUNT_INFO_CACHE_LOCKS[loop] = lock
-    return lock
+    with _ACCOUNT_INFO_CACHE_LOCKS_GUARD:
+        for candidate in tuple(_ACCOUNT_INFO_CACHE_LOCKS):
+            if candidate.is_closed():
+                _ACCOUNT_INFO_CACHE_LOCKS.pop(candidate, None)
+        lock_ref = _ACCOUNT_INFO_CACHE_LOCKS.get(loop)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            _ACCOUNT_INFO_CACHE_LOCKS[loop] = weakref.ref(lock)
+        return lock
 
 
 @dataclass(frozen=True)

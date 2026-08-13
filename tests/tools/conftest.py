@@ -8,7 +8,10 @@ depend on the registry being populated should use it explicitly or via
 ``@pytest.mark.usefixtures("web_registry_populated")``.
 """
 
+import sys
+
 import pytest
+import pytest_asyncio
 
 
 def register_all_web_providers():
@@ -48,3 +51,21 @@ def web_registry_populated():
     yield
     from agent.web_search_registry import _reset_for_tests
     _reset_for_tests()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_unconsumed_mcp_resources():
+    """Release MCP resources from tests that only exercise construction."""
+    yield
+    mcp_tool = sys.modules.get("tools.mcp_tool")
+    close_stderr_log = getattr(mcp_tool, "_close_mcp_stderr_log", None)
+    if close_stderr_log is not None:
+        await close_stderr_log()
+    module = sys.modules.get("tools.mcp_oauth")
+    close_reserved_ports = getattr(
+        module,
+        "_close_reserved_callback_ports",
+        None,
+    )
+    if close_reserved_ports is not None:
+        close_reserved_ports()

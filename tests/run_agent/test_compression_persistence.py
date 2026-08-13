@@ -421,7 +421,10 @@ class TestStoredPromptCwdDrift:
             "Provider: openrouter\n"
         )
 
-        with patch("os.getcwd", return_value="/project/new"):
+        with patch(
+            "agent.runtime_cwd.aiofiles.os.getcwd",
+            return_value="/project/new",
+        ):
             assert await _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
                 "Expected False when stored cwd differs from current cwd"
             )
@@ -440,7 +443,10 @@ class TestStoredPromptCwdDrift:
             "Provider: openrouter\n"
         )
 
-        with patch("os.getcwd", return_value=current_cwd):
+        with patch(
+            "agent.runtime_cwd.aiofiles.os.getcwd",
+            return_value=current_cwd,
+        ):
             assert await _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
                 "Expected True when stored cwd matches current cwd"
             )
@@ -473,7 +479,10 @@ class TestStoredPromptCwdDrift:
             "Provider: openrouter\n"
         )
 
-        with patch("os.getcwd", return_value=current_cwd):
+        with patch(
+            "agent.runtime_cwd.aiofiles.os.getcwd",
+            return_value=current_cwd,
+        ):
             assert await _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
                 "A project file that merely MENTIONS 'Current working "
                 "directory:' must not invalidate the prompt — that would "
@@ -500,7 +509,10 @@ class TestStoredPromptCwdDrift:
             "Provider: openrouter\n"
         )
 
-        with patch("os.getcwd", return_value="/project/new"):
+        with patch(
+            "agent.runtime_cwd.aiofiles.os.getcwd",
+            return_value="/project/new",
+        ):
             assert await _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
                 "Embedded project text naming the new cwd must not mask real "
                 "drift in the host-info block"

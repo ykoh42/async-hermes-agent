@@ -10,8 +10,10 @@ threads.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import inspect
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Generic, Optional, TypeVar
 
@@ -49,25 +51,13 @@ def lazy_singleton(
         await get_client.reset()
     """
     _require_async_factory(factory)
-    lock = asyncio.Lock()
-    box: list[T] = []
+    slot: SingletonSlot[T] = SingletonSlot()
 
     @functools.wraps(factory)
     async def accessor() -> T:
-        if box:
-            return box[0]
-        async with lock:
-            if box:
-                return box[0]
-            instance = await factory()
-            box.append(instance)
-            return instance
+        return await slot.get(factory)
 
-    async def reset() -> None:
-        async with lock:
-            box.clear()
-
-    accessor.reset = reset  # type: ignore[attr-defined]
+    accessor.reset = slot.reset  # type: ignore[attr-defined]
     return accessor
 
 
@@ -78,31 +68,66 @@ class SingletonSlot(Generic[T]):
     ignored, matching the upstream first-value-wins contract.
     """
 
-    __slots__ = ("_lock", "_value", "_set")
+    __slots__ = ("_claim", "_guard", "_value", "_set")
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._guard = threading.RLock()
+        self._claim: concurrent.futures.Future[None] | None = None
         self._value: Optional[T] = None
         self._set = False
 
     async def get(self, factory: Callable[[], Awaitable[T]]) -> T:
-        if self._set:
-            return self._value  # type: ignore[return-value]
         _require_async_factory(factory)
-        async with self._lock:
-            if self._set:
-                return self._value  # type: ignore[return-value]
-            value = await factory()
-            self._value = value
-            self._set = True
-            return value
+        while True:
+            with self._guard:
+                if self._set:
+                    return self._value  # type: ignore[return-value]
+                claim = self._claim
+                owns_claim = claim is None
+                if owns_claim:
+                    claim = concurrent.futures.Future()
+                    self._claim = claim
+
+            if not owns_claim:
+                await asyncio.shield(asyncio.wrap_future(claim))
+                continue
+
+            try:
+                value = await factory()
+            except BaseException:
+                with self._guard:
+                    if self._claim is claim:
+                        self._claim = None
+                        claim.set_result(None)
+                raise
+
+            with self._guard:
+                if self._claim is claim:
+                    self._value = value
+                    self._set = True
+                    self._claim = None
+                    claim.set_result(None)
+                    return value
 
     def peek(self) -> Optional[T]:
         """Return the cached instance without building it (None if unset)."""
-        return self._value if self._set else None
+        with self._guard:
+            return self._value if self._set else None
 
     async def reset(self) -> None:
         """Drop the cached instance so the next awaited ``get()`` rebuilds it."""
-        async with self._lock:
-            self._value = None
-            self._set = False
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            with self._guard:
+                claim = self._claim
+                if claim is None:
+                    self._value = None
+                    self._set = False
+                    break
+            try:
+                await asyncio.shield(asyncio.wrap_future(claim))
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+                if cancellation is None:
+                    cancellation = exc
+        if cancellation is not None:
+            raise cancellation

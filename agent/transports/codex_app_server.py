@@ -314,8 +314,19 @@ class CodexAppServerClient:
     async def _build_spawn_env(self) -> dict[str, str]:
         spawn_env = await hermes_subprocess_env(inherit_credentials=True)
         spawn_env.update(self._env_overrides)
-        if self._codex_home:
-            spawn_env["CODEX_HOME"] = self._codex_home
+        from agent.secret_scope import get_secret, is_multiplex_active
+
+        codex_home = self._codex_home
+        if is_multiplex_active():
+            spawn_env.pop("CODEX_HOME", None)
+            codex_home = codex_home or str(get_secret("CODEX_HOME", "") or "").strip()
+            if not codex_home:
+                raise RuntimeError(
+                    "Codex app-server requires a non-empty profile-scoped "
+                    "CODEX_HOME while profile multiplexing is active."
+                )
+        if codex_home:
+            spawn_env["CODEX_HOME"] = codex_home
         spawn_env.setdefault("RUST_LOG", "warn")
         self._spawn_env = spawn_env
         return spawn_env
@@ -434,12 +445,14 @@ async def check_codex_binary(
     communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
     communication_error: Exception | None = None
     try:
+        spawn_env = await hermes_subprocess_env(inherit_credentials=False)
         proc = await asyncio.create_subprocess_exec(
             codex_bin,
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
+            env=spawn_env,
         )
         communicate_task = asyncio.create_task(proc.communicate())
         stdout, stderr = await asyncio.wait_for(

@@ -40,7 +40,8 @@ import re
 import asyncio
 import contextvars
 from typing import List, Dict, Any, Optional
-import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
+
+from agent.secret_scope import UnscopedSecretError, is_multiplex_active
 
 _web_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "web_config_snapshot", default={}
@@ -60,15 +61,21 @@ from plugins.web.parallel.provider import (  # noqa: F401 — backward-compat na
     _get_parallel_client,
 )
 
-# Module-level cache slot for the Parallel client. The plugin reads/writes it
-# through tools.web_tools so tests can reset the client between cases.
-_parallel_client: Optional[Any] = None
-
 from tools.debug_helpers import DebugSession
 from tools.url_safety import is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    """Preserve the upstream test-patch surface without eager SDK imports."""
+    if name == "httpx":
+        import httpx as _httpx
+
+        globals()["httpx"] = _httpx
+        return _httpx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _web_extract_url(value: Any) -> Optional[str]:
@@ -101,9 +108,13 @@ async def _env_value(name: str) -> str:
         from agent.web_search_provider import get_provider_env
 
         val = await get_provider_env(name)
+    except UnscopedSecretError:
+        raise
     except Exception:
         val = None
     if val is None:
+        if is_multiplex_active():
+            return ""
         val = os.getenv(name, "")
     return (val or "").strip()
 

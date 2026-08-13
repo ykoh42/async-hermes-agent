@@ -6,6 +6,9 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
+import contextvars
+import os
+from collections.abc import Mapping
 from typing import Any
 
 from agent.skill_commands import (
@@ -13,6 +16,35 @@ from agent.skill_commands import (
     SKILL_SCAFFOLD_SQL_LIKE,
     describe_skill_invocation,
 )
+
+
+_SESSION_RUNTIME_CONFIG: contextvars.ContextVar[Mapping[str, Any] | None] = (
+    contextvars.ContextVar("session_runtime_config", default=None)
+)
+
+
+def _set_session_runtime_config(
+    values: Mapping[str, Any] | None,
+) -> contextvars.Token:
+    """Bind one agent's session settings to its current turn task."""
+    return _SESSION_RUNTIME_CONFIG.set(values)
+
+
+def _reset_session_runtime_config(token: contextvars.Token) -> None:
+    """Restore the caller's prior session-settings binding."""
+    _SESSION_RUNTIME_CONFIG.reset(token)
+
+
+def _session_runtime_config_value(
+    name: str,
+    env_name: str,
+    default: str,
+) -> str:
+    """Resolve a turn-local session setting with the legacy env fallback."""
+    values = _SESSION_RUNTIME_CONFIG.get()
+    if values is not None and name in values:
+        return str(values[name])
+    return os.getenv(env_name, default)
 
 
 # Session preview = the head of the first user message, shown wherever a
@@ -317,6 +349,27 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS async_delegations (
+    delegation_id TEXT PRIMARY KEY,
+    origin_session TEXT NOT NULL,
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT,
+    state TEXT NOT NULL,
+    dispatched_at REAL NOT NULL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    task_json TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -334,6 +387,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+    ON async_delegations(delivery_state, completed_at);
 """
 
 

@@ -192,6 +192,7 @@ from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
     build_skills_system_prompt,
+    build_nous_subscription_prompt,
     build_context_files_prompt,
     build_environment_hints,
     load_soul_md,
@@ -500,7 +501,7 @@ class AIAgent:
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
         event_callback: Optional[Callable[[str, dict], None]] = None,
-        reaction_callback: Optional[Callable[..., None]] = None,
+        reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -640,16 +641,50 @@ class AIAgent:
 
     async def __aenter__(self):
         """Support ``async with AIAgent(...)`` without a separate start API."""
-        await self._ensure_provider_runtime()
+        from hermes_state_common import (
+            _reset_session_runtime_config,
+            _set_session_runtime_config,
+        )
+
+        session_runtime_token = _set_session_runtime_config(
+            getattr(self, "_session_runtime_config", None)
+        )
+        try:
+            await self._ensure_provider_runtime()
+        finally:
+            _reset_session_runtime_config(session_runtime_token)
         await _plugins.discover_plugins()
         if not getattr(self, "_lsp_lifecycle_retained", False):
             from agent.lsp import _retain_lsp_lifecycle
 
             await _retain_lsp_lifecycle(self)
             self._lsp_lifecycle_retained = True
+        if not getattr(self, "_auxiliary_lifecycle_retained", False):
+            from agent.auxiliary_client import _retain_auxiliary_lifecycle
+
+            await _retain_auxiliary_lifecycle(self)
+            self._auxiliary_lifecycle_retained = True
+        if (
+            self.api_mode == "bedrock_converse"
+            and not getattr(self, "_bedrock_lifecycle_retained", False)
+        ):
+            from agent.bedrock_adapter import _retain_bedrock_lifecycle
+
+            await _retain_bedrock_lifecycle(self)
+            self._bedrock_lifecycle_retained = True
+        if not getattr(self, "_parallel_lifecycle_retained", False):
+            from plugins.web.parallel.provider import _retain_parallel_lifecycle
+
+            await _retain_parallel_lifecycle(self)
+            self._parallel_lifecycle_retained = True
         if not getattr(self, "_mcp_discovery_started", False):
             self._mcp_discovery_started = True
             try:
+                if not getattr(self, "_local_tts_lifecycle_retained", False):
+                    from tools.tts_tool import _retain_local_tts_lifecycle
+
+                    await _retain_local_tts_lifecycle(self)
+                    self._local_tts_lifecycle_retained = True
                 await _mcp_tool._retain_mcp_lifecycle(self)
                 self._mcp_lifecycle_retained = True
                 await _mcp_tool.discover_mcp_tools()
@@ -667,6 +702,28 @@ class AIAgent:
 
                     await _release_lsp_lifecycle(self)
                     self._lsp_lifecycle_retained = False
+                if self._auxiliary_lifecycle_retained:
+                    from agent.auxiliary_client import _release_auxiliary_lifecycle
+
+                    await _release_auxiliary_lifecycle(self)
+                    self._auxiliary_lifecycle_retained = False
+                if getattr(self, "_bedrock_lifecycle_retained", False):
+                    from agent.bedrock_adapter import _release_bedrock_lifecycle
+
+                    await _release_bedrock_lifecycle(self)
+                    self._bedrock_lifecycle_retained = False
+                if getattr(self, "_parallel_lifecycle_retained", False):
+                    from plugins.web.parallel.provider import (
+                        _release_parallel_lifecycle,
+                    )
+
+                    await _release_parallel_lifecycle(self)
+                    self._parallel_lifecycle_retained = False
+                if getattr(self, "_local_tts_lifecycle_retained", False):
+                    from tools.tts_tool import _release_local_tts_lifecycle
+
+                    await _release_local_tts_lifecycle(self)
+                    self._local_tts_lifecycle_retained = False
                 self._mcp_discovery_started = False
                 raise
         return self
@@ -740,6 +797,14 @@ class AIAgent:
             or getattr(self, "_persist_disabled", False)
         ):
             return
+        from hermes_state_common import (
+            _reset_session_runtime_config,
+            _set_session_runtime_config,
+        )
+
+        session_runtime_token = _set_session_runtime_config(
+            getattr(self, "_session_runtime_config", None)
+        )
         try:
             session_db = self._session_db
             if session_db is None:
@@ -753,6 +818,8 @@ class AIAgent:
         except Exception:
             logger.warning("Failed to persist billing route after model switch", exc_info=True)
             return
+        finally:
+            _reset_session_runtime_config(session_runtime_token)
         self._pending_billing_route = None
 
     async def _transition_context_engine_session(
@@ -875,13 +942,24 @@ class AIAgent:
         self._is_user_initiated_turn = False
 
         # Context engine reset/transition (works for built-in compressor and plugins)
-        await self._transition_context_engine_session(
-            old_session_id=old_session_id,
-            new_session_id=getattr(self, "session_id", None),
-            previous_messages=previous_messages,
-            carry_over_context=carry_over_context,
-            reset_engine=True,
+        from hermes_state_common import (
+            _reset_session_runtime_config,
+            _set_session_runtime_config,
         )
+
+        session_runtime_token = _set_session_runtime_config(
+            getattr(self, "_session_runtime_config", None)
+        )
+        try:
+            await self._transition_context_engine_session(
+                old_session_id=old_session_id,
+                new_session_id=getattr(self, "session_id", None),
+                previous_messages=previous_messages,
+                carry_over_context=carry_over_context,
+                reset_engine=True,
+            )
+        finally:
+            _reset_session_runtime_config(session_runtime_token)
 
         # Reset-only session switches (/new, /resume, /branch) update
         # agent.session_id before calling reset_session_state(). The built-in
@@ -965,7 +1043,20 @@ class AIAgent:
     async def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
-        return await switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
+        from hermes_state_common import (
+            _reset_session_runtime_config,
+            _set_session_runtime_config,
+        )
+
+        session_runtime_token = _set_session_runtime_config(
+            getattr(self, "_session_runtime_config", None)
+        )
+        try:
+            return await switch_model(
+                self, new_model, new_provider, api_key, base_url, api_mode
+            )
+        finally:
+            _reset_session_runtime_config(session_runtime_token)
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
@@ -4098,11 +4189,19 @@ class AIAgent:
         """
         close_lock = self._get_close_lock()
         await close_lock.acquire()
-        cleanup_task = asyncio.create_task(
-            self._close_unlocked(),
-            name="hermes-agent-close",
+        from hermes_state_common import (
+            _reset_session_runtime_config,
+            _set_session_runtime_config,
+        )
+
+        session_runtime_token = _set_session_runtime_config(
+            getattr(self, "_session_runtime_config", None)
         )
         try:
+            cleanup_task = asyncio.create_task(
+                self._close_unlocked(),
+                name="hermes-agent-close",
+            )
             await _finish_owned_task(cleanup_task)
         except asyncio.CancelledError:
             # An internally cancelled teardown may have completed only
@@ -4112,6 +4211,7 @@ class AIAgent:
                 self._closed = False
             raise
         finally:
+            _reset_session_runtime_config(session_runtime_token)
             close_lock.release()
 
     async def _close_unlocked(self) -> None:
@@ -4145,6 +4245,24 @@ class AIAgent:
             turn_result = (await asyncio.gather(active_turn, return_exceptions=True))[0]
             if isinstance(turn_result, Exception):
                 logger.debug("Active turn failed while closing agent: %r", turn_result)
+
+        # Detached delegations are owned by the durable registry rather than
+        # the foreground turn. End only units spawned by this agent and wait
+        # for their interrupted terminal record to be persisted.
+        try:
+            from tools.async_delegation import interrupt_for_session
+
+            await interrupt_for_session(
+                parent_session_id=str(getattr(self, "session_id", "") or ""),
+                reason="agent_close",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Async delegation cleanup failed while closing agent",
+                exc_info=True,
+            )
 
         background_delegation_set = getattr(
             self,
@@ -4200,6 +4318,17 @@ class AIAgent:
 
             for task_id in resource_task_ids:
                 await cleanup_browser(task_id)
+        except Exception:
+            pass
+
+        # Release each session-owned computer-use backend after turns stop.
+        # This ends the exact cua-driver session, invalidates typed-browser
+        # refs/grants, and stops a private unrestricted daemon when present.
+        try:
+            from tools.computer_use import release_computer_use_session
+
+            for task_id in resource_task_ids:
+                await release_computer_use_session(task_id)
         except Exception:
             pass
 
@@ -4305,6 +4434,68 @@ class AIAgent:
                 logger.debug("LSP lifecycle release failed", exc_info=True)
             else:
                 self._lsp_lifecycle_retained = False
+
+        if getattr(self, "_auxiliary_lifecycle_retained", False):
+            try:
+                from agent.auxiliary_client import _release_auxiliary_lifecycle
+
+                await _release_auxiliary_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Auxiliary client lifecycle release failed",
+                    exc_info=True,
+                )
+            else:
+                self._auxiliary_lifecycle_retained = False
+
+        if getattr(self, "_parallel_lifecycle_retained", False):
+            try:
+                from plugins.web.parallel.provider import (
+                    _release_parallel_lifecycle,
+                )
+
+                await _release_parallel_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Parallel web client lifecycle release failed",
+                    exc_info=True,
+                )
+            else:
+                self._parallel_lifecycle_retained = False
+
+        if getattr(self, "_local_tts_lifecycle_retained", False):
+            try:
+                from tools.tts_tool import _release_local_tts_lifecycle
+
+                await _release_local_tts_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Local TTS broker lifecycle release failed",
+                    exc_info=True,
+                )
+            else:
+                self._local_tts_lifecycle_retained = False
+
+        if getattr(self, "_bedrock_lifecycle_retained", False):
+            try:
+                from agent.bedrock_adapter import _release_bedrock_lifecycle
+
+                await _release_bedrock_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Bedrock client lifecycle release failed",
+                    exc_info=True,
+                )
+            else:
+                self._bedrock_lifecycle_retained = False
 
         # Flush and close external memory-provider state before discarding the
         # transcript it may need for end-of-session extraction.
@@ -5511,6 +5702,8 @@ class AIAgent:
         if self.api_mode == "bedrock_converse":
             from agent.bedrock_adapter import (
                 _get_bedrock_runtime_client,
+                _retain_bedrock_lifecycle,
+                invalidate_runtime_client,
                 is_stale_connection_error,
                 is_streaming_access_denied_error,
                 normalize_converse_response,
@@ -5520,35 +5713,45 @@ class AIAgent:
             request = dict(api_kwargs)
             region = request.pop("__bedrock_region__", "us-east-1")
             request.pop("__bedrock_converse__", None)
+            if not getattr(self, "_bedrock_lifecycle_retained", False):
+                await _retain_bedrock_lifecycle(self)
+                self._bedrock_lifecycle_retained = True
             async with _get_bedrock_runtime_client(region) as client:
                 if not use_streaming:
+                    request_error: Exception | None = None
                     try:
-                        return normalize_converse_response(
-                            await client.converse(**request)
-                        )
+                        response = await client.converse(**request)
                     except Exception as exc:
-                        if is_stale_connection_error(exc):
+                        request_error = exc
+                    if request_error is not None:
+                        if is_stale_connection_error(request_error):
                             logger.warning(
                                 "bedrock: stale connection on converse; the next "
                                 "request will create a fresh client"
                             )
-                        raise
+                            await invalidate_runtime_client(region)
+                        raise request_error
+                    return normalize_converse_response(response)
 
                 streaming_access_denied = False
+                request_error = None
                 try:
                     response = await client.converse_stream(**request)
                 except Exception as exc:
-                    if is_streaming_access_denied_error(exc):
+                    request_error = exc
+                if request_error is not None:
+                    if is_streaming_access_denied_error(request_error):
                         self._disable_streaming = True
                         streaming_access_denied = True
-                    elif is_stale_connection_error(exc):
+                    elif is_stale_connection_error(request_error):
                         logger.warning(
                             "bedrock: stale connection on converse_stream; the "
                             "next request will create a fresh client"
                         )
-                        raise
+                        await invalidate_runtime_client(region)
+                        raise request_error
                     else:
-                        raise
+                        raise request_error
 
                 if streaming_access_denied:
                     return normalize_converse_response(
@@ -7545,6 +7748,14 @@ class AIAgent:
         session_id = str(getattr(self, "session_id", None) or "")
         token = None
         acct_token = None
+        from hermes_state_common import (
+            _reset_session_runtime_config,
+            _set_session_runtime_config,
+        )
+
+        session_runtime_token = _set_session_runtime_config(
+            getattr(self, "_session_runtime_config", None)
+        )
         interrupt_token = _bind_interrupt_event(self._interrupt_event)
         try:
             # Publish the conversation id for ambient Nous Portal tagging. Every
@@ -7615,6 +7826,7 @@ class AIAgent:
                     )
                 )
             finally:
+                _reset_session_runtime_config(session_runtime_token)
                 turn_lock.release()
 
     async def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
@@ -7732,10 +7944,10 @@ async def main(
                 print(f"    Requirements: {', '.join(info['requirements'])}")
         
         # Show individual tools
-        all_tools = get_all_tool_names()
+        all_tools = await get_all_tool_names()
         print(f"\n🔧 Individual Tools ({len(all_tools)} available):")
         for tool_name in sorted(all_tools):
-            toolset = get_toolset_for_tool(tool_name)
+            toolset = await get_toolset_for_tool(tool_name)
             print(f"  📌 {tool_name} (from {toolset})")
         
         print("\n💡 Usage Examples:")

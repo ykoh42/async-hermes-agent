@@ -39,6 +39,10 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     # Vision and image generation
     "vision_analyze", "image_generate",
+    # BFL FLUX 3 video generation
+    "bfl_flux3_text_to_video", "bfl_flux3_image_to_video",
+    "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
+    "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -46,6 +50,8 @@ _HERMES_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    # Text-to-speech
+    "text_to_speech",
     # Planning state + persistent memory.  Both are part of the harness
     # trajectory: todo survives context compression while memory spans turns.
     "todo", "memory",
@@ -54,7 +60,11 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Delegation
-    "delegate_task",
+    "execute_code", "delegate_task",
+    # Home Assistant smart-home control (gated on HASS_TOKEN)
+    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Computer use (gated on cua-driver availability by its registry check)
+    "computer_use",
 ]
 
 # Core toolset definitions
@@ -70,6 +80,19 @@ TOOLSETS = {
     "search": {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
+        "includes": []
+    },
+
+    "x_search": {
+        "description": (
+            "Search X (Twitter) posts and threads via xAI's built-in "
+            "x_search Responses tool. Read-only public X discovery; use the "
+            "xurl skill for authenticated X API reads and account actions. "
+            "Available when xAI credentials are configured (SuperGrok OAuth "
+            "or XAI_API_KEY). Off by default; enable in `hermes tools` → "
+            "X (Twitter) Search."
+        ),
+        "tools": ["x_search"],
         "includes": []
     },
 
@@ -99,7 +122,36 @@ TOOLSETS = {
             "extend workflows may appear as separate tools. Configure via "
             "``hermes tools`` → Video Generation."
         ),
-        "tools": ["video_generate"],
+        "tools": ["video_generate", "xai_video_edit", "xai_video_extend"],
+        "includes": []
+    },
+
+    "bfl": {
+        "description": (
+            "Black Forest Labs FLUX 3 video generation through the Nous tool "
+            "gateway: per-mode submit tools (text, image, keyframes, "
+            "continuation), a poll tool, and a prompting guide. Generations "
+            "take minutes, so submit returns a job id and the model polls for "
+            "the result."
+        ),
+        "tools": [
+            "bfl_flux3_text_to_video",
+            "bfl_flux3_image_to_video",
+            "bfl_flux3_keyframes_to_video",
+            "bfl_flux3_video_continuation",
+            "bfl_flux3_get_result",
+            "bfl_flux3_prompting_guide",
+        ],
+        "includes": []
+    },
+
+    "computer_use": {
+        "description": (
+            "Background desktop control via cua-driver (macOS/Windows/Linux) — "
+            "screenshots, mouse, keyboard, scroll, drag. Does NOT steal the "
+            "user's cursor or keyboard focus. Works with any tool-capable model."
+        ),
+        "tools": ["computer_use"],
         "includes": []
     },
 
@@ -107,6 +159,17 @@ TOOLSETS = {
         "description": "Terminal/command execution and process management tools",
         "tools": ["terminal", "process"],
         "includes": []
+    },
+
+    "homeassistant": {
+        "description": "Home Assistant smart-home entity and service control",
+        "tools": [
+            "ha_list_entities",
+            "ha_get_state",
+            "ha_list_services",
+            "ha_call_service",
+        ],
+        "includes": [],
     },
     
     "skills": {
@@ -131,6 +194,12 @@ TOOLSETS = {
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],
+        "includes": []
+    },
+
+    "tts": {
+        "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
+        "tools": ["text_to_speech"],
         "includes": []
     },
     

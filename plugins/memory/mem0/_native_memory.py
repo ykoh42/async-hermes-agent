@@ -17,6 +17,14 @@ import uuid
 
 import aiofiles.os
 
+from agent.secret_scope import (
+    UnscopedSecretError,
+    current_secret_scope,
+    get_secret,
+    is_multiplex_active,
+)
+from hermes_constants import get_hermes_home
+
 from ._native_entities import NativeEntities
 from ._native_nlp import NativeNLP
 from ._native_oss import (
@@ -58,6 +66,29 @@ _CORE_PAYLOAD_KEYS = {
     *_PROMOTED_PAYLOAD_KEYS,
 }
 _UNSET = object()
+_expanduser = aiofiles.os.wrap(os.path.expanduser)
+_realpath = aiofiles.os.wrap(os.path.realpath)
+
+
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned Mem0 cleanup through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 def _copy_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -76,6 +107,49 @@ def _copy_config(config: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             copied[key] = value
     return copied
+
+
+async def _profile_storage_path(*parts: str) -> str:
+    """Resolve storage below the canonical active Hermes profile home."""
+    expanded_home = await _expanduser(os.fspath(get_hermes_home()))
+    canonical_home = await _realpath(expanded_home)
+    return str(Path(canonical_home).joinpath(*parts))
+
+
+async def _resolve_history_db_path(config: dict[str, Any]) -> str:
+    """Preserve legacy history defaults outside multiplexed profile mode."""
+    history_path = config.get("history_db_path")
+    if history_path:
+        return str(await _expanduser(str(history_path)))
+
+    mem0_dir = get_secret("MEM0_DIR")
+    if mem0_dir:
+        expanded_dir = await _expanduser(str(mem0_dir))
+        return os.path.join(expanded_dir, "history.db")
+    if is_multiplex_active():
+        return await _profile_storage_path("mem0", "history.db")
+
+    legacy_dir = await _expanduser(os.path.join("~", ".mem0"))
+    return os.path.join(legacy_dir, "history.db")
+
+
+async def _resolve_vector_config(
+    provider: str | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Isolate implicit local Qdrant storage for multiplexed profiles."""
+    resolved = dict(config)
+    if provider != "qdrant" or not is_multiplex_active():
+        return resolved
+    if any(key in resolved for key in ("client", "url", "host", "path")):
+        return resolved
+    if current_secret_scope() is None:
+        raise UnscopedSecretError(
+            "Implicit Mem0 Qdrant storage requires an active profile secret "
+            "scope while multiplexing is enabled."
+        )
+    resolved["path"] = await _profile_storage_path("mem0_qdrant")
+    return resolved
 
 
 def _validate_entity_id(value: str | None, name: str) -> str | None:
@@ -346,6 +420,7 @@ class Memory:
         self.db: Any = None
         self.nlp: Any = None
         self.entities: Any = None
+        self._history_db_path: str | None = None
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self._closed = False
@@ -381,9 +456,9 @@ class Memory:
             embedder_provider = embedder.get("provider")
             embedder_config = dict(embedder.get("config") or {})
             if embedder_provider == "openai":
-                embedding_model = OpenAIEmbedding(embedder_config)
+                embedder_factory = OpenAIEmbedding
             elif embedder_provider == "ollama":
-                embedding_model = OllamaEmbedding(embedder_config)
+                embedder_factory = OllamaEmbedding
             else:
                 raise ValueError(
                     f"Unsupported native Mem0 embedder provider: {embedder_provider}"
@@ -393,9 +468,9 @@ class Memory:
             llm_provider = llm.get("provider")
             llm_config = dict(llm.get("config") or {})
             if llm_provider == "openai":
-                llm_client = OpenAILLM(llm_config)
+                llm_factory = OpenAILLM
             elif llm_provider == "ollama":
-                llm_client = OllamaLLM(llm_config)
+                llm_factory = OllamaLLM
             else:
                 raise ValueError(
                     f"Unsupported native Mem0 LLM provider: {llm_provider}"
@@ -405,25 +480,26 @@ class Memory:
             vector_provider = vector.get("provider")
             vector_config = dict(vector.get("config") or {})
             if vector_provider == "qdrant":
-                vector_store = Qdrant(vector_config)
+                vector_factory = Qdrant
             elif vector_provider == "pgvector":
-                vector_store = PGVector(vector_config)
+                vector_factory = PGVector
             else:
                 raise ValueError(
                     f"Unsupported native Mem0 vector provider: {vector_provider}"
                 )
 
-            history_path = self.config.get("history_db_path")
-            if not history_path:
-                mem0_dir = os.getenv("MEM0_DIR") or os.path.join(
-                    os.path.expanduser("~"), ".mem0"
-                )
-                history_path = os.path.join(mem0_dir, "history.db")
-            history_path = os.path.expanduser(str(history_path))
+            history_path = await _resolve_history_db_path(self.config)
+            vector_config = await _resolve_vector_config(
+                vector_provider,
+                vector_config,
+            )
             if history_path != ":memory:":
                 parent = str(Path(history_path).parent)
                 await aiofiles.os.makedirs(parent, exist_ok=True)
 
+            embedding_model = embedder_factory(embedder_config)
+            llm_client = llm_factory(llm_config)
+            vector_store = vector_factory(vector_config)
             database = SQLiteManager(history_path)
             nlp = NativeNLP()
             entities = NativeEntities(
@@ -438,12 +514,22 @@ class Memory:
                 await vector_store._initialize()
                 await database._initialize()
             except BaseException:
-                await asyncio.gather(
-                    vector_store.close(),
-                    database.close(),
-                    entities.close(),
-                    nlp.close(),
-                    return_exceptions=True,
+                async def cleanup_failed_initialize() -> None:
+                    await asyncio.gather(
+                        embedding_model.close(),
+                        llm_client.close(),
+                        vector_store.close(),
+                        database.close(),
+                        entities.close(),
+                        nlp.close(),
+                        return_exceptions=True,
+                    )
+
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        cleanup_failed_initialize(),
+                        name="mem0-memory-initialize-cleanup",
+                    )
                 )
                 raise
 
@@ -451,6 +537,7 @@ class Memory:
             self.llm = llm_client
             self.vector_store = vector_store
             self.db = database
+            self._history_db_path = history_path
             self.nlp = nlp
             self.entities = entities
             self._initialized = True
@@ -1211,18 +1298,18 @@ class Memory:
         database = self.db
         await database.reset()
         await database.close()
-        history_path = self.config.get("history_db_path")
-        if not history_path:
-            mem0_dir = os.getenv("MEM0_DIR") or os.path.join(
-                os.path.expanduser("~"),
-                ".mem0",
-            )
-            history_path = os.path.join(mem0_dir, "history.db")
-        replacement = SQLiteManager(os.path.expanduser(str(history_path)))
+        history_path = self._history_db_path
+        assert history_path is not None
+        replacement = SQLiteManager(history_path)
         try:
             await replacement._initialize()
         except BaseException:
-            await replacement.close()
+            await _finish_owned_task(
+                asyncio.create_task(
+                    replacement.close(),
+                    name="mem0-memory-reset-cleanup",
+                )
+            )
             raise
         self.db = replacement
 
@@ -1266,11 +1353,20 @@ class Memory:
             ]
             if not close_tasks:
                 return
-            close_group = asyncio.gather(*close_tasks, return_exceptions=True)
+            results: list[Any] = []
+
+            async def close_resources() -> None:
+                results.extend(
+                    await asyncio.gather(*close_tasks, return_exceptions=True)
+                )
+
+            cleanup = asyncio.create_task(
+                close_resources(),
+                name="mem0-memory-close",
+            )
             try:
-                results = await asyncio.shield(close_group)
+                await _finish_owned_task(cleanup)
             except asyncio.CancelledError:
-                results = await close_group
                 for result in results:
                     if isinstance(result, Exception):
                         logger.error("Mem0 resource cleanup failed: %s", result)

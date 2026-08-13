@@ -15,6 +15,7 @@ Core invariant these tests pin:
   never left to resolve against whatever the process cwd happens to be.
 """
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,7 @@ from blockbuster import BlockBuster
 
 import tools.file_tools as ft
 import tools.terminal_tool as terminal_tool
+from agent import secret_scope
 
 
 @pytest.fixture
@@ -86,7 +88,7 @@ async def test_live_tracking_cwd_wins_over_relative_terminal_cwd(
     """
     workspace, decoy = _isolated_cwd
     monkeypatch.setenv("TERMINAL_CWD", ".")
-    await terminal_tool.record_session_cwd("default", str(workspace))
+    terminal_tool.record_session_cwd("default", str(workspace))
 
     resolved = await ft._resolve_path_for_task("target.py", task_id="default")
 
@@ -102,6 +104,45 @@ async def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
     resolved = await ft._resolve_path_for_task("target.py", task_id="default")
 
     assert resolved == (workspace / "target.py")
+
+
+@pytest.mark.asyncio
+async def test_profile_scoped_terminal_cwd_routes_file_resolution(
+    _isolated_cwd,
+    monkeypatch,
+    tmp_path,
+):
+    _workspace, decoy = _isolated_cwd
+    profile_cwds = {label: tmp_path / label for label in ("a", "b")}
+    for cwd in profile_cwds.values():
+        cwd.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(decoy))
+    previous_multiplex = secret_scope.is_multiplex_active()
+    outer_scope = secret_scope.set_secret_scope(None)
+    secret_scope.set_multiplex_active(True)
+
+    async def resolve(label: str):
+        token = secret_scope.set_secret_scope(
+            {"TERMINAL_CWD": str(profile_cwds[label])}
+        )
+        try:
+            await asyncio.sleep(0)
+            return await ft._resolve_path_for_task(
+                "target.py", task_id=f"profile-{label}"
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    try:
+        assert await asyncio.gather(resolve("a"), resolve("b")) == [
+            profile_cwds["a"] / "target.py",
+            profile_cwds["b"] / "target.py",
+        ]
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            await ft._resolve_path_for_task("target.py", task_id="unscoped")
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+        secret_scope.reset_secret_scope(outer_scope)
 
 
 @pytest.mark.asyncio
@@ -126,7 +167,7 @@ async def test_warning_fires_when_relative_path_escapes_workspace(
     _isolated_cwd,
 ):
     workspace, decoy = _isolated_cwd
-    await terminal_tool.record_session_cwd("default", str(workspace))
+    terminal_tool.record_session_cwd("default", str(workspace))
 
     warning = await ft._path_resolution_warning(
         "../decoy/target.py",
@@ -143,7 +184,7 @@ async def test_warning_fires_when_relative_path_escapes_workspace(
 @pytest.mark.asyncio
 async def test_write_surfaces_workspace_divergence_warning(_isolated_cwd):
     workspace, decoy = _isolated_cwd
-    await terminal_tool.record_session_cwd("default", str(workspace))
+    terminal_tool.record_session_cwd("default", str(workspace))
 
     result = json.loads(
         await ft.write_file_tool(
@@ -191,8 +232,8 @@ async def _two_worktree_sessions(tmp_path, monkeypatch):
     monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     # Both sessions register their worktree cwd (TUI/desktop registration path;
     # registration seeds each session's record).
-    await terminal_tool.register_task_env_overrides("sess-a", {"cwd": str(wt_a)})
-    await terminal_tool.register_task_env_overrides("sess-b", {"cwd": str(wt_b)})
+    terminal_tool.register_task_env_overrides("sess-a", {"cwd": str(wt_a)})
+    terminal_tool.register_task_env_overrides("sess-b", {"cwd": str(wt_b)})
     # Session B ran the last command; the shared env's live cwd is wt_b but
     # only B's RECORD carries it.
     monkeypatch.setattr(
@@ -240,7 +281,7 @@ async def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
 
     # Tool layer resolves against the workspace (worktree registration path).
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-    await terminal_tool.register_task_env_overrides(
+    terminal_tool.register_task_env_overrides(
         task_id, {"cwd": str(workspace)}
     )
 

@@ -13,6 +13,7 @@ from hermes_constants import get_default_hermes_root
 
 import pytest
 import pytest_asyncio
+from blockbuster import BlockBuster
 
 pytestmark = pytest.mark.asyncio
 
@@ -131,6 +132,16 @@ class TestFromGlobalConfig:
 
 
 class TestResolveSessionName:
+    async def test_default_cwd_lookup_does_not_block_event_loop(self):
+        config = HonchoClientConfig()
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            result = await config.resolve_session_name()
+        finally:
+            blocker.deactivate()
+        assert result == Path.cwd().name
+
     async def test_manual_override(self):
         config = HonchoClientConfig(sessions={"/home/user/proj": "custom-session"})
         assert await config.resolve_session_name("/home/user/proj") == "custom-session"

@@ -8,12 +8,14 @@ of the connection config (command/args/url/tools filters).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import threading
 import time
-import asyncio
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,7 +25,29 @@ import aiofiles.os
 logger = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "mcp_schema_cache.json"
-_cache_lock = asyncio.Lock()
+_cache_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, weakref.ReferenceType[asyncio.Lock]],
+] = weakref.WeakKeyDictionary()
+_cache_locks_guard = threading.RLock()
+_realpath = aiofiles.os.wrap(os.path.realpath)
+
+
+async def _cache_lock() -> asyncio.Lock:
+    """Return the current loop's lock for the canonical cache path."""
+    loop = asyncio.get_running_loop()
+    cache_key = os.path.normcase(str(await _realpath(_cache_path())))
+    with _cache_locks_guard:
+        for candidate in tuple(_cache_locks):
+            if candidate.is_closed():
+                _cache_locks.pop(candidate, None)
+        locks = _cache_locks.setdefault(loop, {})
+        lock_ref = locks.get(cache_key)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[cache_key] = weakref.ref(lock)
+        return lock
 
 
 def _cache_path() -> Path:
@@ -82,7 +106,7 @@ async def _save_all(data: Dict[str, Any]) -> None:
 
 async def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     """Return cached entry when fingerprint matches, else None."""
-    async with _cache_lock:
+    async with await _cache_lock():
         entry = (await _load_all()).get(server_name)
     if not isinstance(entry, dict):
         return None
@@ -108,7 +132,7 @@ async def write_cache_entry(
         "tools": tools,
         "utility_tools": utility_tools or [],
     }
-    async with _cache_lock:
+    async with await _cache_lock():
         data = await _load_all()
         # Write-through fires on every registration (reconnects,
         # list_changed refreshes); skip the load-all+rewrite churn when the
@@ -120,7 +144,7 @@ async def write_cache_entry(
 
 
 async def clear_cache_entry(server_name: str) -> None:
-    async with _cache_lock:
+    async with await _cache_lock():
         data = await _load_all()
         if server_name in data:
             del data[server_name]

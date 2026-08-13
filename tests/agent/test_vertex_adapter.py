@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
+import weakref
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -58,6 +60,7 @@ def vertex_adapter(monkeypatch, tmp_path):
 
     va = importlib.reload(va)
     va._creds_cache.clear()
+    va._creds_caches.clear()
     va._cache_locks.clear()
     _Request.instances.clear()
     monkeypatch.setattr(
@@ -322,6 +325,88 @@ async def test_adc_refuses_foreign_profile_google_application_credentials(
 
 
 @pytest.mark.asyncio
+async def test_multiplex_adc_is_disabled_without_profile_credentials(
+    vertex_adapter, monkeypatch, tmp_path
+):
+    from agent import secret_scope
+
+    adc_file = tmp_path / "global-adc.json"
+    adc_file.write_text(
+        '{"type":"authorized_user","client_id":"global"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        vertex_adapter._cloud_sdk,
+        "get_application_default_credentials_path",
+        lambda: str(adc_file),
+    )
+    metadata_calls = 0
+
+    async def metadata_credentials():
+        nonlocal metadata_calls
+        metadata_calls += 1
+        return "global-token", "global-project"
+
+    monkeypatch.setattr(
+        vertex_adapter, "_metadata_credentials", metadata_credentials
+    )
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        assert await vertex_adapter.get_vertex_credentials() == (None, None)
+        assert await vertex_adapter.has_vertex_credentials() is False
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+    assert metadata_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_multiplex_explicit_profile_credentials_and_project_work(
+    vertex_adapter, tmp_path
+):
+    from agent import secret_scope
+
+    credentials_path = tmp_path / "profile-authorized-user.json"
+    credentials_path.write_text(
+        '{"type":"authorized_user","client_id":"profile"}',
+        encoding="utf-8",
+    )
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope(
+        {
+            "VERTEX_CREDENTIALS_PATH": str(credentials_path),
+            "VERTEX_PROJECT_ID": "profile-project",
+        }
+    )
+    try:
+        assert await vertex_adapter.get_vertex_credentials() == (
+            "ya29.FAKE",
+            "profile-project",
+        )
+        assert await vertex_adapter.has_vertex_credentials() is True
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+
+@pytest.mark.asyncio
+async def test_vertex_credentials_unscoped_multiplex_fails_closed(
+    vertex_adapter, monkeypatch
+):
+    from agent import secret_scope
+
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/foreign/adc.json")
+    secret_scope.set_multiplex_active(True)
+    try:
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            await vertex_adapter.get_vertex_credentials()
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+
+@pytest.mark.asyncio
 async def test_refresh_cancellation_closes_transport(vertex_adapter, monkeypatch):
     started = asyncio.Event()
 
@@ -338,3 +423,88 @@ async def test_refresh_cancellation_closes_transport(vertex_adapter, monkeypatch
     with pytest.raises(asyncio.CancelledError):
         await task
     assert _Request.instances[-1].closed is True
+
+
+@pytest.mark.asyncio
+async def test_credentials_cache_isolated_by_profile(
+    vertex_adapter, monkeypatch, tmp_path
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    credentials_path = tmp_path / "shared-service-account.json"
+    credentials_path.write_text(
+        '{"type":"service_account","project_id":"unused"}',
+        encoding="utf-8",
+    )
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    loads: list[str] = []
+
+    async def load_credentials(_path):
+        from hermes_constants import get_hermes_home
+
+        profile_name = get_hermes_home().name
+        loads.append(profile_name)
+        await asyncio.sleep(0)
+        return _Credentials(token=f"token-{profile_name}"), profile_name
+
+    monkeypatch.setattr(vertex_adapter, "_load_credentials_file", load_credentials)
+
+    async def resolve(profile):
+        token = set_hermes_home_override(profile)
+        try:
+            return await vertex_adapter.get_vertex_credentials(str(credentials_path))
+        finally:
+            reset_hermes_home_override(token)
+
+    first_a, first_b = await asyncio.gather(
+        resolve(profile_a),
+        resolve(profile_b),
+    )
+    second_a, second_b = await asyncio.gather(
+        resolve(profile_a),
+        resolve(profile_b),
+    )
+
+    assert first_a == second_a == ("token-profile-a", "profile-a")
+    assert first_b == second_b == ("token-profile-b", "profile-b")
+    assert sorted(loads) == ["profile-a", "profile-b"]
+
+
+def test_credentials_cache_does_not_retain_closed_event_loop(
+    vertex_adapter, monkeypatch, tmp_path
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    credentials_path = tmp_path / "service-account.json"
+    credentials_path.write_text(
+        '{"type":"service_account","project_id":"project"}',
+        encoding="utf-8",
+    )
+
+    async def load_credentials(_path):
+        return _Credentials(token="token"), "project"
+
+    monkeypatch.setattr(vertex_adapter, "_load_credentials_file", load_credentials)
+
+    loop_refs = []
+
+    async def resolve(profile):
+        loop_refs.append(weakref.ref(asyncio.get_running_loop()))
+        token = set_hermes_home_override(profile)
+        try:
+            assert await vertex_adapter.get_vertex_credentials(
+                str(credentials_path)
+            ) == ("token", "project")
+        finally:
+            reset_hermes_home_override(token)
+
+    asyncio.run(resolve(tmp_path / "profile-a"))
+    asyncio.run(resolve(tmp_path / "profile-b"))
+    gc.collect()
+
+    assert loop_refs[0]() is None
+    assert len(vertex_adapter._creds_caches) <= 1
+    assert len(vertex_adapter._cache_locks) <= 1

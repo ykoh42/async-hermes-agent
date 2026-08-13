@@ -35,8 +35,8 @@ Do not call these methods from `asyncio.to_thread()`, and do not add a
 
 ## Long-lived host lifecycle
 
-Create long-lived agents during the host's async startup and close them during
-shutdown:
+Create a long-lived agent for one ordered conversation and close it with the
+host-owned conversation lifecycle:
 
 ```python
 from contextlib import AsyncExitStack
@@ -59,36 +59,26 @@ finally:
 
 ## FastAPI example
 
-FastAPI is not a dependency of this package. If the host already uses it, wire
-the agent into FastAPI's lifespan rather than adding framework code to the
-library:
+FastAPI is not a dependency of this package. The smallest safe example creates
+an isolated agent per independent request; a production host normally replaces
+this with a conversation-ID keyed agent/session store:
 
 ```python
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
-
 from run_agent import AIAgent
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with AIAgent(...) as agent:
-        app.state.agent = agent
-        yield
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 
 @app.post("/chat")
 async def chat(message: str):
-    return await app.state.agent.run_conversation(message)
+    async with AIAgent(...) as agent:
+        return await agent.run_conversation(message)
 ```
 
-This example demonstrates lifecycle placement only. A production endpoint must
-add its own request schema, identity and session mapping, authorization,
-timeouts, quotas, and error policy.
+This example deliberately does not resume conversation state. A production
+endpoint must add its own request schema, identity-to-conversation mapping,
+agent/session lifecycle, authorization, timeouts, quotas, and error policy.
 
 ## Choosing the agent concurrency model
 

@@ -268,7 +268,7 @@ class TestDynamicSchema:
     async def test_builder_wired_into_registry(self):
         from tools.registry import discover_builtin_tools, registry
 
-        discover_builtin_tools()
+        await discover_builtin_tools()
         entry = registry._tools["image_generate"]
         assert entry.dynamic_schema_overrides is not None
         out = await entry.dynamic_schema_overrides()

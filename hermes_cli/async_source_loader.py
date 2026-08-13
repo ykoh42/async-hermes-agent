@@ -93,7 +93,7 @@ async def _read_source(path: Path) -> str:
     return importlib.util.decode_source(raw)
 
 
-async def locate_source_module(
+async def _locate_source_module(
     module_name: str,
     *,
     distribution=None,  # type: ignore[no-untyped-def]
@@ -227,7 +227,7 @@ async def _package_alias_records(
     return records
 
 
-async def load_source_package(
+async def _load_source_package(
     module_name: str,
     init_file: Path,
     *,
@@ -279,7 +279,7 @@ async def load_source_package(
     return module
 
 
-async def load_source_module(
+async def _load_source_module(
     module_name: str,
     source_file: Path,
     *,
@@ -343,6 +343,10 @@ async def load_source_module(
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)  # type: ignore[union-attr]
+        if parent_name:
+            parent_module = sys.modules.get(parent_name)
+            if parent_module is not None:
+                setattr(parent_module, leaf_name, module)
     except BaseException:
         for loaded_name in tuple(sys.modules):
             if loaded_name in modules_before:
@@ -358,7 +362,7 @@ async def load_source_module(
     return module
 
 
-def unload_source_finder(module: ModuleType) -> None:
+def _unload_source_finder(module: ModuleType) -> None:
     """Remove a finder retained by a previously loaded source module."""
     finder = getattr(module, "__hermes_async_source_finder__", None)
     if finder is None:
@@ -367,11 +371,3 @@ def unload_source_finder(module: ModuleType) -> None:
         sys.meta_path.remove(finder)
     except ValueError:
         pass
-
-
-__all__ = [
-    "locate_source_module",
-    "load_source_module",
-    "load_source_package",
-    "unload_source_finder",
-]

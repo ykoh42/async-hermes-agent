@@ -35,6 +35,19 @@ from tools.file_tools import (
 )
 
 
+def test_public_exports_match_upstream_contract():
+    assert file_state.__all__ == [
+        "FileStateRegistry",
+        "get_registry",
+        "record_read",
+        "note_write",
+        "check_stale",
+        "lock_path",
+        "writes_since",
+        "known_reads",
+    ]
+
+
 def _tmp_file(content: str = "initial\n") -> str:
     fd, path = tempfile.mkstemp(prefix="hermes_file_state_test_", suffix=".txt")
     with os.fdopen(fd, "w") as f:

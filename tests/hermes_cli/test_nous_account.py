@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import gc
 import json
+import weakref
 import time
 from typing import Any
 from unittest.mock import AsyncMock
@@ -82,6 +84,26 @@ def test_account_info_cache_lock_is_loop_scoped():
     second = asyncio.run(_return_value(_account_info_cache_lock))
 
     assert first is not second
+
+
+def test_contended_account_info_cache_lock_does_not_retain_closed_loop():
+    from hermes_cli.nous_account import _account_info_cache_lock
+
+    holder: dict[str, object] = {}
+
+    async def contend() -> None:
+        lock = _account_info_cache_lock()
+        await lock.acquire()
+        waiter = asyncio.create_task(lock.acquire())
+        await asyncio.sleep(0)
+        lock.release()
+        await waiter
+        lock.release()
+        holder["loop"] = weakref.ref(asyncio.get_running_loop())
+
+    asyncio.run(contend())
+    gc.collect()
+    assert holder["loop"]() is None
 
 
 async def _return_value(factory):
@@ -378,6 +400,5 @@ async def test_account_api_tool_access_parser_fails_closed(monkeypatch):
 
 
 # ── org slug/name parsing + top-up URL builder ──────────────────────────────
-
 
 

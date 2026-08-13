@@ -7,12 +7,65 @@ the file-write logic live here.
 
 import json
 import asyncio
+from collections import deque
+import concurrent.futures
 import logging
+import os
+import threading
 import aiofiles
+import aiofiles.os
 from datetime import datetime
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+_TRAJECTORY_FILE_CLAIMS_GUARD = threading.RLock()
+_TRAJECTORY_FILE_CLAIMS: dict[
+    str,
+    deque[concurrent.futures.Future[bool]],
+] = {}
+
+
+def _claim_trajectory_file(
+    filename: str,
+) -> tuple[str, bool, concurrent.futures.Future[bool]]:
+    """Queue one append ticket without binding ownership to an event loop."""
+    path_key = os.path.normcase(os.path.normpath(os.fspath(filename)))
+    with _TRAJECTORY_FILE_CLAIMS_GUARD:
+        claims = _TRAJECTORY_FILE_CLAIMS.setdefault(path_key, deque())
+        owner = not claims
+        claim: concurrent.futures.Future[bool] = concurrent.futures.Future()
+        claims.append(claim)
+        if owner:
+            claim.set_result(True)
+        return path_key, owner, claim
+
+
+def _finish_trajectory_file_claim(
+    path_key: str,
+    claim: concurrent.futures.Future[bool],
+) -> None:
+    """Remove one ticket and hand ownership to the next FIFO waiter."""
+    with _TRAJECTORY_FILE_CLAIMS_GUARD:
+        claims = _TRAJECTORY_FILE_CLAIMS.get(path_key)
+        if not claims:
+            return
+        was_owner = claims[0] is claim
+        if was_owner:
+            claims.popleft()
+        else:
+            try:
+                claims.remove(claim)
+            except ValueError:
+                return
+            if not claim.done():
+                claim.cancel()
+        while claims and claims[0].cancelled():
+            claims.popleft()
+        if not claims:
+            _TRAJECTORY_FILE_CLAIMS.pop(path_key, None)
+        elif was_owner and not claims[0].done():
+            claims[0].set_result(True)
 
 
 def convert_scratchpad_to_think(content: str) -> str:
@@ -53,9 +106,21 @@ async def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
     line = json.dumps(entry, ensure_ascii=False) + "\n"
 
     async def _append() -> None:
-        async with aiofiles.open(filename, "a", encoding="utf-8") as handle:
-            await handle.write(line)
-            await handle.flush()
+        claim_filename = os.fspath(filename)
+        if not os.path.isabs(claim_filename):
+            claim_filename = os.path.join(
+                await aiofiles.os.getcwd(),
+                claim_filename,
+            )
+        path_key, owner, claim = _claim_trajectory_file(claim_filename)
+        try:
+            if not owner:
+                await asyncio.wrap_future(claim)
+            async with aiofiles.open(filename, "a", encoding="utf-8") as handle:
+                await handle.write(line)
+                await handle.flush()
+        finally:
+            _finish_trajectory_file_claim(path_key, claim)
 
     cancellation: asyncio.CancelledError | None = None
     try:

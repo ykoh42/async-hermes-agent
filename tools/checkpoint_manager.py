@@ -74,6 +74,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
+_IMPORT_CHECKPOINT_BASE = CHECKPOINT_BASE
+
+
+def _checkpoint_base() -> Path:
+    """Resolve the active profile's checkpoint root at the call boundary."""
+    configured = Path(CHECKPOINT_BASE)
+    if configured != _IMPORT_CHECKPOINT_BASE:
+        return configured
+    return get_hermes_home() / "checkpoints"
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -210,7 +219,7 @@ async def _project_hash(working_dir: str) -> str:
 
 def _store_path(base: Optional[Path] = None) -> Path:
     """Return the single shared shadow store path."""
-    return (base or CHECKPOINT_BASE) / _STORE_DIRNAME
+    return (base or _checkpoint_base()) / _STORE_DIRNAME
 
 
 def _shadow_repo_path(working_dir: str) -> Path:  # pragma: no cover — kept for BC
@@ -907,7 +916,7 @@ class CheckpointManager:
     async def list_checkpoints(self, working_dir: str) -> List[Dict]:
         """List available checkpoints for a directory (most recent first)."""
         abs_dir = str(await _normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path()
 
         if not await aiofiles.os.path.exists(store / "HEAD"):
             return []
@@ -965,7 +974,7 @@ class CheckpointManager:
             return {"success": False, "error": hash_err}
 
         abs_dir = str(await _normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path()
 
         if not await aiofiles.os.path.exists(store / "HEAD"):
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -1058,7 +1067,7 @@ class CheckpointManager:
             if path_err:
                 return {"success": False, "error": path_err}
 
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path()
 
         if not await aiofiles.os.path.exists(store / "HEAD"):
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -1130,7 +1139,7 @@ class CheckpointManager:
 
     async def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path()
 
         err = await _init_store(store, working_dir)
         if err:
@@ -1650,7 +1659,7 @@ async def prune_checkpoints(
 
     Never raises — maintenance must never block interactive startup.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _checkpoint_base()
     result = {
         "scanned": 0,
         "deleted_orphan": 0,
@@ -1918,7 +1927,7 @@ async def maybe_auto_prune_checkpoints(
     Returns ``{"skipped": bool, "result": prune_checkpoints-dict,
     "error": optional str}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _checkpoint_base()
     out: Dict[str, object] = {"skipped": False}
 
     try:
@@ -1990,7 +1999,7 @@ async def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     ``pre_v2_projects``, since ``prune_checkpoints`` deletes orphans from
     both layouts.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _checkpoint_base()
     out: Dict = {
         "base": str(base),
         "store_size_bytes": 0,
@@ -2070,7 +2079,7 @@ async def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _checkpoint_base()
     out = {"bytes_freed": 0, "deleted": False}
     if not await aiofiles.os.path.exists(base):
         return out
@@ -2089,7 +2098,7 @@ async def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]
 
     Returns ``{"bytes_freed": N, "deleted": count}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _checkpoint_base()
     out = {"bytes_freed": 0, "deleted": 0}
     if not await aiofiles.os.path.exists(base):
         return out

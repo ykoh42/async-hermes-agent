@@ -57,6 +57,9 @@ def _build_agent(monkeypatch):
     agent._save_trajectory = AsyncMock()
     agent._runtime_config_loaded = True
     agent._runtime_config_snapshot = {}
+    # The helper constructs a post-initialization agent so individual tests
+    # can control the compressor's context limits deterministically.
+    agent._context_engine_started = True
     agent.tools = [
         {
             "type": "function",

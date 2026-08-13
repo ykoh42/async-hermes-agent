@@ -4,6 +4,10 @@ The module landed in #56832's extraction without its tests; these cover the
 fingerprint keying, read/write round-trip, and invalidation behavior.
 """
 
+import asyncio
+import gc
+import weakref
+
 import pytest
 
 import tools.mcp_schema_cache as msc
@@ -119,3 +123,43 @@ class TestWriteSkip:
         # Changed payload → rewrite.
         await msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
         assert len(saves) == 2
+
+
+class TestCacheLockLifecycle:
+    def test_sequential_event_loops_do_not_reuse_lock(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
+        loop_refs = []
+        lock_refs = []
+
+        async def use_lock():
+            loop_refs.append(weakref.ref(asyncio.get_running_loop()))
+            lock = await msc._cache_lock()
+            lock_refs.append(weakref.ref(lock))
+            async with lock:
+                await asyncio.sleep(0)
+
+        asyncio.run(use_lock())
+        asyncio.run(use_lock())
+        gc.collect()
+
+        assert loop_refs[0]() is None
+        assert lock_refs[0]() is None
+
+    @pytest.mark.asyncio
+    async def test_symlink_aliases_share_one_cache_lock(
+        self, monkeypatch, tmp_path
+    ):
+        real_home = tmp_path / "real"
+        alias_home = tmp_path / "alias"
+        real_home.mkdir()
+        alias_home.symlink_to(real_home, target_is_directory=True)
+        active_path = real_home / "cache.json"
+        monkeypatch.setattr(msc, "_cache_path", lambda: active_path)
+
+        first = await msc._cache_lock()
+        active_path = alias_home / "cache.json"
+        second = await msc._cache_lock()
+
+        assert first is second

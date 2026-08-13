@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from pathlib import Path
 import sys
 from typing import Any
 
-from hermes_cli.async_source_loader import locate_source_module
+from hermes_cli.async_source_loader import _locate_source_module
 
 from ._native_oss import _finish_cleanup
 
@@ -61,11 +60,17 @@ class NativeWorker:
                 return None
             if self._process is not None:
                 return self._process
-            if await locate_source_module(self._dependency) is None:
+            if await _locate_source_module(self._dependency) is None:
                 self._available = False
                 return None
 
-            environment = dict(os.environ)
+            # These local transform workers never authenticate to a provider.
+            # Route their environment through the shared non-model child
+            # boundary so a multiplexed profile cannot hand them process-global
+            # provider, gateway, or infrastructure credentials.
+            from tools.environments.local import hermes_subprocess_env
+
+            environment = await hermes_subprocess_env(inherit_credentials=False)
             environment["PYTHONUNBUFFERED"] = "1"
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_exec(

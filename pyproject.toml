@@ -1,6 +1,11 @@
+[tool.async-hermes]
+upstream_version = "0.20.0"
+upstream_tag = "v2026.8.3"
+async_revision = 5
+
 [project]
 name = "async-hermes-agent"
-version = "0.20.4"
+version = "0.20.0.5"
 description = "A native-async AI agent harness for tools, MCP, skills, memory, and trajectory generation"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -40,6 +45,17 @@ dependencies = [
   "aiofiles==24.1.0",
   "python-dotenv==1.2.2",
   "httpx[socks]==0.28.1",
+  # Imported directly by the retained TLS resolver. Keep the reviewed CA
+  # bundle version stable instead of accepting whichever transitive release
+  # httpx happens to resolve in an unlocked wheel install.
+  "certifi==2026.5.20",
+  # The retained Bitwarden secret source imports cryptography directly. MCP
+  # also pulls it transitively today, but that is not a stable public contract.
+  "cryptography==48.0.1",  # CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf
+  # Home Assistant is a retained built-in tool. Its REST helpers use the
+  # coroutine-native aiohttp transport and construct one owned session per
+  # operation, so the base package works whenever HASS_TOKEN is present.
+  "aiohttp==3.14.3",
   # The retained trajectory compressor's default Kimi tokenizer publishes a
   # tiktoken BPE. We download its assets with httpx/aiofiles and construct the
   # CPU-only encoder directly, avoiding Transformers' synchronous Hub/file I/O.
@@ -119,8 +135,28 @@ vertex = ["google-auth[aiohttp]==2.56.2"]
 azure-identity = ["azure-identity==1.25.3", "aiohttp==3.14.3"]
 # Web search backends — each only loaded when selected in config.yaml.
 parallel-web = ["parallel-web==0.4.2"]
+# Exa and Firecrawl now use the retained native httpx transport; keep their
+# upstream install-extra names as no-op compatibility aliases.
+exa = []
+firecrawl = []
 # FAL video generation backend; loaded only when that plugin is selected.
 fal = ["fal-client==0.13.1"]
+# Retained native-async speech providers.
+edge-tts = ["edge-tts==7.2.7"]
+tts-premium = ["elevenlabs==1.59.0"]
+mistral = ["mistralai==2.4.8"]
+# Piper's SDK is synchronous; the retained tool runs it in an owned,
+# profile-scoped subprocess broker. Keep the GPL provider opt-in and out of
+# the base library dependency set.
+piper-tts = ["piper-tts==1.6.0"]
+# Optional native-async cloud execution backends retained from upstream.
+modal = ["modal==1.3.4"]
+daytona = ["daytona==0.155.0"]
+vercel = ["vercel==0.7.2"]
+# Retained tools whose former optional dependencies are now in core.
+homeassistant = []  # aiohttp is a core dependency.
+computer-use = []  # MCP is a core dependency; cua-driver remains external.
+vision = []  # Pillow is a core dependency.
 dev = ["pytest==9.1.1", "pytest-asyncio==1.3.0", "blockbuster==1.5.26", "flake8-async==26.6.1", "pyleak==0.2.0", "ty==0.0.21", "ruff==0.15.10", "setuptools==83.0.0"]
 # CVE-2026-48710 (BadHost): Starlette is pulled transitively by MCP's
 # sse-starlette / HTTP-SSE stack. Before
@@ -147,7 +183,7 @@ supermemory = ["supermemory==3.50.0"]
 # Hindsight's published client exposes native coroutine retain/recall/reflect
 # operations and deterministic ``aclose()``; local embedded mode additionally
 # needs the separately installed ``hindsight-all`` runtime.
-hindsight = ["hindsight-client==0.6.1"]
+hindsight = ["hindsight-client==0.6.1", "packaging==26.0"]
 # Honcho 2.2 exposes provider, peer, session, and conclusion operations through
 # its native coroutine ``.aio`` views. The plugin never instantiates the SDK's
 # synchronous HTTP transport.
@@ -187,6 +223,10 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*",
 # directly, but wheels need them declared explicitly or every bundled web
 # provider silently disappears after installation.
 plugins = ["**/*.yaml"]
+# NeuTTS resolves its upstream default reference voice relative to
+# ``tools/tts_tool.py``. Keep the exact tracked transcript/audio pair in built
+# wheels so source and clean-install behavior are identical.
+tools = ["neutts_samples/*.txt", "neutts_samples/*.wav"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

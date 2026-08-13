@@ -24,10 +24,10 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
@@ -272,7 +272,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         """
         if isinstance(explicit, str) and explicit.strip():
             return [explicit.strip()]
-        env_override = os.environ.get(self._model_env_var, "").strip()
+        env_override = (get_secret(self._model_env_var, "") or "").strip()
         if env_override:
             return [env_override]
         cfg = await _load_image_gen_config()

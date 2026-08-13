@@ -29,7 +29,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Callable, Dict, Any, Optional, List, Tuple, Set
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -336,6 +336,13 @@ def _reject_denylisted_env_var(key: str) -> None:
         )
 
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
+# The native read-only loader keeps the unexpanded sources separately from the
+# historical expanded snapshot above.  A malformed edit must retain the last
+# valid policy while re-resolving user refs for the *current* profile; retaining
+# an already-expanded dict would hand profile A's credential to profile B.
+_LAST_READONLY_CONFIG_SOURCES_BY_PATH: Dict[
+    str, Tuple[Dict[str, Any], Dict[str, Any]]
+] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
 # hasn't changed since the last load, skipping yaml.safe_load +
@@ -348,7 +355,7 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+_LOAD_CONFIG_CACHE: Dict[str, tuple] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -2172,7 +2179,10 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match_with(
+    m: re.Match,
+    resolver: Callable[[str], Optional[str]],
+) -> str:
     """Expand one ``${...}`` config reference.
 
     Two accepted shapes, matching what MCP server config already resolves
@@ -2196,7 +2206,7 @@ def _env_expand_match(m: re.Match) -> str:
         name = inner[len("env:"):].strip()
         if not name:
             return raw
-        val = os.environ.get(name)
+        val = resolver(name)
         if val is not None:
             return val
         logger.warning(
@@ -2217,7 +2227,13 @@ def _env_expand_match(m: re.Match) -> str:
         )
         return raw
     # Legacy ``${VAR}`` — bare name.
-    return os.environ.get(inner, raw)
+    value = resolver(inner)
+    return raw if value is None else value
+
+
+def _env_expand_match(m: re.Match) -> str:
+    """Expand one config reference against the process environment."""
+    return _env_expand_match_with(m, os.environ.get)
 
 
 def _env_ref_var_name(ref: str) -> Optional[str]:
@@ -2232,6 +2248,24 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
+def _expand_env_vars_with(
+    obj: Any,
+    resolver: Callable[[str], Optional[str]],
+) -> Any:
+    """Recursively expand config refs with an explicit value resolver."""
+    if isinstance(obj, str):
+        return re.sub(
+            r"\${([^}]+)}",
+            lambda match: _env_expand_match_with(match, resolver),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {k: _expand_env_vars_with(v, resolver) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars_with(item, resolver) for item in obj]
+    return obj
+
+
 def _expand_env_vars(obj):
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
     values.
@@ -2240,13 +2274,7 @@ def _expand_env_vars(obj):
     None are left untouched.  Unresolved references (variable not in
     ``os.environ``) are kept verbatim so callers can detect them.
     """
-    if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
-    return obj
+    return _expand_env_vars_with(obj, os.environ.get)
 
 
 def _env_ref_snapshot(obj, snapshot=None):
@@ -2277,6 +2305,28 @@ def _env_ref_snapshot(obj, snapshot=None):
     elif isinstance(obj, list):
         for item in obj:
             _env_ref_snapshot(item, snapshot)
+    return snapshot
+
+
+def _env_ref_snapshot_with(
+    obj: Any,
+    resolver: Callable[[str], Optional[str]],
+    snapshot: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Optional[str]]:
+    """Capture referenced values through the same resolver used to expand."""
+    if snapshot is None:
+        snapshot = {}
+    if isinstance(obj, str):
+        for raw in re.findall(r"\${([^}]+)}", obj):
+            name = _env_ref_var_name(raw)
+            if name is not None:
+                snapshot[name] = resolver(name)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _env_ref_snapshot_with(value, resolver, snapshot)
+    elif isinstance(obj, list):
+        for item in obj:
+            _env_ref_snapshot_with(item, resolver, snapshot)
     return snapshot
 
 
@@ -2836,6 +2886,13 @@ async def load_config_readonly() -> Dict[str, Any]:
     import aiofiles
     import aiofiles.os
 
+    from agent.secret_scope import get_secret, is_multiplex_active
+
+    # User config belongs to the active Hermes profile. Managed policy is a
+    # deployment-level layer and intentionally keeps the legacy process-env
+    # resolver below.
+    user_env_resolver = get_secret
+
     async def _signature(
         path: Path, *, suppress_os_error: bool = False
     ) -> Optional[Tuple[int, int]]:
@@ -2884,9 +2941,13 @@ async def load_config_readonly() -> Dict[str, Any]:
         cached = _LOAD_CONFIG_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             env_snapshot = cached[5] if len(cached) > 5 else {}
+            managed_env_snapshot = cached[6] if len(cached) > 6 else {}
             if all(
-                os.environ.get(key) == value
+                user_env_resolver(key) == value
                 for key, value in env_snapshot.items()
+            ) and all(
+                os.environ.get(key) == value
+                for key, value in managed_env_snapshot.items()
             ):
                 return cached[4]
 
@@ -2902,22 +2963,54 @@ async def load_config_readonly() -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
                 config = _deep_merge(config, user_config)
             except Exception as exc:
-                last_known_good = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                last_sources = _LAST_READONLY_CONFIG_SOURCES_BY_PATH.get(path_key)
+                legacy_last_known_good = (
+                    _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                    if not is_multiplex_active()
+                    else None
+                )
+                has_last_known_good = (
+                    last_sources is not None or legacy_last_known_good is not None
+                )
                 await _warn_config_parse_failure_from_event_loop(
                     config_path,
                     exc,
                     fallback=(
-                        "last-known-good" if last_known_good is not None else "defaults"
+                        "last-known-good" if has_last_known_good else "defaults"
                     ),
                 )
-                if last_known_good is not None:
-                    retained = _expand_env_vars(copy.deepcopy(last_known_good))
+                if last_sources is not None:
+                    retained_normalized, retained_managed = copy.deepcopy(
+                        last_sources
+                    )
+                    retained = _expand_env_vars_with(
+                        retained_normalized, user_env_resolver
+                    )
+                    if retained_managed:
+                        retained = _deep_merge(
+                            retained,
+                            _expand_env_vars(retained_managed),
+                        )
+                    env_snapshot = _env_ref_snapshot_with(
+                        retained_normalized, user_env_resolver
+                    )
+                    managed_env_snapshot = _env_ref_snapshot(retained_managed)
+                    if cache_sig is not None:
+                        _LOAD_CONFIG_CACHE[path_key] = (
+                            *cache_sig,
+                            retained,
+                            env_snapshot,
+                            managed_env_snapshot,
+                        )
+                    return retained
+                if legacy_last_known_good is not None:
+                    retained = copy.deepcopy(legacy_last_known_good)
                     if cache_sig is not None:
                         _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, retained, {})
                     return retained
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
+        expanded = _expand_env_vars_with(normalized, user_env_resolver)
         managed_config: Dict[str, Any] = {}
         if managed_path is not None and managed_sig is not None:
             try:
@@ -2936,13 +3029,22 @@ async def load_config_readonly() -> Dict[str, Any]:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
 
+        _LAST_READONLY_CONFIG_SOURCES_BY_PATH[path_key] = copy.deepcopy(
+            (normalized, managed_config)
+        )
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             cached_copy = copy.deepcopy(expanded)
-            env_snapshot = _env_ref_snapshot(normalized)
-            if managed_config:
-                _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            env_snapshot = _env_ref_snapshot_with(
+                normalized, user_env_resolver
+            )
+            managed_env_snapshot = _env_ref_snapshot(managed_config)
+            _LOAD_CONFIG_CACHE[path_key] = (
+                *cache_sig,
+                cached_copy,
+                env_snapshot,
+                managed_env_snapshot,
+            )
             return cached_copy
 
         _LOAD_CONFIG_CACHE.pop(path_key, None)
@@ -2950,9 +3052,36 @@ async def load_config_readonly() -> Dict[str, Any]:
 
 
 TERMINAL_CONFIG_ENV_MAP = {
+    "backend": "TERMINAL_ENV",
+    "modal_mode": "TERMINAL_MODAL_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
-    "local_persistent": "TERMINAL_LOCAL_PERSISTENT",
+    "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+    "docker_image": "TERMINAL_DOCKER_IMAGE",
+    "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+    "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+    "modal_image": "TERMINAL_MODAL_IMAGE",
+    "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+    "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+    "ssh_host": "TERMINAL_SSH_HOST",
+    "ssh_user": "TERMINAL_SSH_USER",
+    "ssh_port": "TERMINAL_SSH_PORT",
+    "ssh_key": "TERMINAL_SSH_KEY",
+    "container_cpu": "TERMINAL_CONTAINER_CPU",
+    "container_memory": "TERMINAL_CONTAINER_MEMORY",
+    "container_disk": "TERMINAL_CONTAINER_DISK",
+    "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+    "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+    "docker_env": "TERMINAL_DOCKER_ENV",
+    "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+    "docker_network": "TERMINAL_DOCKER_NETWORK",
+    "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+    "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
+    "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+    "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+    "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
+    "sandbox_dir": "TERMINAL_SANDBOX_DIR",
+    "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
 }
 
 

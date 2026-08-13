@@ -230,6 +230,19 @@ _reserved_sockets: "dict[int, socket.socket]" = {}
 _MAX_RESERVED_SOCKETS = 8
 
 
+def _close_reserved_callback_ports() -> None:
+    """Release callback reservations owned by the process MCP lifecycle."""
+    global _oauth_port
+    reserved = tuple(_reserved_sockets.values())
+    _reserved_sockets.clear()
+    _oauth_port = None
+    for callback_socket in reserved:
+        try:
+            callback_socket.close()
+        except OSError:
+            pass
+
+
 def _reserve_callback_port() -> int:
     """Pick an ephemeral callback port and keep its socket bound.
 

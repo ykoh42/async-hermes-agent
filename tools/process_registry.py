@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import contextvars
 import errno
+import inspect
 import json
 import logging
 import os
+import shlex
 import signal
 import struct
 import sys
 import time
+import threading
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import aiofiles
 import aiofiles.os
@@ -34,6 +39,7 @@ from tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+_IMPORTED_CHECKPOINT_PATH = Path(CHECKPOINT_PATH)
 MAX_OUTPUT_CHARS = 200_000
 FINISHED_TTL_SECONDS = 1800
 MAX_PROCESSES = 64
@@ -43,6 +49,82 @@ WATCH_STRIKE_LIMIT = 3
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
+_REMOTE_POLL_INTERVAL_SECONDS = 2
+
+_ProcessScopeKey = tuple[object, str]
+_PROCESS_NO_LOOP = object()
+_process_scope_context: contextvars.ContextVar[
+    tuple[str, str] | None
+] = contextvars.ContextVar("process_registry_profile_scope", default=None)
+_process_scope_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_process_scope_aliases_lock = threading.RLock()
+
+
+def _lexical_process_profile_identity() -> str:
+    """Return the environment-only profile marker without filesystem I/O."""
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_process_scope_key() -> _ProcessScopeKey:
+    lexical = _lexical_process_profile_identity()
+    active = _process_scope_context.get()
+    try:
+        loop: object = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _PROCESS_NO_LOOP
+    if active is not None and active[0] == lexical and loop is not _PROCESS_NO_LOOP:
+        return loop, active[1]
+    if loop is _PROCESS_NO_LOOP:
+        return loop, lexical
+    with _process_scope_aliases_lock:
+        aliases = _process_scope_aliases.get(loop)
+        canonical = aliases.get(lexical, lexical) if aliases is not None else lexical
+    return loop, canonical
+
+
+async def _activate_process_scope() -> tuple[_ProcessScopeKey, _ProcessScopeKey]:
+    """Activate the current loop's canonical profile and return old/new keys."""
+    lexical = _lexical_process_profile_identity()
+    loop = asyncio.get_running_loop()
+    lexical_key: _ProcessScopeKey = (loop, lexical)
+    active = _process_scope_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = str(await expanduser(lexical))
+        is_absolute = (
+            expanded.startswith(("/", "\\\\"))
+            or (len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in "/\\")
+        )
+        if not is_absolute:
+            expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        canonical = os.path.normcase(str(await realpath(expanded)))
+    canonical_key: _ProcessScopeKey = (loop, canonical)
+    with _process_scope_aliases_lock:
+        _process_scope_aliases.setdefault(loop, {})[lexical] = canonical
+    _process_scope_context.set((lexical, canonical))
+    return lexical_key, canonical_key
+
+
+@dataclass
+class _ProcessRegistryState:
+    running: dict[str, "ProcessSession"] = field(default_factory=dict)
+    finished: dict[str, "ProcessSession"] = field(default_factory=dict)
+    completion_consumed: set[str] = field(default_factory=set)
+    poll_observed: set[str] = field(default_factory=set)
+    checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pending_watchers: list[dict[str, Any]] = field(default_factory=list)
+    completion_queue: asyncio.Queue[dict[str, Any]] = field(
+        default_factory=asyncio.Queue
+    )
+    global_watch_window_start: float = 0.0
+    global_watch_window_hits: int = 0
+    global_watch_tripped_until: float = 0.0
+    global_watch_suppressed_during_trip: int = 0
 
 
 async def _finish_cancelled_cleanup(
@@ -123,36 +205,191 @@ class ProcessRegistry:
     """Track local background processes without leaving the event loop."""
 
     def __init__(self) -> None:
-        self._running: dict[str, ProcessSession] = {}
-        self._finished: dict[str, ProcessSession] = {}
-        self._completion_consumed: set[str] = set()
-        self._poll_observed: set[str] = set()
-        self._checkpoint_lock = asyncio.Lock()
-        self.pending_watchers: list[dict[str, Any]] = []
-        self.completion_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._global_watch_window_start = 0.0
-        self._global_watch_window_hits = 0
-        self._global_watch_tripped_until = 0.0
-        self._global_watch_suppressed_during_trip = 0
+        self._loop_profile_states: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, _ProcessRegistryState]
+        ] = weakref.WeakKeyDictionary()
+        self._staged_profile_states: dict[str, _ProcessRegistryState] = {}
+
+    def _prune_closed_loops(self) -> None:
+        loop_states = getattr(self, "_loop_profile_states", None)
+        if loop_states is not None:
+            for loop in tuple(loop_states):
+                if loop.is_closed():
+                    loop_states.pop(loop, None)
+        with _process_scope_aliases_lock:
+            for loop in tuple(_process_scope_aliases):
+                if loop.is_closed():
+                    _process_scope_aliases.pop(loop, None)
+
+    def _states_for_scope(
+        self,
+        scope: _ProcessScopeKey,
+    ) -> tuple[dict[str, _ProcessRegistryState], str]:
+        loop, profile = scope
+        if loop is _PROCESS_NO_LOOP:
+            states = getattr(self, "_staged_profile_states", None)
+            if states is None:
+                states = {}
+                self._staged_profile_states = states
+            return states, profile
+        loop_states = getattr(self, "_loop_profile_states", None)
+        if loop_states is None:
+            loop_states = weakref.WeakKeyDictionary()
+            self._loop_profile_states = loop_states
+        return loop_states.setdefault(loop, {}), profile
+
+    def _profile_state(self) -> _ProcessRegistryState:
+        self._prune_closed_loops()
+        states, profile = self._states_for_scope(_current_process_scope_key())
+        return states.setdefault(profile, _ProcessRegistryState())
+
+    async def _activate_profile_state(self) -> _ProcessRegistryState:
+        self._prune_closed_loops()
+        lexical_key, canonical_key = await _activate_process_scope()
+        states, profile = self._states_for_scope(canonical_key)
+        for source_key in (lexical_key, (_PROCESS_NO_LOOP, lexical_key[1])):
+            source_states, source_profile = self._states_for_scope(source_key)
+            if source_key == canonical_key or source_profile not in source_states:
+                continue
+            staged = source_states.pop(source_profile)
+            active = states.get(profile)
+            if active is None:
+                states[profile] = staged
+                continue
+            active.running.update(staged.running)
+            active.finished.update(staged.finished)
+            active.completion_consumed.update(staged.completion_consumed)
+            active.poll_observed.update(staged.poll_observed)
+            active.pending_watchers.extend(staged.pending_watchers)
+            while not staged.completion_queue.empty():
+                active.completion_queue.put_nowait(
+                    staged.completion_queue.get_nowait()
+                )
+        return states.setdefault(profile, _ProcessRegistryState())
+
+    @property
+    def _running(self) -> dict[str, ProcessSession]:
+        return self._profile_state().running
+
+    @_running.setter
+    def _running(self, value: dict[str, ProcessSession]) -> None:
+        self._profile_state().running = value
+
+    @property
+    def _finished(self) -> dict[str, ProcessSession]:
+        return self._profile_state().finished
+
+    @_finished.setter
+    def _finished(self, value: dict[str, ProcessSession]) -> None:
+        self._profile_state().finished = value
+
+    @property
+    def _completion_consumed(self) -> set[str]:
+        return self._profile_state().completion_consumed
+
+    @_completion_consumed.setter
+    def _completion_consumed(self, value: set[str]) -> None:
+        self._profile_state().completion_consumed = value
+
+    @property
+    def _poll_observed(self) -> set[str]:
+        return self._profile_state().poll_observed
+
+    @_poll_observed.setter
+    def _poll_observed(self, value: set[str]) -> None:
+        self._profile_state().poll_observed = value
+
+    @property
+    def _checkpoint_lock(self) -> asyncio.Lock:
+        return self._profile_state().checkpoint_lock
+
+    @_checkpoint_lock.setter
+    def _checkpoint_lock(self, value: asyncio.Lock) -> None:
+        self._profile_state().checkpoint_lock = value
+
+    @property
+    def pending_watchers(self) -> list[dict[str, Any]]:
+        return self._profile_state().pending_watchers
+
+    @pending_watchers.setter
+    def pending_watchers(self, value: list[dict[str, Any]]) -> None:
+        self._profile_state().pending_watchers = value
+
+    @property
+    def completion_queue(self) -> asyncio.Queue[dict[str, Any]]:
+        return self._profile_state().completion_queue
+
+    @completion_queue.setter
+    def completion_queue(self, value: asyncio.Queue[dict[str, Any]]) -> None:
+        self._profile_state().completion_queue = value
+
+    @property
+    def _global_watch_window_start(self) -> float:
+        return self._profile_state().global_watch_window_start
+
+    @_global_watch_window_start.setter
+    def _global_watch_window_start(self, value: float) -> None:
+        self._profile_state().global_watch_window_start = value
+
+    @property
+    def _global_watch_window_hits(self) -> int:
+        return self._profile_state().global_watch_window_hits
+
+    @_global_watch_window_hits.setter
+    def _global_watch_window_hits(self, value: int) -> None:
+        self._profile_state().global_watch_window_hits = value
+
+    @property
+    def _global_watch_tripped_until(self) -> float:
+        return self._profile_state().global_watch_tripped_until
+
+    @_global_watch_tripped_until.setter
+    def _global_watch_tripped_until(self, value: float) -> None:
+        self._profile_state().global_watch_tripped_until = value
+
+    @property
+    def _global_watch_suppressed_during_trip(self) -> int:
+        return self._profile_state().global_watch_suppressed_during_trip
+
+    @_global_watch_suppressed_during_trip.setter
+    def _global_watch_suppressed_during_trip(self, value: int) -> None:
+        self._profile_state().global_watch_suppressed_during_trip = value
+
+    def _checkpoint_path(self) -> Path:
+        configured = Path(CHECKPOINT_PATH)
+        if configured != _IMPORTED_CHECKPOINT_PATH:
+            return configured
+        return Path(_current_process_scope_key()[1]) / "processes.json"
 
     async def spawn_local(
         self,
         command: str,
-        cwd: str | None = None,
+        cwd: str = None,
         task_id: str = "",
         session_key: str = "",
-        env_vars: dict[str, str] | None = None,
+        env_vars: dict = None,
         use_pty: bool = False,
     ) -> ProcessSession:
         """Spawn a local command and start native async output collection."""
+        await self._activate_profile_state()
         from tools.terminal_tool import _rewrite_compound_background
 
         safe_command = _rewrite_compound_background(command)
+        child_env_vars = dict(env_vars or {})
+        snapshot_path = child_env_vars.pop(
+            "_HERMES_SESSION_SNAPSHOT_PATH",
+            None,
+        )
+        if snapshot_path:
+            safe_command = (
+                f"source {shlex.quote(str(snapshot_path))} >/dev/null 2>&1 || true\n"
+                + safe_command
+            )
         raw_workdir = cwd or await aiofiles.os.getcwd()
         expanduser = aiofiles.os.wrap(os.path.expanduser)
         workdir = await aiofiles.os.path.abspath(await expanduser(raw_workdir))
         shell = os.environ.get("SHELL") or "/bin/sh"
-        env = await build_subprocess_env(scrub_secrets=True, extra=env_vars)
+        env = await build_subprocess_env(scrub_secrets=True, extra=child_env_vars)
         env["PYTHONUNBUFFERED"] = "1"
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
@@ -207,6 +444,192 @@ class ProcessRegistry:
             )
             raise
         return session
+
+    @staticmethod
+    async def _env_temp_dir(env: Any) -> str:
+        """Return the writable sandbox temp dir for env-backed background tasks."""
+        get_temp_dir = getattr(env, "get_temp_dir", None)
+        if callable(get_temp_dir):
+            try:
+                temp_dir = get_temp_dir()
+                if inspect.isawaitable(temp_dir):
+                    temp_dir = await temp_dir
+                if isinstance(temp_dir, str) and temp_dir.startswith("/"):
+                    return temp_dir.rstrip("/") or "/"
+            except Exception as exc:
+                logger.debug("Could not resolve environment temp dir: %s", exc)
+        return "/tmp"
+
+    async def spawn_via_env(
+        self,
+        env: Any,
+        command: str,
+        cwd: str = None,
+        task_id: str = "",
+        session_key: str = "",
+        timeout: int = 10,
+    ) -> ProcessSession:
+        """Spawn and monitor a background process inside a remote backend."""
+        await self._activate_profile_state()
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id,
+            session_key=session_key,
+            cwd=cwd,
+            started_at=time.time(),
+            env_ref=env,
+            pid_scope="sandbox",
+        )
+        temp_dir = await self._env_temp_dir(env)
+        log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
+        pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
+        exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
+        quoted_command = shlex.quote(command)
+        quoted_temp_dir = shlex.quote(temp_dir)
+        quoted_log_path = shlex.quote(log_path)
+        quoted_pid_path = shlex.quote(pid_path)
+        quoted_exit_path = shlex.quote(exit_path)
+        background_command = (
+            f"mkdir -p {quoted_temp_dir} && "
+            f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
+            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+        )
+
+        async def cleanup_uncertain_start() -> None:
+            await env.execute(
+                f"test ! -f {quoted_pid_path} || "
+                f"kill \"$(cat {quoted_pid_path})\" 2>/dev/null || true",
+                timeout=5,
+                rewrite_compound_background=False,
+            )
+
+        try:
+            result = await env.execute(
+                background_command,
+                timeout=timeout,
+                rewrite_compound_background=False,
+            )
+        except asyncio.CancelledError as cancellation:
+            cleanup = asyncio.create_task(cleanup_uncertain_start())
+            await _finish_cancelled_cleanup(
+                cleanup,
+                error_message="Remote process cleanup after cancelled spawn failed",
+            )
+            raise cancellation
+        except Exception as exc:
+            session.exited = True
+            session.exit_code = -1
+            session.completion_reason = "failed_start"
+            session.termination_source = "failed_start"
+            session.output_buffer = f"Failed to start: {exc}"
+            return session
+
+        output = str(result.get("output", "")).strip()
+        for line in output.splitlines():
+            if line.strip().isdigit():
+                session.pid = int(line.strip())
+                break
+        if session.pid is None:
+            session.exited = True
+            session.exit_code = int(result.get("returncode", -1))
+            if session.exit_code == 0:
+                session.exit_code = -1
+            session.completion_reason = "failed_start"
+            session.termination_source = "failed_start"
+            session.output_buffer = output
+            return session
+
+        self._prune_finished()
+        self._running[session.id] = session
+        session._monitor_task = asyncio.create_task(
+            self._monitor_env(session, env, log_path, pid_path, exit_path),
+            name=f"process-poller-{session.id}",
+        )
+        try:
+            await self._write_checkpoint()
+        except asyncio.CancelledError as cancellation:
+            cleanup = asyncio.create_task(
+                self.kill_process(
+                    session.id,
+                    source="failed_start",
+                    consume_output=False,
+                )
+            )
+            await _finish_cancelled_cleanup(
+                cleanup,
+                error_message="Remote process cleanup after cancelled checkpoint failed",
+            )
+            raise cancellation
+        return session
+
+    async def _monitor_env(
+        self,
+        session: ProcessSession,
+        env: Any,
+        log_path: str,
+        pid_path: str,
+        exit_path: str,
+    ) -> None:
+        """Poll one remote process without a reader thread."""
+        quoted_log_path = shlex.quote(log_path)
+        quoted_pid_path = shlex.quote(pid_path)
+        quoted_exit_path = shlex.quote(exit_path)
+        previous_output_length = 0
+        while not session.exited:
+            await asyncio.sleep(_REMOTE_POLL_INTERVAL_SECONDS)
+            if session.exited:
+                return
+            try:
+                result = await env.execute(
+                    f"cat {quoted_log_path} 2>/dev/null",
+                    timeout=10,
+                )
+                new_output = str(result.get("output", ""))
+                if new_output:
+                    delta = (
+                        new_output[previous_output_length:]
+                        if len(new_output) > previous_output_length
+                        else ""
+                    )
+                    previous_output_length = len(new_output)
+                    session.output_buffer = new_output[-session.max_output_chars :]
+                    if delta:
+                        self._check_watch_patterns(session, delta)
+
+                check = await env.execute(
+                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" "
+                    "2>/dev/null; echo $?",
+                    timeout=5,
+                )
+                check_output = str(check.get("output", "")).strip()
+                if check_output and check_output.splitlines()[-1].strip() != "0":
+                    exit_result = await env.execute(
+                        f"cat {quoted_exit_path} 2>/dev/null",
+                        timeout=5,
+                    )
+                    exit_output = str(exit_result.get("output", "")).strip()
+                    try:
+                        session.exit_code = int(
+                            exit_output.splitlines()[-1].strip()
+                        )
+                    except (ValueError, IndexError):
+                        session.exit_code = -1
+                    session.exited = True
+                    if session.completion_reason != "killed":
+                        session.completion_reason = "exited"
+                    await self._move_to_finished(session)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                session.exited = True
+                session.exit_code = -1
+                session.completion_reason = "lost"
+                session.termination_source = "backend_lost"
+                await self._move_to_finished(session)
+                return
 
     async def _spawn_posix_pty(
         self,
@@ -458,10 +881,13 @@ class ProcessRegistry:
     async def _move_to_finished(self, session: ProcessSession) -> None:
         was_running = self._running.pop(session.id, None) is not None
         self._finished[session.id] = session
-        session._completion_event.set()
         await self._write_checkpoint()
         if was_running and session.notify_on_complete:
             self._enqueue_completion(session)
+        # Publication is the final lifecycle edge: waiters may immediately
+        # tear their event loop down after this signal, so every checkpoint
+        # file handle and atomic replace must already be complete.
+        session._completion_event.set()
 
     @staticmethod
     def _close_pty(session: ProcessSession) -> None:
@@ -487,6 +913,7 @@ class ProcessRegistry:
                 self._finished.pop(session.id, None)
 
     async def get(self, session_id: str) -> ProcessSession | None:
+        await self._activate_profile_state()
         session = self._running.get(session_id) or self._finished.get(session_id)
         return await self._refresh_detached_session(session)
 
@@ -560,10 +987,13 @@ class ProcessRegistry:
                 event = self.completion_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            is_async_delegation = event.get("type") == "async_delegation"
             event_session_key = str(event.get("session_key") or "")
             origin_session_id = str(event.get("origin_ui_session_id") or "")
-            routed = bool(event_session_key or origin_session_id)
-            if owns_event is not None and routed:
+            requires_positive_proof = is_async_delegation or bool(
+                event_session_key or origin_session_id
+            )
+            if owns_event is not None and requires_positive_proof:
                 try:
                     owned = bool(owns_event(event))
                 except Exception:
@@ -571,7 +1001,11 @@ class ProcessRegistry:
                 if not owned:
                     requeue.append(event)
                     continue
-            elif session_key and routed and event_session_key != session_key:
+            elif session_key and requires_positive_proof:
+                if event_session_key != session_key:
+                    requeue.append(event)
+                    continue
+            elif is_async_delegation and event.get("restored"):
                 requeue.append(event)
                 continue
             event_session_id = str(event.get("session_id") or "")
@@ -618,8 +1052,8 @@ class ProcessRegistry:
     async def wait(
         self,
         session_id: str,
-        timeout: int | None = None,  # noqa: ASYNC109 - upstream public API
-    ) -> dict[str, Any]:
+        timeout: int = None,  # noqa: ASYNC109 - upstream public API
+    ) -> dict:
         """Wait without blocking the event loop or stopping the process on timeout."""
         from tools.ansi_strip import strip_ansi
         from tools.interrupt import is_interrupted
@@ -627,8 +1061,10 @@ class ProcessRegistry:
         session = await self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        from agent.secret_scope import get_secret
+
         try:
-            configured_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+            configured_timeout = int(get_secret("TERMINAL_TIMEOUT", "180"))
         except (TypeError, ValueError):
             configured_timeout = 180
         requested_timeout = timeout
@@ -734,6 +1170,28 @@ class ProcessRegistry:
         try:
             if process is not None:
                 await _terminate_process(process)
+            elif session.env_ref is not None and session.pid:
+                async def terminate_remote() -> None:
+                    await session.env_ref.execute(
+                        f"kill {session.pid} 2>/dev/null",
+                        timeout=5,
+                    )
+                    session.exited = True
+                    session.exit_code = -signal.SIGTERM
+                    await self._move_to_finished(session)
+                    monitor = session._monitor_task
+                    if monitor is not None:
+                        await monitor
+
+                remote_cleanup = asyncio.create_task(terminate_remote())
+                try:
+                    await asyncio.shield(remote_cleanup)
+                except asyncio.CancelledError as cancellation:
+                    await _finish_cancelled_cleanup(
+                        remote_cleanup,
+                        error_message="Remote process termination failed",
+                    )
+                    raise cancellation
             elif session.detached and session.pid_scope == "host" and session.pid:
                 terminated = await self._terminate_host_pid(
                     session.pid,
@@ -841,9 +1299,10 @@ class ProcessRegistry:
 
     async def list_sessions(
         self,
-        task_id: str | None = None,
-        session_key: str | None = None,
-    ) -> list[dict[str, Any]]:
+        task_id: str = None,
+        session_key: str = None,
+    ) -> list:
+        await self._activate_profile_state()
         sessions: list[ProcessSession] = []
         for session in [*self._running.values(), *self._finished.values()]:
             refreshed = await self._refresh_detached_session(session)
@@ -893,6 +1352,7 @@ class ProcessRegistry:
         return len(self._running)
 
     async def has_active_processes(self, task_id: str) -> bool:
+        await self._activate_profile_state()
         for session in tuple(self._running.values()):
             await self._refresh_detached_session(session)
         return any(session.task_id == task_id for session in self._running.values())
@@ -900,8 +1360,9 @@ class ProcessRegistry:
     async def has_active_for_session(
         self,
         session_key: str,
-        max_active_age: float | None = None,
+        max_active_age: Optional[float] = None,
     ) -> bool:
+        await self._activate_profile_state()
         for session in tuple(self._running.values()):
             await self._refresh_detached_session(session)
         now = time.time()
@@ -912,6 +1373,7 @@ class ProcessRegistry:
         )
 
     async def has_any_active(self) -> bool:
+        await self._activate_profile_state()
         for session in tuple(self._running.values()):
             await self._refresh_detached_session(session)
         return bool(self._running)
@@ -939,12 +1401,13 @@ class ProcessRegistry:
 
     async def kill_all(
         self,
-        task_id: str | None = None,
+        task_id: Optional[str] = None,
         *,
-        exclude_ids: frozenset[str] = frozenset(),
+        exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
     ) -> int:
+        await self._activate_profile_state()
         targets = [
             session.id
             for session in self._running.values()
@@ -1087,6 +1550,7 @@ class ProcessRegistry:
 
     async def _write_checkpoint(self) -> None:
         """Persist running host-process metadata with an atomic async replace."""
+        await self._activate_profile_state()
         async with self._checkpoint_lock:
             entries: list[dict[str, Any]] = []
             for session in self._running.values():
@@ -1122,7 +1586,7 @@ class ProcessRegistry:
                         "watch_patterns": session.watch_patterns,
                     }
                 )
-            checkpoint = Path(CHECKPOINT_PATH)
+            checkpoint = self._checkpoint_path()
             temporary = checkpoint.with_name(
                 f".{checkpoint.name}.{uuid.uuid4().hex}.tmp"
             )
@@ -1147,7 +1611,8 @@ class ProcessRegistry:
 
     async def recover_from_checkpoint(self) -> int:
         """Recover live host PIDs from the upstream processes.json checkpoint."""
-        checkpoint = Path(CHECKPOINT_PATH)
+        await self._activate_profile_state()
+        checkpoint = self._checkpoint_path()
         try:
             async with aiofiles.open(checkpoint, "r", encoding="utf-8") as handle:
                 entries = json.loads(await handle.read())
@@ -1376,7 +1841,7 @@ def _format_async_delegation(evt: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_process_notification(evt: dict[str, Any]) -> str | None:
+def format_process_notification(evt: dict) -> "str | None":
     """Format a queued process event using the upstream reinjection shape."""
     event_type = evt.get("type", "completion")
     session_id = evt.get("session_id", "unknown")

@@ -22,6 +22,15 @@ def test_nous_portal_tags_contains_product_and_client():
     assert len(tags) == 2
 
 
+def test_portal_client_tag_uses_the_full_async_release_version():
+    """The downstream revision must not be dropped from Portal attribution."""
+    from agent.portal_tags import hermes_client_tag
+    from hermes_cli import __version__
+
+    assert hermes_client_tag() == f"client=hermes-client-v{__version__}"
+    assert __version__.count(".") == 3
+
+
 
 
 

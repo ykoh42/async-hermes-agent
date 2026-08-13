@@ -889,7 +889,10 @@ class TestBuildSystemPrompt:
                 "run_agent.check_toolset_requirements",
                 side_effect=AssertionError("should not re-check toolset requirements"),
             ),
-            patch("run_agent.get_toolset_for_tool", create=True, side_effect=toolset_map.get),
+            patch(
+                "run_agent.get_toolset_for_tool",
+                new=AsyncMock(side_effect=toolset_map.get),
+            ),
             patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT") as mock_skills,
             patch("run_agent.OpenAI"),
         ):
@@ -2977,6 +2980,13 @@ class TestRunConversation:
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
+        # This fixture installs a complete synthetic tool snapshot.  Do not
+        # let the global registry generation mutated by unrelated test files
+        # make the turn prologue replace it with live discovered tools.
+        from tools.registry import registry
+
+        agent._tool_snapshot_generation = registry._generation
+        agent._skip_mcp_refresh = True
 
     @pytest.mark.asyncio
     async def test_stop_finish_reason_returns_response(self, agent):

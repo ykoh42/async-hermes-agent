@@ -105,16 +105,24 @@ async def matrix_env(tmp_path, monkeypatch):
     async def _no_sleep(*a, **k): return None
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
-    # Reset FAL plugin's lazy fal_client cache so it picks up the stub
-    from plugins.video_gen import fal as fal_plugin
-    fal_plugin._fal_client = None
-
-    # Force discovery
+    # Force discovery in this profile, then patch the exact scoped modules
+    # that registered the active providers. Profile-isolated plugin modules
+    # deliberately do not use the legacy process-global hermes_plugins name.
+    from agent.video_gen_registry import get_provider
     from hermes_cli.plugins import _ensure_plugins_discovered
-    await _ensure_plugins_discovered(force=True)
-    import sys
 
-    xai_plugin = sys.modules["hermes_plugins.video_gen__xai"]
+    manager = await _ensure_plugins_discovered(force=True)
+    xai_plugin = manager._plugins["video_gen/xai"].module
+    fal_plugin = manager._plugins["video_gen/fal"].module
+    xai_provider = get_provider("xai")
+    fal_provider = get_provider("fal")
+    assert xai_plugin is not None
+    assert fal_plugin is not None
+    assert xai_provider is not None
+    assert fal_provider is not None
+    assert type(xai_provider).__module__ == xai_plugin.__name__
+    assert type(fal_provider).__module__ == fal_plugin.__name__
+    fal_plugin._fal_client = None
     monkeypatch.setattr(xai_plugin, "_create_httpx_client", _create_xai_client)
 
     return tmp_path, fal_calls, xai_calls
@@ -129,7 +137,7 @@ async def _invoke_tool(home, cfg: dict, args: dict, tool_name: str = "video_gene
 
     from tools.registry import discover_builtin_tools, registry
     if tool_name not in registry._tools:
-        discover_builtin_tools()
+        await discover_builtin_tools()
     handler = registry._tools[tool_name].handler
     return json.loads(await handler(args))
 

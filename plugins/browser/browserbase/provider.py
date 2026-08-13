@@ -32,7 +32,6 @@ Optional feature knobs::
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any, Dict, Optional
 
@@ -74,8 +73,10 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             return {
                 "api_key": api_key,
                 "project_id": project_id,
-                "base_url": os.environ.get(
-                    "BROWSERBASE_BASE_URL", "https://api.browserbase.com"
+                "base_url": str(
+                    get_secret(
+                        "BROWSERBASE_BASE_URL", "https://api.browserbase.com"
+                    )
                 ).rstrip("/"),
             }
         return None
@@ -97,14 +98,19 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         config = self._get_config()
 
         # Optional env-var knobs
-        enable_proxies = os.environ.get("BROWSERBASE_PROXIES", "true").lower() != "false"
+        enable_proxies = (
+            str(get_secret("BROWSERBASE_PROXIES", "true")).lower()
+            != "false"
+        )
         enable_advanced_stealth = (
-            os.environ.get("BROWSERBASE_ADVANCED_STEALTH", "false").lower() == "true"
+            str(get_secret("BROWSERBASE_ADVANCED_STEALTH", "false")).lower()
+            == "true"
         )
         enable_keep_alive = (
-            os.environ.get("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
+            str(get_secret("BROWSERBASE_KEEP_ALIVE", "true")).lower()
+            != "false"
         )
-        custom_timeout_ms = os.environ.get("BROWSERBASE_SESSION_TIMEOUT")
+        custom_timeout_ms = get_secret("BROWSERBASE_SESSION_TIMEOUT")
 
         features_enabled = {
             "basic_stealth": True,

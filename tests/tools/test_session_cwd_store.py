@@ -23,14 +23,14 @@ async def test_records_are_keyed_and_cleared_by_session(tmp_path):
     first.mkdir()
     second.mkdir()
 
-    await terminal.record_session_cwd("one", str(first))
-    await terminal.record_session_cwd("two", str(second))
+    terminal.record_session_cwd("one", str(first))
+    terminal.record_session_cwd("two", str(second))
 
-    assert await terminal.get_session_cwd("one") == str(first)
-    assert await terminal.get_session_cwd("two") == str(second)
+    assert terminal.get_session_cwd("one") == str(first)
+    assert terminal.get_session_cwd("two") == str(second)
     terminal.clear_session_cwd("one")
-    assert await terminal.get_session_cwd("one") != str(first)
-    assert await terminal.get_session_cwd("two") == str(second)
+    assert terminal.get_session_cwd("one") != str(first)
+    assert terminal.get_session_cwd("two") == str(second)
 
 
 @pytest.mark.asyncio
@@ -40,10 +40,10 @@ async def test_registered_override_seeds_and_updates_record(tmp_path):
     first.mkdir()
     second.mkdir()
 
-    await terminal.register_task_env_overrides("session", {"cwd": str(first)})
-    assert await terminal.get_session_cwd("session") == str(first)
-    await terminal.register_task_env_overrides("session", {"cwd": str(second)})
-    assert await terminal.get_session_cwd("session") == str(second)
+    terminal.register_task_env_overrides("session", {"cwd": str(first)})
+    assert terminal.get_session_cwd("session") == str(first)
+    terminal.register_task_env_overrides("session", {"cwd": str(second)})
+    assert terminal.get_session_cwd("session") == str(second)
 
 
 @pytest.mark.asyncio
@@ -55,8 +55,8 @@ async def test_file_resolution_uses_each_sessions_record(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
-    await terminal.record_session_cwd("one", str(first))
-    await terminal.record_session_cwd("two", str(second))
+    terminal.record_session_cwd("one", str(first))
+    terminal.record_session_cwd("two", str(second))
 
     assert await file_tools._resolve_path_for_task("f.py", "one") == first / "f.py"
     assert await file_tools._resolve_path_for_task("f.py", "two") == second / "f.py"
@@ -70,16 +70,16 @@ async def test_cd_updates_only_its_session_record(tmp_path):
     first.mkdir()
     second.mkdir()
     destination.mkdir()
-    await terminal.register_task_env_overrides("one", {"cwd": str(first)})
-    await terminal.register_task_env_overrides("two", {"cwd": str(second)})
+    terminal.register_task_env_overrides("one", {"cwd": str(first)})
+    terminal.register_task_env_overrides("two", {"cwd": str(second)})
 
     result = json.loads(
         await terminal.terminal_tool(f"cd {destination}", task_id="one")
     )
 
     assert result["exit_code"] == 0
-    assert await terminal.get_session_cwd("one") == str(destination)
-    assert await terminal.get_session_cwd("two") == str(second)
+    assert terminal.get_session_cwd("one") == str(destination)
+    assert terminal.get_session_cwd("two") == str(second)
 
 
 @pytest.mark.asyncio
@@ -88,7 +88,7 @@ async def test_next_command_runs_from_updated_cwd(tmp_path):
     destination = tmp_path / "destination"
     start.mkdir()
     destination.mkdir()
-    await terminal.register_task_env_overrides("session", {"cwd": str(start)})
+    terminal.register_task_env_overrides("session", {"cwd": str(start)})
 
     await terminal.terminal_tool(f"cd {destination}", task_id="session")
     result = json.loads(await terminal.terminal_tool("pwd", task_id="session"))
@@ -102,11 +102,11 @@ async def test_child_record_can_diverge_without_mutating_parent(tmp_path):
     child = tmp_path / "child"
     parent.mkdir()
     child.mkdir()
-    await terminal.record_session_cwd("parent", str(parent))
-    await terminal.record_session_cwd(
-        "child", await terminal.get_session_cwd("parent")
+    terminal.record_session_cwd("parent", str(parent))
+    terminal.record_session_cwd(
+        "child", terminal.get_session_cwd("parent")
     )
-    await terminal.record_session_cwd("child", str(child))
+    terminal.record_session_cwd("child", str(child))
 
-    assert await terminal.get_session_cwd("parent") == str(parent)
-    assert await terminal.get_session_cwd("child") == str(child)
+    assert terminal.get_session_cwd("parent") == str(parent)
+    assert terminal.get_session_cwd("child") == str(child)

@@ -11,6 +11,7 @@ from pyleak.eventloop import LeakAction
 
 from agent.auxiliary_client import scoped_runtime_main
 from mini_swe_runner import MiniSWERunner
+from tests.e2e.trajectory_assertions import assert_exact_terminal_trajectory
 
 
 LIVE = os.environ.get("HERMES_LIVE_TESTS") == "1"
@@ -43,6 +44,14 @@ async def test_live_single_runner_tool_observation_trajectory_and_cleanup(
 
     observation = "LIVE_SINGLE_RUNNER_OBSERVATION_8C42"
     final = "LIVE_SINGLE_RUNNER_FINAL_8C42"
+    command = f"printf {observation}"
+    prompt = (
+        "Make exactly two model responses. In the first response, emit no "
+        "visible text and call terminal exactly once with exactly these "
+        f'arguments and no extra keys: {{"command":"{command}"}}. After the '
+        "tool observation, make no further tool calls and emit exactly this "
+        f"visible final answer with no other text: {final}"
+    )
     runner = MiniSWERunner(
         model=model,
         cwd=str(tmp_path),
@@ -55,24 +64,17 @@ async def test_live_single_runner_tool_observation_trajectory_and_cleanup(
         no_task_leaks(action=LeakAction.RAISE),
     ):
         with scoped_runtime_main({"provider": PROVIDER, "model": model}):
-            result = await runner.run_task(
-                "Call the terminal tool exactly once with command "
-                f"`printf {observation}`. After reading its result, call no "
-                f"more tools and reply exactly {final}."
-            )
+            result = await runner.run_task(prompt)
 
     conversations = result["conversations"]
     assert result["completed"] is True
     assert result["api_calls"] == 2
-    assert [turn["from"] for turn in conversations] == [
-        "system",
-        "human",
-        "gpt",
-        "tool",
-        "gpt",
-    ]
-    assert '"name": "terminal"' in conversations[2]["value"]
-    assert observation in conversations[3]["value"]
-    assert conversations[4]["value"].strip() == final
+    assert_exact_terminal_trajectory(
+        conversations,
+        prompt=prompt,
+        command=command,
+        observation=observation,
+        final=final,
+    )
     assert runner.client is None
     assert runner.env is None

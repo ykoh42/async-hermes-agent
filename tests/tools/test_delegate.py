@@ -12,14 +12,17 @@ Run with:  python -m pytest tests/test_delegate.py -v
 import asyncio
 import json
 import os
+import tempfile
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from blockbuster import BlockBuster
 
+from agent import secret_scope
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -35,6 +38,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_workspace_hint,
 )
 
 
@@ -69,7 +73,7 @@ def _make_child_mock():
     return child
 
 
-class TestDelegateRequirements(unittest.IsolatedAsyncioTestCase):
+class TestDelegateRequirements(unittest.TestCase):
 
     def test_schema_valid(self):
         self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
@@ -94,17 +98,18 @@ class TestDelegateRequirements(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
-class TestChildSystemPrompt(unittest.IsolatedAsyncioTestCase):
+class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
-class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
-    def test_removes_blocked_toolsets(self):
+@pytest.mark.asyncio
+class TestStripBlockedTools:
+    async def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "custom"])
-        self.assertEqual(sorted(result), ["custom", "file", "terminal"])
+        assert sorted(result) == ["custom", "file", "terminal"]
 
     async def test_mixed_composite_is_subtracted_at_child_assembly(self):
         """A mixed platform bundle must not re-expose blocked leaf tools.
@@ -136,13 +141,13 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
 
         _, kwargs = MockAgent.call_args
         disabled = kwargs["disabled_toolsets"]
-        self.assertIn("browser", disabled)
+        assert "browser" in disabled
         for toolset_name in (
             "clarify",
             "delegation",
             "memory",
         ):
-            self.assertIn(toolset_name, disabled)
+            assert toolset_name in disabled
         definitions = await model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
@@ -150,8 +155,8 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
             skip_tool_search_assembly=True,
         )
         names = {item["function"]["name"] for item in definitions}
-        self.assertTrue(names & {"terminal", "read_file", "web_search"})
-        self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
+        assert names & {"terminal", "read_file", "web_search"}
+        assert DELEGATE_BLOCKED_TOOLS.isdisjoint(names)
 
     async def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
@@ -180,7 +185,7 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
 
         _, kwargs = MockAgent.call_args
         disabled = kwargs["disabled_toolsets"]
-        self.assertNotIn("delegation", disabled)
+        assert "delegation" not in disabled
         definitions = await model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
@@ -188,30 +193,20 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
             skip_tool_search_assembly=True,
         )
         names = {item["function"]["name"] for item in definitions}
-        self.assertIn("delegate_task", names)
-        self.assertTrue(
-            (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
-        )
+        assert "delegate_task" in names
+        assert (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
 
-    async def test_acp_command_probe_runs_off_the_event_loop(self):
+    async def test_acp_command_probe_uses_async_path_resolution(self):
         parent = _make_mock_parent()
-
-        def which_with_filesystem_probe(command):
-            with open(__file__):
-                pass
-            return f"/usr/bin/{command}"
-
-        with (
-            patch("run_agent.AIAgent") as MockAgent,
-            patch(
-                "tools.delegate_tool.shutil.which",
-                side_effect=which_with_filesystem_probe,
-            ),
-        ):
-            MockAgent.return_value = MagicMock()
-            blocker = BlockBuster()
-            blocker.activate()
-            try:
+        with tempfile.TemporaryDirectory() as directory:
+            command_path = Path(directory) / "codex-acp"
+            command_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            command_path.chmod(0o700)
+            with (
+                patch("run_agent.AIAgent") as MockAgent,
+                patch.dict(os.environ, {"PATH": directory}),
+            ):
+                MockAgent.return_value = MagicMock()
                 await _build_child_agent(
                     task_index=0,
                     goal="Use the configured ACP transport",
@@ -223,11 +218,9 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
                     task_count=1,
                     override_acp_command="codex-acp",
                 )
-            finally:
-                blocker.deactivate()
 
         _, kwargs = MockAgent.call_args
-        self.assertEqual(kwargs["acp_command"], "codex-acp")
+        assert kwargs["acp_command"] == "codex-acp"
 
 
 @pytest.mark.asyncio
@@ -258,6 +251,42 @@ async def test_first_delegate_uses_lazy_tracker_workspace(
 
     _, kwargs = MockAgent.call_args
     assert str(tmp_path) in kwargs["ephemeral_system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_hint_uses_active_profile_cwd(monkeypatch, tmp_path):
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "foreign"))
+    previous_multiplex = secret_scope.is_multiplex_active()
+    outer_scope = secret_scope.set_secret_scope(None)
+    secret_scope.set_multiplex_active(True)
+    parent = _make_mock_parent()
+    parent._subdirectory_hints = None
+    parent.terminal_cwd = None
+    parent.cwd = None
+    profile_cwds = {label: tmp_path / label for label in ("a", "b")}
+    for cwd in profile_cwds.values():
+        cwd.mkdir()
+
+    async def resolve(label: str):
+        token = secret_scope.set_secret_scope(
+            {"TERMINAL_CWD": str(profile_cwds[label])}
+        )
+        try:
+            await asyncio.sleep(0)
+            return await _resolve_workspace_hint(parent)
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    try:
+        assert await asyncio.gather(resolve("a"), resolve("b")) == [
+            str(profile_cwds["a"]),
+            str(profile_cwds["b"]),
+        ]
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            await _resolve_workspace_hint(parent)
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+        secret_scope.reset_secret_scope(outer_scope)
 
 
 class TestDelegateTask(unittest.IsolatedAsyncioTestCase):
@@ -1559,9 +1588,11 @@ class TestFallbackModelInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+@pytest.mark.asyncio
 class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.parent = _make_mock_parent(depth=0)
+        self.parent.session_id = "parent-session"
         self.parent._background_delegations = set()
         self.parent._closed = False
         self.parent.event_callback = MagicMock()
@@ -1581,6 +1612,29 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
             "command": None,
             "args": None,
         }
+
+    async def asyncSetUp(self):
+        from tools import async_delegation
+        from tools.process_registry import process_registry
+
+        self._delegation_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._delegation_home.cleanup)
+        self.enterContext(
+            patch(
+                "tools.async_delegation._db_path",
+                return_value=Path(self._delegation_home.name) / "state.db",
+            )
+        )
+        await async_delegation._reset_for_tests()
+        process_registry.completion_queue = asyncio.Queue()
+
+    async def asyncTearDown(self):
+        from tools import async_delegation
+        from tools.process_registry import process_registry
+
+        await async_delegation._reset_for_tests()
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
 
     async def _dispatch(self, run_child):
         self.enterContext(
@@ -1615,7 +1669,6 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
     async def test_top_level_model_dispatch_returns_before_child_finishes(self):
         started = asyncio.Event()
         release = asyncio.Event()
-        reinjected = asyncio.Event()
 
         async def run_child(*_args, **_kwargs):
             started.set()
@@ -1627,11 +1680,6 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
                 "duration_seconds": 0.1,
             }
 
-        async def run_parent(message, **kwargs):
-            reinjected.set()
-            return {"final_response": "used the child result"}
-
-        self.parent.run_conversation.side_effect = run_parent
         output = json.loads(await self._dispatch(run_child))
 
         self.assertEqual(output["status"], "dispatched")
@@ -1642,17 +1690,19 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
             "keep working; its full result re-enters the conversation as a "
             "new message when it finishes. Do not wait or poll — just continue.",
         )
-        self.assertEqual(len(self.parent._background_delegations), 1)
         await asyncio.wait_for(started.wait(), timeout=1)
         self.parent.run_conversation.assert_not_awaited()
 
         release.set()
-        await asyncio.wait_for(reinjected.wait(), timeout=1)
-        tasks = tuple(self.parent._background_delegations)
-        await asyncio.gather(*tasks)
+        from tools.process_registry import (
+            format_process_notification,
+            process_registry,
+        )
 
-        message = self.parent.run_conversation.await_args.args[0]
-        kwargs = self.parent.run_conversation.await_args.kwargs
+        event = await asyncio.wait_for(
+            process_registry.completion_queue.get(), timeout=1
+        )
+        message = format_process_notification(event)
         self.assertIn(
             "[ASYNC DELEGATION BATCH COMPLETE — " + output["delegation_id"] + "]",
             message,
@@ -1670,11 +1720,8 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
             "migration verified",
             message,
         )
-        self.assertEqual(
-            kwargs["persist_user_display_kind"],
-            "async_delegation_complete",
-        )
-        self.parent.event_callback.assert_called_once()
+        self.parent.run_conversation.assert_not_awaited()
+        self.parent.event_callback.assert_not_called()
 
     async def test_nested_orchestrator_awaits_its_worker(self):
         self.parent._delegate_depth = 1
@@ -1703,10 +1750,15 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("child lifecycle crashed")
 
         output = json.loads(await self._dispatch(run_child))
-        (task,) = self.parent._background_delegations
-        await task
+        from tools.process_registry import (
+            format_process_notification,
+            process_registry,
+        )
 
-        message = self.parent.run_conversation.await_args.args[0]
+        event = await asyncio.wait_for(
+            process_registry.completion_queue.get(), timeout=1
+        )
+        message = format_process_notification(event)
         self.assertIn(
             "[ASYNC DELEGATION BATCH COMPLETE — " + output["delegation_id"] + "]",
             message,
@@ -1717,19 +1769,8 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
             "RuntimeError: child lifecycle crashed",
             message,
         )
-        self.assertEqual(
-            self.parent.run_conversation.await_args.kwargs[
-                "persist_user_display_kind"
-            ],
-            "async_delegation_complete",
-        )
-        self.parent.event_callback.assert_called_once_with(
-            "delegation:error",
-            {
-                "delegation_id": output["delegation_id"],
-                "error": "child lifecycle crashed",
-            },
-        )
+        self.parent.run_conversation.assert_not_awaited()
+        self.parent.event_callback.assert_not_called()
 
     async def test_cancelling_background_owner_cancels_child_work(self):
         started = asyncio.Event()
@@ -1745,9 +1786,12 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
         output = json.loads(await self._dispatch(run_child))
         self.assertEqual(output["status"], "dispatched")
         await asyncio.wait_for(started.wait(), timeout=1)
-        (task,) = self.parent._background_delegations
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        from tools.async_delegation import interrupt_for_session
+
+        self.assertEqual(
+            await interrupt_for_session(parent_session_id="parent-session"),
+            1,
+        )
 
         await asyncio.wait_for(cancelled.wait(), timeout=1)
         self.parent.run_conversation.assert_not_awaited()

@@ -70,6 +70,33 @@ async def test_gateway_token_override_is_isolated_between_concurrent_profiles(
 
 
 @pytest.mark.asyncio
+async def test_gateway_token_override_does_not_borrow_process_token(
+    monkeypatch,
+    tmp_path,
+):
+    from agent import secret_scope
+
+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "wrong-process-token")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    previous = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        empty_scope = secret_scope.set_secret_scope({})
+        try:
+            assert await gateway.peek_nous_access_token() is None
+        finally:
+            secret_scope.reset_secret_scope(empty_scope)
+
+        with pytest.raises(
+            secret_scope.UnscopedSecretError,
+            match="TOOL_GATEWAY_USER_TOKEN",
+        ):
+            await gateway.peek_nous_access_token()
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+@pytest.mark.asyncio
 async def test_read_nous_access_token_refreshes_expiring_token(
     monkeypatch,
     tmp_path,

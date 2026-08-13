@@ -22,10 +22,11 @@ update when it's noticed.
 
 import json
 import logging
-import os
 import datetime
 import uuid
 from typing import Any, Dict, Optional
+
+from agent.secret_scope import get_secret
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
 # eagerly added ~64 ms to every CLI cold start because
@@ -556,7 +557,7 @@ async def _resolve_fal_model() -> tuple:
 
     # Env var escape hatch (undocumented; backward-compat for tests/scripts).
     if not model_id:
-        model_id = os.getenv("FAL_IMAGE_MODEL", "").strip()
+        model_id = (get_secret("FAL_IMAGE_MODEL", "") or "").strip()
 
     if not model_id:
         return DEFAULT_MODEL, FAL_MODELS[DEFAULT_MODEL]

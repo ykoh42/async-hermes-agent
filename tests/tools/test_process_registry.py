@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shlex
+import signal
 import sys
 from types import SimpleNamespace
 
@@ -614,3 +615,126 @@ async def test_checkpoint_recovery_refuses_recycled_pid(
     restarted = ProcessRegistry()
     assert await restarted.recover_from_checkpoint() == 0
     assert await restarted.get("proc_recycled") is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_via_env_checks_returncode_when_wrapper_fails():
+    class Environment:
+        async def execute(self, _command, **_kwargs):
+            return {"output": "syntax error", "returncode": 2}
+
+    registry = ProcessRegistry()
+    session = await registry.spawn_via_env(Environment(), "echo hello")
+
+    assert session.exited is True
+    assert session.exit_code == 2
+    assert session.pid is None
+    assert session.output_buffer == "syntax error"
+    assert session.id not in registry._running
+
+
+@pytest.mark.asyncio
+async def test_spawn_via_env_quotes_async_temp_path():
+    class Environment:
+        def __init__(self):
+            self.command = ""
+
+        async def get_temp_dir(self):
+            return "/tmp/remote path"
+
+        async def execute(self, command, **_kwargs):
+            self.command = command
+            return {"output": "syntax error", "returncode": 2}
+
+    registry = ProcessRegistry()
+    environment = Environment()
+    await registry.spawn_via_env(environment, "echo hello")
+
+    assert "mkdir -p '/tmp/remote path'" in environment.command
+    assert "> '/tmp/remote path/hermes_bg_" in environment.command
+
+
+@pytest.mark.asyncio
+async def test_spawn_via_env_polls_output_and_exit_code(monkeypatch):
+    monkeypatch.setattr(process_registry_module, "_REMOTE_POLL_INTERVAL_SECONDS", 0)
+
+    class Environment:
+        def __init__(self):
+            self.commands: list[tuple[str, dict]] = []
+
+        async def execute(self, command, **kwargs):
+            self.commands.append((command, kwargs))
+            if "nohup bash -lc" in command:
+                return {"output": "4321\n", "returncode": 0}
+            if command.startswith("cat ") and ".log" in command:
+                return {"output": "hello from sandbox\n", "returncode": 0}
+            if command.startswith("kill -0"):
+                return {"output": "1\n", "returncode": 0}
+            if command.startswith("cat ") and ".exit" in command:
+                return {"output": "7\n", "returncode": 0}
+            raise AssertionError(command)
+
+    registry = ProcessRegistry()
+    environment = Environment()
+    session = await registry.spawn_via_env(
+        environment,
+        "printf hello",
+        cwd="/root",
+        task_id="sandbox-task",
+        session_key="session",
+    )
+    await asyncio.wait_for(session._completion_event.wait(), timeout=1)
+
+    assert session.pid == 4321
+    assert session.pid_scope == "sandbox"
+    assert session.output_buffer == "hello from sandbox\n"
+    assert session.exit_code == 7
+    assert session.completion_reason == "exited"
+    assert session.id in registry._finished
+    launch_command, launch_kwargs = environment.commands[0]
+    assert "nohup bash -lc" in launch_command
+    assert launch_kwargs["rewrite_compound_background"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remote_kill_finishes_before_reraising(monkeypatch):
+    monkeypatch.setattr(
+        process_registry_module,
+        "_REMOTE_POLL_INTERVAL_SECONDS",
+        0.01,
+    )
+    kill_started = asyncio.Event()
+    release_kill = asyncio.Event()
+    kill_completed = asyncio.Event()
+
+    class Environment:
+        async def execute(self, command, **_kwargs):
+            if "nohup bash -lc" in command:
+                return {"output": "9876\n", "returncode": 0}
+            if command == "kill 9876 2>/dev/null":
+                kill_started.set()
+                await release_kill.wait()
+                kill_completed.set()
+                return {"output": "", "returncode": 0}
+            if command.startswith("cat ") and ".log" in command:
+                return {"output": "", "returncode": 0}
+            if command.startswith("kill -0"):
+                return {"output": "0\n", "returncode": 0}
+            raise AssertionError(command)
+
+    registry = ProcessRegistry()
+    session = await registry.spawn_via_env(Environment(), "sleep 30")
+    killing = asyncio.create_task(registry.kill_process(session.id))
+    await kill_started.wait()
+    killing.cancel()
+    await asyncio.sleep(0)
+    killing.cancel()
+    assert killing.done() is False
+    release_kill.set()
+    with pytest.raises(asyncio.CancelledError):
+        await killing
+
+    assert kill_completed.is_set()
+    assert session.exited is True
+    assert session.exit_code == -signal.SIGTERM
+    assert session.id in registry._finished

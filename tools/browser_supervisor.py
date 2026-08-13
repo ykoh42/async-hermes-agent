@@ -21,14 +21,21 @@ Design spec: ``website/docs/developer-guide/browser-supervisor.md``.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
+import os
+import threading
 import time
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from typing import Any, Coroutine, Dict, List, Optional, Tuple
 
+import aiofiles.os
 import websockets
 from websockets.asyncio.client import ClientConnection
+
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -1414,20 +1421,208 @@ class CDPSupervisor:
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 
-class _SupervisorRegistry:
-    """Process-global (task_id → supervisor) map with idempotent start/stop.
+_SupervisorScopeKey = tuple[object, str]
+_SUPERVISOR_NO_LOOP = object()
+_supervisor_scope_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("browser_supervisor_profile_scope", default=None)
+)
+_supervisor_scope_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_supervisor_scope_aliases_lock = threading.RLock()
 
-    One instance, exposed as ``SUPERVISOR_REGISTRY``. Mutations are serialized
-    on the active event loop.
+
+def _lexical_supervisor_profile_identity() -> str:
+    """Return the environment-only profile marker without filesystem I/O."""
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_supervisor_scope_key() -> _SupervisorScopeKey:
+    """Return the active loop/profile scope without filesystem I/O."""
+    lexical = _lexical_supervisor_profile_identity()
+    try:
+        loop: object = asyncio.get_running_loop()
+    except RuntimeError:
+        return _SUPERVISOR_NO_LOOP, lexical
+    active = _supervisor_scope_context.get()
+    if active is not None and active[0] == lexical:
+        return loop, active[1]
+    with _supervisor_scope_aliases_lock:
+        aliases = _supervisor_scope_aliases.get(loop)
+        canonical = aliases.get(lexical, lexical) if aliases is not None else lexical
+    return loop, canonical
+
+
+async def _activate_supervisor_scope() -> tuple[
+    _SupervisorScopeKey,
+    _SupervisorScopeKey,
+]:
+    """Resolve the active profile canonically on its owning event loop."""
+    lexical = _lexical_supervisor_profile_identity()
+    loop = asyncio.get_running_loop()
+    lexical_key: _SupervisorScopeKey = (loop, lexical)
+    active = _supervisor_scope_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = str(await expanduser(lexical))
+        is_absolute = (
+            expanded.startswith(("/", "\\\\"))
+            or (
+                len(expanded) >= 3
+                and expanded[1] == ":"
+                and expanded[2] in "/\\"
+            )
+        )
+        if not is_absolute:
+            expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        canonical = os.path.normcase(str(await realpath(expanded)))
+    with _supervisor_scope_aliases_lock:
+        _supervisor_scope_aliases.setdefault(loop, {})[lexical] = canonical
+    _supervisor_scope_context.set((lexical, canonical))
+    return lexical_key, (loop, canonical)
+
+
+@dataclass
+class _SupervisorRegistryState:
+    """Supervisors and mutation lock owned by one loop/profile pair."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    by_task: Dict[str, CDPSupervisor] = field(default_factory=dict)
+
+
+async def _finish_owned_registry_task(task: asyncio.Task[Any]) -> Any:
+    """Finish registry-owned cleanup before propagating caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _stop_supervisor_owned(supervisor: CDPSupervisor) -> None:
+    """Stop one detached registry value through repeated cancellation."""
+    await _finish_owned_registry_task(asyncio.create_task(supervisor.stop()))
+
+
+class _SupervisorRegistry:
+    """Loop/profile-scoped task-id map with idempotent start/stop.
+
+    One process-global instance is exposed as ``SUPERVISOR_REGISTRY``, while
+    every supervisor remains owned by the event loop and canonical Hermes
+    profile that created it. This preserves upstream task-id semantics without
+    allowing another profile or event loop to operate on the supervisor task.
     """
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._by_task: Dict[str, CDPSupervisor] = {}
+        self._scope_lock = threading.RLock()
+        self._loop_profile_states: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, _SupervisorRegistryState]
+        ] = weakref.WeakKeyDictionary()
+        self._staged_profile_states: dict[str, _SupervisorRegistryState] = {}
+
+    def _prune_closed_loops(self) -> None:
+        """Drop closed-loop values so their tasks cannot retain dead loops."""
+        with self._scope_lock:
+            for loop in tuple(self._loop_profile_states):
+                if loop.is_closed():
+                    states = self._loop_profile_states.pop(loop, {})
+                    abandoned = sum(len(state.by_task) for state in states.values())
+                    if abandoned:
+                        logger.debug(
+                            "Discarding %s CDP supervisor(s) owned by a closed loop",
+                            abandoned,
+                        )
+        with _supervisor_scope_aliases_lock:
+            for loop in tuple(_supervisor_scope_aliases):
+                if loop.is_closed():
+                    _supervisor_scope_aliases.pop(loop, None)
+
+    def _states_for_scope(
+        self,
+        scope: _SupervisorScopeKey,
+    ) -> tuple[dict[str, _SupervisorRegistryState], str]:
+        loop, profile = scope
+        if loop is _SUPERVISOR_NO_LOOP:
+            return self._staged_profile_states, profile
+        assert isinstance(loop, asyncio.AbstractEventLoop)
+        states = self._loop_profile_states.get(loop)
+        if states is None:
+            states = {}
+            self._loop_profile_states[loop] = states
+        return states, profile
+
+    def _profile_state(self) -> _SupervisorRegistryState:
+        self._prune_closed_loops()
+        with self._scope_lock:
+            states, profile = self._states_for_scope(
+                _current_supervisor_scope_key()
+            )
+            return states.setdefault(profile, _SupervisorRegistryState())
+
+    async def _activate_profile_state(
+        self,
+    ) -> tuple[_SupervisorScopeKey, _SupervisorRegistryState]:
+        self._prune_closed_loops()
+        lexical_key, canonical_key = await _activate_supervisor_scope()
+        with self._scope_lock:
+            states, profile = self._states_for_scope(canonical_key)
+            state = states.setdefault(profile, _SupervisorRegistryState())
+            source_keys = (
+                lexical_key,
+                (_SUPERVISOR_NO_LOOP, lexical_key[1]),
+            )
+            for source_key in source_keys:
+                if source_key == canonical_key:
+                    continue
+                source_states, source_profile = self._states_for_scope(source_key)
+                staged = source_states.pop(source_profile, None)
+                if staged is not None:
+                    state.by_task.update(staged.by_task)
+            return canonical_key, state
+
+    def _discard_empty_state(
+        self,
+        scope: _SupervisorScopeKey,
+        state: _SupervisorRegistryState,
+    ) -> None:
+        with self._scope_lock:
+            states, profile = self._states_for_scope(scope)
+            if states.get(profile) is state and not state.by_task:
+                states.pop(profile, None)
+            loop = scope[0]
+            if loop is not _SUPERVISOR_NO_LOOP and not states:
+                assert isinstance(loop, asyncio.AbstractEventLoop)
+                if loop in self._loop_profile_states:
+                    del self._loop_profile_states[loop]
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """Private compatibility view of the active scope's mutation lock."""
+        return self._profile_state().lock
+
+    @property
+    def _by_task(self) -> Dict[str, CDPSupervisor]:
+        """Private dict-compatible view retained for upstream test hooks."""
+        return self._profile_state().by_task
 
     def get(self, task_id: str) -> Optional[CDPSupervisor]:
         """Return the supervisor for ``task_id`` if running, else ``None``."""
-        return self._by_task.get(task_id)
+        return self._profile_state().by_task.get(task_id)
 
     async def get_or_start(
         self,
@@ -1443,8 +1638,9 @@ class _SupervisorRegistry:
         If a supervisor exists for this task but was bound to a different
         ``cdp_url``, the old one is stopped and a fresh one is started.
         """
-        async with self._lock:
-            existing = self._by_task.get(task_id)
+        scope, state = await self._activate_profile_state()
+        async with state.lock:
+            existing = state.by_task.get(task_id)
             if existing is not None:
                 if existing.cdp_url == cdp_url:
                     run_task = getattr(existing, "_run_task", None)
@@ -1453,9 +1649,9 @@ class _SupervisorRegistry:
                         return existing
                     # Unhealthy — tear down and recreate.
                 # URL changed or unhealthy — tear down, fall through to re-create.
-                self._by_task.pop(task_id, None)
+                state.by_task.pop(task_id, None)
         if existing is not None:
-            await existing.stop()
+            await _stop_supervisor_owned(existing)
 
         supervisor = CDPSupervisor(
             task_id=task_id,
@@ -1464,30 +1660,108 @@ class _SupervisorRegistry:
             dialog_timeout_s=dialog_timeout_s,
         )
         await supervisor.start(timeout=start_timeout)
-        async with self._lock:
-            # Guard against a concurrent get_or_start from another task.
-            already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url:
+        try:
+            async with state.lock:
+                # Guard against a concurrent get_or_start from another task.
+                already = state.by_task.get(task_id)
+                if already is None:
+                    state.by_task[task_id] = supervisor
+                    return supervisor
+                if already.cdp_url != cdp_url:
+                    state.by_task[task_id] = supervisor
+        except BaseException:
+            await _stop_supervisor_owned(supervisor)
+            self._discard_empty_state(scope, state)
+            raise
+        if already.cdp_url == cdp_url:
+            await _stop_supervisor_owned(supervisor)
+            return already
+        try:
+            await _stop_supervisor_owned(already)
+        except BaseException:
+            async def rollback_replacement() -> None:
+                async with state.lock:
+                    if state.by_task.get(task_id) is supervisor:
+                        state.by_task.pop(task_id, None)
                 await supervisor.stop()
-                return already
-            self._by_task[task_id] = supervisor
+                self._discard_empty_state(scope, state)
+
+            await _finish_owned_registry_task(
+                asyncio.create_task(rollback_replacement())
+            )
+            raise
         return supervisor
 
     async def stop(self, task_id: str) -> None:
         """Stop and discard the supervisor for ``task_id`` if it exists."""
-        async with self._lock:
-            supervisor = self._by_task.pop(task_id, None)
+        scope, state = await self._activate_profile_state()
+        async with state.lock:
+            supervisor = state.by_task.pop(task_id, None)
         if supervisor is not None:
-            await supervisor.stop()
+            await _stop_supervisor_owned(supervisor)
+        self._discard_empty_state(scope, state)
 
     async def stop_all(self) -> None:
-        """Stop every running supervisor. For shutdown / test teardown."""
-        async with self._lock:
-            items = list(self._by_task.items())
-            self._by_task.clear()
-        async with asyncio.TaskGroup() as group:
-            for _, supervisor in items:
-                group.create_task(supervisor.stop())
+        """Stop every supervisor at the process-final emergency boundary.
+
+        Each shutdown coroutine is dispatched to the event loop that owns its
+        supervisors. Ordinary profile cleanup uses :meth:`stop` instead, so it
+        cannot terminate another profile's or loop's live browser.
+        """
+        await self._activate_profile_state()
+        current_loop = asyncio.get_running_loop()
+        with self._scope_lock:
+            owner_loops = tuple(self._loop_profile_states)
+
+        async def stop_on_owner_loop(
+            owner_loop: asyncio.AbstractEventLoop,
+        ) -> None:
+            with self._scope_lock:
+                loop_states = tuple(
+                    self._loop_profile_states.get(owner_loop, {}).items()
+                )
+            supervisors: list[CDPSupervisor] = []
+            for _, state in loop_states:
+                async with state.lock:
+                    supervisors.extend(state.by_task.values())
+                    state.by_task.clear()
+            with self._scope_lock:
+                states = self._loop_profile_states.get(owner_loop)
+                if states is not None:
+                    for profile, state in loop_states:
+                        if states.get(profile) is state and not state.by_task:
+                            states.pop(profile, None)
+                    if not states:
+                        self._loop_profile_states.pop(owner_loop, None)
+            async with asyncio.TaskGroup() as group:
+                for supervisor in supervisors:
+                    group.create_task(supervisor.stop())
+
+        async def dispatch_to_owner_loop(
+            owner_loop: asyncio.AbstractEventLoop,
+        ) -> None:
+            if owner_loop is current_loop:
+                await stop_on_owner_loop(owner_loop)
+                return
+            if owner_loop.is_closed() or not owner_loop.is_running():
+                logger.debug(
+                    "Cannot stop CDP supervisors on an inactive owner loop"
+                )
+                return
+            coroutine = stop_on_owner_loop(owner_loop)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, owner_loop)
+            except BaseException:
+                coroutine.close()
+                raise
+            await asyncio.wrap_future(future)
+
+        async def stop_owned() -> None:
+            async with asyncio.TaskGroup() as group:
+                for owner_loop in owner_loops:
+                    group.create_task(dispatch_to_owner_loop(owner_loop))
+
+        await _finish_owned_registry_task(asyncio.create_task(stop_owned()))
 
 
 SUPERVISOR_REGISTRY = _SupervisorRegistry()

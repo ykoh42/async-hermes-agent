@@ -22,15 +22,16 @@ import asyncio
 import base64
 import logging
 import mimetypes
-import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import aiofiles
 import aiofiles.os
-import httpx
 
+if TYPE_CHECKING:
+    import httpx
+from agent.secret_scope import UnscopedSecretError, get_secret
 from agent.video_gen_provider import (
     VideoGenProvider,
     error_response,
@@ -39,6 +40,21 @@ from agent.video_gen_provider import (
 from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    """Resolve httpx lazily while preserving the plugin patch surface."""
+    if name == "httpx":
+        module = _get_httpx_module()
+        globals()["httpx"] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _get_httpx_module():
+    import httpx as httpx_module
+
+    return httpx_module
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +116,16 @@ async def _resolve_xai_credentials() -> Tuple[str, str]:
         from tools.xai_http import resolve_xai_http_credentials
 
         creds = await resolve_xai_http_credentials() or {}
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("xAI credential resolver failed: %s", exc)
         creds = {}
 
-    api_key = str(creds.get("api_key") or os.getenv("XAI_API_KEY", "")).strip()
+    api_key = str(creds.get("api_key") or get_secret("XAI_API_KEY", "")).strip()
     base_url = str(
         creds.get("base_url")
-        or os.getenv("XAI_BASE_URL")
+        or get_secret("XAI_BASE_URL")
         or DEFAULT_XAI_BASE_URL
     ).strip().rstrip("/")
     return api_key, base_url
@@ -800,6 +818,7 @@ async def _submit_xai_video_payload(
     operation: str,
     resolution: Optional[str] = None,
 ) -> Dict[str, Any]:
+    httpx = _get_httpx_module()
     try:
         from tools.xai_http import (
             build_xai_storage_options,

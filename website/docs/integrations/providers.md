@@ -46,8 +46,8 @@ API-key variable.
 | `anthropic` | `ANTHROPIC_API_KEY`, `ANTHROPIC_TOKEN`, or Claude OAuth | Native Anthropic |
 | `gemini` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Native Gemini HTTP |
 | `vertex` | Google Application Default Credentials | Google Vertex |
-| `bedrock` | AWS SDK credential chain | AWS Bedrock Converse |
-| `azure-foundry` | `AZURE_FOUNDRY_API_KEY` and `AZURE_FOUNDRY_BASE_URL`, or Entra ID | OpenAI-compatible / Azure identity |
+| `bedrock` | AWS SDK credential chain | AWS Bedrock Converse (SDK bootstrap limitation below) |
+| `azure-foundry` | `AZURE_FOUNDRY_API_KEY` and `AZURE_FOUNDRY_BASE_URL`, or restricted Entra ID | OpenAI-compatible / Azure identity |
 | `openai-codex` | ChatGPT/Codex OAuth state | Codex Responses |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` | GitHub Copilot |
 | `nous` | `NOUS_API_KEY` or Nous OAuth state | OpenAI-compatible |
@@ -83,7 +83,8 @@ synchronous discovery fallback; subsequent calls reuse the in-memory registry.
 
 ## Retained transport families
 
-The retained runtime has native async paths for these families:
+The retained runtime exposes awaited paths for these families. Their network
+transports are native async except where the SDK boundary below says otherwise:
 
 | Family | Typical profiles | Dependency |
 | --- | --- | --- |
@@ -91,8 +92,8 @@ The retained runtime has native async paths for these families:
 | Native Anthropic | `anthropic` | `anthropic` extra |
 | Google Gemini HTTP | `gemini` | Base install |
 | Google Vertex | `vertex` | `vertex` extra for credentials |
-| Microsoft Foundry/Azure | `azure-foundry` | `azure-identity` extra for Entra ID |
-| AWS Bedrock | `bedrock` | `bedrock` extra |
+| Microsoft Foundry/Azure | `azure-foundry` | Base transport; restricted `azure-identity` extra for Entra ID |
+| AWS Bedrock | `bedrock` | `bedrock` extra; see SDK boundary below |
 | Codex Responses and Copilot ACP | Corresponding bundled profiles | Profile-specific credentials/runtime |
 
 Bundled profile discovery includes additional OpenAI-compatible services. A
@@ -113,6 +114,27 @@ uv sync --extra bedrock
 
 See [Installation](../getting-started/installation.md) for the complete extras
 list.
+
+### Azure Identity and Bedrock SDK boundaries
+
+The pinned `azure-identity` asynchronous package does not expose the same
+credential chain as its synchronous `DefaultAzureCredential`: broker and
+interactive-browser entries are absent, while workload identity, shared token
+cache, Visual Studio Code, and certificate paths still perform synchronous
+file/cache work. Async Hermes therefore enables only the verified client-secret
+environment or managed-identity route and fails clearly when an unsupported
+chain is selected. Static Azure Foundry API-key authentication is unaffected.
+
+The pinned `aiobotocore` transport provides coroutine network requests, but
+client/credential construction still synchronously loads botocore config and
+service-model files. AWS profile, SSO, web-identity, and related file-backed
+credential chains therefore do not satisfy this project's strict zero-thread,
+OS-native bootstrap ideal. This is a documented SDK boundary rather than a
+hidden thread fallback in Hermes. A single-profile process may still use the
+SDK's default chain with that bootstrap limitation. When profile multiplexing
+is active, Hermes accepts explicit profile-scoped AWS credentials or Bedrock
+bearer authentication and fails explicitly for shared/global credential
+chains that cannot be isolated safely.
 
 ## Custom OpenAI-compatible endpoint
 

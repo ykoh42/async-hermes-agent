@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+from agent import secret_scope
 from hermes_cli import codex_models
 from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
 
@@ -89,3 +91,34 @@ async def test_codex_model_resolver_reads_local_sources_asynchronously(
     assert models[0:2] == ["configured-model", "cached-model"]
     assert "hidden-model" not in models
     assert set(DEFAULT_CODEX_MODELS).issubset(models)
+
+
+@pytest.mark.asyncio
+async def test_codex_model_resolver_does_not_share_os_user_state_in_multiplex(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("CODEX_HOME", "/foreign/process/codex")
+
+    token = secret_scope.set_secret_scope({})
+    try:
+        with pytest.raises(RuntimeError, match="profile-scoped CODEX_HOME"):
+            await get_codex_model_ids()
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+
+@pytest.mark.asyncio
+async def test_live_codex_model_result_does_not_require_local_codex_home(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    fetch = AsyncMock(return_value=["live-codex-model"])
+    monkeypatch.setattr(codex_models, "_fetch_models_from_api", fetch)
+    token = secret_scope.set_secret_scope({})
+    try:
+        models = await get_codex_model_ids("profile-access-token")
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert models[0] == "live-codex-model"

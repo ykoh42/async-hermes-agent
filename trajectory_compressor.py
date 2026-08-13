@@ -54,6 +54,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 from agent.retry_utils import jittered_backoff
+from agent.secret_scope import get_secret
 
 
 _KIMI_TOKENIZER_NAME = "moonshotai/Kimi-K2-Thinking"
@@ -311,7 +312,7 @@ async def _load_hf_tokenizer_assets(
             "HF_HUB_OFFLINE is enabled."
         )
 
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    token = get_secret("HF_TOKEN") or get_secret("HUGGING_FACE_HUB_TOKEN")
     common_headers = {"User-Agent": "async-hermes-agent/trajectory-compressor"}
     if token:
         common_headers["Authorization"] = f"Bearer {token}"
@@ -1060,7 +1061,7 @@ class TrajectoryCompressor:
         else:
             # Custom endpoint — retain only lazy client construction metadata.
             self._use_call_llm = False
-            api_key = os.getenv(self.config.api_key_env)
+            api_key = get_secret(self.config.api_key_env)
             if not api_key:
                 raise RuntimeError(
                     f"Missing API key. Set {self.config.api_key_env} "

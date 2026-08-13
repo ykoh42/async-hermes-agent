@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlencode
 
 
 def import_fal_client() -> Any:
-    """Import and return the optional ``fal_client`` SDK."""
-    import fal_client  # type: ignore[import-not-found]
+    """Return the preloaded SDK without cold-importing it on an event loop."""
+    loaded = sys.modules.get("fal_client")
+    if loaded is not None:
+        return loaded
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        import fal_client  # type: ignore[import-not-found]
 
-    return fal_client
+        return fal_client
+    raise ImportError(
+        "fal-client must be installed before the async runtime starts. "
+        "Install async-hermes-agent[fal] and import run_agent before entering "
+        "the application event loop."
+    )
 
 
 async def _create_fal_client(fal_client: Any, *, key: str | None = None) -> Any:

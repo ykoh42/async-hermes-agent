@@ -1,5 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+import pytest
+
 from tools.registry import ToolRegistry
 from model_tools import get_all_tool_names
 from toolsets import (
@@ -190,8 +192,9 @@ class TestToolsetConsistency:
             assert "tools" in ts, f"{name} missing tools"
             assert "includes" in ts, f"{name} missing includes"
 
-    def test_static_toolsets_only_reference_registered_tools(self):
-        registered = set(get_all_tool_names())
+    @pytest.mark.asyncio
+    async def test_static_toolsets_only_reference_registered_tools(self):
+        registered = set(await get_all_tool_names())
         missing = {
             tool
             for toolset in TOOLSETS.values()
@@ -231,3 +234,17 @@ class TestResolveToolsetIncludeRegistry:
 
     def test_registry_only_toolset_static_view_is_empty(self):
         assert resolve_toolset("__definitely_not_a_real_toolset__", include_registry=False) == []
+
+
+def test_tts_toolset_preserves_upstream_core_classification():
+    from toolsets import _HERMES_CORE_TOOLS
+
+    assert "text_to_speech" in _HERMES_CORE_TOOLS
+    assert TOOLSETS["tts"] == {
+        "description": (
+            "Text-to-speech: convert text to audio with Edge TTS (free), "
+            "ElevenLabs, OpenAI, or xAI"
+        ),
+        "tools": ["text_to_speech"],
+        "includes": [],
+    }

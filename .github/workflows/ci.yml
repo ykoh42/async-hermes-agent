@@ -74,3 +74,39 @@ jobs:
 
       - name: Build distributions
         run: uv build
+
+  python-compatibility:
+    name: Python ${{ matrix.python-version }} compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Install project and test dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev
+
+      - name: Test retained compatibility surface
+        run: >-
+          scripts/run_tests.sh -j 2 -- -q
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+          tests/runtime/test_core.py
+          tests/test_hermes_state.py
+          tests/tools/test_terminal_exit_semantics.py

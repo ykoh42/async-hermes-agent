@@ -468,6 +468,8 @@ class TestIsInteractive:
             dt.join()
         finally:
             loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=5)
+            loop.close()
 
         assert result["cross_thread"] is True, "probe must run on the loop thread"
         # The whole point: suppression must hold on the loop thread.

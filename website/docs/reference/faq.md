@@ -57,9 +57,12 @@ tool limits still determine performance.
 
 ## Which providers work?
 
-The retained registry includes native Anthropic, Gemini, Vertex and Bedrock
-routes, Codex and cloud-identity routes, many OpenAI-compatible profiles, and
-custom/local endpoints. Some require an optional dependency extra. See
+The retained registry includes Anthropic, Gemini, Vertex, Bedrock, Codex and
+cloud-identity routes, many OpenAI-compatible profiles, and custom/local
+endpoints. Most network transports are native async; Bedrock and some identity
+SDK paths retain the blocking bootstrap limitations documented in
+[Providers](/integrations/providers). Some routes require an optional
+dependency extra. See
 [Providers](/integrations/providers) and the provider's plugin manifest.
 
 ## A provider says the key is missing

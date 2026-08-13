@@ -23,13 +23,17 @@ def _clear_caches():
 
 
 class TestTerminalRequirements:
-    def test_local_backend_requirements(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_local_backend_requirements(self, monkeypatch):
+        async def local_config():
+            return {"env_type": "local"}
+
         monkeypatch.setattr(
             terminal_tool_module,
             "_get_env_config",
-            lambda: {"env_type": "local"},
+            local_config,
         )
-        assert terminal_tool_module.check_terminal_requirements() is True
+        assert await terminal_tool_module.check_terminal_requirements() is True
 
 class TestCheckFnTransientFailureSuppression:
     """The check_fn TTL cache should absorb transient probe failures.
@@ -248,7 +252,7 @@ class TestCheckFnTransientFailureSuppression:
 
         flake = {"first": True}
 
-        def flaky_terminal_check():
+        async def flaky_terminal_check():
             if flake["first"]:
                 flake["first"] = False
                 return True

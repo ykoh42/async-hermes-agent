@@ -108,7 +108,7 @@ async def test_shell_file_operations_real_native_async_workflow(tmp_path):
         assert write.verified is True
 
         read = await ops.read_file("notes.txt")
-        assert read.to_dict()["content"] == "1|old value"
+        assert read.to_dict()["content"] == "1|old value\n2|"
 
         patch = await ops.patch_replace("notes.txt", "old value", "new value")
         assert patch.success is True
@@ -146,7 +146,7 @@ async def test_shell_file_operations_tracks_live_environment_cwd(tmp_path):
         assert ops.cwd == str(first)
 
         read = await ops.read_file("target.txt")
-        assert read.content == "1|second"
+        assert read.content == "1|second\n2|"
     finally:
         await env.cleanup()
 

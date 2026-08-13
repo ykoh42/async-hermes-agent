@@ -55,11 +55,16 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+import weakref
+from collections.abc import Iterator, MutableMapping
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
+
+import aiofiles.os
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
@@ -742,7 +747,7 @@ def build_or_headers(or_config: dict | None = None) -> dict:
     or_config = or_config or {}
 
     # Determine cache enabled: env var overrides config.
-    env_cache = os.environ.get("HERMES_OPENROUTER_CACHE", "").strip().lower()
+    env_cache = _scoped_key_env("HERMES_OPENROUTER_CACHE").lower()
     if env_cache:
         cache_enabled = env_cache in _TRUTHY_ENV_VALUES
     else:
@@ -754,7 +759,7 @@ def build_or_headers(or_config: dict | None = None) -> dict:
     headers["X-OpenRouter-Cache"] = "true"
 
     # Determine TTL: env var overrides config.
-    env_ttl = os.environ.get("HERMES_OPENROUTER_CACHE_TTL", "").strip()
+    env_ttl = _scoped_key_env("HERMES_OPENROUTER_CACHE_TTL")
     if env_ttl:
         if env_ttl.isdigit():
             ttl = int(env_ttl)
@@ -820,6 +825,28 @@ NOUS_EXTRA_BODY = _nous_extra_body()
 
 # Set at resolve time — True if the auxiliary client points to Nous Portal
 auxiliary_is_nous: bool = False
+_AUXILIARY_IS_NOUS_CONTEXT: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("auxiliary_is_nous_context", default=None)
+)
+
+
+def _set_auxiliary_is_nous(value: bool) -> None:
+    """Record one route without sharing it across concurrent agent turns.
+
+    The historical module attribute remains a best-effort compatibility
+    snapshot. Runtime request shaping reads the task-local value so two
+    agents resolving different providers on one loop cannot overwrite each
+    other's Nous routing decision.
+    """
+    global auxiliary_is_nous
+    auxiliary_is_nous = value
+    _AUXILIARY_IS_NOUS_CONTEXT.set(value)
+
+
+def _is_auxiliary_nous_route() -> bool:
+    """Return the task-local route, or the compatibility snapshot if unset."""
+    scoped = _AUXILIARY_IS_NOUS_CONTEXT.get()
+    return auxiliary_is_nous if scoped is None else scoped
 
 # Default auxiliary models per provider
 _OPENROUTER_MODEL = "google/gemini-3.6-flash"
@@ -967,11 +994,9 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
     if entry is None:
         return str(fallback or "").strip().rstrip("/")
     if getattr(entry, "provider", None) == "nous":
-        # Funnel through the canonical auth-layer reader so the env override
-        # shares one normalization path with the rest of the NOUS resolution.
-        from hermes_cli.auth import _nous_inference_env_override
-
-        env_url = _nous_inference_env_override()
+        # Preserve the upstream non-empty env override while reading it from
+        # the active profile instead of the process-global environment.
+        env_url = _scoped_key_env("NOUS_INFERENCE_BASE_URL").rstrip("/")
         if env_url:
             return env_url
     # runtime_base_url handles provider-specific logic (e.g. nous prefers inference_base_url).
@@ -1010,7 +1035,10 @@ def _is_anthropic_compatible_host(url: str) -> bool:
 
 def _nous_min_key_ttl_seconds() -> int:
     try:
-        return max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
+        return max(
+            60,
+            int(_scoped_key_env("HERMES_NOUS_MIN_KEY_TTL_SECONDS") or "1800"),
+        )
     except (TypeError, ValueError):
         return 1800
 
@@ -1019,16 +1047,9 @@ def _scoped_key_env(name: str) -> str:
     """Read a provider key without borrowing another profile's secret."""
     if not name:
         return ""
-    try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+    from agent.secret_scope import get_secret
 
-        try:
-            return (get_secret(name) or "").strip()
-        except UnscopedSecretError:
-            pass
-    except Exception:
-        pass
-    return (os.getenv(name) or "").strip()
+    return (get_secret(name) or "").strip()
 
 
 # ── Codex Responses → chat.completions adapter ─────────────────────────────
@@ -1813,7 +1834,9 @@ def _nous_api_key(provider: dict) -> str:
 
 def _nous_base_url() -> str:
     """Resolve the Nous inference base URL from env or default."""
-    return os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
+    from agent.secret_scope import get_secret
+
+    return str(get_secret("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL))
 
 
 async def _resolve_nous_pool_runtime_api(
@@ -1913,6 +1936,8 @@ async def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     auth-store-only logins. Returns ``None`` if the user is not authenticated
     with xAI Grok OAuth.
     """
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         from hermes_cli.auth import (
             DEFAULT_XAI_OAUTH_BASE_URL,
@@ -1929,8 +1954,8 @@ async def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
                     or ""
                 ).strip()
                 base_url = _xai_validate_inference_base_url(
-                    os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
-                    or os.getenv("XAI_BASE_URL", "").strip().rstrip("/")
+                    _scoped_key_env("HERMES_XAI_BASE_URL").rstrip("/")
+                    or _scoped_key_env("XAI_BASE_URL").rstrip("/")
                     or str(getattr(entry, "runtime_base_url", None) or "")
                     .strip()
                     .rstrip("/")
@@ -1939,6 +1964,8 @@ async def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
                 )
                 if api_key and base_url:
                     return api_key, base_url
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
 
@@ -2094,18 +2121,14 @@ async def _resolve_api_key_provider(
             return _client, model
 
         api_key = next(
-            (
-                os.getenv(env_var, "").strip()
-                for env_var in pconfig.api_key_env_vars
-                if os.getenv(env_var, "").strip()
-            ),
+            filter(None, (_scoped_key_env(name) for name in pconfig.api_key_env_vars)),
             "",
         )
         if not api_key:
             continue
 
         raw_base_url = (
-            os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
+            _scoped_key_env(pconfig.base_url_env_var).rstrip("/")
             if pconfig.base_url_env_var
             else ""
         ) or pconfig.inference_base_url
@@ -2326,8 +2349,7 @@ async def _try_nous(
             "Auxiliary Nous: runtime JWT refresh failed; checking stored "
             "auth.json token."
         )
-    global auxiliary_is_nous
-    auxiliary_is_nous = True
+    _set_auxiliary_is_nous(True)
     logger.debug("Auxiliary client: Nous Portal")
 
     # Ask the Portal which model it currently recommends for this task type.
@@ -2671,7 +2693,9 @@ def _resolve_custom_runtime(
         logger.debug("Auxiliary client: custom config resolution failed: %s", exc)
         model_config = {}
 
-    custom_base = model_config.get("base_url") or os.getenv("OPENAI_BASE_URL", "")
+    custom_base = model_config.get("base_url") or _scoped_key_env(
+        "OPENAI_BASE_URL"
+    )
     custom_key = model_config.get("api_key") or _scoped_key_env("OPENAI_API_KEY")
     custom_mode = model_config.get("api_mode")
     if not isinstance(custom_base, str) or not custom_base.strip():
@@ -2767,7 +2791,7 @@ async def _try_custom_endpoint(
         config = await load_config_readonly()
     runtime = _normalize_main_runtime(None)
     custom_base = str(
-        runtime.get("base_url") or os.getenv("OPENAI_BASE_URL") or ""
+        runtime.get("base_url") or _scoped_key_env("OPENAI_BASE_URL")
     ).strip()
     custom_key = runtime.get("api_key") or _scoped_key_env("OPENAI_API_KEY")
     custom_mode = str(runtime.get("api_mode") or "").strip() or None
@@ -3224,8 +3248,54 @@ def _get_provider_chain() -> List[tuple]:
 # the user might be running two profiles with different OpenRouter keys.
 
 _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
-_aux_unhealthy_until: Dict[str, float] = {}
-_aux_unhealthy_logged_at: Dict[str, float] = {}
+
+
+def _auxiliary_profile_key() -> str:
+    """Return a filesystem-free key for the active profile context."""
+    return os.path.normcase(os.path.normpath(str(get_hermes_home())))
+
+
+class _ProfileScopedHealthCache(MutableMapping[str, float]):
+    """Present the upstream dict contract for only the active profile.
+
+    A payment failure belongs to the credentials of one profile. Sharing the
+    old process-global map made a depleted key in profile A disable a healthy
+    provider in profile B. The proxy keeps existing private dict operations
+    (including test/plugin ``clear`` and membership checks) while isolating
+    storage by the task-local Hermes home.
+    """
+
+    def __init__(self) -> None:
+        self._by_profile: Dict[str, Dict[str, float]] = {}
+
+    def _active(self, *, create: bool = False) -> Dict[str, float]:
+        profile_key = _auxiliary_profile_key()
+        if create:
+            return self._by_profile.setdefault(profile_key, {})
+        return self._by_profile.get(profile_key, {})
+
+    def __getitem__(self, key: str) -> float:
+        return self._active()[key]
+
+    def __setitem__(self, key: str, value: float) -> None:
+        self._active(create=True)[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._active()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._active())
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def clear(self) -> None:
+        profile_key = _auxiliary_profile_key()
+        self._by_profile.pop(profile_key, None)
+
+
+_aux_unhealthy_until: MutableMapping[str, float] = _ProfileScopedHealthCache()
+_aux_unhealthy_logged_at: MutableMapping[str, float] = _ProfileScopedHealthCache()
 
 # Map provider names that show up in resolved_provider / explicit-config
 # back to the chain labels used by _get_provider_chain(). Keep in sync
@@ -3753,18 +3823,32 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
 
 async def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
+    await _activate_auxiliary_cache_scope()
     normalized = _normalize_aux_provider(provider)
+    entries: list[tuple[Any, Any]] = []
     async with _client_cache_lock:
         stale_keys = [
             key
             for key in _client_cache
             if _normalize_aux_provider(str(key[0])) == normalized
         ]
-        clients = [_client_cache.get(key, (None, None, None))[0] for key in stale_keys]
+        entries = [
+            _client_cache.get(key, (None, None, None))
+            for key in stale_keys
+        ]
         for key in stale_keys:
             _client_cache.pop(key, None)
-    for client in clients:
-        await _close_cached_client(client)
+    for client, _default_model, bound_loop in entries:
+        # Compatibility tests/plugins may replace the private scoped cache
+        # with a plain dict. Preserve the historical immediate close contract
+        # for those explicitly injected loop-less objects.
+        if (
+            isinstance(_client_cache, _ScopedAuxiliaryClientCache)
+            and bound_loop is not None
+        ):
+            _retired_auxiliary_clients[id(client)] = client
+        else:
+            await _close_cached_client(client)
 
 
 async def _evict_cached_client_instance(target: Any) -> bool:
@@ -3783,6 +3867,7 @@ async def _evict_cached_client_instance(target: Any) -> bool:
     """
     if target is None:
         return False
+    await _activate_auxiliary_cache_scope()
     evicted = False
     async with _client_cache_lock:
         for key in list(_client_cache.keys()):
@@ -5011,8 +5096,8 @@ async def _resolve_auto(
       2. OpenRouter → Nous → custom → Codex → API-key providers (fallback
          chain, only used when the main provider has no working client).
     """
-    global auxiliary_is_nous, _stale_base_url_warned
-    auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    global _stale_base_url_warned
+    _set_auxiliary_is_nous(False)  # _try_nous() sets True when it wins.
     if config is None:
         from hermes_cli.config import load_config_readonly
 
@@ -5030,7 +5115,7 @@ async def _resolve_auto(
     #    scenario where a user switches providers via `hermes model` but the
     #    old OPENAI_BASE_URL lingers in ~/.hermes/.env. ──
     if not _stale_base_url_warned:
-        _env_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        _env_base = _scoped_key_env("OPENAI_BASE_URL")
         model_cfg = (
             config_snapshot.get("model", {})
             if isinstance(config_snapshot, dict)
@@ -6118,7 +6203,7 @@ async def resolve_provider_client(
         base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
         if (
             is_anthropic_bedrock_model(final_model)
-            and not os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip()
+            and not _scoped_key_env("AWS_BEARER_TOKEN_BEDROCK")
         ):
             real_client = await build_anthropic_bedrock_client(region)
             client = AnthropicAuxiliaryClient(
@@ -6602,7 +6687,7 @@ def get_auxiliary_extra_body() -> dict:
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. Returns empty dict otherwise.
     """
-    return _nous_extra_body() if auxiliary_is_nous else {}
+    return _nous_extra_body() if _is_auxiliary_nous_route() else {}
 
 
 def _build_auxiliary_max_tokens_param(
@@ -6652,7 +6737,7 @@ async def auxiliary_max_tokens_param(
     return _build_auxiliary_max_tokens_param(
         value,
         model=model,
-        provider="nous" if auxiliary_is_nous else None,
+        provider="nous" if _is_auxiliary_nous_route() else None,
         config=await load_config_readonly(),
     )
 
@@ -6669,15 +6754,203 @@ async def auxiliary_max_tokens_param(
 # Every auxiliary LLM consumer should use these instead of manually
 # constructing clients and calling .chat.completions.create().
 
-# Client cache: (provider, base_url, api_key, api_mode, runtime_key) -> (client, default_model, loop)
-# NOTE: loop identity is NOT part of the key. On cache hits we check
-# whether the cached loop is the *current* loop; if not, the stale entry is
-# replaced in-place.  This bounds cache growth to one entry per unique
-# provider config rather than one per (config × event-loop), which previously
-# caused unbounded fd accumulation in long-running gateway processes (#10200).
-_client_cache: Dict[tuple, tuple] = {}
-_client_cache_lock = asyncio.Lock()
+# Client cache entries retain their upstream key/value shapes, but the mapping
+# itself is scoped to one event loop and canonical Hermes profile. Replacing a
+# process-global entry on a cross-loop/profile hit can otherwise invalidate a
+# transport while its original request is still in flight.
+_AuxiliaryCacheScope = tuple[asyncio.AbstractEventLoop | object, str]
+_AUXILIARY_CACHE_NO_LOOP = object()
+_auxiliary_cache_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("auxiliary_client_cache_scope", default=None)
+)
+_auxiliary_cache_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_auxiliary_cache_guard = threading.RLock()
+
+
+def _lexical_auxiliary_cache_profile() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_auxiliary_cache_scope() -> _AuxiliaryCacheScope:
+    lexical = _lexical_auxiliary_cache_profile()
+    try:
+        loop: asyncio.AbstractEventLoop | object = asyncio.get_running_loop()
+    except RuntimeError:
+        return _AUXILIARY_CACHE_NO_LOOP, lexical
+    active = _auxiliary_cache_context.get()
+    if active is not None and active[0] == lexical:
+        return loop, active[1]
+    with _auxiliary_cache_guard:
+        aliases = _auxiliary_cache_aliases.get(loop)
+        canonical = aliases.get(lexical, lexical) if aliases is not None else lexical
+    return loop, canonical
+
+
+class _ScopedAuxiliaryClientCache(MutableMapping):
+    """Dict-compatible view over the active loop/profile client cache."""
+
+    def __init__(self) -> None:
+        self._loop_values: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            dict[str, dict],
+        ] = weakref.WeakKeyDictionary()
+        self._staged_values: dict[str, dict] = {}
+
+    def _active(self) -> dict:
+        loop, profile = _current_auxiliary_cache_scope()
+        with _auxiliary_cache_guard:
+            if loop is _AUXILIARY_CACHE_NO_LOOP:
+                return self._staged_values.setdefault(profile, {})
+            assert isinstance(loop, asyncio.AbstractEventLoop)
+            return self._loop_values.setdefault(loop, {}).setdefault(profile, {})
+
+    def __getitem__(self, key):
+        return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        del self._active()[key]
+
+    def __iter__(self) -> Iterator:
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def clear(self) -> None:
+        loop, profile = _current_auxiliary_cache_scope()
+        with _auxiliary_cache_guard:
+            if loop is _AUXILIARY_CACHE_NO_LOOP:
+                # Preserve the historical private fixture hook: a synchronous
+                # process-level reset must not leave hidden loop scopes behind.
+                self._loop_values.clear()
+                self._staged_values.clear()
+                return
+            assert isinstance(loop, asyncio.AbstractEventLoop)
+            profiles = self._loop_values.get(loop)
+            if profiles is not None:
+                profiles.pop(profile, None)
+                if not profiles:
+                    self._loop_values.pop(loop, None)
+
+    def migrate(
+        self,
+        source: _AuxiliaryCacheScope,
+        target: _AuxiliaryCacheScope,
+    ) -> None:
+        if source == target:
+            return
+        source_loop, source_profile = source
+        target_loop, target_profile = target
+        assert isinstance(target_loop, asyncio.AbstractEventLoop)
+        with _auxiliary_cache_guard:
+            if source_loop is _AUXILIARY_CACHE_NO_LOOP:
+                source_values = self._staged_values.pop(source_profile, {})
+            else:
+                assert isinstance(source_loop, asyncio.AbstractEventLoop)
+                source_profiles = self._loop_values.get(source_loop)
+                source_values = (
+                    source_profiles.pop(source_profile, {})
+                    if source_profiles is not None
+                    else {}
+                )
+                if source_profiles is not None and not source_profiles:
+                    self._loop_values.pop(source_loop, None)
+            if source_values:
+                target_values = self._loop_values.setdefault(
+                    target_loop, {}
+                ).setdefault(target_profile, {})
+                for key, value in source_values.items():
+                    target_values.setdefault(key, value)
+
+
+class _ScopedAuxiliaryCacheLock:
+    """Async lock routed to the current loop/profile without loop retention."""
+
+    def __init__(self) -> None:
+        self._locks: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            dict[str, weakref.ReferenceType[asyncio.Lock]],
+        ] = weakref.WeakKeyDictionary()
+        self._held: contextvars.ContextVar[asyncio.Lock | None] = (
+            contextvars.ContextVar("auxiliary_client_cache_lock", default=None)
+        )
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        _, profile = _current_auxiliary_cache_scope()
+        with _auxiliary_cache_guard:
+            locks = self._locks.setdefault(loop, {})
+            lock_ref = locks.get(profile)
+            lock = lock_ref() if lock_ref is not None else None
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[profile] = weakref.ref(lock)
+            return lock
+
+    async def __aenter__(self) -> asyncio.Lock:
+        lock = self._lock()
+        await lock.acquire()
+        self._held.set(lock)
+        return lock
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        lock = self._held.get()
+        self._held.set(None)
+        if lock is not None:
+            lock.release()
+
+
+_client_cache: MutableMapping[tuple, tuple] = _ScopedAuxiliaryClientCache()
+_retired_auxiliary_clients: MutableMapping[int, Any] = (
+    _ScopedAuxiliaryClientCache()
+)
+_client_cache_lock = _ScopedAuxiliaryCacheLock()
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
+
+
+async def _activate_auxiliary_cache_scope() -> _AuxiliaryCacheScope:
+    loop = asyncio.get_running_loop()
+    lexical = _lexical_auxiliary_cache_profile()
+    active = _auxiliary_cache_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = str(await expanduser(lexical))
+        is_absolute = (
+            expanded.startswith(("/", "\\\\"))
+            or (
+                len(expanded) >= 3
+                and expanded[1] == ":"
+                and expanded[2] in "/\\"
+            )
+        )
+        if not is_absolute:
+            expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        canonical = os.path.normcase(str(await realpath(expanded)))
+    target = (loop, canonical)
+    with _auxiliary_cache_guard:
+        _auxiliary_cache_aliases.setdefault(loop, {})[lexical] = canonical
+    if isinstance(_client_cache, _ScopedAuxiliaryClientCache):
+        _client_cache.migrate((loop, lexical), target)
+        _client_cache.migrate(
+            (_AUXILIARY_CACHE_NO_LOOP, lexical),
+            target,
+        )
+    if isinstance(_retired_auxiliary_clients, _ScopedAuxiliaryClientCache):
+        _retired_auxiliary_clients.migrate((loop, lexical), target)
+        _retired_auxiliary_clients.migrate(
+            (_AUXILIARY_CACHE_NO_LOOP, lexical),
+            target,
+        )
+    _auxiliary_cache_context.set((lexical, canonical))
+    return target
 
 
 class _CallableCacheDiscriminator:
@@ -6723,6 +6996,7 @@ async def _client_cache_key(
     task: Optional[str] = None,
     model: Optional[str] = None,
 ) -> tuple:
+    await _activate_auxiliary_cache_scope()
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = (
         tuple(
@@ -6768,10 +7042,11 @@ async def _store_cached_client(
     *,
     bound_loop: Any = None,
 ) -> None:
+    await _activate_auxiliary_cache_scope()
     async with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            await _close_cached_client(old_entry[0])
+            _retired_auxiliary_clients[id(old_entry[0])] = old_entry[0]
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
@@ -6865,11 +7140,103 @@ async def _close_cached_client(client: Any) -> None:
                 )
 
 
+_auxiliary_lifecycle_consumers: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, weakref.WeakSet[object]],
+] = weakref.WeakKeyDictionary()
+_auxiliary_lifecycle_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, weakref.ReferenceType[asyncio.Lock]],
+] = weakref.WeakKeyDictionary()
+_auxiliary_owner_scopes: weakref.WeakKeyDictionary[
+    object,
+    tuple[weakref.ReferenceType[asyncio.AbstractEventLoop], str],
+] = weakref.WeakKeyDictionary()
+
+
+def _auxiliary_lifecycle_lock(
+    scope: _AuxiliaryCacheScope,
+) -> asyncio.Lock:
+    loop, profile = scope
+    assert isinstance(loop, asyncio.AbstractEventLoop)
+    with _auxiliary_cache_guard:
+        locks = _auxiliary_lifecycle_locks.setdefault(loop, {})
+        lock_ref = locks.get(profile)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[profile] = weakref.ref(lock)
+        return lock
+
+
+def _auxiliary_consumers(
+    scope: _AuxiliaryCacheScope,
+) -> weakref.WeakSet[object]:
+    loop, profile = scope
+    assert isinstance(loop, asyncio.AbstractEventLoop)
+    with _auxiliary_cache_guard:
+        return _auxiliary_lifecycle_consumers.setdefault(loop, {}).setdefault(
+            profile,
+            weakref.WeakSet(),
+        )
+
+
+async def _retain_auxiliary_lifecycle(owner: object) -> None:
+    """Keep the active profile's shared auxiliary transports alive."""
+    scope = await _activate_auxiliary_cache_scope()
+    async with _auxiliary_lifecycle_lock(scope):
+        _auxiliary_consumers(scope).add(owner)
+        with _auxiliary_cache_guard:
+            _auxiliary_owner_scopes[owner] = (
+                weakref.ref(scope[0]),
+                scope[1],
+            )
+
+
+async def _release_auxiliary_lifecycle(owner: object) -> None:
+    """Close the owner's cache only after its profile's final lease."""
+    current_loop = asyncio.get_running_loop()
+    with _auxiliary_cache_guard:
+        retained_scope = _auxiliary_owner_scopes.get(owner)
+    if retained_scope is None:
+        return
+    retained_loop = retained_scope[0]()
+    if retained_loop is not current_loop:
+        raise RuntimeError(
+            "The auxiliary client lifecycle lease belongs to another event "
+            "loop; release it on its owning loop"
+        )
+    scope: _AuxiliaryCacheScope = (current_loop, retained_scope[1])
+    async with _auxiliary_lifecycle_lock(scope):
+        consumers = _auxiliary_consumers(scope)
+        if owner not in consumers:
+            with _auxiliary_cache_guard:
+                _auxiliary_owner_scopes.pop(owner, None)
+            return
+        consumers.remove(owner)
+        with _auxiliary_cache_guard:
+            _auxiliary_owner_scopes.pop(owner, None)
+        if not consumers:
+            from hermes_constants import (
+                reset_hermes_home_override,
+                set_hermes_home_override,
+            )
+
+            home_token = set_hermes_home_override(scope[1])
+            token = _auxiliary_cache_context.set((scope[1], scope[1]))
+            try:
+                await shutdown_cached_clients()
+            finally:
+                _auxiliary_cache_context.reset(token)
+                reset_hermes_home_override(home_token)
+
+
 async def shutdown_cached_clients() -> None:
     """Close all cached clients before their event loop shuts down.
 
     Call this during agent shutdown, while the event loop is still running.
     """
+    await _activate_auxiliary_cache_scope()
     cleanup_task = asyncio.create_task(
         _shutdown_cached_clients_owned(),
         name="auxiliary-client-cache-shutdown",
@@ -6881,8 +7248,14 @@ async def _shutdown_cached_clients_owned() -> None:
     """Close the cached client snapshot as one cancellation-safe operation."""
     async with _client_cache_lock:
         clients = [entry[0] for entry in _client_cache.values()]
+        clients.extend(_retired_auxiliary_clients.values())
         _client_cache.clear()
+        _retired_auxiliary_clients.clear()
+    seen: set[int] = set()
     for client in clients:
+        if client is None or id(client) in seen:
+            continue
+        seen.add(id(client))
         await _close_cached_client(client)
 
 
@@ -6983,7 +7356,7 @@ async def _get_cached_client(
             stale_client = cached_client
             del _client_cache[cache_key]
     if stale_client is not None:
-        _force_close_httpx_transport(stale_client)
+        _retired_auxiliary_clients[id(stale_client)] = stale_client
     # Build outside the lock.
     # For pool-backed api_key providers, derive the active API key from the
     # pool entry rather than from env vars.  resolve_api_key_provider_credentials
@@ -7021,7 +7394,8 @@ async def _get_cached_client(
                 # happen after in-flight users release it.
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
                     evict_key = next(iter(_client_cache))
-                    del _client_cache[evict_key]
+                    evicted_client = _client_cache.pop(evict_key)[0]
+                    _retired_auxiliary_clients[id(evicted_client)] = evicted_client
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
                 built_client = client
@@ -8359,7 +8733,7 @@ async def call_llm(
     extra_headers: Optional[Dict[str, str]] = None,
     api_mode: str = None,
     stream: bool = False,
-    stream_options: Optional[dict] = None,
+    stream_options: dict = None,
 ) -> Any:
     """Centralized native-async LLM call."""
     # Keep every async phase on the same runtime identity, even if another

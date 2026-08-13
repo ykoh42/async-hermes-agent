@@ -48,6 +48,7 @@ from hermes_state_common import (
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
+    _session_runtime_config_value,
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
@@ -278,7 +279,7 @@ async def _apply_delete_for_wal_reset_bug(
 
 
 async def apply_wal_with_fallback(
-    conn,
+    conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
     require_wal: bool = False,
@@ -366,7 +367,7 @@ async def apply_wal_with_fallback(
 
 
 async def apply_database_pragmas(
-    conn,
+    conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
 ) -> None:
@@ -911,7 +912,9 @@ async def fts5_cjk_so_path() -> Path:
 
 def _cjk_fts_config_enabled() -> bool:
     """config.yaml ``sessions.cjk_fts`` (default on), via its env bridge."""
-    return os.getenv("HERMES_CJK_FTS", "1").strip().lower() not in (
+    return _session_runtime_config_value(
+        "cjk_fts", "HERMES_CJK_FTS", "1"
+    ).strip().lower() not in (
         "0",
         "false",
         "off",
@@ -919,7 +922,7 @@ def _cjk_fts_config_enabled() -> bool:
     )
 
 
-async def load_fts5_cjk_extension(conn) -> bool:
+async def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
     """Best-effort load of the cjk_unicode61 tokenizer into ``connection``."""
     if not _cjk_fts_config_enabled():
         return False
@@ -3546,7 +3549,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         row = await cursor.fetchone()
         return row["value"] if row is not None else None
 
-    async def set_meta(self, key: str, value: str, *, cursor: Any = None) -> None:
+    async def set_meta(
+        self,
+        key: str,
+        value: str,
+        *,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> None:
         """Atomically upsert a value in the durable ``state_meta`` store."""
 
         if cursor is not None:
@@ -4078,7 +4087,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return count
 
     async def prune_empty_ghost_sessions(
-        self, sessions_dir: Optional[Path] = None
+        self, sessions_dir: "Optional[Path]" = None
     ) -> int:
         cutoff = time.time() - 86_400
         removed_ids: List[str] = []

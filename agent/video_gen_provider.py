@@ -54,7 +54,6 @@ import logging
 import uuid
 import aiofiles
 import aiofiles.os
-import httpx
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -382,6 +381,30 @@ def error_response(
     }
 
 
+async def _close_owned_client(client: Any) -> None:
+    """Close one SDK client before propagating repeated caller cancellation."""
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    close_task = asyncio.create_task(close())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(close_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if close_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
 # ---------------------------------------------------------------------------
 # Reusable OpenAI-compatible backend
 # ---------------------------------------------------------------------------
@@ -420,9 +443,9 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
     _poll_deadline_s: float = 900.0
 
     def _api_key(self) -> str:
-        import os
+        from agent.secret_scope import get_secret
 
-        return os.environ.get(self._env_key, "").strip()
+        return (get_secret(self._env_key, "") or "").strip()
 
     async def is_available(self) -> bool:
         return bool(self._api_key())
@@ -452,9 +475,11 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
         return video
 
     def _base_url(self) -> str:
-        import os
+        from agent.secret_scope import get_secret
 
-        override = os.environ.get(f"{self.name.upper()}_BASE_URL", "").strip()
+        override = (
+            get_secret(f"{self.name.upper()}_BASE_URL", "") or ""
+        ).strip()
         return override or self._default_base_url
 
     async def generate(
@@ -603,6 +628,4 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
                 provider=self.name,
             )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                await close()
+            await _close_owned_client(client)

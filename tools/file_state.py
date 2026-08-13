@@ -10,8 +10,8 @@ Design
 ------
 A process-wide singleton ``FileStateRegistry`` tracks, per resolved path:
 
-  * per-agent read stamps: {task_id: {path: (mtime, read_ts, partial)}}
-  * last writer globally: {path: (task_id, write_ts)}
+  * per-profile, per-agent read stamps: {task_id: {path: (mtime, read_ts, partial)}}
+  * last writer within a profile: {path: (task_id, write_ts)}
   * per-event-loop path locks for read→modify→write critical sections
 
 Three public hooks are used by the file tools:
@@ -33,15 +33,20 @@ loop detection, which is a different concern.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
+import threading
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from weakref import WeakKeyDictionary
 
 import aiofiles.os
+
+from hermes_constants import get_hermes_home
 
 
 # ── Public stamp type ────────────────────────────────────────────────
@@ -58,22 +63,115 @@ _MAX_PATHS_PER_AGENT = 4096
 # Global last-writer map cap.  Same policy.
 _MAX_GLOBAL_WRITERS = 4096
 
+_file_profile_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("file_state_profile_scope", default=None)
+)
+_file_profile_aliases: dict[str, str] = {}
+_file_profile_aliases_lock = threading.RLock()
+
+
+def _lexical_profile_identity() -> str:
+    """Return the environment-only marker for the active Hermes profile."""
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_profile_identity() -> str:
+    """Return the activated canonical profile, or its lexical staging key."""
+    lexical = _lexical_profile_identity()
+    active = _file_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    with _file_profile_aliases_lock:
+        return _file_profile_aliases.get(lexical, lexical)
+
+
+async def _resolve_profile_identity(lexical: str) -> str:
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = str(await expanduser(lexical))
+    is_absolute = (
+        expanded.startswith(("/", "\\\\"))
+        or (len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in "/\\")
+    )
+    if not is_absolute:
+        expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    return os.path.normcase(str(await realpath(expanded)))
+
+
+@dataclass
+class _FileProfileState:
+    """Read/write coordination metadata owned by one canonical profile."""
+
+    reads: Dict[str, Dict[str, ReadStamp]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    last_writer: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+    metadata_lock: threading.RLock = field(default_factory=threading.RLock)
+
 
 class FileStateRegistry:
     """Process-wide coordinator for cross-agent file edits."""
 
     def __init__(self) -> None:
-        self._reads: Dict[str, Dict[str, ReadStamp]] = defaultdict(dict)
-        self._last_writer: Dict[str, Tuple[str, float]] = {}
+        self._profile_states: dict[str, _FileProfileState] = {}
+        self._profile_states_lock = threading.RLock()
         self._path_locks: WeakKeyDictionary[
             asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]
         ] = WeakKeyDictionary()
+        self._path_locks_lock = threading.RLock()
+
+    def _profile_state(self) -> _FileProfileState:
+        profile = _current_profile_identity()
+        with self._profile_states_lock:
+            return self._profile_states.setdefault(profile, _FileProfileState())
+
+    async def _activate_profile_state(self) -> _FileProfileState:
+        lexical = _lexical_profile_identity()
+        active = _file_profile_context.get()
+        if active is not None and active[0] == lexical:
+            canonical = active[1]
+        else:
+            canonical = await _resolve_profile_identity(lexical)
+            with _file_profile_aliases_lock:
+                _file_profile_aliases[lexical] = canonical
+            _file_profile_context.set((lexical, canonical))
+        with self._profile_states_lock:
+            state = self._profile_states.setdefault(canonical, _FileProfileState())
+            if lexical != canonical:
+                staged = self._profile_states.pop(lexical, None)
+                if staged is not None and staged is not state:
+                    with staged.metadata_lock, state.metadata_lock:
+                        for task_id, paths in staged.reads.items():
+                            current = state.reads[task_id]
+                            for path, stamp in paths.items():
+                                prior = current.get(path)
+                                if prior is None or stamp[1] > prior[1]:
+                                    current[path] = stamp
+                        for path, writer in staged.last_writer.items():
+                            prior = state.last_writer.get(path)
+                            if prior is None or writer[1] > prior[1]:
+                                state.last_writer[path] = writer
+            return state
+
+    @property
+    def _reads(self) -> Dict[str, Dict[str, ReadStamp]]:
+        """Private dict-compatible view for the active profile."""
+        return self._profile_state().reads
+
+    @property
+    def _last_writer(self) -> Dict[str, Tuple[str, float]]:
+        """Private dict-compatible view for the active profile."""
+        return self._profile_state().last_writer
 
     # ── Path lock management ────────────────────────────────────────
     def _lock_for(self, resolved: str) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
-        locks = self._path_locks.setdefault(loop, {})
-        return locks.setdefault(resolved, asyncio.Lock())
+        with self._path_locks_lock:
+            for known_loop in tuple(self._path_locks):
+                if known_loop.is_closed():
+                    self._path_locks.pop(known_loop, None)
+            locks = self._path_locks.setdefault(loop, {})
+            return locks.setdefault(resolved, asyncio.Lock())
 
     @asynccontextmanager
     async def lock_path(self, resolved: str):
@@ -92,15 +190,17 @@ class FileStateRegistry:
     ) -> None:
         if _disabled():
             return
+        state = await self._activate_profile_state()
         if mtime is None:
             try:
                 mtime = (await aiofiles.os.stat(resolved)).st_mtime
             except OSError:
                 return
         now = time.time()
-        agent_reads = self._reads[task_id]
-        agent_reads[resolved] = (float(mtime), now, bool(partial))
-        _cap_dict(agent_reads, _MAX_PATHS_PER_AGENT)
+        with state.metadata_lock:
+            agent_reads = state.reads[task_id]
+            agent_reads[resolved] = (float(mtime), now, bool(partial))
+            _cap_dict(agent_reads, _MAX_PATHS_PER_AGENT)
 
     async def note_write(
         self,
@@ -117,17 +217,19 @@ class FileStateRegistry:
         """
         if _disabled():
             return
+        state = await self._activate_profile_state()
         if mtime is None:
             try:
                 mtime = (await aiofiles.os.stat(resolved)).st_mtime
             except OSError:
                 return
         now = time.time()
-        self._last_writer[resolved] = (task_id, now)
-        _cap_dict(self._last_writer, _MAX_GLOBAL_WRITERS)
-        # Writer's own view is now up-to-date.
-        self._reads[task_id][resolved] = (float(mtime), now, False)
-        _cap_dict(self._reads[task_id], _MAX_PATHS_PER_AGENT)
+        with state.metadata_lock:
+            state.last_writer[resolved] = (task_id, now)
+            _cap_dict(state.last_writer, _MAX_GLOBAL_WRITERS)
+            # Writer's own view is now up-to-date.
+            state.reads[task_id][resolved] = (float(mtime), now, False)
+            _cap_dict(state.reads[task_id], _MAX_PATHS_PER_AGENT)
 
     async def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
         """Return a model-facing warning if this write would be stale.
@@ -143,8 +245,10 @@ class FileStateRegistry:
         """
         if _disabled():
             return None
-        stamp = self._reads.get(task_id, {}).get(resolved)
-        last_writer = self._last_writer.get(resolved)
+        state = await self._activate_profile_state()
+        with state.metadata_lock:
+            stamp = state.reads.get(task_id, {}).get(resolved)
+            last_writer = state.last_writer.get(resolved)
 
         # Case 3: never read AND we have no write record — net-new file or
         # first touch by this agent.  Let existing _check_sensitive_path
@@ -218,33 +322,40 @@ class FileStateRegistry:
         """
         if _disabled():
             return {}
+        state = self._profile_state()
         paths_set = set(paths)
         out: Dict[str, List[str]] = defaultdict(list)
-        for p, (writer_tid, ts) in self._last_writer.items():
-            if writer_tid == exclude_task_id:
-                continue
-            if ts < since_ts:
-                continue
-            if p in paths_set:
-                out[writer_tid].append(p)
+        with state.metadata_lock:
+            for p, (writer_tid, ts) in state.last_writer.items():
+                if writer_tid == exclude_task_id:
+                    continue
+                if ts < since_ts:
+                    continue
+                if p in paths_set:
+                    out[writer_tid].append(p)
         return dict(out)
 
     def known_reads(self, task_id: str) -> List[str]:
         """Return the list of resolved paths this agent has read."""
         if _disabled():
             return []
-        return list(self._reads.get(task_id, {}).keys())
+        state = self._profile_state()
+        with state.metadata_lock:
+            return list(state.reads.get(task_id, {}).keys())
 
     # ── Testing hooks ───────────────────────────────────────────────
     def clear(self) -> None:
         """Reset all state.  Intended for tests only."""
-        self._reads.clear()
-        self._last_writer.clear()
-        self._path_locks.clear()
+        with self._profile_states_lock:
+            self._profile_states.clear()
+        with self._path_locks_lock:
+            self._path_locks.clear()
 
     def _clear_task(self, task_id: str) -> None:
         """Drop read stamps owned by a task whose environment was closed."""
-        self._reads.pop(task_id, None)
+        state = self._profile_state()
+        with state.metadata_lock:
+            state.reads.pop(task_id, None)
 
 
 # ── Module-level singleton + helpers ─────────────────────────────────
@@ -253,6 +364,12 @@ _registry = FileStateRegistry()
 
 def get_registry() -> FileStateRegistry:
     return _registry
+
+
+async def _activate_profile_scope() -> str:
+    """Activate canonical file metadata ownership for the current profile."""
+    await _registry._activate_profile_state()
+    return _current_profile_identity()
 
 
 def _disabled() -> bool:

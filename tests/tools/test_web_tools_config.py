@@ -1,16 +1,20 @@
 """Configuration and native-async dispatch contracts for web tools."""
 
+import asyncio
 import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent import secret_scope
 import tools.web_tools as web_tools
 
 
 @pytest.fixture(autouse=True)
 def clean_web_registry(monkeypatch):
+    previous_multiplex = secret_scope.is_multiplex_active()
+    scope_token = secret_scope.set_secret_scope(None)
     for key in (
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
@@ -21,6 +25,43 @@ def clean_web_registry(monkeypatch):
         "BRAVE_SEARCH_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
+    yield
+    secret_scope.reset_secret_scope(scope_token)
+    secret_scope.set_multiplex_active(previous_multiplex)
+
+
+@pytest.mark.asyncio
+async def test_backend_env_lookup_is_profile_scoped(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "foreign-process-key")
+    secret_scope.set_multiplex_active(True)
+
+    async def lookup(value: str) -> str:
+        token = secret_scope.set_secret_scope({"TAVILY_API_KEY": value})
+        try:
+            await asyncio.sleep(0)
+            return await web_tools._env_value("TAVILY_API_KEY")
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    assert await asyncio.gather(lookup("profile-a"), lookup("profile-b")) == [
+        "profile-a",
+        "profile-b",
+    ]
+
+    empty_token = secret_scope.set_secret_scope({"TAVILY_API_KEY": ""})
+    try:
+        assert await web_tools._env_value("TAVILY_API_KEY") == ""
+    finally:
+        secret_scope.reset_secret_scope(empty_token)
+
+
+@pytest.mark.asyncio
+async def test_backend_env_lookup_unscoped_multiplex_fails_closed(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "foreign-process-key")
+    secret_scope.set_multiplex_active(True)
+
+    with pytest.raises(secret_scope.UnscopedSecretError, match="TAVILY_API_KEY"):
+        await web_tools._env_value("TAVILY_API_KEY")
 
 
 @pytest.mark.asyncio

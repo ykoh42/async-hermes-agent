@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import sqlite3
 import time
@@ -24,6 +23,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _session_runtime_config_value,
 )
 
 
@@ -1148,7 +1148,11 @@ class SessionSearchMixin:
             return rows
         finally:
             try:
-                threshold = float(os.getenv("HERMES_SEARCH_SLOW_MS", "1000"))
+                threshold = float(
+                    _session_runtime_config_value(
+                        "search_slow_ms", "HERMES_SEARCH_SLOW_MS", "1000"
+                    )
+                )
             except (TypeError, ValueError):
                 threshold = 1000.0
             elapsed_ms = (time.time() - started) * 1000.0

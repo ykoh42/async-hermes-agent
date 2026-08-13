@@ -552,7 +552,7 @@ async def test_relative_write_uses_recorded_session_cwd(tmp_path):
     from tools.file_tools import write_file_tool
 
     task_id = "cwd-round-trip"
-    await terminal.record_session_cwd(task_id, str(tmp_path))
+    terminal.record_session_cwd(task_id, str(tmp_path))
     try:
         result = json.loads(await write_file_tool("report.txt", "hello\n", task_id))
         assert result["resolved_path"] == str(tmp_path / "report.txt")

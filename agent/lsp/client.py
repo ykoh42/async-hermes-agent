@@ -316,9 +316,12 @@ class LSPClient:
         return cmd
 
     async def _spawn(self) -> None:
-        env = dict(os.environ)
-        if self._env:
-            env.update(self._env)
+        from tools.environments.local import build_subprocess_env
+
+        # LSP config retains its upstream overlay semantics, but the overlay and
+        # inherited process environment must cross the same profile/credential
+        # boundary as every other non-terminal child.
+        env = await build_subprocess_env(extra=self._env)
 
         cmd = self._command
         if sys.platform == "win32":

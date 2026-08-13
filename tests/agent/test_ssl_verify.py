@@ -1,6 +1,7 @@
 """Tests for agent.ssl_verify.resolve_httpx_verify."""
 
 import asyncio
+import inspect
 import ssl
 import threading
 from unittest.mock import AsyncMock
@@ -10,9 +11,19 @@ import httpx
 import pytest
 from blockbuster import BlockBuster
 
+from agent import ssl_verify as ssl_verify_module
+from agent.secret_scope import (
+    UnscopedSecretError,
+    is_multiplex_active,
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
 from agent.ssl_verify import (
+    _context_from_ca_directories,
     _create_httpx_client,
     _create_openai_sdk_client,
+    _default_proxy_context,
     _materialize_httpx_verify,
     _resolve_httpx_client_verify,
     resolve_httpx_verify,
@@ -35,10 +46,55 @@ def clean_ca_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture
+def upstream_certifi_context(clean_ca_env):
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+@pytest.fixture
+def upstream_proxy_context(clean_ca_env):
+    import httpcore
+
+    return httpcore.default_ssl_context()
+
+
+@pytest.fixture
+def upstream_empty_capath_context(clean_ca_env, tmp_path):
+    return ssl.create_default_context(capath=str(tmp_path))
+
+
 async def test_hermes_ca_bundle_returns_ssl_context(clean_ca_env, monkeypatch):
     monkeypatch.setenv("HERMES_CA_BUNDLE", certifi.where())
     result = await resolve_httpx_verify()
     assert isinstance(result, ssl.SSLContext)
+
+
+async def test_in_memory_certifi_context_preserves_tls_and_trust_store(
+    clean_ca_env,
+    upstream_certifi_context,
+):
+    result = await _resolve_httpx_client_verify(trust_env=False)
+
+    assert result.options == upstream_certifi_context.options
+    assert result.verify_flags == upstream_certifi_context.verify_flags
+    assert result.minimum_version == upstream_certifi_context.minimum_version
+    assert set(result.get_ca_certs(binary_form=True)) == set(
+        upstream_certifi_context.get_ca_certs(binary_form=True)
+    )
+
+
+async def test_proxy_context_preserves_httpcore_default_trust_store(
+    clean_ca_env,
+    upstream_proxy_context,
+):
+    result = await _default_proxy_context()
+
+    assert result.options == upstream_proxy_context.options
+    assert result.verify_flags == upstream_proxy_context.verify_flags
+    assert result.minimum_version == upstream_proxy_context.minimum_version
+    assert set(result.get_ca_certs(binary_form=True)) == set(
+        upstream_proxy_context.get_ca_certs(binary_form=True)
+    )
 
 
 async def test_default_without_env_is_true(clean_ca_env):
@@ -56,8 +112,8 @@ async def test_ca_env_priority_matches_upstream_requests_resolver(
     ssl_bundle.write_text("ssl")
     seen = []
 
-    def create_default_context(*, cafile=None, capath=None):
-        seen.append((cafile, capath))
+    def create_default_context(*, cadata=None):
+        seen.append(cadata)
         return object()
 
     monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(requests_bundle))
@@ -66,7 +122,7 @@ async def test_ca_env_priority_matches_upstream_requests_resolver(
 
     await resolve_httpx_verify()
 
-    assert seen == [(str(requests_bundle), None)]
+    assert seen == [b"requests"]
 
 
 async def test_invalid_higher_priority_ca_env_falls_through_to_valid_candidate(
@@ -78,8 +134,8 @@ async def test_invalid_higher_priority_ca_env_falls_through_to_valid_candidate(
     requests_bundle.write_text("requests")
     seen = []
 
-    def create_default_context(*, cafile=None, capath=None):
-        seen.append((cafile, capath))
+    def create_default_context(*, cadata=None):
+        seen.append(cadata)
         return object()
 
     monkeypatch.setenv("HERMES_CA_BUNDLE", str(tmp_path / "missing.pem"))
@@ -88,7 +144,7 @@ async def test_invalid_higher_priority_ca_env_falls_through_to_valid_candidate(
 
     await resolve_httpx_verify()
 
-    assert seen == [(str(requests_bundle), None)]
+    assert seen == [b"requests"]
 
 
 async def test_ca_directory_falls_back_to_upstream_true(
@@ -111,21 +167,34 @@ async def test_client_materializer_preserves_httpx_ssl_cert_dir(
     clean_ca_env,
     tmp_path,
     monkeypatch,
+    upstream_empty_capath_context,
 ):
-    calls = []
-    create_default_context = ssl.create_default_context
-
-    def tracked_create_default_context(*args, **kwargs):
-        calls.append(kwargs)
-        return create_default_context(*args, **kwargs)
-
     monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
-    monkeypatch.setattr(ssl, "create_default_context", tracked_create_default_context)
 
     result = await _resolve_httpx_client_verify()
 
     assert isinstance(result, ssl.SSLContext)
-    assert calls == [{"capath": str(tmp_path)}]
+    assert result.check_hostname is True
+    assert result.verify_mode is ssl.CERT_REQUIRED
+    assert result.options == upstream_empty_capath_context.options
+    assert result.verify_flags == upstream_empty_capath_context.verify_flags
+    assert result.minimum_version == upstream_empty_capath_context.minimum_version
+    assert result.cert_store_stats() == upstream_empty_capath_context.cert_store_stats()
+
+
+async def test_ca_directory_only_trusts_openssl_hashed_entries(
+    clean_ca_env,
+    tmp_path,
+):
+    bundle = await ssl_verify_module._read_file_bytes(certifi.where())
+    (tmp_path / "unhashed.pem").write_bytes(bundle)
+
+    empty = await _context_from_ca_directories(str(tmp_path))
+    assert empty.cert_store_stats()["x509"] == 0
+
+    (tmp_path / "0123abcd.0").write_bytes(bundle)
+    populated = await _context_from_ca_directories(str(tmp_path))
+    assert populated.cert_store_stats()["x509"] > 0
 
 
 async def test_client_materializer_ignores_ca_env_when_trust_env_is_false(
@@ -146,10 +215,12 @@ async def test_client_materializer_ignores_ca_env_when_trust_env_is_false(
     result = await _resolve_httpx_client_verify(trust_env=False)
 
     assert isinstance(result, ssl.SSLContext)
-    assert calls == [{"cafile": certifi.where()}]
+    assert len(calls) == 1
+    assert set(calls[0]) == {"cadata"}
+    assert isinstance(calls[0]["cadata"], str)
 
 
-async def test_default_context_creation_does_not_block_event_loop(
+async def test_default_context_parsing_stays_on_event_loop_without_file_blocking(
     clean_ca_env,
     monkeypatch,
 ):
@@ -158,11 +229,12 @@ async def test_default_context_creation_does_not_block_event_loop(
     certifi_where = certifi.where
 
     def tracked_create_default_context(*args, **kwargs):
-        assert threading.get_ident() != event_loop_thread
+        assert threading.get_ident() == event_loop_thread
+        assert set(kwargs) == {"cadata"}
         return create_default_context(*args, **kwargs)
 
     def tracked_certifi_where():
-        assert threading.get_ident() != event_loop_thread
+        assert threading.get_ident() == event_loop_thread
         return certifi_where()
 
     monkeypatch.setattr(ssl, "create_default_context", tracked_create_default_context)
@@ -175,6 +247,38 @@ async def test_default_context_creation_does_not_block_event_loop(
         blocker.deactivate()
 
     assert isinstance(result, ssl.SSLContext)
+
+
+async def test_ca_read_cancellation_propagates_without_leaking_a_task(
+    clean_ca_env,
+    monkeypatch,
+    tmp_path,
+):
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_bytes(b"unused")
+    started = asyncio.Event()
+    wait_forever = asyncio.Event()
+
+    async def stalled_read(_path):
+        started.set()
+        await wait_forever.wait()
+        return b"unused"
+
+    monkeypatch.setattr(ssl_verify_module, "_read_file_bytes", stalled_read)
+    resolver = asyncio.create_task(resolve_httpx_verify(ca_bundle=str(ca_path)))
+    await started.wait()
+    resolver.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await resolver
+    assert resolver.cancelled()
+
+
+async def test_ssl_verify_has_no_generic_worker_bridge():
+    source = inspect.getsource(ssl_verify_module)
+    assert "aiofiles.os.wrap" not in source
+    assert "asyncio.to_thread" not in source
+    assert "run_in_executor" not in source
 
 
 async def test_bare_httpx_materializer_does_not_apply_hermes_ca_env(
@@ -194,7 +298,9 @@ async def test_bare_httpx_materializer_does_not_apply_hermes_ca_env(
     result = await _materialize_httpx_verify()
 
     assert isinstance(result, ssl.SSLContext)
-    assert calls == [{"cafile": certifi.where()}]
+    assert len(calls) == 1
+    assert set(calls[0]) == {"cadata"}
+    assert isinstance(calls[0]["cadata"], str)
 
 
 async def test_httpx_client_preserves_env_proxy_mounts_and_trust_env(
@@ -229,34 +335,44 @@ async def test_httpx_client_preserves_env_proxy_mounts_and_trust_env(
         await client.aclose()
 
 
-async def test_httpx_client_runs_proxy_discovery_and_tls_setup_off_loop(
+async def test_httpx_client_proxy_discovery_and_tls_parsing_do_not_use_workers(
     clean_ca_env,
     monkeypatch,
 ):
-    import httpcore
-
     event_loop_thread = threading.get_ident()
-    default_proxy_context = httpcore.default_ssl_context
+    create_default_context = ssl.create_default_context
+    context_calls = []
 
     def tracked_environment_proxies():
-        assert threading.get_ident() != event_loop_thread
+        assert threading.get_ident() == event_loop_thread
         return {"https://": "https://proxy.example:8443"}
 
-    def tracked_proxy_context():
-        assert threading.get_ident() != event_loop_thread
-        return default_proxy_context()
+    def tracked_create_default_context(*args, **kwargs):
+        assert threading.get_ident() == event_loop_thread
+        context_calls.append(kwargs)
+        return create_default_context(*args, **kwargs)
 
     monkeypatch.setattr(
         "httpx._utils.get_environment_proxies",
         tracked_environment_proxies,
     )
     monkeypatch.setattr(
-        "httpcore.default_ssl_context",
-        tracked_proxy_context,
+        ssl,
+        "create_default_context",
+        tracked_create_default_context,
     )
 
-    client = await _create_httpx_client(timeout=1.0)
-    await client.aclose()
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        client = await _create_httpx_client(timeout=1.0)
+    finally:
+        blocker.deactivate()
+    try:
+        assert context_calls
+        assert all(set(call) == {"cadata"} for call in context_calls)
+    finally:
+        await client.aclose()
 
 
 async def test_httpx_client_materializes_explicit_proxy_mount(clean_ca_env):
@@ -462,3 +578,66 @@ async def test_openai_sdk_constructor_cleanup_survives_repeated_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await create
     assert close_finished.is_set()
+
+
+async def test_openai_sdk_default_base_url_is_profile_scoped(monkeypatch):
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    captured: list[str] = []
+
+    class HttpClient:
+        async def aclose(self):
+            return None
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.http_client = kwargs["http_client"]
+
+    async def create_http_client(**kwargs):
+        await asyncio.sleep(0)
+        captured.append(kwargs["base_url"])
+        return HttpClient()
+
+    async def resolve(name: str):
+        token = set_secret_scope(
+            {"OPENAI_BASE_URL": f"https://{name}.example/v1"}
+        )
+        try:
+            return await _create_openai_sdk_client(Client, api_key="test")
+        finally:
+            reset_secret_scope(token)
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://foreign.example/v1")
+    monkeypatch.setattr(
+        "agent.ssl_verify._create_httpx_client",
+        create_http_client,
+    )
+    try:
+        await asyncio.gather(resolve("alpha"), resolve("beta"))
+    finally:
+        set_multiplex_active(previous)
+
+    assert set(captured) == {
+        "https://alpha.example/v1",
+        "https://beta.example/v1",
+    }
+
+
+async def test_openai_sdk_default_base_url_fails_closed_without_scope(
+    monkeypatch,
+):
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://foreign.example/v1")
+    create_http_client = AsyncMock()
+    monkeypatch.setattr(
+        "agent.ssl_verify._create_httpx_client",
+        create_http_client,
+    )
+    try:
+        with pytest.raises(UnscopedSecretError, match="OPENAI_BASE_URL"):
+            await _create_openai_sdk_client(object, api_key="test")
+    finally:
+        set_multiplex_active(previous)
+
+    create_http_client.assert_not_awaited()

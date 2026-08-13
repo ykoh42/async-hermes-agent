@@ -17,9 +17,11 @@ under the ``vertex:`` section; env vars take precedence over config.yaml.
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
+import threading
 import time
 import weakref
 from typing import Optional, Tuple
@@ -28,7 +30,11 @@ import aiofiles
 import aiofiles.os
 import httpx
 
-from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
+from agent.secret_scope import (
+    UnscopedSecretError,
+    get_secret as _get_secret,
+    is_multiplex_active,
+)
 
 try:
     from google.auth import _cloud_sdk
@@ -45,10 +51,58 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REGION = "global"
 
+# Credential objects are mutable (refresh updates token/expiry) and some async
+# transports bind state to the loop that refreshed them.  Keep them within the
+# loop and Hermes profile that resolved the credential source.  ``_creds_cache``
+# remains the active-scope projection for the upstream private test/reset hook;
+# production lookups use the ContextVar-backed cache selected below.
 _creds_cache: dict = {}
-_cache_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+_creds_cache_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "vertex_credentials_cache",
+    default=None,
+)
+_creds_caches: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, dict]]" = (
     weakref.WeakKeyDictionary()
 )
+_cache_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, weakref.ReferenceType[asyncio.Lock]]]" = (
+    weakref.WeakKeyDictionary()
+)
+_cache_state_guard = threading.RLock()
+_realpath = aiofiles.os.wrap(os.path.realpath)
+
+
+async def _activate_credentials_cache() -> tuple[dict, asyncio.Lock]:
+    """Select the loop/profile-owned credentials cache and refresh lock."""
+    from hermes_constants import get_hermes_home
+
+    loop = asyncio.get_running_loop()
+    profile = os.path.normcase(str(await _realpath(get_hermes_home())))
+    with _cache_state_guard:
+        for candidate in set(_creds_caches) | set(_cache_locks):
+            if candidate.is_closed():
+                _creds_caches.pop(candidate, None)
+                _cache_locks.pop(candidate, None)
+
+        caches = _creds_caches.setdefault(loop, {})
+        cache = caches.setdefault(profile, {})
+
+        locks = _cache_locks.setdefault(loop, {})
+        lock_ref = locks.get(profile)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[profile] = weakref.ref(lock)
+
+    global _creds_cache
+    _creds_cache = cache
+    _creds_cache_context.set(cache)
+    return cache, lock
+
+
+def _active_credentials_cache() -> dict:
+    """Return the cache selected by the current awaited credential boundary."""
+    cache = _creds_cache_context.get()
+    return cache if cache is not None else _creds_cache
 
 
 async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
@@ -103,15 +157,6 @@ async def _finish_process_communicate(
     if cancellation is not None:
         raise cancellation
     return output
-
-
-def _cache_lock() -> asyncio.Lock:
-    loop = asyncio.get_running_loop()
-    lock = _cache_locks.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        _cache_locks[loop] = lock
-    return lock
 
 
 async def _vertex_config() -> dict:
@@ -202,12 +247,17 @@ async def _load_credentials_file(path: str):
 
 async def _gcloud_project_id() -> Optional[str]:
     project_id = (
-        os.getenv("GOOGLE_CLOUD_PROJECT")
-        or os.getenv("GCLOUD_PROJECT")
+        _get_secret("GOOGLE_CLOUD_PROJECT")
+        or _get_secret("GCLOUD_PROJECT")
         or ""
     ).strip()
     if project_id:
         return project_id
+    # gcloud's active configuration belongs to the OS user, not the current
+    # Hermes profile.  A multiplexed process must not attribute profile B's
+    # requests to whichever project profile A selected globally.
+    if is_multiplex_active():
+        return None
     try:
         process = await asyncio.create_subprocess_exec(
             "gcloud.cmd" if os.name == "nt" else "gcloud",
@@ -266,7 +316,7 @@ async def _metadata_credentials() -> Tuple[Optional[str], Optional[str]]:
     if not token or not project_id:
         return None, None
     expires_in = max(int(token_data.get("expires_in") or 0), 0)
-    _creds_cache["__metadata__"] = {
+    _active_credentials_cache()["__metadata__"] = {
         "token": token,
         "project_id": project_id,
         "expires_at": time.time() + expires_in,
@@ -286,9 +336,10 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
 
     resolved_path = await _resolve_credentials_path(credentials_path)
     cache_key = resolved_path
+    cache, cache_lock = await _activate_credentials_cache()
 
     try:
-        async with _cache_lock():
+        async with cache_lock:
             if resolved_path is None:
                 # google.auth.default() reads GOOGLE_APPLICATION_CREDENTIALS
                 # straight from os.environ internally — it has no notion of
@@ -299,13 +350,15 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
                 # first, so a raw os.environ read here can still pick up a
                 # different profile's service-account path. Refuse rather
                 # than silently authenticating under a stranger's identity.
-                if is_multiplex_active() and os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+                if is_multiplex_active():
                     logger.warning(
                         "Vertex ADC skipped for this profile: "
-                        "GOOGLE_APPLICATION_CREDENTIALS is set in the process "
-                        "environment (from another profile's .env) but not in "
-                        "this profile's own config. Set VERTEX_CREDENTIALS_PATH "
-                        "in this profile's .env instead of relying on ADC."
+                        "the default ADC file, gcloud active project, and "
+                        "metadata identity are process or host-global. Set "
+                        "VERTEX_CREDENTIALS_PATH (or "
+                        "GOOGLE_APPLICATION_CREDENTIALS) and VERTEX_PROJECT_ID "
+                        "in this profile instead of relying on the global ADC "
+                        "chain."
                     )
                     return None, None
                 adc_path = _cloud_sdk.get_application_default_credentials_path()
@@ -313,7 +366,7 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
                     resolved_path = adc_path
                     cache_key = resolved_path
                 else:
-                    cached_metadata = _creds_cache.get("__metadata__")
+                    cached_metadata = cache.get("__metadata__")
                     if (
                         isinstance(cached_metadata, dict)
                         and cached_metadata.get("expires_at", 0) - time.time() >= 300
@@ -325,12 +378,12 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
                     override_project = await _resolve_project_override()
                     return token, override_project or project_id
 
-            cached = _creds_cache.get(cache_key)
+            cached = cache.get(cache_key)
             if cached is None:
                 creds, project_id = await _load_credentials_file(resolved_path)
                 if project_id is None and resolved_path == _cloud_sdk.get_application_default_credentials_path():
                     project_id = await _gcloud_project_id()
-                _creds_cache[cache_key] = (creds, project_id)
+                cache[cache_key] = (creds, project_id)
             else:
                 creds, project_id = cached
 
@@ -352,9 +405,11 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
         return creds.token, project_id
     except asyncio.CancelledError:
         raise
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         logger.error(f"Failed to resolve Vertex AI credentials: {e}")
-        _creds_cache.pop(cache_key, None)
+        cache.pop(cache_key, None)
 
         # If ADC failed (e.g. expired refresh token), try the SA file
         # before giving up — it may have been added after initial startup.
@@ -403,6 +458,8 @@ async def has_vertex_credentials() -> bool:
     """
     if await _resolve_credentials_path(None):
         return True
+    if is_multiplex_active():
+        return False
     if await _resolve_project_override():
         return True
     return False

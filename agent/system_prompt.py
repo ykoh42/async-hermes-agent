@@ -212,6 +212,19 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
 
+    # Computer-use is a standalone multi-paragraph block. Render it for the
+    # host OS so non-macOS agents never receive Mac/Space/cmd-only guidance.
+    if "computer_use" in agent.valid_tool_names:
+        from agent.prompt_builder import computer_use_guidance
+
+        stable_parts.append(computer_use_guidance())
+
+    nous_subscription_prompt = await _r.build_nous_subscription_prompt(
+        agent.valid_tool_names
+    )
+    if nous_subscription_prompt:
+        stable_parts.append(nous_subscription_prompt)
+
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
     # agent.tool_use_enforcement:
@@ -250,13 +263,11 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
-        avail_toolsets = {
-            toolset
-            for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
-            )
-            if toolset
-        }
+        avail_toolsets = set()
+        for tool_name in agent.valid_tool_names:
+            toolset = await _r.get_toolset_for_tool(tool_name)
+            if toolset:
+                avail_toolsets.add(toolset)
         # Focus mode (opt-in) demotes non-coding skill categories to
         # names-only in the index (never hidden — skill_view/skills_list
         # reach everything, and every name stays visible for recall). The

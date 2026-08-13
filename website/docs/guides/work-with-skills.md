@@ -80,9 +80,11 @@ The `skills` toolset contains:
 | `skill_view` | Read a complete `SKILL.md` or one of its supporting files |
 | `skill_manage` | Create, patch, edit, delete, or manage supporting files |
 
-Skill reads and writes are native async filesystem operations. When trajectory
-saving is enabled, list/view/manage calls and their observations retain their
-normal place in the trajectory.
+Skill reads and writes expose awaited coroutine APIs. They currently use the
+package's executor-backed `aiofiles` regular-file layer, so they must not be
+described as OS-native file I/O. When trajectory saving is enabled,
+list/view/manage calls and their observations retain their normal place in the
+trajectory.
 
 ## Distribution note
 

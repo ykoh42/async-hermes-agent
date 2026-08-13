@@ -33,10 +33,10 @@ HTTPS URL from FAL's CDN.
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.secret_scope import get_secret
 from agent.video_gen_provider import (
     VideoGenProvider,
     error_response,
@@ -214,7 +214,7 @@ async def _resolve_family(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]
     """Decide which FAL family to use. Returns ``(family_id, meta)``."""
     candidates: List[Optional[str]] = []
     candidates.append(explicit)
-    candidates.append(os.environ.get("FAL_VIDEO_MODEL"))
+    candidates.append(get_secret("FAL_VIDEO_MODEL"))
 
     cfg = await _load_video_gen_section()
     fal_cfg = cfg.get("fal") if isinstance(cfg.get("fal"), dict) else {}

@@ -130,15 +130,36 @@ DEFAULT_CONFIG = {
     },
 
     "terminal": {
+        "backend": "local",
+        "modal_mode": "auto",
         "cwd": ".",  # Use current directory
         "timeout": 180,
-        # Keep one local shell state per task so cwd and exported variables
-        # survive between tool calls.
-        "local_persistent": False,
-        # Environment variables to pass through to local terminal execution.
-        # Skill-declared required_environment_variables
-        # are passed through automatically; this list is for non-skill use cases.
+        "daemon_term_grace_seconds": 2.0,
+        # Environment variables to pass through to sandboxed execution.
+        # Skill-declared required_environment_variables are included
+        # automatically; this list is for non-skill use cases.
         "env_passthrough": [],
+        "home_mode": "auto",
+        "shell_init_files": [],
+        "auto_source_bashrc": True,
+        "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "docker_forward_env": [],
+        "docker_env": {},
+        "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+        "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "vercel_runtime": "node24",
+        "container_cpu": 1,
+        "container_memory": 5120,
+        "container_disk": 51200,
+        "container_persistent": True,
+        "docker_volumes": [],
+        "docker_mount_cwd_to_workspace": False,
+        "docker_network": True,
+        "docker_extra_args": [],
+        "docker_shm_size": "1g",
+        "docker_run_as_host_user": False,
+        "persistent_shell": True,
     },
 
     # Language Server Protocol — semantic diagnostics from real language

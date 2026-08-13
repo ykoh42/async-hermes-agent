@@ -21,6 +21,23 @@ _TERMINAL_EVENT_TYPES = frozenset({
 })
 
 
+def _resolve_codex_app_server_home() -> str | None:
+    """Resolve Codex state without sharing an OS-user account across profiles."""
+    from agent.secret_scope import get_secret, is_multiplex_active
+
+    configured = get_secret("CODEX_HOME")
+    if configured is not None and str(configured).strip():
+        return str(configured)
+    if is_multiplex_active():
+        raise RuntimeError(
+            "Codex app-server requires a non-empty profile-scoped CODEX_HOME "
+            "while profile multiplexing is active; falling back to the OS-user "
+            "~/.codex directory would share authentication and policy state "
+            "between profiles."
+        )
+    return None
+
+
 async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     """Finish one owned Codex stream task through repeated cancellation."""
     cancellation: asyncio.CancelledError | None = None
@@ -699,6 +716,7 @@ async def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_home=_resolve_codex_app_server_home(),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

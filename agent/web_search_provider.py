@@ -57,6 +57,12 @@ from typing import Any, Dict, List, Optional
 
 import aiofiles
 
+from agent.secret_scope import (
+    UnscopedSecretError,
+    get_secret,
+    is_multiplex_active,
+)
+
 
 async def get_provider_env(name: str) -> str:
     """Config-aware env lookup for web providers.
@@ -74,7 +80,6 @@ async def get_provider_env(name: str) -> str:
     """
     val: Optional[str] = None
     try:
-        from agent.secret_scope import get_secret
         from hermes_cli.config import (
             _parse_env_value,
             _sanitize_env_lines,
@@ -102,9 +107,11 @@ async def get_provider_env(name: str) -> str:
                 key, _, value = stripped.partition("=")
                 if key.strip() == name:
                     val = _parse_env_value(value)
+    except UnscopedSecretError:
+        raise
     except Exception:  # noqa: BLE001 — config layer optional here
         val = None
-    if val is None:
+    if val is None and not is_multiplex_active():
         val = os.getenv(name, "")
     return (val or "").strip()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -86,15 +87,57 @@ async def _finish_process_communicate(
     return output
 
 
+async def _build_inline_shell_env() -> dict[str, str]:
+    """Build an inline-shell environment without crossing profile scopes."""
+    from agent.secret_scope import (
+        UnscopedSecretError,
+        _is_global_env,
+        current_secret_scope,
+        is_multiplex_active,
+    )
+    from tools.environments.local import build_subprocess_env
+
+    if not is_multiplex_active():
+        return await build_subprocess_env(
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+
+    scope = current_secret_scope()
+    if scope is None:
+        raise UnscopedSecretError(
+            "Skill inline-shell subprocess environment requires an active "
+            "profile secret scope while multiplexing is enabled."
+        )
+
+    from tools.env_passthrough import get_all_passthrough
+
+    passthrough_names = await get_all_passthrough()
+    base_env = {
+        name: value
+        for name, value in os.environ.items()
+        if _is_global_env(name)
+    }
+    for name in passthrough_names:
+        if _is_global_env(name):
+            continue
+        value = scope.get(name)
+        if value is not None:
+            base_env[name] = value
+    return await build_subprocess_env(base=base_env, scrub_secrets=True)
+
+
 async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     """Execute one trusted skill inline-shell snippet without blocking."""
     timeout = max(1, int(timeout))
+    env = await _build_inline_shell_env()
     try:
         process = await asyncio.create_subprocess_exec(
             "bash",
             "-c",
             command,
             cwd=str(cwd) if cwd else None,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

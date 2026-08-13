@@ -26,7 +26,9 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -42,6 +44,7 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from hermes_constants import get_hermes_home
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -154,7 +157,10 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                     except json.JSONDecodeError:
                         # This shouldn't happen since we validate and retry during conversation,
                         # but if it does, log warning and use empty dict
-                        logger.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
+                        logger.warning(
+                            "Unexpected invalid JSON in trajectory conversion: %s",
+                            tool_call["function"]["arguments"][:100],
+                        )
                         arguments = {}
                     
                     tool_call_json = {
@@ -409,7 +415,14 @@ def sanitize_tool_call_arguments(
 # never see (#64934).  Keyed by session_id so that route produces the same
 # named warning.  Process-local by design — same visibility scope as the
 # per-agent marker it extends.
-_INFLIGHT_TURNS_BY_SESSION: Dict[str, Tuple[str, float]] = {}
+_INFLIGHT_TURNS_BY_SESSION: Dict[Tuple[str, str], Tuple[str, float]] = {}
+_INFLIGHT_TURNS_BY_SESSION_GUARD = threading.RLock()
+
+
+def _turn_session_scope_key(session_id: str) -> Tuple[str, str]:
+    """Key the diagnostic slot by the active library profile and session."""
+    profile = os.path.normcase(os.path.normpath(os.fspath(get_hermes_home())))
+    return profile, session_id
 
 
 def note_turn_start(agent, turn_id: str):
@@ -456,12 +469,15 @@ def note_turn_start(agent, turn_id: str):
     session_id = getattr(agent, "session_id", None)
     if session_id and not getattr(agent, "_persist_disabled", False):
         now = time.time()
-        entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
-        _INFLIGHT_TURNS_BY_SESSION[session_id] = (turn_id, now)
+        session_scope_key = _turn_session_scope_key(session_id)
+        with _INFLIGHT_TURNS_BY_SESSION_GUARD:
+            entry = _INFLIGHT_TURNS_BY_SESSION.get(session_scope_key)
+            _INFLIGHT_TURNS_BY_SESSION[session_scope_key] = (turn_id, now)
         # Stamp the session id this turn registered under: compression can
         # rotate agent.session_id mid-turn, and the persist-time clear must
         # pop the slot the turn actually holds, not the rotated id.
         agent._inflight_turn_session_id = session_id
+        agent._inflight_turn_session_scope_key = session_scope_key
         if entry and entry[0] not in (turn_id, prev):
             logger.warning(
                 "turn %s starting while turn %s (started %.0fs ago) is still "
@@ -494,8 +510,15 @@ def note_turn_persisted(agent):
             agent, "session_id", None
         )
         if session_id:
-            _INFLIGHT_TURNS_BY_SESSION.pop(session_id, None)
+            session_scope_key = getattr(
+                agent,
+                "_inflight_turn_session_scope_key",
+                None,
+            ) or _turn_session_scope_key(session_id)
+            with _INFLIGHT_TURNS_BY_SESSION_GUARD:
+                _INFLIGHT_TURNS_BY_SESSION.pop(session_scope_key, None)
     agent._inflight_turn_session_id = None
+    agent._inflight_turn_session_scope_key = None
 
 
 def repair_message_sequence(agent, messages: List[Dict]) -> int:
@@ -1311,6 +1334,9 @@ async def try_recover_primary_transport(
                 "request_timeout": rt.get("request_timeout"),
                 "stale_timeout": rt.get("stale_timeout"),
                 "update_primary": False,
+                # This rebuild stays on the durable primary route; its context
+                # engine already carries that route's authoritative window.
+                "skip_context_engine_update": True,
             }
             await agent._ensure_provider_runtime()
 
@@ -1563,6 +1589,9 @@ async def restore_primary_runtime(agent) -> bool:
                 "request_timeout": rt.get("request_timeout"),
                 "stale_timeout": rt.get("stale_timeout"),
                 "update_primary": False,
+                # Restore the exact snapshotted context-engine state below;
+                # do not publish a transient live resolution first.
+                "skip_context_engine_update": True,
             }
             await agent._ensure_provider_runtime()
 
@@ -2187,7 +2216,7 @@ def anthropic_prompt_cache_policy(
 
 
 async def create_openai_client(
-    agent: Any,
+    agent,
     client_kwargs: dict,
     *,
     reason: str,
@@ -2381,7 +2410,7 @@ def _iter_pool_sockets(client: Any):
                 yield sock
 
 
-async def cleanup_dead_connections(agent: Any) -> bool:
+async def cleanup_dead_connections(agent) -> bool:
     """Rebuild the native async primary client when its pool contains dead sockets."""
     client = getattr(agent, "client", None)
     if client is None:
@@ -2464,6 +2493,9 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         or getattr(agent, "provider", "")
         or ""
     ).strip().lower()
+    context_engine_started_before_switch = bool(
+        getattr(agent, "_context_engine_started", False)
+    )
     # A provider change must not inherit the previous provider's endpoint.
     # An omitted URL is resolved by the destination provider during deferred
     # initialization; only same-provider model changes may reuse the live URL.
@@ -2480,8 +2512,8 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
 
     # Resolve destination-only context configuration before mutating the live
     # runtime.  A model switch must never inherit the previous model's explicit
-    # window.  Configuration I/O stays async; the metadata lookup below is the
-    # pure, no-network resolver used on the conversation path.
+    # window. Configuration and live metadata I/O both stay behind awaited
+    # boundaries.
     from hermes_cli.config import (
         get_compatible_custom_providers,
         get_custom_provider_context_length,
@@ -2556,6 +2588,10 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         "request_timeout": None,
         "stale_timeout": None,
         "update_primary": False,
+        # ``switch_model`` performs the single upstream-equivalent context
+        # update after the destination transport is live.  Credential/fallback
+        # refreshes still use the deferred runtime's normal update path.
+        "skip_context_engine_update": context_engine_started_before_switch,
     }
     try:
         await agent._ensure_provider_runtime()
@@ -2621,8 +2657,12 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
             )
 
     compressor = getattr(agent, "context_compressor", None)
-    if compressor is not None:
-        from agent.model_metadata import _get_static_context_length
+    context_engine_initialized_during_switch = (
+        not context_engine_started_before_switch
+        and bool(getattr(agent, "_context_engine_started", False))
+    )
+    if compressor is not None and not context_engine_initialized_during_switch:
+        from agent.model_metadata import get_model_context_length
 
         if current_provider == "lmstudio":
             context_length = agent._effective_lmstudio_context_length(
@@ -2632,9 +2672,12 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         else:
             context_length = None
         if context_length is None:
-            context_length = _get_static_context_length(
+            context_length = await get_model_context_length(
                 agent.model,
                 base_url=agent.base_url,
+                api_key=(
+                    agent.api_key if isinstance(agent.api_key, str) else ""
+                ),
                 provider=agent.provider,
                 config_context_length=(
                     None if current_provider == "lmstudio" else destination_context

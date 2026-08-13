@@ -1,5 +1,5 @@
-"""Native async local subprocess support."""
+"""Hermes native-async execution environment backends."""
 
-from tools.environments.local import build_subprocess_env
+from tools.environments.base import BaseEnvironment
 
-__all__ = ["build_subprocess_env"]
+__all__ = ["BaseEnvironment"]

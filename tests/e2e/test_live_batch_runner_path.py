@@ -11,6 +11,8 @@ import pytest
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
+from tests.e2e.trajectory_assertions import assert_exact_terminal_trajectory
+
 
 LIVE = os.environ.get("HERMES_LIVE_REASONING_TESTS") == "1"
 PROVIDER = (
@@ -43,11 +45,23 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
     )
 
     dataset = tmp_path / "dataset.jsonl"
-    prompt = (
-        "Call terminal exactly once with `printf LIVE_BATCH_OBSERVATION`. "
-        "After reading the observation reply exactly LIVE_BATCH_FINAL."
+    observations = ["LIVE_BATCH_OBSERVATION_0", "LIVE_BATCH_OBSERVATION_1"]
+    finals = ["LIVE_BATCH_FINAL_0", "LIVE_BATCH_FINAL_1"]
+    commands = [f"printf {observation}" for observation in observations]
+    prompts = [
+        (
+            "Make exactly two model responses. In the first response, emit no "
+            "visible text and call terminal exactly once with exactly these "
+            f'arguments and no extra keys: {{"command":"{command}"}}. After '
+            "the tool observation, make no further tool calls and emit exactly "
+            f"this visible final answer with no other text: {final}"
+        )
+        for command, final in zip(commands, finals, strict=True)
+    ]
+    dataset.write_text(
+        json.dumps({"prompt": prompts[0]}) + "\n",
+        encoding="utf-8",
     )
-    dataset.write_text(json.dumps({"prompt": prompt}) + "\n", encoding="utf-8")
     runner_kwargs = {
         "dataset_file": str(dataset),
         "batch_size": 1,
@@ -73,48 +87,99 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
         runner_kwargs["base_url"] = base_url
     if api_key:
         runner_kwargs["api_key"] = api_key
-    runner = BatchRunner(**runner_kwargs)
+    first_runner = BatchRunner(**runner_kwargs)
 
     async with (
         no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
         no_task_leaks(action=LeakAction.RAISE),
     ):
-        assert await runner.run() is None
+        assert await first_runner.run() is None
         output_dir = tmp_path / "data" / "live-batch"
         shard = output_dir / "batch_0.jsonl"
         async with aiofiles.open(shard, "rb") as handle:
-            before_resume = await handle.read()
-        assert await runner.run(resume=True) is None
+            first_shard = await handle.read()
+        async with aiofiles.open(
+            output_dir / "checkpoint.json", encoding="utf-8"
+        ) as handle:
+            first_checkpoint = json.loads(await handle.read())
+        async with aiofiles.open(
+            output_dir / "statistics.json", encoding="utf-8"
+        ) as handle:
+            first_statistics = json.loads(await handle.read())
+
+        async with aiofiles.open(dataset, "a", encoding="utf-8") as handle:
+            await handle.write(json.dumps({"prompt": prompts[1]}) + "\n")
+            await handle.flush()
+
+        # A process restart constructs a fresh runner. Its lazy dataset load
+        # must see the appended prompt while content-based resume skips prompt 0.
+        restarted_runner = BatchRunner(**runner_kwargs)
+        assert await restarted_runner.run(resume=True) is None
         async with aiofiles.open(shard, "rb") as handle:
-            after_resume = await handle.read()
+            resumed_shard = await handle.read()
+        async with aiofiles.open(
+            output_dir / "checkpoint.json", encoding="utf-8"
+        ) as handle:
+            resumed_checkpoint = json.loads(await handle.read())
+        async with aiofiles.open(
+            output_dir / "trajectories.jsonl", encoding="utf-8"
+        ) as handle:
+            merged_rows = [
+                json.loads(line) for line in (await handle.read()).splitlines()
+            ]
+        async with aiofiles.open(
+            output_dir / "statistics.json", encoding="utf-8"
+        ) as handle:
+            resumed_statistics = json.loads(await handle.read())
 
-    assert before_resume == after_resume
-    checkpoint = json.loads((output_dir / "checkpoint.json").read_text())
-    assert checkpoint["completed_prompts"] == [0]
-
-    shard_rows = [json.loads(line) for line in before_resume.splitlines()]
-    assert len(shard_rows) == 1
-    conversations = shard_rows[0]["conversations"]
-    assert [turn["from"] for turn in conversations] == [
-        "system",
-        "human",
-        "gpt",
-        "tool",
-        "gpt",
+    assert first_checkpoint["completed_prompts"] == [0]
+    assert resumed_checkpoint["completed_prompts"] == [0, 1]
+    assert resumed_shard.startswith(first_shard)
+    dataset_rows = [
+        json.loads(line) for line in dataset.read_text(encoding="utf-8").splitlines()
     ]
-    assert conversations[2]["value"].startswith("<think>\n")
-    assert '"name": "terminal"' in conversations[2]["value"]
-    assert "LIVE_BATCH_OBSERVATION" in conversations[3]["value"]
-    assert conversations[4]["value"].startswith("<think>\n")
-    assert conversations[4]["value"].endswith("LIVE_BATCH_FINAL")
+    assert dataset_rows == [{"prompt": prompts[0]}, {"prompt": prompts[1]}]
 
-    merged_rows = [
-        json.loads(line)
-        for line in (output_dir / "trajectories.jsonl").read_text().splitlines()
-    ]
-    assert merged_rows == shard_rows
-    statistics = json.loads((output_dir / "statistics.json").read_text())
-    assert statistics["reasoning_statistics"]["turns_with_reasoning"] >= 2
-    assert statistics["tool_statistics"]["terminal"]["count"] == 1
-    assert statistics["tool_statistics"]["terminal"]["success"] == 1
-    assert statistics["tool_statistics"]["terminal"]["failure"] == 0
+    first_rows = [json.loads(line) for line in first_shard.splitlines()]
+    resumed_rows = [json.loads(line) for line in resumed_shard.splitlines()]
+    assert len(first_rows) == 1
+    assert len(resumed_rows) == 2
+    assert resumed_rows[0] == first_rows[0]
+    assert [row["prompt_index"] for row in resumed_rows] == [0, 1]
+    assert merged_rows == resumed_rows
+
+    for index, row in enumerate(resumed_rows):
+        assert row["completed"] is True
+        assert row["partial"] is False
+        assert row["api_calls"] == 2
+        assert row["tool_stats"]["terminal"] == {
+            "count": 1,
+            "success": 1,
+            "failure": 0,
+        }
+        assert row["tool_error_counts"]["terminal"] == 0
+        assert_exact_terminal_trajectory(
+            row["conversations"],
+            prompt=prompts[index],
+            command=commands[index],
+            observation=observations[index],
+            final=finals[index],
+        )
+
+    expected_run_terminal_stats = {
+        "count": 1,
+        "success": 1,
+        "failure": 0,
+        "success_rate": 100.0,
+        "failure_rate": 0.0,
+    }
+    assert first_statistics["total_prompts"] == 1
+    assert first_statistics["tool_statistics"]["terminal"] == (
+        expected_run_terminal_stats
+    )
+    assert resumed_statistics["total_prompts"] == 2
+    # Upstream statistics.json describes the current run, while checkpoint and
+    # merged shards preserve cross-run progress. The resume run processed one.
+    assert resumed_statistics["tool_statistics"]["terminal"] == (
+        expected_run_terminal_stats
+    )

@@ -15,11 +15,11 @@ to be re-exported here.
 """
 
 
-def check_file_requirements():
+async def check_file_requirements():
     """File tools only require terminal backend availability."""
     from .terminal_tool import check_terminal_requirements
 
-    return check_terminal_requirements()
+    return await check_terminal_requirements()
 
 
 __all__ = ["check_file_requirements"]

@@ -31,7 +31,14 @@ fail because of a malformed config.
 
 from __future__ import annotations
 
+import contextvars
+import os
+import threading
 from typing import Any, Dict
+
+import aiofiles.os
+
+from hermes_constants import get_hermes_home
 
 # Hardcoded defaults — these match the pre-existing values, so adding
 # this module is behaviour-preserving for users who don't set
@@ -43,6 +50,75 @@ DEFAULT_MAX_LINE_LENGTH = 2000   # file_operations.MAX_LINE_LENGTH
 # Module-level cache — populated on first call.
 # Avoids repeated config file I/O on every tool call.
 _cached_limits: dict | None = None
+_limits_profile_context: contextvars.ContextVar[
+    tuple[str, str] | None
+] = contextvars.ContextVar("tool_output_limits_profile", default=None)
+_limits_profile_aliases: dict[str, str] = {}
+_limits_by_profile: dict[str, dict[str, int]] = {}
+_limits_cache_guard = threading.RLock()
+
+
+def _lexical_limits_profile() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_limits_profile() -> str:
+    lexical = _lexical_limits_profile()
+    active = _limits_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    with _limits_cache_guard:
+        return _limits_profile_aliases.get(lexical, lexical)
+
+
+async def _activate_limits_profile() -> str:
+    """Activate one canonical HERMES_HOME at the awaited refresh edge."""
+    lexical = _lexical_limits_profile()
+    active = _limits_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    with _limits_cache_guard:
+        canonical = _limits_profile_aliases.get(lexical)
+    if canonical is None:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = str(await expanduser(lexical))
+        is_absolute = (
+            expanded.startswith(("/", "\\\\"))
+            or (
+                len(expanded) >= 3
+                and expanded[1] == ":"
+                and expanded[2] in "/\\"
+            )
+        )
+        if not is_absolute:
+            expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        canonical = os.path.normcase(str(await realpath(expanded)))
+    with _limits_cache_guard:
+        _limits_profile_aliases[lexical] = canonical
+        if lexical != canonical:
+            staged = _limits_by_profile.pop(lexical, None)
+            if staged is not None:
+                _limits_by_profile.setdefault(canonical, staged)
+    _limits_profile_context.set((lexical, canonical))
+    return canonical
+
+
+def _default_limits() -> dict[str, int]:
+    return {
+        "max_bytes": DEFAULT_MAX_BYTES,
+        "max_lines": DEFAULT_MAX_LINES,
+        "max_line_length": DEFAULT_MAX_LINE_LENGTH,
+    }
+
+
+def _publish_limits(profile: str, limits: dict[str, int]) -> dict[str, int]:
+    """Store one profile value and update the historical private snapshot."""
+    global _cached_limits
+    with _limits_cache_guard:
+        _limits_by_profile[profile] = limits
+        _cached_limits = limits
+    return limits
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -58,20 +134,17 @@ def _coerce_positive_int(value: Any, default: int) -> int:
 
 def get_tool_output_limits() -> Dict[str, int]:
     """Return deterministic limits without synchronous configuration I/O."""
-    global _cached_limits
-    if _cached_limits is not None:
-        return _cached_limits
-    _cached_limits = {
-        "max_bytes": DEFAULT_MAX_BYTES,
-        "max_lines": DEFAULT_MAX_LINES,
-        "max_line_length": DEFAULT_MAX_LINE_LENGTH,
-    }
-    return _cached_limits
+    profile = _current_limits_profile()
+    with _limits_cache_guard:
+        cached = _limits_by_profile.get(profile)
+    if cached is not None:
+        return cached
+    return _publish_limits(profile, _default_limits())
 
 
 async def _refresh_tool_output_limits() -> Dict[str, int]:
-    """Refresh the process snapshot through the native async config loader."""
-    global _cached_limits
+    """Refresh the active profile through the native async config loader."""
+    profile = await _activate_limits_profile()
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -81,20 +154,24 @@ async def _refresh_tool_output_limits() -> Dict[str, int]:
             section = {}
     except Exception:
         section = {}
-    _cached_limits = {
+    limits = {
         "max_bytes": _coerce_positive_int(section.get("max_bytes"), DEFAULT_MAX_BYTES),
         "max_lines": _coerce_positive_int(section.get("max_lines"), DEFAULT_MAX_LINES),
         "max_line_length": _coerce_positive_int(
             section.get("max_line_length"), DEFAULT_MAX_LINE_LENGTH
         ),
     }
-    return _cached_limits
+    return _publish_limits(profile, limits)
 
 
 def _reset_tool_output_limits_cache() -> None:
     """Reset the cached limits — for tests or after config hot-reload."""
     global _cached_limits
-    _cached_limits = None
+    with _limits_cache_guard:
+        _limits_by_profile.clear()
+        _limits_profile_aliases.clear()
+        _cached_limits = None
+    _limits_profile_context.set(None)
 
 
 def get_max_bytes() -> int:

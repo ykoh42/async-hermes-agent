@@ -31,6 +31,7 @@ import asyncio
 import inspect
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, MutableMapping, Optional
@@ -50,7 +51,33 @@ logger = logging.getLogger(__name__)
 # Ordered registry: name → source instance.  Python dicts preserve
 # insertion order, which doubles as the default apply order.
 _SOURCES: Dict[str, SecretSource] = {}
+_PLUGIN_SOURCES: Dict[object, Dict[str, SecretSource]] = {}
 _BUILTINS_LOADED = False
+
+
+def _plugin_scope(
+    *, registration: bool = False, module_name: str = ""
+) -> object | None:
+    module = sys.modules.get("hermes_cli.plugins")
+    current = getattr(module, "_current_plugin_registry_scope", None)
+    scope = current(registration=registration) if callable(current) else None
+    if scope is None and registration and module_name:
+        resolve = getattr(module, "_plugin_registry_scope_for_module", None)
+        if callable(resolve):
+            return resolve(module_name)
+    return scope
+
+
+def _source_snapshot() -> Dict[str, SecretSource]:
+    sources = dict(_SOURCES)
+    scope = _plugin_scope()
+    if scope is not None:
+        sources.update(_PLUGIN_SOURCES.get(scope, {}))
+    return sources
+
+
+def _clear_plugin_scope(scope: object) -> None:
+    _PLUGIN_SOURCES.pop(scope, None)
 
 
 @dataclass
@@ -136,14 +163,21 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
             getattr(source, "shape", None),
         )
         return False
-    if name in _SOURCES and not replace:
+    scope = _plugin_scope(
+        registration=True,
+        module_name=type(source).__module__,
+    )
+    target = _PLUGIN_SOURCES.setdefault(scope, {}) if scope is not None else _SOURCES
+    effective = dict(_SOURCES)
+    effective.update(target)
+    if name in effective and not replace:
         logger.warning(
             "Secret source '%s' already registered; ignoring duplicate", name
         )
         return False
     scheme = getattr(source, "scheme", None)
     if scheme:
-        for other_name, other in _SOURCES.items():
+        for other_name, other in effective.items():
             if other_name != name and getattr(other, "scheme", None) == scheme:
                 logger.warning(
                     "Ignoring secret source '%s': scheme '%s://' is already "
@@ -153,18 +187,18 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
                     other_name,
                 )
                 return False
-    _SOURCES[name] = source
+    target[name] = source
     return True
 
 
 def get_source(name: str) -> Optional[SecretSource]:
     _ensure_builtin_sources()
-    return _SOURCES.get(name)
+    return _source_snapshot().get(name)
 
 
 def list_sources() -> List[SecretSource]:
     _ensure_builtin_sources()
-    return list(_SOURCES.values())
+    return list(_source_snapshot().values())
 
 
 def _ensure_builtin_sources() -> None:
@@ -206,6 +240,7 @@ def _ensure_builtin_sources() -> None:
 def _reset_registry_for_tests() -> None:
     global _BUILTINS_LOADED
     _SOURCES.clear()
+    _PLUGIN_SOURCES.clear()
     _BUILTINS_LOADED = False
 
 
@@ -262,27 +297,28 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
     precedence is applied on top of this order by :func:`apply_all`.
     """
     _ensure_builtin_sources()
+    sources = _source_snapshot()
 
     explicit = secrets_cfg.get("sources")
     order: List[str] = []
     if isinstance(explicit, list):
         for entry in explicit:
-            if isinstance(entry, str) and entry in _SOURCES and entry not in order:
+            if isinstance(entry, str) and entry in sources and entry not in order:
                 order.append(entry)
-        unknown = [e for e in explicit if isinstance(e, str) and e not in _SOURCES]
+        unknown = [e for e in explicit if isinstance(e, str) and e not in sources]
         if unknown:
             logger.warning(
                 "secrets.sources names unknown source(s): %s (known: %s)",
                 ", ".join(unknown),
-                ", ".join(_SOURCES) or "none",
+                ", ".join(sources) or "none",
             )
-    for name in _SOURCES:
+    for name in sources:
         if name not in order:
             order.append(name)
 
     enabled: List[SecretSource] = []
     for name in order:
-        source = _SOURCES[name]
+        source = sources[name]
         cfg = secrets_cfg.get(name)
         cfg = cfg if isinstance(cfg, dict) else {}
         try:

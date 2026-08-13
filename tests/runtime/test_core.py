@@ -197,9 +197,9 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.isasyncgenfunction(_command_detection_variants)
     assert inspect.iscoroutinefunction(detect_hardline_command)
     assert inspect.iscoroutinefunction(detect_dangerous_command)
-    assert inspect.iscoroutinefunction(get_session_cwd)
-    assert inspect.iscoroutinefunction(record_session_cwd)
-    assert inspect.iscoroutinefunction(register_task_env_overrides)
+    assert not inspect.iscoroutinefunction(get_session_cwd)
+    assert not inspect.iscoroutinefunction(record_session_cwd)
+    assert not inspect.iscoroutinefunction(register_task_env_overrides)
     assert inspect.iscoroutinefunction(_resolve_path_for_task)
     assert inspect.iscoroutinefunction(read_file_tool)
     assert inspect.iscoroutinefunction(write_file_tool)
@@ -850,7 +850,7 @@ async def test_builtin_tool_availability_checks_do_not_block_event_loop(
     from tools.registry import discover_builtin_tools
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    discover_builtin_tools()
+    await discover_builtin_tools()
     checks = {
         entry.check_fn
         for entry in registry._tools.values()
@@ -1071,12 +1071,29 @@ async def test_async_context_manager_initializes_provider_mcp_and_tools():
         skip_context_files=True,
         skip_memory=True,
     )
+    agent.api_mode = "bedrock_converse"
     agent._ensure_provider_runtime = AsyncMock()
     agent.close = AsyncMock()
 
     with (
         patch("agent.lsp._retain_lsp_lifecycle", new=AsyncMock()) as retain_lsp,
         patch("agent.lsp._release_lsp_lifecycle", new=AsyncMock()) as release_lsp,
+        patch(
+            "agent.auxiliary_client._retain_auxiliary_lifecycle",
+            new=AsyncMock(),
+        ) as retain_auxiliary,
+        patch(
+            "agent.bedrock_adapter._retain_bedrock_lifecycle",
+            new=AsyncMock(),
+        ) as retain_bedrock,
+        patch(
+            "plugins.web.parallel.provider._retain_parallel_lifecycle",
+            new=AsyncMock(),
+        ) as retain_parallel,
+        patch(
+            "tools.tts_tool._retain_local_tts_lifecycle",
+            new=AsyncMock(),
+        ) as retain_local_tts,
         patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()) as retain,
         patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()) as discover,
         patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
@@ -1091,6 +1108,10 @@ async def test_async_context_manager_initializes_provider_mcp_and_tools():
     agent._ensure_provider_runtime.assert_awaited_once()
     retain_lsp.assert_awaited_once_with(agent)
     release_lsp.assert_not_awaited()
+    retain_auxiliary.assert_awaited_once_with(agent)
+    retain_bedrock.assert_awaited_once_with(agent)
+    retain_parallel.assert_awaited_once_with(agent)
+    retain_local_tts.assert_awaited_once_with(agent)
     retain.assert_awaited_once_with(agent)
     discover.assert_awaited_once()
     refresh.assert_awaited_once_with(agent, quiet_mode=True)
@@ -1108,11 +1129,44 @@ async def test_async_context_manager_rolls_back_failed_mcp_initialization():
         skip_context_files=True,
         skip_memory=True,
     )
+    agent.api_mode = "bedrock_converse"
     agent._ensure_provider_runtime = AsyncMock()
 
     with (
         patch("agent.lsp._retain_lsp_lifecycle", new=AsyncMock()),
         patch("agent.lsp._release_lsp_lifecycle", new=AsyncMock()) as release_lsp,
+        patch(
+            "agent.auxiliary_client._retain_auxiliary_lifecycle",
+            new=AsyncMock(),
+        ),
+        patch(
+            "agent.auxiliary_client._release_auxiliary_lifecycle",
+            new=AsyncMock(),
+        ) as release_auxiliary,
+        patch(
+            "agent.bedrock_adapter._retain_bedrock_lifecycle",
+            new=AsyncMock(),
+        ),
+        patch(
+            "agent.bedrock_adapter._release_bedrock_lifecycle",
+            new=AsyncMock(),
+        ) as release_bedrock,
+        patch(
+            "plugins.web.parallel.provider._retain_parallel_lifecycle",
+            new=AsyncMock(),
+        ),
+        patch(
+            "plugins.web.parallel.provider._release_parallel_lifecycle",
+            new=AsyncMock(),
+        ) as release_parallel,
+        patch(
+            "tools.tts_tool._retain_local_tts_lifecycle",
+            new=AsyncMock(),
+        ),
+        patch(
+            "tools.tts_tool._release_local_tts_lifecycle",
+            new=AsyncMock(),
+        ) as release_local_tts,
         patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()),
         patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()),
         patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
@@ -1126,8 +1180,16 @@ async def test_async_context_manager_rolls_back_failed_mcp_initialization():
 
     release.assert_awaited_once_with(agent)
     release_lsp.assert_awaited_once_with(agent)
+    release_auxiliary.assert_awaited_once_with(agent)
+    release_bedrock.assert_awaited_once_with(agent)
+    release_parallel.assert_awaited_once_with(agent)
+    release_local_tts.assert_awaited_once_with(agent)
     assert agent._mcp_lifecycle_retained is False
     assert agent._lsp_lifecycle_retained is False
+    assert agent._auxiliary_lifecycle_retained is False
+    assert agent._bedrock_lifecycle_retained is False
+    assert agent._parallel_lifecycle_retained is False
+    assert agent._local_tts_lifecycle_retained is False
     assert agent._mcp_discovery_started is False
 
 
@@ -2957,6 +3019,98 @@ async def test_close_releases_retained_lsp_lifecycle(monkeypatch):
 
     assert released == [agent]
     assert agent._lsp_lifecycle_retained is False
+
+
+@pytest.mark.asyncio
+async def test_close_releases_retained_auxiliary_lifecycle(monkeypatch):
+    from agent import auxiliary_client
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._auxiliary_lifecycle_retained = True
+    released = []
+
+    async def release(owner):
+        released.append(owner)
+
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_release_auxiliary_lifecycle",
+        release,
+    )
+
+    await agent.close()
+
+    assert released == [agent]
+    assert agent._auxiliary_lifecycle_retained is False
+
+
+@pytest.mark.asyncio
+async def test_close_releases_retained_parallel_lifecycle(monkeypatch):
+    from plugins.web.parallel import provider as parallel_provider
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._parallel_lifecycle_retained = True
+    released = []
+
+    async def release(owner):
+        released.append(owner)
+
+    monkeypatch.setattr(
+        parallel_provider,
+        "_release_parallel_lifecycle",
+        release,
+    )
+
+    await agent.close()
+
+    assert released == [agent]
+    assert agent._parallel_lifecycle_retained is False
+
+
+@pytest.mark.asyncio
+async def test_close_releases_retained_local_tts_lifecycle(monkeypatch):
+    from tools import tts_tool
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._local_tts_lifecycle_retained = True
+    released = []
+
+    async def release(owner):
+        released.append(owner)
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_release_local_tts_lifecycle",
+        release,
+    )
+
+    await agent.close()
+
+    assert released == [agent]
+    assert agent._local_tts_lifecycle_retained is False
+
+
+@pytest.mark.asyncio
+async def test_close_releases_retained_bedrock_lifecycle(monkeypatch):
+    from agent import bedrock_adapter
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._bedrock_lifecycle_retained = True
+    released = []
+
+    async def release(owner):
+        released.append(owner)
+
+    monkeypatch.setattr(
+        bedrock_adapter,
+        "_release_bedrock_lifecycle",
+        release,
+    )
+
+    await agent.close()
+
+    assert released == [agent]
+    assert agent._bedrock_lifecycle_retained is False
 
 
 @pytest.mark.asyncio

@@ -68,6 +68,27 @@ _DEFAULT_ENTITY_CONTEXT = (
 )
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned Supermemory cleanup through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 def _default_config() -> dict:
     return {
         "container_tag": _DEFAULT_CONTAINER_TAG,
@@ -99,7 +120,7 @@ def _resolve_base_url(config_value: Any = "") -> str:
     """
     raw = (
         str(config_value or "").strip()
-        or os.environ.get("SUPERMEMORY_BASE_URL", "").strip()
+        or str(get_secret("SUPERMEMORY_BASE_URL", "") or "").strip()
     )
     return (raw or _DEFAULT_BASE_URL).rstrip("/") or _DEFAULT_BASE_URL
 
@@ -381,7 +402,12 @@ class _SupermemoryClient:
                 http_client=http_client,
             )
         except BaseException:
-            await http_client.aclose()
+            await _finish_owned_task(
+                asyncio.create_task(
+                    http_client.aclose(),
+                    name="supermemory-http-initialize-cleanup",
+                )
+            )
             raise
         self._http_client = http_client
         self._client = client
@@ -505,12 +531,20 @@ class _SupermemoryClient:
         http_client = self._http_client
         self._client = None
         self._http_client = None
-        try:
-            if client is not None:
-                await client.close()
-        finally:
-            if http_client is not None and not http_client.is_closed:
-                await http_client.aclose()
+
+        async def close_transports() -> None:
+            try:
+                if client is not None:
+                    await client.close()
+            finally:
+                if http_client is not None and not http_client.is_closed:
+                    await http_client.aclose()
+
+        cleanup = asyncio.create_task(
+            close_transports(),
+            name="supermemory-client-close",
+        )
+        await _finish_owned_task(cleanup)
 
 
 async def _resolve_container_tag_for_setup(
@@ -519,7 +553,7 @@ async def _resolve_container_tag_for_setup(
     identity: str = "default",
 ) -> str:
     config = await _load_supermemory_config(hermes_home)
-    env_tag = os.environ.get("SUPERMEMORY_CONTAINER_TAG", "").strip()
+    env_tag = str(get_secret("SUPERMEMORY_CONTAINER_TAG", "") or "").strip()
     raw_tag = env_tag or config["container_tag"]
     return _sanitize_tag(raw_tag.replace("{identity}", identity))
 
@@ -703,7 +737,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         # Resolve container tag: env var > config > default.
         # Supports {identity} template for profile-scoped containers.
-        env_tag = os.environ.get("SUPERMEMORY_CONTAINER_TAG", "").strip()
+        env_tag = str(get_secret("SUPERMEMORY_CONTAINER_TAG", "") or "").strip()
         raw_tag = env_tag or self._config["container_tag"]
         identity = kwargs.get("agent_identity", "default")
         self._container_tag = _sanitize_tag(raw_tag.replace("{identity}", identity))
@@ -743,29 +777,39 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 await client.initialize()
                 self._client = client
             except asyncio.CancelledError:
+                self._active = False
+                self._client = None
                 if client is not None:
                     try:
-                        await client.close()
+                        await _finish_owned_task(
+                            asyncio.create_task(
+                                client.close(),
+                                name="supermemory-initialize-cancel-cleanup",
+                            )
+                        )
                     except Exception:
                         logger.debug(
                             "Supermemory cleanup after initialization cancellation failed",
                             exc_info=True,
                         )
-                self._active = False
-                self._client = None
                 raise
             except Exception:
                 logger.warning("Supermemory initialization failed", exc_info=True)
+                self._active = False
+                self._client = None
                 if client is not None:
                     try:
-                        await client.close()
+                        await _finish_owned_task(
+                            asyncio.create_task(
+                                client.close(),
+                                name="supermemory-initialize-error-cleanup",
+                            )
+                        )
                     except Exception:
                         logger.debug(
                             "Supermemory cleanup after initialization failure failed",
                             exc_info=True,
                         )
-                self._active = False
-                self._client = None
 
     async def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
@@ -951,7 +995,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
         close_error: Exception | None = None
         if client is not None:
             try:
-                await client.close()
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        client.close(),
+                        name="supermemory-provider-close",
+                    )
+                )
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+                if cancellation is None:
+                    cancellation = exc
             except Exception as exc:
                 close_error = exc
         self._client = None

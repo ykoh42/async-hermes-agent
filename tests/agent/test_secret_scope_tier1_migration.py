@@ -40,10 +40,11 @@ def test_auxiliary_scoped_miss_does_not_borrow(monkeypatch):
         assert _scoped_key_env("OPENAI_API_KEY") == ""
 
 
-def test_auxiliary_unscoped_startup_keeps_legacy_environment(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-own-env")
+def test_auxiliary_unscoped_multiplex_lookup_fails_closed(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-other-profile")
     ss.set_multiplex_active(True)
-    assert _scoped_key_env("OPENAI_API_KEY") == "sk-own-env"
+    with pytest.raises(ss.UnscopedSecretError, match="OPENAI_API_KEY"):
+        _scoped_key_env("OPENAI_API_KEY")
 
 
 def test_auxiliary_empty_name_is_empty():

@@ -132,12 +132,13 @@ class TestSmartApproval:
 
 
 class TestSessionApproval:
-    def test_session_approval_uses_canonical_pattern_key(self):
+    @pytest.mark.asyncio
+    async def test_session_approval_uses_canonical_pattern_key(self):
         session_key = "approval-unit-session"
-        clear_session(session_key)
+        await clear_session(session_key)
         approve_session(session_key, "recursive delete")
         assert is_approved(session_key, "recursive delete") is True
-        clear_session(session_key)
+        await clear_session(session_key)
 
     @pytest.mark.asyncio
     async def test_session_choice_skips_later_prompt(self, monkeypatch):
@@ -156,7 +157,7 @@ class TestSessionApproval:
         )
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         session_key = "approval-async-session"
-        clear_session(session_key)
+        await clear_session(session_key)
         token = set_current_session_key(session_key)
         try:
             first = await check_all_command_guards(
@@ -167,7 +168,7 @@ class TestSessionApproval:
             )
         finally:
             reset_current_session_key(token)
-            clear_session(session_key)
+            await clear_session(session_key)
 
         assert first["approved"] is True
         assert second["approved"] is True

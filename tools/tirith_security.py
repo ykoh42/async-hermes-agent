@@ -21,6 +21,7 @@ never blocks.
 """
 
 import asyncio
+import contextvars
 import hashlib
 import io
 import json
@@ -30,7 +31,10 @@ import platform
 import shutil
 import stat
 import tarfile
+import threading
 import time
+import weakref
+from dataclasses import dataclass, field
 
 import aiofiles
 import aiofiles.os
@@ -114,6 +118,196 @@ _CRASH_LIMIT = 3
 _crash_count: int = 0
 _circuit_open: bool = False
 
+# Background install task coordination. These module globals remain as the
+# historical private test/debug snapshot; retained runtime state lives in the
+# active loop/profile state below.
+_install_lock: asyncio.Lock | None = None
+_install_task: asyncio.Task[str | None] | None = None
+
+# Warning de-duplication snapshot retained for private reset hooks.
+_warned_messages: set[str] = set()
+
+_TIRITH_NO_LOOP = object()
+_TirithScope = tuple[asyncio.AbstractEventLoop | object, str]
+_tirith_scope_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("tirith_security_profile_scope", default=None)
+)
+_tirith_scope_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_tirith_scope_guard = threading.RLock()
+
+
+@dataclass
+class _TirithProfileState:
+    resolved_path: str | None | bool = None
+    install_failure_reason: str = ""
+    crash_count: int = 0
+    circuit_open: bool = False
+    install_task: asyncio.Task[str | None] | None = None
+    install_lock_ref: weakref.ReferenceType[asyncio.Lock] | None = None
+    warned_messages: set[str] = field(default_factory=set)
+
+
+_tirith_loop_states: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, _TirithProfileState]
+] = weakref.WeakKeyDictionary()
+_tirith_staged_states: dict[str, _TirithProfileState] = {}
+_legacy_state_snapshot: tuple = (
+    _resolved_path,
+    _install_failure_reason,
+    _crash_count,
+    _circuit_open,
+    _install_task,
+    frozenset(_warned_messages),
+)
+
+
+def _lexical_tirith_profile() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_tirith_scope() -> _TirithScope:
+    lexical = _lexical_tirith_profile()
+    try:
+        loop: asyncio.AbstractEventLoop | object = asyncio.get_running_loop()
+    except RuntimeError:
+        return _TIRITH_NO_LOOP, lexical
+    active = _tirith_scope_context.get()
+    if active is not None and active[0] == lexical:
+        return loop, active[1]
+    with _tirith_scope_guard:
+        aliases = _tirith_scope_aliases.get(loop)
+        canonical = aliases.get(lexical, lexical) if aliases is not None else lexical
+    return loop, canonical
+
+
+def _state_for_scope(scope: _TirithScope) -> _TirithProfileState:
+    loop, profile = scope
+    with _tirith_scope_guard:
+        if loop is _TIRITH_NO_LOOP:
+            return _tirith_staged_states.setdefault(profile, _TirithProfileState())
+        assert isinstance(loop, asyncio.AbstractEventLoop)
+        return _tirith_loop_states.setdefault(loop, {}).setdefault(
+            profile, _TirithProfileState()
+        )
+
+
+def _publish_legacy_state(state: _TirithProfileState) -> None:
+    """Update historical module snapshots without driving runtime behavior."""
+    global _resolved_path, _install_failure_reason, _crash_count
+    global _circuit_open, _install_task, _warned_messages, _legacy_state_snapshot
+    with _tirith_scope_guard:
+        _resolved_path = state.resolved_path
+        _install_failure_reason = state.install_failure_reason
+        _crash_count = state.crash_count
+        _circuit_open = state.circuit_open
+        _install_task = state.install_task
+        _warned_messages = state.warned_messages
+        _legacy_state_snapshot = (
+            _resolved_path,
+            _install_failure_reason,
+            _crash_count,
+            _circuit_open,
+            _install_task,
+            frozenset(_warned_messages),
+        )
+
+
+def _update_tirith_state(state: _TirithProfileState, **changes) -> None:
+    for name, value in changes.items():
+        setattr(state, name, value)
+    _publish_legacy_state(state)
+
+
+def _capture_legacy_overrides(state: _TirithProfileState) -> None:
+    """Honor direct assignments used by retained private reset seams."""
+    global _legacy_state_snapshot
+    current = (
+        _resolved_path,
+        _install_failure_reason,
+        _crash_count,
+        _circuit_open,
+        _install_task,
+        frozenset(_warned_messages),
+    )
+    previous = _legacy_state_snapshot
+    if current[0] != previous[0]:
+        state.resolved_path = current[0]
+    if current[1] != previous[1]:
+        state.install_failure_reason = current[1]
+    if current[2] != previous[2]:
+        state.crash_count = current[2]
+    if current[3] != previous[3]:
+        state.circuit_open = current[3]
+    if current[4] is not previous[4]:
+        state.install_task = current[4]
+    if current[5] != previous[5]:
+        state.warned_messages = set(current[5])
+    _publish_legacy_state(state)
+
+
+async def _activate_tirith_state() -> _TirithProfileState:
+    """Resolve and activate one loop/canonical-profile runtime state."""
+    loop = asyncio.get_running_loop()
+    lexical = _lexical_tirith_profile()
+    active = _tirith_scope_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        with _tirith_scope_guard:
+            aliases = _tirith_scope_aliases.get(loop)
+            canonical = aliases.get(lexical) if aliases is not None else None
+        if canonical is None:
+            expanduser = aiofiles.os.wrap(os.path.expanduser)
+            expanded = str(await expanduser(lexical))
+            is_absolute = (
+                expanded.startswith(("/", "\\\\"))
+                or (
+                    len(expanded) >= 3
+                    and expanded[1] == ":"
+                    and expanded[2] in "/\\"
+                )
+            )
+            if not is_absolute:
+                expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+            realpath = aiofiles.os.wrap(os.path.realpath)
+            canonical = os.path.normcase(str(await realpath(expanded)))
+        with _tirith_scope_guard:
+            _tirith_scope_aliases.setdefault(loop, {})[lexical] = canonical
+    scope = (loop, canonical)
+    _tirith_scope_context.set((lexical, canonical))
+    state = _state_for_scope(scope)
+    with _tirith_scope_guard:
+        for source_scope in ((loop, lexical), (_TIRITH_NO_LOOP, lexical)):
+            if source_scope == scope:
+                continue
+            source_loop, source_profile = source_scope
+            if source_loop is _TIRITH_NO_LOOP:
+                staged = _tirith_staged_states.pop(source_profile, None)
+            else:
+                profiles = _tirith_loop_states.get(loop)
+                staged = profiles.pop(source_profile, None) if profiles else None
+            if staged is not None and staged is not state:
+                state.resolved_path = staged.resolved_path
+                state.install_failure_reason = staged.install_failure_reason
+                state.crash_count = staged.crash_count
+                state.circuit_open = staged.circuit_open
+                state.install_task = staged.install_task
+                state.warned_messages.update(staged.warned_messages)
+        _capture_legacy_overrides(state)
+    return state
+
+
+def _state_install_lock(state: _TirithProfileState) -> asyncio.Lock:
+    with _tirith_scope_guard:
+        lock_ref = state.install_lock_ref
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            state.install_lock_ref = weakref.ref(lock)
+        return lock
+
 
 async def _finish_process_communicate(
     process: asyncio.subprocess.Process,
@@ -149,33 +343,27 @@ async def _finish_process_communicate(
 
 def _record_tirith_crash() -> None:
     """Increment the crash counter and open the circuit breaker if needed."""
-    global _crash_count, _circuit_open
-    _crash_count += 1
-    if _crash_count >= _CRASH_LIMIT:
-        _circuit_open = True
+    state = _state_for_scope(_current_tirith_scope())
+    state.crash_count += 1
+    if state.crash_count >= _CRASH_LIMIT:
+        state.circuit_open = True
         logger.warning(
             "tirith circuit breaker opened after %d consecutive failures; "
             "disabling for the rest of the process",
-            _crash_count,
+            state.crash_count,
         )
+    _publish_legacy_state(state)
 
-# Background install task coordination
-_install_lock = asyncio.Lock()
-_install_task: asyncio.Task[str | None] | None = None
 
-# Warning de-duplication. The spawn/path warnings live in the hot path —
-# without this dedupe set, a Windows install where ``tirith`` isn't on PATH
-# (e.g. background install thread still running, or install marked failed)
-# spams ``tirith spawn failed: [WinError 2]...`` once per terminal command,
-# easily filling errors.log with hundreds of identical lines.
-_warned_messages: set[str] = set()
 def _warn_once(key: str, message: str, *args) -> None:
     """``logger.warning`` but at-most-once per ``key`` for the process
     lifetime. Used to avoid drowning the log when a fail-open tirith
     misconfiguration fires on every command."""
-    if key in _warned_messages:
+    state = _state_for_scope(_current_tirith_scope())
+    if key in state.warned_messages:
         return
-    _warned_messages.add(key)
+    state.warned_messages.add(key)
+    _publish_legacy_state(state)
     logger.warning(message, *args)
 
 
@@ -184,7 +372,18 @@ def _reset_spawn_warning_state() -> None:
     (re)installed so a subsequent failure surfaces again — e.g. user
     deletes the binary mid-session.
     """
-    _warned_messages.clear()
+    state = _state_for_scope(_current_tirith_scope())
+    # This retained private reset hook is also the test-suite's state seeding
+    # boundary. Copy every historical scalar rather than relying on change
+    # detection: a fresh event loop may have defaults even when the assigned
+    # compatibility value happens to equal the previous loop's snapshot.
+    state.resolved_path = _resolved_path
+    state.install_failure_reason = _install_failure_reason
+    state.crash_count = _crash_count
+    state.circuit_open = _circuit_open
+    state.install_task = _install_task
+    state.warned_messages.clear()
+    _publish_legacy_state(state)
 
 # Disk-persistent failure marker — avoids retry across process restarts
 _MARKER_TTL = 86400  # 24 hours
@@ -616,23 +815,26 @@ async def _resolve_tirith_path(configured_path: str) -> str:
     Failed installs are cached for the process lifetime (and persisted to
     disk for 24h) to avoid repeated network attempts.
     """
-    global _resolved_path, _install_failure_reason
+    state = await _activate_tirith_state()
 
     # Fast path: successfully resolved on a previous call.
-    if _resolved_path is not None and _resolved_path is not _INSTALL_FAILED:
-        return _resolved_path
+    if state.resolved_path is not None and state.resolved_path is not _INSTALL_FAILED:
+        return state.resolved_path
 
     expanded = os.path.expanduser(configured_path)
     explicit = _is_explicit_path(configured_path)
-    install_failed = _resolved_path is _INSTALL_FAILED
+    install_failed = state.resolved_path is _INSTALL_FAILED
 
     # Platform has no tirith build (Windows etc.). Cache the verdict and
     # return the unexpanded configured path — the spawn loop will fail-open
     # via the dedupe'd OSError handler, but only after the first call; on
     # subsequent calls the fast-path above short-circuits before spawning.
     if not explicit and not is_platform_supported():
-        _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = "unsupported_platform"
+        _update_tirith_state(
+            state,
+            resolved_path=_INSTALL_FAILED,
+            install_failure_reason="unsupported_platform",
+        )
         return expanded
 
     # Explicit path: check it and stop. Never auto-download a replacement.
@@ -640,16 +842,19 @@ async def _resolve_tirith_path(configured_path: str) -> str:
         if await aiofiles.os.path.isfile(expanded) and await aiofiles.os.wrap(
             os.access
         )(expanded, os.X_OK):
-            _resolved_path = expanded
+            _update_tirith_state(state, resolved_path=expanded)
             return expanded
         # Also try shutil.which in case it's a bare name on PATH
         found = await aiofiles.os.wrap(shutil.which)(expanded)
         if found:
-            _resolved_path = found
+            _update_tirith_state(state, resolved_path=found)
             return found
         logger.warning("Configured tirith path %r not found; scanning disabled", configured_path)
-        _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = "explicit_path_missing"
+        _update_tirith_state(
+            state,
+            resolved_path=_INSTALL_FAILED,
+            install_failure_reason="explicit_path_missing",
+        )
         return expanded
 
     # Default "tirith" — always re-run cheap local checks so a manual
@@ -657,8 +862,11 @@ async def _resolve_tirith_path(configured_path: str) -> str:
     # long-lived gateway/CLI recovers without restart).
     found = await aiofiles.os.wrap(shutil.which)("tirith")
     if found:
-        _resolved_path = found
-        _install_failure_reason = ""
+        _update_tirith_state(
+            state,
+            resolved_path=found,
+            install_failure_reason="",
+        )
         await _clear_install_failed()
         return found
 
@@ -666,8 +874,11 @@ async def _resolve_tirith_path(configured_path: str) -> str:
     if await aiofiles.os.path.isfile(hermes_bin) and await aiofiles.os.wrap(
         os.access
     )(hermes_bin, os.X_OK):
-        _resolved_path = hermes_bin
-        _install_failure_reason = ""
+        _update_tirith_state(
+            state,
+            resolved_path=hermes_bin,
+            install_failure_reason="",
+        )
         await _clear_install_failed()
         return hermes_bin
 
@@ -676,12 +887,15 @@ async def _resolve_tirith_path(configured_path: str) -> str:
     # cosign is now available (retryable cause resolved in-process).
     if install_failed:
         if (
-            _install_failure_reason == "cosign_missing"
+            state.install_failure_reason == "cosign_missing"
             and await aiofiles.os.wrap(shutil.which)("cosign")
         ):
             # Retryable cause resolved — clear sentinel and fall through to retry
-            _resolved_path = None
-            _install_failure_reason = ""
+            _update_tirith_state(
+                state,
+                resolved_path=None,
+                install_failure_reason="",
+            )
             await _clear_install_failed()
             install_failed = False
         else:
@@ -692,8 +906,11 @@ async def _resolve_tirith_path(configured_path: str) -> str:
     # detect retryable causes (e.g. cosign_missing) without restart.
     disk_reason = await _read_failure_reason()
     if disk_reason is not None and await _is_install_failed_on_disk():
-        _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = disk_reason
+        _update_tirith_state(
+            state,
+            resolved_path=_INSTALL_FAILED,
+            install_failure_reason=disk_reason,
+        )
         return expanded
 
     installed = await _background_install()
@@ -704,39 +921,62 @@ async def _resolve_tirith_path(configured_path: str) -> str:
 
 async def _background_install(*, log_failures: bool = True) -> str | None:
     """Download and install tirith while serializing concurrent attempts."""
-    global _resolved_path, _install_failure_reason
-    async with _install_lock:
+    state = await _activate_tirith_state()
+    async with _state_install_lock(state):
         # Double-check after acquiring the lock; another task may have resolved it.
-        if _resolved_path is _INSTALL_FAILED:
+        if state.resolved_path is _INSTALL_FAILED:
             return None
-        if _resolved_path is not None:
-            return _resolved_path
+        if state.resolved_path is not None:
+            return state.resolved_path
 
         # Re-check local paths (may have been installed by another process)
         found = await aiofiles.os.wrap(shutil.which)("tirith")
         if found:
-            _resolved_path = found
-            _install_failure_reason = ""
+            _update_tirith_state(
+                state,
+                resolved_path=found,
+                install_failure_reason="",
+            )
             return found
 
         hermes_bin = os.path.join(await _hermes_bin_dir(), "tirith")
         if await aiofiles.os.path.isfile(hermes_bin) and await aiofiles.os.wrap(
             os.access
         )(hermes_bin, os.X_OK):
-            _resolved_path = hermes_bin
-            _install_failure_reason = ""
+            _update_tirith_state(
+                state,
+                resolved_path=hermes_bin,
+                install_failure_reason="",
+            )
             return hermes_bin
 
         installed, reason = await _install_tirith(log_failures=log_failures)
         if installed:
-            _resolved_path = installed
-            _install_failure_reason = ""
+            _update_tirith_state(
+                state,
+                resolved_path=installed,
+                install_failure_reason="",
+            )
             await _clear_install_failed()
         else:
-            _resolved_path = _INSTALL_FAILED
-            _install_failure_reason = reason
+            _update_tirith_state(
+                state,
+                resolved_path=_INSTALL_FAILED,
+                install_failure_reason=reason,
+            )
             await _mark_install_failed(reason)
         return installed
+
+
+def _clear_finished_install_task(
+    state: _TirithProfileState,
+    task: asyncio.Task[str | None],
+) -> None:
+    """Drop completed tasks so scoped state never retains an owning loop."""
+    if state.install_task is task:
+        state.install_task = None
+    if _install_task is task:
+        _publish_legacy_state(state)
 
 
 async def ensure_installed(*, log_failures: bool = True):
@@ -746,15 +986,14 @@ async def ensure_installed(*, log_failures: bool = True):
     download runs in a native task. Safe to call multiple times.
     Returns the resolved path immediately if available, or None.
     """
-    global _resolved_path, _install_task, _install_failure_reason
-
     cfg = await _load_security_config()
     if not cfg["tirith_enabled"]:
         return None
+    state = await _activate_tirith_state()
 
     # Already resolved from a previous call
-    if _resolved_path is not None and _resolved_path is not _INSTALL_FAILED:
-        path = _resolved_path
+    if state.resolved_path is not None and state.resolved_path is not _INSTALL_FAILED:
+        path = state.resolved_path
         if await aiofiles.os.path.isfile(path) and await aiofiles.os.wrap(
             os.access
         )(path, os.X_OK):
@@ -765,8 +1004,11 @@ async def ensure_installed(*, log_failures: bool = True):
     # don't start a download thread, don't write a disk failure marker.
     # Pattern-matching guards still run; this path stays silent.
     if not is_platform_supported():
-        _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = "unsupported_platform"
+        _update_tirith_state(
+            state,
+            resolved_path=_INSTALL_FAILED,
+            install_failure_reason="unsupported_platform",
+        )
         return None
 
     configured_path = cfg["tirith_path"]
@@ -778,21 +1020,27 @@ async def ensure_installed(*, log_failures: bool = True):
         if await aiofiles.os.path.isfile(expanded) and await aiofiles.os.wrap(
             os.access
         )(expanded, os.X_OK):
-            _resolved_path = expanded
+            _update_tirith_state(state, resolved_path=expanded)
             return expanded
         found = await aiofiles.os.wrap(shutil.which)(expanded)
         if found:
-            _resolved_path = found
+            _update_tirith_state(state, resolved_path=found)
             return found
-        _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = "explicit_path_missing"
+        _update_tirith_state(
+            state,
+            resolved_path=_INSTALL_FAILED,
+            install_failure_reason="explicit_path_missing",
+        )
         return None
 
     # Default "tirith" — quick local checks first (no network)
     found = await aiofiles.os.wrap(shutil.which)("tirith")
     if found:
-        _resolved_path = found
-        _install_failure_reason = ""
+        _update_tirith_state(
+            state,
+            resolved_path=found,
+            install_failure_reason="",
+        )
         await _clear_install_failed()
         return found
 
@@ -800,19 +1048,25 @@ async def ensure_installed(*, log_failures: bool = True):
     if await aiofiles.os.path.isfile(hermes_bin) and await aiofiles.os.wrap(
         os.access
     )(hermes_bin, os.X_OK):
-        _resolved_path = hermes_bin
-        _install_failure_reason = ""
+        _update_tirith_state(
+            state,
+            resolved_path=hermes_bin,
+            install_failure_reason="",
+        )
         await _clear_install_failed()
         return hermes_bin
 
     # If previously failed in-memory, check if the cause is now resolved
-    if _resolved_path is _INSTALL_FAILED:
+    if state.resolved_path is _INSTALL_FAILED:
         if (
-            _install_failure_reason == "cosign_missing"
+            state.install_failure_reason == "cosign_missing"
             and await aiofiles.os.wrap(shutil.which)("cosign")
         ):
-            _resolved_path = None
-            _install_failure_reason = ""
+            _update_tirith_state(
+                state,
+                resolved_path=None,
+                install_failure_reason="",
+            )
             await _clear_install_failed()
         else:
             return None
@@ -822,15 +1076,22 @@ async def ensure_installed(*, log_failures: bool = True):
     # Preserve the marker's real reason for in-memory retry logic.
     disk_reason = await _read_failure_reason()
     if disk_reason is not None and await _is_install_failed_on_disk():
-        _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = disk_reason
+        _update_tirith_state(
+            state,
+            resolved_path=_INSTALL_FAILED,
+            install_failure_reason=disk_reason,
+        )
         return None
 
     # Need to download — launch one tracked native task so startup does not block.
-    if _install_task is None or _install_task.done():
-        _install_task = asyncio.create_task(
+    if state.install_task is None or state.install_task.done():
+        task = asyncio.create_task(
             _background_install(log_failures=log_failures),
             name="tirith-install",
+        )
+        _update_tirith_state(state, install_task=task)
+        task.add_done_callback(
+            lambda done, state=state: _clear_finished_install_task(state, done)
         )
 
     return None  # Not available yet; commands will fail-open until ready
@@ -854,19 +1115,18 @@ async def check_command_security(command: str) -> dict:
     Returns:
         {"action": "allow"|"warn"|"block", "findings": [...], "summary": str}
     """
-    global _crash_count, _circuit_open
-
     cfg = await _load_security_config()
 
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
+    state = await _activate_tirith_state()
 
     # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row,
     # stop trying for the rest of the process.  Without this, a corrupted
     # or missing binary causes every tool call to hit the same spawn failure
     # → fail-open → agent retry loop, hanging the user for 20+ minutes
     # (issue #41400).
-    if _circuit_open:
+    if state.circuit_open:
         return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
@@ -959,7 +1219,7 @@ async def check_command_security(command: str) -> dict:
     if exit_code == 0:
         action = "allow"
         # Successful execution — reset circuit breaker
-        _crash_count = 0
+        _update_tirith_state(state, crash_count=0)
     elif exit_code == 1:
         action = "block"
     elif exit_code == 2:

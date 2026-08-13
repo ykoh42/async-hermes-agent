@@ -27,16 +27,34 @@ the same Converse API integration in TypeScript via ``@aws-sdk/client-bedrock``.
 Requires: ``aiobotocore`` (optional dependency — only needed when using the Bedrock provider).
 """
 
+import asyncio
 import configparser
+import contextvars
+import hashlib
 import json
 import logging
 import os
 import re
+import threading
+import weakref
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import aiofiles
+import aiofiles.os
+
+from agent.secret_scope import (
+    UnscopedSecretError,
+    current_secret_scope,
+    is_multiplex_active,
+)
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,19 +66,403 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 try:
+    from aiobotocore.config import AioConfig as _AioConfig
+    from aiobotocore.credentials import AioCredentials as _AioCredentials
     from aiobotocore.session import get_session as _aiobotocore_get_session
+    from botocore.tokens import ScopedEnvTokenProvider as _ScopedEnvTokenProvider
+    from botocore.tokens import TokenProviderChain as _TokenProviderChain
     _aiobotocore_import_error: Exception | None = None
 except Exception as exc:
+    _AioConfig = None
+    _AioCredentials = None
     _aiobotocore_get_session = None
+    _ScopedEnvTokenProvider = None
+    _TokenProviderChain = None
     _aiobotocore_import_error = exc
 
-# Retain upstream's cache-management state and public hooks.  Native async
-# requests intentionally do not put aiobotocore clients here: each request
-# owns an async context manager and closes it before returning.  Keeping the
-# dictionaries preserves the exact reset/invalidation contract for callers
-# and tests without leaking an event-loop-bound SDK client globally.
+# Compatibility projections for upstream's private cache dictionaries. Native
+# async ownership is held by the scoped state below; these remain available to
+# tests and integrations that inspect or seed the historical cache surface.
 _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
+
+
+@dataclass
+class _CachedBedrockClient:
+    service: str
+    region: str
+    identity: tuple[Any, ...]
+    manager: Any
+    client: Any
+    active_leases: int = 0
+    retired: bool = False
+    closed: bool = False
+
+
+@dataclass
+class _BedrockScopeState:
+    profile_home: str
+    credential_identities: dict[tuple[Any, ...], tuple[Any, ...]] = field(
+        default_factory=dict
+    )
+    clients: dict[tuple[str, str, tuple[Any, ...]], _CachedBedrockClient] = field(
+        default_factory=dict
+    )
+    discovery: dict[tuple[str, tuple[str, ...], tuple[Any, ...]], Any] = field(
+        default_factory=dict
+    )
+    discovery_tasks: dict[
+        tuple[str, tuple[str, ...], tuple[Any, ...]],
+        asyncio.Task[List[Dict[str, Any]]],
+    ] = field(default_factory=dict)
+    discovery_waiters: dict[
+        tuple[str, tuple[str, ...], tuple[Any, ...]], int
+    ] = field(default_factory=dict)
+    discovery_generation: int = 0
+    consumers: weakref.WeakSet[object] = field(default_factory=weakref.WeakSet)
+    lock: asyncio.Lock | None = None
+    lock_users: int = 0
+
+
+_bedrock_scope_states: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, _BedrockScopeState]
+] = weakref.WeakKeyDictionary()
+_bedrock_scope_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_bedrock_owner_scopes: weakref.WeakKeyDictionary[
+    object, tuple[weakref.ReferenceType[asyncio.AbstractEventLoop], str]
+] = weakref.WeakKeyDictionary()
+_bedrock_scope_guard = threading.RLock()
+_bedrock_scope_context: contextvars.ContextVar[
+    tuple[str, _BedrockScopeState] | None
+] = contextvars.ContextVar("bedrock_profile_scope", default=None)
+_bedrock_credential_context: contextvars.ContextVar[
+    tuple[Any, tuple[Any, ...], dict[str, Any]] | None
+] = contextvars.ContextVar("bedrock_credential_scope", default=None)
+
+
+async def _finish_owned_task(
+    task: asyncio.Task[Any],
+    cancellation: asyncio.CancelledError | None = None,
+) -> Any:
+    first_cancellation = cancellation
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                if first_cancellation is not None:
+                    raise first_cancellation from exc  # noqa: ASYNC104
+                raise
+            if first_cancellation is None:
+                first_cancellation = exc
+        except Exception as exc:
+            if first_cancellation is not None:
+                raise first_cancellation from exc
+            raise
+    if first_cancellation is not None:
+        raise first_cancellation
+    return result
+
+
+def _lexical_bedrock_home() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+async def _canonical_bedrock_home() -> tuple[asyncio.AbstractEventLoop, str]:
+    loop = asyncio.get_running_loop()
+    lexical = _lexical_bedrock_home()
+    active = _bedrock_scope_context.get()
+    if active is not None and active[0] == lexical:
+        return loop, active[1].profile_home
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = str(await expanduser(lexical))
+    if not os.path.isabs(expanded):
+        expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    return loop, os.path.normcase(str(await realpath(expanded)))
+
+
+async def _activate_bedrock_scope() -> _BedrockScopeState:
+    lexical = _lexical_bedrock_home()
+    active = _bedrock_scope_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    loop, canonical = await _canonical_bedrock_home()
+    with _bedrock_scope_guard:
+        for closed_loop in tuple(_bedrock_scope_states):
+            if closed_loop.is_closed():
+                _bedrock_scope_states.pop(closed_loop, None)
+                _bedrock_scope_aliases.pop(closed_loop, None)
+        _bedrock_scope_aliases.setdefault(loop, {})[lexical] = canonical
+        state = _bedrock_scope_states.setdefault(loop, {}).setdefault(
+            canonical, _BedrockScopeState(canonical)
+        )
+    _bedrock_scope_context.set((lexical, state))
+    return state
+
+
+class _BedrockStateLock:
+    def __init__(self, state: _BedrockScopeState) -> None:
+        self.state = state
+        self.lock: asyncio.Lock | None = None
+
+    async def __aenter__(self) -> None:
+        with _bedrock_scope_guard:
+            lock = self.state.lock
+            if lock is None:
+                lock = asyncio.Lock()
+                self.state.lock = lock
+            self.state.lock_users += 1
+            self.lock = lock
+        try:
+            await lock.acquire()
+        except BaseException:
+            with _bedrock_scope_guard:
+                remaining = self.state.lock_users - 1
+                self.state.lock_users = remaining
+                if remaining == 0:
+                    self.state.lock = None
+            raise
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        assert self.lock is not None
+        self.lock.release()
+        with _bedrock_scope_guard:
+            remaining = self.state.lock_users - 1
+            self.state.lock_users = remaining
+            if remaining == 0:
+                self.state.lock = None
+
+
+def _secret_digest(value: str) -> bytes:
+    return hashlib.blake2b(value.encode("utf-8"), digest_size=16).digest()
+
+
+class _BedrockProfileIsolationError(RuntimeError):
+    """Raised when an AWS auth source cannot be isolated by profile."""
+
+
+_AWS_IDENTITY_ENV_NAMES = (
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+)
+_AWS_UNSUPPORTED_MULTIPLEX_SOURCES = (
+    "AWS_PROFILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+)
+
+
+@dataclass(frozen=True)
+class _ScopedAWSClientConfiguration:
+    identity: tuple[Any, ...]
+    create_kwargs: dict[str, Any]
+    bearer_token: str | None = None
+
+
+def _aws_setting(settings: Mapping[str, Any], name: str) -> str:
+    value = settings.get(name)
+    return str(value).strip() if value is not None else ""
+
+
+def _aws_environment_settings(
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[Mapping[str, Any], bool]:
+    """Return the AWS settings authoritative for the current request."""
+    multiplexed = is_multiplex_active()
+    if env is not None:
+        return env, multiplexed
+    if not multiplexed:
+        return os.environ, False
+    scope = current_secret_scope()
+    if scope is None:
+        raise UnscopedSecretError(
+            "AWS Bedrock credential resolution requires an active profile "
+            "secret scope while multiplexing is enabled"
+        )
+    return scope, True
+
+
+def _scoped_aws_client_configuration(
+    settings: Mapping[str, Any],
+) -> _ScopedAWSClientConfiguration:
+    """Build explicit client auth without entering AWS's global chain."""
+    bearer_token = _aws_setting(settings, "AWS_BEARER_TOKEN_BEDROCK")
+    access_key = _aws_setting(settings, "AWS_ACCESS_KEY_ID")
+    secret_key = _aws_setting(settings, "AWS_SECRET_ACCESS_KEY")
+    session_token = _aws_setting(settings, "AWS_SESSION_TOKEN")
+
+    if bearer_token:
+        assert _AioConfig is not None
+        return _ScopedAWSClientConfiguration(
+            identity=(("bearer", _secret_digest(bearer_token)),),
+            create_kwargs={
+                "config": _AioConfig(signature_version="bearer"),
+                # aiobotocore resolves its credential chain before selecting
+                # the bearer signer. In multiplex mode that default chain is
+                # both profile-unsafe and unnecessary, so satisfy the client
+                # constructor with inert credentials that bearer auth ignores.
+                "aws_access_key_id": "hermes-bedrock-bearer",
+                "aws_secret_access_key": "hermes-bedrock-bearer",
+            },
+            bearer_token=bearer_token,
+        )
+
+    if bool(access_key) != bool(secret_key):
+        raise _BedrockProfileIsolationError(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be configured "
+            "together for profile-scoped Bedrock authentication"
+        )
+    if access_key:
+        assert _AioConfig is not None
+        identity: tuple[Any, ...] = (
+            ("access-key", _secret_digest(access_key)),
+            ("secret-key", _secret_digest(secret_key)),
+        )
+        create_kwargs: dict[str, Any] = {
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key,
+            # Pin SigV4 so a foreign process-global Bedrock bearer token
+            # cannot override this profile's explicit IAM credentials.
+            "config": _AioConfig(signature_version="v4"),
+        }
+        if session_token:
+            identity += (("session-token", _secret_digest(session_token)),)
+            create_kwargs["aws_session_token"] = session_token
+        return _ScopedAWSClientConfiguration(identity, create_kwargs)
+
+    unsupported = [
+        name
+        for name in _AWS_UNSUPPORTED_MULTIPLEX_SOURCES
+        if _aws_setting(settings, name)
+    ]
+    if unsupported:
+        sources = ", ".join(unsupported)
+        raise _BedrockProfileIsolationError(
+            "AWS Bedrock profile multiplexing cannot use "
+            f"{sources}: aiobotocore resolves these sources through shared "
+            "profile files, process-global selectors, metadata endpoints, or "
+            "blocking credential providers. Configure explicit profile-scoped "
+            "AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (and optional "
+            "AWS_SESSION_TOKEN), use AWS_BEARER_TOKEN_BEDROCK, or isolate "
+            "this profile in its own process."
+        )
+    raise _BedrockProfileIsolationError(
+        "AWS Bedrock profile multiplexing requires explicit profile-scoped AWS "
+        "credentials: configure AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY "
+        "(and optional AWS_SESSION_TOKEN) or AWS_BEARER_TOKEN_BEDROCK. The "
+        "default AWS profile, shared credentials, container/web-identity, and "
+        "instance-metadata chains are not profile-isolated."
+    )
+
+
+async def _resolve_anthropic_bedrock_credentials() -> Any:
+    """Resolve credentials for Anthropic's SigV4-only Bedrock transport."""
+    settings, multiplexed = _aws_environment_settings()
+    if multiplexed:
+        _require_aiobotocore()
+        configuration = _scoped_aws_client_configuration(settings)
+        if configuration.bearer_token is not None:
+            raise _BedrockProfileIsolationError(
+                "AWS_BEARER_TOKEN_BEDROCK cannot authenticate the Anthropic "
+                "Bedrock transport because AsyncAnthropicBedrock supports only "
+                "SigV4 credentials. Use the Bedrock Converse transport for "
+                "bearer authentication or configure profile-scoped "
+                "AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY."
+            )
+        assert _AioCredentials is not None
+        return _AioCredentials(
+            configuration.create_kwargs["aws_access_key_id"],
+            configuration.create_kwargs["aws_secret_access_key"],
+            configuration.create_kwargs.get("aws_session_token"),
+            method="hermes-profile-scope",
+        )
+
+    session = _require_aiobotocore()()
+    credentials = await session.get_credentials()
+    if credentials is None:
+        raise RuntimeError("could not resolve credentials from AWS session")
+    return credentials
+
+
+def _configure_scoped_aws_session(
+    session: Any,
+    configuration: _ScopedAWSClientConfiguration,
+) -> None:
+    """Install a scoped bearer provider without mutating ``os.environ``."""
+    assert _TokenProviderChain is not None
+    providers = []
+    if configuration.bearer_token is not None:
+        assert _ScopedEnvTokenProvider is not None
+        providers.append(
+            _ScopedEnvTokenProvider(
+                session,
+                environ={
+                    "AWS_BEARER_TOKEN_BEDROCK": configuration.bearer_token
+                },
+            )
+        )
+    session.register_component("token_provider", _TokenProviderChain(providers))
+
+
+def _aws_environment_identity(
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[Any, ...]:
+    """Return the secret-safe environment portion of AWS identity."""
+    settings, _multiplexed = _aws_environment_settings(env)
+    return tuple(
+        (name, _secret_digest(value))
+        for name in _AWS_IDENTITY_ENV_NAMES
+        if (value := _aws_setting(settings, name))
+    )
+
+
+async def _aws_credential_identity(
+    session: Any,
+    env_identity: tuple[Any, ...] | None = None,
+) -> tuple[Any, ...]:
+    """Return a secret-safe identity for the effective AWS credential chain."""
+    env_identity = (
+        _aws_environment_identity() if env_identity is None else env_identity
+    )
+    try:
+        credentials = await session.get_credentials()
+        frozen = (
+            await credentials.get_frozen_credentials()
+            if credentials is not None
+            else None
+        )
+        access_key = str(getattr(frozen, "access_key", "") or "")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        access_key = ""
+    if access_key:
+        return env_identity + (
+            ("resolved-access-key", _secret_digest(access_key)),
+        )
+    return env_identity
+
 
 def _require_aiobotocore():
     """Return aiobotocore's cached session factory or a clear install error."""
@@ -77,32 +479,290 @@ def _require_aiobotocore():
     return _aiobotocore_get_session
 
 
-def _get_bedrock_runtime_client(region: str):
-    """Create a native-async ``bedrock-runtime`` client context manager.
+class _BedrockClientLease:
+    def __init__(self, service: str, region: str) -> None:
+        self.service = service
+        self.region = region
+        self.state: _BedrockScopeState | None = None
+        self.entry: _CachedBedrockClient | None = None
 
-    Uses the default AWS credential chain (env vars → profile → instance role).
-    """
-    return _require_aiobotocore()().create_client(
-        "bedrock-runtime", region_name=region
-    )
+    def _claim(
+        self,
+        state: _BedrockScopeState,
+        entry: _CachedBedrockClient,
+    ) -> Any:
+        entry.active_leases += 1
+        self.state = state
+        self.entry = entry
+        cache = (
+            _bedrock_runtime_client_cache
+            if self.service == "bedrock-runtime"
+            else _bedrock_control_client_cache
+        )
+        cache[self.region] = entry.client
+        return entry.client
+
+    async def __aenter__(self) -> Any:
+        state = await _activate_bedrock_scope()
+        credential_scope = _bedrock_credential_context.get()
+        if credential_scope is None:
+            settings, multiplexed = _aws_environment_settings()
+            environment_identity = _aws_environment_identity()
+            scoped_configuration = None
+            if multiplexed:
+                _require_aiobotocore()
+                scoped_configuration = _scoped_aws_client_configuration(settings)
+            async with _BedrockStateLock(state):
+                identity = state.credential_identities.get(environment_identity)
+                if identity is not None:
+                    entry = state.clients.get(
+                        (self.service, self.region, identity)
+                    )
+                    if entry is not None and not entry.retired and not entry.closed:
+                        return self._claim(state, entry)
+            session = _require_aiobotocore()()
+            if identity is None:
+                if scoped_configuration is not None:
+                    identity = scoped_configuration.identity
+                else:
+                    identity = await _aws_credential_identity(
+                        session,
+                        environment_identity,
+                    )
+                async with _BedrockStateLock(state):
+                    state.credential_identities[environment_identity] = identity
+            if scoped_configuration is not None:
+                _configure_scoped_aws_session(session, scoped_configuration)
+                create_kwargs = scoped_configuration.create_kwargs
+            else:
+                create_kwargs = {}
+        else:
+            session, identity, create_kwargs = credential_scope
+        key = (self.service, self.region, identity)
+        async with _BedrockStateLock(state):
+            entry = state.clients.get(key)
+            if entry is None or entry.retired or entry.closed:
+                manager = session.create_client(
+                    self.service,
+                    region_name=self.region,
+                    **create_kwargs,
+                )
+                try:
+                    client = await manager.__aenter__()
+                except BaseException as exc:
+                    cleanup = asyncio.create_task(
+                        manager.__aexit__(None, None, None),
+                        name="bedrock-partial-client-cleanup",
+                    )
+                    cancellation = (
+                        exc if isinstance(exc, asyncio.CancelledError) else None
+                    )
+                    await _finish_owned_task(cleanup, cancellation)
+                    raise
+                entry = _CachedBedrockClient(
+                    self.service,
+                    self.region,
+                    identity,
+                    manager,
+                    client,
+                )
+                state.clients[key] = entry
+            return self._claim(state, entry)
+
+    async def __aexit__(self, _exc_type: Any, exc: Any, _tb: Any) -> None:
+        state = self.state
+        entry = self.entry
+        self.state = None
+        self.entry = None
+        if state is None or entry is None:
+            return
+        cleanup = asyncio.create_task(
+            _release_bedrock_client_lease(state, entry),
+            name="bedrock-client-lease-release",
+        )
+        cancellation = exc if isinstance(exc, asyncio.CancelledError) else None
+        await _finish_owned_task(cleanup, cancellation)
+
+
+async def _release_bedrock_client_lease(
+    state: _BedrockScopeState, entry: _CachedBedrockClient
+) -> None:
+    close_entry = False
+    async with _BedrockStateLock(state):
+        entry.active_leases = max(0, entry.active_leases - 1)
+        if entry.active_leases == 0 and (entry.retired or not state.consumers):
+            state.clients.pop((entry.service, entry.region, entry.identity), None)
+            close_entry = True
+    if close_entry:
+        await _close_bedrock_entry(entry)
+
+
+def _get_bedrock_runtime_client(region: str):
+    """Get a native-async lease on the scoped ``bedrock-runtime`` client."""
+    return _BedrockClientLease("bedrock-runtime", region)
 
 
 def _get_bedrock_control_client(region: str):
-    """Create a native-async ``bedrock`` control-plane client context manager."""
-    return _require_aiobotocore()().create_client("bedrock", region_name=region)
+    """Get a native-async lease on the scoped ``bedrock`` control client."""
+    return _BedrockClientLease("bedrock", region)
 
 
-def reset_client_cache():
-    """Clear cached AWS clients. Used in tests and profile switches."""
-    _bedrock_runtime_client_cache.clear()
-    _bedrock_control_client_cache.clear()
+async def _close_bedrock_entry(entry: _CachedBedrockClient) -> None:
+    if entry.closed:
+        return
+    entry.closed = True
+    try:
+        await entry.manager.__aexit__(None, None, None)
+    finally:
+        cache = (
+            _bedrock_runtime_client_cache
+            if entry.service == "bedrock-runtime"
+            else _bedrock_control_client_cache
+        )
+        if cache.get(entry.region) is entry.client:
+            cache.pop(entry.region, None)
 
 
-def invalidate_runtime_client(region: str) -> bool:
+def _compatibility_client_is_scoped(client: Any) -> bool:
+    with _bedrock_scope_guard:
+        return any(
+            entry.client is client
+            for profiles in _bedrock_scope_states.values()
+            for state in profiles.values()
+            for entry in state.clients.values()
+        )
+
+
+def _clear_compatibility_clients(entries: list[_CachedBedrockClient]) -> None:
+    for cache in (
+        _bedrock_runtime_client_cache,
+        _bedrock_control_client_cache,
+    ):
+        for region, client in tuple(cache.items()):
+            if any(entry.client is client for entry in entries) or not (
+                _compatibility_client_is_scoped(client)
+            ):
+                cache.pop(region, None)
+
+
+async def reset_client_cache():
+    """Close and clear cached AWS clients for the active profile."""
+    state = await _activate_bedrock_scope()
+    cleanup = asyncio.create_task(
+        _reset_client_cache_owned(state),
+        name="bedrock-client-cache-reset",
+    )
+    await _finish_owned_task(cleanup)
+
+
+async def _reset_client_cache_owned(state: _BedrockScopeState) -> None:
+    to_close: list[_CachedBedrockClient] = []
+    async with _BedrockStateLock(state):
+        entries = list(state.clients.values())
+        for entry in entries:
+            entry.retired = True
+            if entry.active_leases == 0:
+                to_close.append(entry)
+        state.clients.clear()
+        state.credential_identities.clear()
+    _clear_compatibility_clients(entries)
+    for entry in to_close:
+        await _close_bedrock_entry(entry)
+
+
+async def invalidate_runtime_client(region: str) -> bool:
     """Evict the cached ``bedrock-runtime`` client for one region."""
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
+    state = await _activate_bedrock_scope()
+    existed = False
+    to_close: list[_CachedBedrockClient] = []
+    async with _BedrockStateLock(state):
+        for key, entry in tuple(state.clients.items()):
+            if entry.service == "bedrock-runtime" and entry.region == region:
+                entry.retired = True
+                state.clients.pop(key, None)
+                if entry.active_leases == 0:
+                    to_close.append(entry)
+                existed = True
+    compatibility = _bedrock_runtime_client_cache.get(region)
+    if compatibility is not None and (
+        any(entry.client is compatibility for entry in to_close)
+        or not _compatibility_client_is_scoped(compatibility)
+    ):
+        _bedrock_runtime_client_cache.pop(region, None)
+        existed = True
+    for entry in to_close:
+        await _close_bedrock_entry(entry)
     return existed
+
+
+async def _retain_bedrock_lifecycle(owner: object) -> None:
+    state = await _activate_bedrock_scope()
+    loop = asyncio.get_running_loop()
+    async with _BedrockStateLock(state):
+        state.consumers.add(owner)
+        with _bedrock_scope_guard:
+            _bedrock_owner_scopes[owner] = (weakref.ref(loop), state.profile_home)
+
+
+async def _release_bedrock_lifecycle(owner: object) -> None:
+    current_loop = asyncio.get_running_loop()
+    with _bedrock_scope_guard:
+        retained = _bedrock_owner_scopes.get(owner)
+    if retained is None:
+        return
+    retained_loop = retained[0]()
+    if retained_loop is not current_loop:
+        raise RuntimeError(
+            "The Bedrock client lifecycle lease belongs to another event loop; "
+            "release it on its owning loop"
+        )
+    with _bedrock_scope_guard:
+        state = _bedrock_scope_states.get(current_loop, {}).get(retained[1])
+    if state is None:
+        with _bedrock_scope_guard:
+            _bedrock_owner_scopes.pop(owner, None)
+        return
+    cleanup = asyncio.create_task(
+        _release_bedrock_lifecycle_owned(owner, state),
+        name="bedrock-client-lifecycle-release",
+    )
+    await _finish_owned_task(cleanup)
+
+
+async def _release_bedrock_lifecycle_owned(
+    owner: object, state: _BedrockScopeState
+) -> None:
+    to_close: list[_CachedBedrockClient] = []
+    discovery_tasks: list[asyncio.Task[List[Dict[str, Any]]]] = []
+    async with _BedrockStateLock(state):
+        state.consumers.discard(owner)
+        with _bedrock_scope_guard:
+            _bedrock_owner_scopes.pop(owner, None)
+        if state.consumers:
+            return
+        state.credential_identities.clear()
+        state.discovery.clear()
+        state.discovery_generation += 1
+        discovery_tasks = list(state.discovery_tasks.values())
+        state.discovery_tasks.clear()
+        state.discovery_waiters.clear()
+        for key, entry in tuple(state.clients.items()):
+            entry.retired = True
+            state.clients.pop(key, None)
+            if entry.active_leases == 0:
+                to_close.append(entry)
+    home_token = set_hermes_home_override(state.profile_home)
+    scope_token = _bedrock_scope_context.set((state.profile_home, state))
+    try:
+        for task in discovery_tasks:
+            task.cancel()
+        if discovery_tasks:
+            await asyncio.gather(*discovery_tasks, return_exceptions=True)
+        for entry in to_close:
+            await _close_bedrock_entry(entry)
+    finally:
+        _bedrock_scope_context.reset(scope_token)
+        reset_hermes_home_override(home_token)
 
 
 # ---------------------------------------------------------------------------
@@ -261,23 +921,44 @@ async def resolve_aws_auth_env_var(
     whether the user has any AWS credentials configured without actually
     attempting to authenticate.
     """
-    env = env if env is not None else os.environ
+    settings, multiplexed = _aws_environment_settings(env)
     # Bearer token takes highest priority
-    if env.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
+    if _aws_setting(settings, "AWS_BEARER_TOKEN_BEDROCK"):
         return "AWS_BEARER_TOKEN_BEDROCK"
     # Explicit access key pair
-    if (env.get("AWS_ACCESS_KEY_ID", "").strip()
-            and env.get("AWS_SECRET_ACCESS_KEY", "").strip()):
+    access_key = _aws_setting(settings, "AWS_ACCESS_KEY_ID")
+    secret_key = _aws_setting(settings, "AWS_SECRET_ACCESS_KEY")
+    if access_key and secret_key:
         return "AWS_ACCESS_KEY_ID"
+    if multiplexed and bool(access_key) != bool(secret_key):
+        raise _BedrockProfileIsolationError(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be configured "
+            "together for profile-scoped Bedrock authentication"
+        )
     # Named profile (SSO, assume-role, etc.)
-    if env.get("AWS_PROFILE", "").strip():
+    if not multiplexed and _aws_setting(settings, "AWS_PROFILE"):
         return "AWS_PROFILE"
     # Container credentials (ECS, CodeBuild)
-    if env.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "").strip():
+    if not multiplexed and _aws_setting(
+        settings, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+    ):
         return "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
     # Web identity (EKS IRSA)
-    if env.get("AWS_WEB_IDENTITY_TOKEN_FILE", "").strip():
+    if not multiplexed and _aws_setting(
+        settings, "AWS_WEB_IDENTITY_TOKEN_FILE"
+    ):
         return "AWS_WEB_IDENTITY_TOKEN_FILE"
+    if multiplexed:
+        unsupported = [
+            name
+            for name in _AWS_UNSUPPORTED_MULTIPLEX_SOURCES
+            if _aws_setting(settings, name)
+        ]
+        if unsupported:
+            # Reuse the same actionable error contract as actual client
+            # construction instead of detecting a source we cannot safely use.
+            _scoped_aws_client_configuration(settings)
+        return None
     # No env vars — check whether the async SDK can resolve an implicit source
     # such as EC2 IMDS, an ECS task role, or a Lambda execution role.
     try:
@@ -321,17 +1002,24 @@ async def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     live model discovery would always return us.* profile IDs regardless of
     the user's actual region.
     """
-    env = env if env is not None else os.environ
+    settings, multiplexed = _aws_environment_settings(env)
     explicit = (
-        env.get("AWS_REGION", "").strip()
-        or env.get("AWS_DEFAULT_REGION", "").strip()
+        _aws_setting(settings, "AWS_REGION")
+        or _aws_setting(settings, "AWS_DEFAULT_REGION")
     )
     if explicit:
         return explicit
+    # The default AWS config/profile belongs to the whole process and may be
+    # another Hermes profile. A scoped caller can still pass an explicit env
+    # mapping to inspect a specific config file, but the ambient multiplexed
+    # path must not consult Path.home() or process-global profile selection.
+    if multiplexed and env is None:
+        return "us-east-1"
     config_path = Path(
-        env.get("AWS_CONFIG_FILE", "").strip() or Path.home() / ".aws" / "config"
+        _aws_setting(settings, "AWS_CONFIG_FILE")
+        or Path.home() / ".aws" / "config"
     ).expanduser()
-    profile = env.get("AWS_PROFILE", "").strip() or "default"
+    profile = _aws_setting(settings, "AWS_PROFILE") or "default"
     section = "default" if profile == "default" else f"profile {profile}"
     try:
         async with aiofiles.open(config_path, encoding="utf-8") as handle:
@@ -361,6 +1049,8 @@ async def bedrock_model_ids_or_none() -> Optional[List[str]]:
         discovered = await discover_bedrock_models(await resolve_bedrock_region())
         if discovered:
             return [m["id"] for m in discovered]
+    except (UnscopedSecretError, _BedrockProfileIsolationError):
+        raise
     except Exception:
         pass
     return None
@@ -1081,18 +1771,22 @@ async def call_converse(
     )
 
     async with _get_bedrock_runtime_client(region) as client:
+        request_error: Exception | None = None
         try:
             response = await client.converse(**kwargs)
         except Exception as exc:
-            if is_stale_connection_error(exc):
+            request_error = exc
+        if request_error is not None:
+            if is_stale_connection_error(request_error):
                 logger.warning(
                     "bedrock: stale-connection error on converse(region=%s, model=%s): "
                     "%s — the next call will create a fresh client.",
                     region,
                     model,
-                    type(exc).__name__,
+                    type(request_error).__name__,
                 )
-            raise
+                await invalidate_runtime_client(region)
+            raise request_error
     return normalize_converse_response(response)
 
 
@@ -1149,6 +1843,7 @@ async def call_converse_stream(
                     model,
                     type(stream_error).__name__,
                 )
+                await invalidate_runtime_client(region)
             raise stream_error
         return await normalize_converse_stream_events(response)
 
@@ -1157,13 +1852,54 @@ async def call_converse_stream(
 # Model discovery
 # ---------------------------------------------------------------------------
 
-_discovery_cache: Dict[str, Any] = {}
+_discovery_cache: Dict[Any, Any] = {}
 _DISCOVERY_CACHE_TTL_SECONDS = 3600
 
 
-def reset_discovery_cache():
-    """Clear the model discovery cache. Used in tests."""
+async def reset_discovery_cache():
+    """Cancel active discovery and clear the active profile's cache."""
+    state = await _activate_bedrock_scope()
+    cleanup = asyncio.create_task(
+        _reset_discovery_cache_owned(state),
+        name="bedrock-discovery-cache-reset",
+    )
+    await _finish_owned_task(cleanup)
+
+
+async def _reset_discovery_cache_owned(state: _BedrockScopeState) -> None:
+    tasks = list(state.discovery_tasks.values())
+    state.discovery_tasks.clear()
+    state.discovery_waiters.clear()
+    state.discovery.clear()
+    state.discovery_generation += 1
     _discovery_cache.clear()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _finish_cancelled_discovery(
+    state: _BedrockScopeState,
+    cache_key: tuple[str, tuple[str, ...], tuple[Any, ...]],
+    task: asyncio.Task[Any],
+) -> None:
+    # Give an already-scheduled sibling request one loop turn to register as a
+    # waiter before deciding that this shared discovery has no observers.  A
+    # caller cancellation can otherwise cancel the operation between the
+    # sibling being scheduled and reaching its waiter registration below.
+    await asyncio.sleep(0)
+    if (
+        state.discovery_tasks.get(cache_key) is not task
+        or state.discovery_waiters.get(cache_key, 0) > 0
+    ):
+        return
+    task.cancel()
+    try:
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        if state.discovery_tasks.get(cache_key) is task:
+            state.discovery_tasks.pop(cache_key, None)
 
 
 async def discover_bedrock_models(
@@ -1187,14 +1923,107 @@ async def discover_bedrock_models(
     """
     import time
 
-    cache_key = f"{region}:{','.join(sorted(provider_filter or []))}"
-    cached = _discovery_cache.get(cache_key)
+    state = await _activate_bedrock_scope()
+    settings, multiplexed = _aws_environment_settings()
+    environment_identity = _aws_environment_identity()
+    scoped_configuration = None
+    if multiplexed:
+        _require_aiobotocore()
+        scoped_configuration = _scoped_aws_client_configuration(settings)
+    async with _BedrockStateLock(state):
+        identity = state.credential_identities.get(environment_identity)
+    session = None
+    if identity is None:
+        session = _require_aiobotocore()()
+        if scoped_configuration is not None:
+            identity = scoped_configuration.identity
+        else:
+            identity = await _aws_credential_identity(
+                session,
+                environment_identity,
+            )
+        async with _BedrockStateLock(state):
+            state.credential_identities[environment_identity] = identity
+    normalized_filter = tuple(
+        sorted({f.lower() for f in (provider_filter or [])})
+    )
+    cache_key = (region, normalized_filter, identity)
+    generation = state.discovery_generation
+    cached = state.discovery.get(cache_key)
     if cached and (time.time() - cached["timestamp"]) < _DISCOVERY_CACHE_TTL_SECONDS:
         return cached["models"]
+    task = state.discovery_tasks.get(cache_key)
+    if task is None:
+        if session is None:
+            session = _require_aiobotocore()()
+        create_kwargs: dict[str, Any] = {}
+        if scoped_configuration is not None:
+            _configure_scoped_aws_session(session, scoped_configuration)
+            create_kwargs = scoped_configuration.create_kwargs
+        task = asyncio.create_task(
+            _discover_bedrock_models_uncached(
+                state,
+                cache_key,
+                session,
+                create_kwargs,
+                region,
+                provider_filter,
+            ),
+            name="bedrock-model-discovery",
+        )
+        state.discovery_tasks[cache_key] = task
+    state.discovery_waiters[cache_key] = state.discovery_waiters.get(cache_key, 0) + 1
+    cancellation: asyncio.CancelledError | None = None
+    retry = False
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as exc:  # noqa: ASYNC103 - cleanup below
+        current = asyncio.current_task()
+        if (
+            current is not None
+            and current.cancelling() == 0
+            and state.discovery_generation == generation
+        ):
+            retry = True
+        else:
+            cancellation = exc
+    finally:
+        remaining = max(0, state.discovery_waiters.get(cache_key, 1) - 1)
+        if remaining:
+            state.discovery_waiters[cache_key] = remaining
+        else:
+            state.discovery_waiters.pop(cache_key, None)
+            if not task.done():
+                cleanup = asyncio.create_task(
+                    _finish_cancelled_discovery(state, cache_key, task),
+                    name="bedrock-discovery-cancellation-cleanup",
+                )
+                await _finish_owned_task(cleanup, cancellation)
+        if task.done() and state.discovery_tasks.get(cache_key) is task:
+            state.discovery_tasks.pop(cache_key, None)
+    if cancellation is not None:
+        raise cancellation
+    if retry:
+        return await discover_bedrock_models(region, provider_filter)
+    raise RuntimeError("Bedrock discovery ended without a result")
+
+
+async def _discover_bedrock_models_uncached(
+    state: _BedrockScopeState,
+    cache_key: tuple[str, tuple[str, ...], tuple[Any, ...]],
+    session: Any,
+    create_kwargs: dict[str, Any],
+    region: str,
+    provider_filter: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    import time
 
     models = []
     seen_ids = set()
     filter_set = {f.lower() for f in (provider_filter or [])}
+    credential_token = _bedrock_credential_context.set(
+        (session, cache_key[2], create_kwargs)
+    )
     try:
         async with _get_bedrock_control_client(region) as client:
             # 1. Discover foundation models
@@ -1277,9 +2106,13 @@ async def discover_bedrock_models(
                     seen_ids.add(profile_id.lower())
             except Exception as exc:
                 logger.debug("Skipping inference profile discovery: %s", exc)
+    except (UnscopedSecretError, _BedrockProfileIsolationError):
+        raise
     except Exception as exc:
         logger.warning("Failed to create Bedrock client for model discovery: %s", exc)
         return []
+    finally:
+        _bedrock_credential_context.reset(credential_token)
 
     models.sort(
         key=lambda model: (
@@ -1287,10 +2120,12 @@ async def discover_bedrock_models(
             model["name"].lower(),
         )
     )
-    _discovery_cache[cache_key] = {
+    cache_value = {
         "timestamp": time.time(),
         "models": models,
     }
+    state.discovery[cache_key] = cache_value
+    _discovery_cache[cache_key] = cache_value
     return models
 
 
@@ -1506,6 +2341,8 @@ async def probe_bedrock_context_length(
                             f"{limit:,}",
                         )
                         return limit
+    except (UnscopedSecretError, _BedrockProfileIsolationError):
+        raise
     except Exception as exc:
         logger.debug("Bedrock context probe skipped for %s: %s", model_id, exc)
         return None

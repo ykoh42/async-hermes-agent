@@ -30,6 +30,7 @@ Usage:
 
 import base64
 import asyncio
+import contextvars
 import aiofiles
 import aiofiles.os
 import io
@@ -40,8 +41,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
-import httpx
-
+from agent.secret_scope import UnscopedSecretError, get_secret
 # ``agent.auxiliary_client`` pulls credential_pool → hermes_cli.auth → httpx
 # → rich (~50 ms cold); only vision handlers need it. Loaded lazily; both
 # Names stay module attributes so callers can inject native async test doubles.
@@ -62,7 +62,7 @@ def _load_auxiliary_client() -> None:
             extract_content_or_reasoning = _ecr
 
 
-from hermes_constants import get_hermes_dir
+from hermes_constants import get_hermes_dir, get_hermes_home
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
 import sys
@@ -70,6 +70,36 @@ import sys
 logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+_DEBUG_SESSION_CONTEXT: contextvars.ContextVar[DebugSession | None] = (
+    contextvars.ContextVar("vision_tools_debug_session", default=None)
+)
+
+
+def _active_debug_session() -> DebugSession:
+    """Return debug state rooted in the active Hermes profile."""
+    active_log_dir = get_hermes_home() / "logs"
+    if _debug.log_dir == active_log_dir:
+        return _debug
+    scoped = _DEBUG_SESSION_CONTEXT.get()
+    if scoped is None or scoped.log_dir != active_log_dir:
+        scoped = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+        _DEBUG_SESSION_CONTEXT.set(scoped)
+    return scoped
+
+
+def __getattr__(name: str):
+    """Resolve the optional HTTP namespace only when a caller needs it."""
+    if name == "httpx":
+        module = _get_httpx_module()
+        globals()["httpx"] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _get_httpx_module():
+    import httpx as httpx_module
+
+    return httpx_module
 
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
@@ -349,7 +379,8 @@ def _is_retryable_download_error(error: Exception) -> bool:
     """
     if isinstance(error, (PermissionError, ValueError)):
         return False
-    if isinstance(error, httpx.HTTPStatusError):
+    httpx_module = _get_httpx_module()
+    if isinstance(error, httpx_module.HTTPStatusError):
         status = error.response.status_code
         if 400 <= status < 500 and status != 429:
             return False
@@ -1273,8 +1304,9 @@ async def vision_analyze_tool(
         debug_call_data["analysis_length"] = analysis_length
         
         # Log debug information
-        _debug.log_call("vision_analyze_tool", debug_call_data)
-        await _debug.save()
+        debug = _active_debug_session()
+        debug.log_call("vision_analyze_tool", debug_call_data)
+        await debug.save()
         
         return json.dumps(result, indent=2, ensure_ascii=False)
         
@@ -1322,8 +1354,9 @@ async def vision_analyze_tool(
         }
         
         debug_call_data["error"] = error_msg
-        _debug.log_call("vision_analyze_tool", debug_call_data)
-        await _debug.save()
+        debug = _active_debug_session()
+        debug.log_call("vision_analyze_tool", debug_call_data)
+        await debug.save()
         
         return json.dumps(result, indent=2, ensure_ascii=False)
     
@@ -1354,17 +1387,41 @@ async def check_vision_requirements() -> bool:
     when the auto chain would have served the request (issue #31179).
     """
     try:
-        from agent.auxiliary_client import resolve_vision_provider_client
+        from agent.auxiliary_client import (
+            _close_cached_client,
+            _finish_owned_task,
+            resolve_vision_provider_client,
+        )
     except ImportError:
         return False
     try:
         _provider, client, _model = await resolve_vision_provider_client()
-        if client is not None:
-            return True
+        try:
+            if client is not None:
+                return True
+        finally:
+            if client is not None:
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        _close_cached_client(client),
+                        name="vision-requirements-client-close",
+                    )
+                )
         # Same fallback to "auto" that call_llm performs when the configured
         # provider can't be resolved.
         _provider, client, _model = await resolve_vision_provider_client(provider="auto")
-        return client is not None
+        try:
+            return client is not None
+        finally:
+            if client is not None:
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        _close_cached_client(client),
+                        name="vision-requirements-fallback-client-close",
+                    )
+                )
+    except UnscopedSecretError:
+        raise
     except Exception:
         return False
 
@@ -1436,7 +1493,7 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     except Exception:
         pass
     if not model:
-        model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+        model = (get_secret("AUXILIARY_VISION_MODEL") or "").strip() or None
     return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id)
 
 
@@ -1708,8 +1765,9 @@ async def video_analyze_tool(
 
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
-        _debug.log_call("video_analyze_tool", debug_call_data)
-        await _debug.save()
+        debug = _active_debug_session()
+        debug.log_call("video_analyze_tool", debug_call_data)
+        await debug.save()
 
         return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -1757,8 +1815,9 @@ async def video_analyze_tool(
         }
 
         debug_call_data["error"] = error_msg
-        _debug.log_call("video_analyze_tool", debug_call_data)
-        await _debug.save()
+        debug = _active_debug_session()
+        debug.log_call("video_analyze_tool", debug_call_data)
+        await debug.save()
 
         return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -1823,7 +1882,11 @@ async def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> str:
     except Exception:
         pass
     if not model:
-        model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+        model = (
+            (get_secret("AUXILIARY_VIDEO_MODEL") or "").strip()
+            or (get_secret("AUXILIARY_VISION_MODEL") or "").strip()
+            or None
+        )
     return await video_analyze_tool(video_url, full_prompt, model)
 
 

@@ -476,7 +476,7 @@ class TestDiscoverBedrockModels:
     @pytest.mark.asyncio
     async def test_provider_filter(self):
         from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
-        reset_discovery_cache()
+        await reset_discovery_cache()
 
         mock_client = MagicMock()
         mock_client.list_foundation_models = AsyncMock(return_value={
@@ -519,7 +519,7 @@ class TestDiscoverBedrockModels:
     @pytest.mark.asyncio
     async def test_caches_results(self):
         from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
-        reset_discovery_cache()
+        await reset_discovery_cache()
 
         mock_client = MagicMock()
         mock_client.list_foundation_models = AsyncMock(return_value={
@@ -553,7 +553,7 @@ class TestDiscoverBedrockModels:
     @pytest.mark.asyncio
     async def test_handles_api_error_gracefully(self):
         from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
-        reset_discovery_cache()
+        await reset_discovery_cache()
 
         with patch("agent.bedrock_adapter._get_bedrock_control_client", side_effect=Exception("No creds")):
             models = await discover_bedrock_models("us-east-1")
@@ -867,31 +867,32 @@ class TestEmptyTextBlockFix:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestInvalidateRuntimeClient:
     """Preserve the upstream cache-management surface for provider callers."""
 
-    def test_evicts_only_the_target_region(self):
+    async def test_evicts_only_the_target_region(self):
         from agent.bedrock_adapter import (
             _bedrock_runtime_client_cache,
             invalidate_runtime_client,
             reset_client_cache,
         )
 
-        reset_client_cache()
+        await reset_client_cache()
         _bedrock_runtime_client_cache["us-east-1"] = "dead-client"
         _bedrock_runtime_client_cache["us-west-2"] = "live-client"
 
-        evicted = invalidate_runtime_client("us-east-1")
+        evicted = await invalidate_runtime_client("us-east-1")
 
         assert evicted is True
         assert "us-east-1" not in _bedrock_runtime_client_cache
         assert _bedrock_runtime_client_cache["us-west-2"] == "live-client"
 
-    def test_returns_false_when_region_not_cached(self):
+    async def test_returns_false_when_region_not_cached(self):
         from agent.bedrock_adapter import invalidate_runtime_client, reset_client_cache
 
-        reset_client_cache()
-        assert invalidate_runtime_client("eu-west-1") is False
+        await reset_client_cache()
+        assert await invalidate_runtime_client("eu-west-1") is False
 
 
 class TestIsStaleConnectionError:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -21,6 +22,7 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from agent.secret_scope import get_secret
 from agent.ssl_verify import _create_httpx_client
 from hermes_cli import __version__ as _HERMES_VERSION
 
@@ -603,6 +605,14 @@ def _is_model_free(model_id: str, pricing: dict[str, dict[str, str]]) -> bool:
 # ---------------------------------------------------------------------------
 _FREE_TIER_CACHE_TTL: int = 180  # seconds (3 minutes)
 _free_tier_cache: tuple[bool, float] | None = None  # (result, timestamp)
+_free_tier_cache_by_profile: dict[str, tuple[bool, float]] = {}
+
+
+def _free_tier_profile_key() -> str:
+    """Return a filesystem-free key for the active Hermes profile."""
+    from hermes_constants import get_hermes_home
+
+    return os.path.normcase(os.path.normpath(str(get_hermes_home())))
 
 
 # ---------------------------------------------------------------------------
@@ -635,8 +645,15 @@ async def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
     """Check if the current Nous Portal user is on a free (unpaid) tier."""
     global _free_tier_cache
     now = time.monotonic()
-    if not force_fresh and _free_tier_cache is not None:
-        cached_result, cached_at = _free_tier_cache
+    profile_key = _free_tier_profile_key()
+    # Preserve the historical private reset convention used by downstream
+    # tests and embedders: assigning ``_free_tier_cache = None`` invalidates
+    # the active profile's entry without touching sibling profiles.
+    if _free_tier_cache is None:
+        _free_tier_cache_by_profile.pop(profile_key, None)
+    cached = _free_tier_cache_by_profile.get(profile_key)
+    if not force_fresh and cached is not None:
+        cached_result, cached_at = cached
         if now - cached_at < _FREE_TIER_CACHE_TTL:
             return cached_result
 
@@ -646,9 +663,11 @@ async def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
         account_info = await get_nous_portal_account_info(force_fresh=force_fresh)
         result = account_info.is_free_tier
         _free_tier_cache = (result, now)
+        _free_tier_cache_by_profile[profile_key] = (result, now)
         return result
     except Exception:
         _free_tier_cache = (False, now)
+        _free_tier_cache_by_profile[profile_key] = (False, now)
         return False
 
 
@@ -2176,20 +2195,31 @@ _DEEPINFRA_SURFACE_TAGS: frozenset[str] = frozenset({
 _DEEPINFRA_DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
 _DEEPINFRA_MODELS_QUERY = "filter=true&sort_by=hermes"
 
-# Module-level cache for the full tagged catalog response, keyed by base URL.
+# Module-level cache for the full tagged catalog response, keyed by base URL
+# and a non-secret credential discriminator. DeepInfra catalog visibility can
+# differ by account, even when both accounts use the canonical endpoint.
 # Each value is the parsed ``data`` list. Surface-specific filters read from
 # this cache so a single network round-trip serves chat / image-gen / tts /
-# stt callers across the whole process lifetime.
-_deepinfra_catalog_cache: dict[str, list[dict]] = {}
+# stt callers for one credential across the whole process lifetime.
+_DeepInfraCatalogCacheKey = tuple[str, str]
+_deepinfra_catalog_cache: dict[_DeepInfraCatalogCacheKey, list[dict]] = {}
 
 # Negative cache: monotonic timestamp of the last failed fetch, keyed by base
-# URL. Without this, an unreachable catalog (offline / DNS / firewall) makes
-# every surface helper (chat picker, pricing, image/video/tts/stt defaults,
-# vision) re-attempt a fresh blocking fetch that eats the full timeout each
-# time — several sequential stalls in one user-visible operation. A short TTL
-# lets connectivity recover without a process restart.
-_deepinfra_catalog_neg_cache: dict[str, float] = {}
+# URL and credential. Without this, an unreachable catalog (offline / DNS /
+# firewall) makes every surface helper (chat picker, pricing,
+# image/video/tts/stt defaults, vision) re-attempt a fresh blocking fetch that
+# eats the full timeout each time — several sequential stalls in one
+# user-visible operation. A short TTL lets connectivity recover without a
+# process restart.
+_deepinfra_catalog_neg_cache: dict[_DeepInfraCatalogCacheKey, float] = {}
 _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
+
+
+def _deepinfra_credential_discriminator(secret: str) -> str:
+    """Return a stable, non-secret discriminator for credentialed catalogs."""
+    if not secret:
+        return ""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
 
 
 def deepinfra_base_url(section: Optional[dict] = None) -> str:
@@ -2199,13 +2229,20 @@ def deepinfra_base_url(section: Optional[dict] = None) -> str:
     ``DEEPINFRA_BASE_URL``, then the canonical DeepInfra default.
     """
     candidate = section.get("base_url") if isinstance(section, dict) else None
-    value = candidate or os.getenv("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
+    value = (
+        candidate
+        or get_secret("DEEPINFRA_BASE_URL", "")
+        or _DEEPINFRA_DEFAULT_BASE_URL
+    )
     return str(value).strip().rstrip("/")
 
 
 def _deepinfra_catalog_url() -> tuple[str, str]:
     """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
-    base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
+    base = (
+        (get_secret("DEEPINFRA_BASE_URL", "") or "").strip()
+        or _DEEPINFRA_DEFAULT_BASE_URL
+    )
     cache_key = base.rstrip("/")
     return cache_key, f"{cache_key}/models?{_DEEPINFRA_MODELS_QUERY}"
 
@@ -2216,7 +2253,9 @@ async def _fetch_deepinfra_catalog(
     force_refresh: bool = False,
 ) -> Optional[list[dict]]:
     """Fetch and cache the shared DeepInfra catalog with native async HTTP."""
-    cache_key, url = _deepinfra_catalog_url()
+    cache_base, url = _deepinfra_catalog_url()
+    api_key = (get_secret("DEEPINFRA_API_KEY", "") or "").strip()
+    cache_key = (cache_base, _deepinfra_credential_discriminator(api_key))
     if not force_refresh:
         if cache_key in _deepinfra_catalog_cache:
             return _deepinfra_catalog_cache[cache_key]
@@ -2228,7 +2267,6 @@ async def _fetch_deepinfra_catalog(
             return None
 
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 

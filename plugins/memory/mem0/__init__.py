@@ -44,7 +44,7 @@ import aiofiles.os
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret
-from hermes_cli.async_source_loader import locate_source_module
+from hermes_cli.async_source_loader import _locate_source_module
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -116,16 +116,16 @@ async def _load_config() -> dict:
     from hermes_constants import get_hermes_home
 
     config = {
-        "mode": os.environ.get("MEM0_MODE", "platform"),
+        "mode": get_secret("MEM0_MODE", "platform"),
         "api_key": get_secret("MEM0_API_KEY", ""),
-        "host": os.environ.get("MEM0_HOST", ""),
-        "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
+        "host": get_secret("MEM0_HOST", ""),
+        "agent_id": get_secret("MEM0_AGENT_ID", "hermes"),
         "oss": {},
     }
     # Only carry user_id when the operator explicitly configured one (env or
     # mem0.json). An absent key tells initialize() to fall back to the
     # caller-provided id from kwargs instead of overriding it with a placeholder.
-    env_user_id = os.environ.get("MEM0_USER_ID")
+    env_user_id = get_secret("MEM0_USER_ID")
     if env_user_id:
         config["user_id"] = env_user_id
 
@@ -256,7 +256,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if mode == "oss":
             return bool(
                 cfg.get("oss", {}).get("vector_store")
-                and await locate_source_module("mem0")
+                and await _locate_source_module("mem0")
             )
         # Platform needs an api_key; self-hosted needs a host (api_key optional
         # when the server runs with AUTH_DISABLED).
@@ -298,7 +298,7 @@ class Mem0MemoryProvider(MemoryProvider):
             raise
 
     def get_config_schema(self):
-        cfg = self._config or {"mode": os.environ.get("MEM0_MODE", "platform")}
+        cfg = self._config or {"mode": get_secret("MEM0_MODE", "platform")}
         mode = cfg.get("mode", "platform")
         api_key_required = mode != "oss"
         return [

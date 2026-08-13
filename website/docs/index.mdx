@@ -2,7 +2,7 @@
 slug: /
 sidebar_position: 0
 title: "Async Hermes Agent Documentation"
-description: "Hermes Agent's complete agent harness, converted to a native-async Python library."
+description: "An async-only Python library port of the retained Hermes Agent harness."
 hide_table_of_contents: true
 displayed_sidebar: docs
 ---
@@ -12,9 +12,9 @@ import useBaseUrl from "@docusaurus/useBaseUrl";
 
 # Async Hermes Agent
 
-The Hermes Agent harness, converted to a native-async Python library. It keeps
+The Hermes Agent harness, converted to an async-only Python library. It keeps
 the upstream agent loop, tools, providers, MCP, skills, memory, sessions,
-trajectories, runner, and batch runner while making I/O awaitable end to end.
+trajectories, runner, and batch runner behind coroutine entry points.
 
 <div
   style={{
@@ -67,15 +67,14 @@ trajectories, runner, and batch runner while making I/O awaitable end to end.
 ## Install
 
 Python 3.11 through 3.13 is supported. Install the currently verified release
-from its GitHub tag:
+from PyPI:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
+uv pip install "async-hermes-agent==0.20.0.5"
 ```
 
-The package metadata for this release is `async-hermes-agent==0.20.4`. PyPI
-publication is not enabled for this distribution; install from the GitHub
-release or a reviewed source checkout.
+PyPI publication uses OIDC Trusted Publishing. The same verified wheel, source
+distribution, and checksums are attached to the corresponding GitHub Release.
 
 Then follow the **[Installation Guide](/getting-started/installation)** to
 verify the package and choose only the provider dependencies your application
@@ -113,10 +112,21 @@ it.
 | 🏗️ **[Architecture](/developer-guide/architecture)**          | Understand the native-async narrow waist                                   |
 | ❓ **[FAQ & Troubleshooting](/reference/faq)**                | Common integration and migration questions                                |
 
+:::caution Native-file implementation boundary
+Provider, network, MCP, and subprocess paths use coroutine transports. The
+regular-file layer uses `aiofiles`, which delegates disk operations to an
+executor, and `aiosqlite` executes SQLite calls on a connection worker thread.
+The supported Python 3.11–3.13 releases—and
+[Python 3.14](https://docs.python.org/3.14/library/asyncio-eventloop.html#working-with-pipes)—have
+no portable asyncio regular-file or embedded-SQLite API.
+The library therefore promises directly awaitable, event-loop-nonblocking
+entry points rather than zero-thread, OS-native regular-file or SQLite I/O.
+:::
+
 ## Key Features
 
-- **Native async end to end** — Model, tool, MCP, session, trajectory, runner,
-  and batch-runner I/O is awaited without a thread-pool compatibility fallback
+- **Async library surface** — Model, tool, MCP, session, trajectory, runner,
+  and batch-runner entry points are awaited under their upstream names
 - **Familiar upstream surface** — Core file locations, import paths, public
   names, arguments, and return shapes stay recognizable; I/O calls add `await`
 - **Extensible tool use** — Retained terminal, file, web, browser, vision,

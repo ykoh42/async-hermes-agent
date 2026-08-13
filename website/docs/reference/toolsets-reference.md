@@ -23,14 +23,19 @@ agent = AIAgent(
 | --- | --- |
 | `web` | `web_search`, `web_extract` |
 | `search` | `web_search` |
+| `x_search` | `x_search` |
 | `vision` | `vision_analyze` |
 | `video` | `video_analyze` |
 | `image_gen` | `image_generate` |
-| `video_gen` | `video_generate` |
+| `video_gen` | `video_generate`, `xai_video_edit`, `xai_video_extend` |
+| `bfl` | Six FLUX 3 submit, poll, and prompting-guide tools |
+| `computer_use` | `computer_use` |
 | `terminal` | `terminal`, `process` |
 | `file` | `read_file`, `write_file`, `patch`, `search_files` |
 | `skills` | `skills_list`, `skill_view`, `skill_manage` |
 | `browser` | Browser operations plus `web_search` |
+| `tts` | `text_to_speech` |
+| `homeassistant` | Four Home Assistant entity/state/service tools |
 | `todo` | `todo` |
 | `memory` | `memory` |
 | `session_search` | `session_search` |
@@ -51,6 +56,10 @@ The `safe` name means “without terminal access”; it is not a complete securi
 sandbox. It includes external web calls and image generation.
 
 ## Dynamic toolsets
+
+Built-in discovery also registers `code_execution` with `execute_code`. It is
+not authored in the static `TOOLSETS` mapping, but it resolves through the same
+registry-backed public helpers after tool discovery.
 
 ### MCP
 

@@ -15,8 +15,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-
 logger = logging.getLogger(__name__)
 
 # Sentinel for "omit temperature entirely" (Kimi: server manages it)

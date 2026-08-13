@@ -11,7 +11,6 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 """
 
 import logging
-import os
 import aiofiles.os
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -27,8 +26,9 @@ _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 # When a backend is launched from, or self-spawns into, this tree (the desktop
 # app default), an os.getcwd() fallback would inject this repo's contributor
 # AGENTS.md as authoritative project context. Context discovery must never
-# resolve here.
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+# resolve here. Keep module initialization lexical; ``Path.resolve()`` probes
+# the filesystem and belongs at the awaited comparison boundary below.
+_PACKAGE_ROOT = Path(__file__).parent.parent
 
 
 async def _is_install_tree(p: Path) -> bool:
@@ -37,9 +37,10 @@ async def _is_install_tree(p: Path) -> bool:
     # site-packages parent) are legitimate workspaces and must not be blocked.
     try:
         p = await aiofiles.os.wrap(Path.resolve)(p)
+        package_root = await aiofiles.os.wrap(Path.resolve)(_PACKAGE_ROOT)
     except Exception:
         return False
-    return p == _PACKAGE_ROOT or _PACKAGE_ROOT in p.parents
+    return p == package_root or package_root in p.parents
 
 
 def set_session_cwd(cwd: str | None) -> Token:
@@ -66,13 +67,15 @@ async def resolve_agent_cwd() -> Path:
         if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("configured working directory does not exist: %s", override)
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    from agent.secret_scope import get_secret
+
+    raw = str(get_secret("TERMINAL_CWD", "") or "").strip()
     if raw:
         p = await aiofiles.os.wrap(Path.expanduser)(Path(raw))
         if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("TERMINAL_CWD does not exist: %s", raw)
-    return Path(await aiofiles.os.wrap(os.getcwd)())
+    return Path(await aiofiles.os.getcwd())
 
 
 async def resolve_context_cwd() -> Path | None:
@@ -85,7 +88,9 @@ async def resolve_context_cwd() -> Path | None:
         else:
             return p
         return None
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    from agent.secret_scope import get_secret
+
+    raw = str(get_secret("TERMINAL_CWD", "") or "").strip()
     if raw:
         p = await aiofiles.os.wrap(Path.expanduser)(Path(raw))
         if not await aiofiles.os.path.isdir(p):

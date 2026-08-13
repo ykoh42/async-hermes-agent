@@ -15,17 +15,38 @@ application supplies its own service or UI boundary.
 - Git
 - A model provider credential, unless you use a local endpoint
 
-## 1. Install the current verified release
+## 1. Install the current release
 
-The v0.20.4 GitHub release has a verified source tag. Install it directly:
+Install the exact reviewed package version from PyPI:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
+uv pip install "async-hermes-agent==0.20.0.5"
 ```
 
-The package metadata for this release is `async-hermes-agent==0.20.4`.
-PyPI publication is not enabled for this distribution; use the GitHub release
-or a reviewed source checkout.
+The release workflow publishes through OIDC Trusted Publishing. The same
+verified wheel, source distribution, and `SHA256SUMS` file are attached to the
+[`v0.20.0.5` GitHub Release](https://github.com/ykoh42/async-hermes-agent/releases/tag/v0.20.0.5).
+To install the reviewed source snapshot instead, pin the immutable tag:
+
+```bash
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.0.5"
+```
+
+## Version policy
+
+The four numeric segments keep the fork tied to its upstream baseline.
+`0.20.0.5` means upstream Python package version `0.20.0` (tag `v2026.8.3`)
+plus async-distribution revision `5`. Fork-only releases increment the final
+segment; a completed upstream port changes the first three segments and resets
+the final segment to `1`.
+
+The earlier `0.20.4` GitHub release used an independent scheme. Python version
+ordering considers it newer than `0.20.0.5`, so an installation made from that
+tag needs this one-time explicit migration:
+
+```bash
+uv pip install --reinstall "async-hermes-agent==0.20.0.5"
+```
 
 ## 2. Or install from a checkout
 
@@ -53,11 +74,46 @@ choose.
 | --- | --- |
 | `anthropic` | Native Anthropic API |
 | `vertex` | Google Vertex credentials and async transport support |
-| `azure-identity` | Microsoft Entra ID authentication |
-| `bedrock` | AWS Bedrock native async transport |
+| `azure-identity` | Restricted Microsoft Entra ID support; see provider limitations |
+| `bedrock` | AWS Bedrock transport; the pinned SDK still has blocking bootstrap boundaries |
 | `parallel-web` | Parallel web search provider |
-| `fal` | FAL media generation provider |
-| `mem0` | Mem0 memory provider |
+| `fal` | FAL image/video generation |
+| `edge-tts` | Edge text-to-speech backend |
+| `tts-premium` | ElevenLabs text-to-speech backend |
+| `mistral` | Mistral text-to-speech backend |
+| `piper-tts` | Local Piper backend, isolated in a profile-scoped subprocess broker |
+| `modal` | Modal execution backend |
+| `daytona` | Daytona execution backend |
+| `vercel` | Vercel Sandbox execution backend |
+| `mem0` | Mem0 memory provider, including optional OSS dependencies |
+| `supermemory` | Supermemory memory provider |
+| `hindsight` | Hindsight memory provider client; embedded-local mode also needs `hindsight-all` |
+| `honcho` | Honcho memory provider |
+| `dev` | Test, lint, leak-check, and type-check dependencies |
+
+KittenTTS 0.8.1 is published by KittenML as a GitHub release wheel rather
+than an official PyPI distribution. PyPI rejects direct URL dependencies in
+uploaded package metadata, so this project cannot offer it as a normal extra.
+The public-index package named `kittentts` is not the compatible KittenML 0.8.1
+artifact. Install the hash-verified official wheel when selecting
+`tts.provider: kittentts`; the wheel declares its own `soundfile` dependency:
+
+```bash
+python -m pip install \
+  'https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl#sha256=482a436c4f1f3192153710376e459ff3689517ebcda7c2b051e2fd4187b41851'
+```
+
+Piper is available through the package extra:
+
+```bash
+python -m pip install 'async-hermes-agent[piper-tts]'
+```
+
+The compatibility extras `exa`, `firecrawl`, `homeassistant`,
+`computer-use`, `vision`, and `mcp` currently add no Python distributions:
+their retained Python dependencies are already in the base install. They keep
+the upstream install names valid. External runtimes are still separate; for
+example, `computer-use` requires a working `cua-driver` installation.
 
 From a checkout, for example:
 

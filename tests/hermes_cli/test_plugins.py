@@ -369,7 +369,7 @@ class TestPluginLoading:
     async def test_relative_imports_use_async_source_loader(self, tmp_path, monkeypatch):
         """A plugin's lazy relative import must not invoke SourceFileLoader."""
         from importlib._bootstrap_external import SourceFileLoader
-        from hermes_cli.async_source_loader import unload_source_finder
+        from hermes_cli.async_source_loader import _unload_source_finder
 
         plugin_dir = tmp_path / "relative_plugin"
         plugin_dir.mkdir()
@@ -402,7 +402,7 @@ class TestPluginLoading:
             assert module.__file__ == str(plugin_dir / "__init__.py")
             assert "hermes_plugins.relative_plugin.helper" in sys.modules
         finally:
-            unload_source_finder(module)
+            _unload_source_finder(module)
             for name in tuple(sys.modules):
                 if name.startswith("hermes_plugins.relative_plugin"):
                     sys.modules.pop(name, None)
@@ -413,7 +413,7 @@ class TestPluginLoading:
     ):
         """Nested plugin packages must not fall back to synchronous source I/O."""
         from importlib._bootstrap_external import SourceFileLoader
-        from hermes_cli.async_source_loader import unload_source_finder
+        from hermes_cli.async_source_loader import _unload_source_finder
 
         plugin_dir = tmp_path / "nested_relative_plugin"
         nested_dir = plugin_dir / "subpkg"
@@ -451,7 +451,7 @@ class TestPluginLoading:
             assert "hermes_plugins.nested_relative_plugin.subpkg" in sys.modules
             assert "hermes_plugins.nested_relative_plugin.subpkg.helper" in sys.modules
         finally:
-            unload_source_finder(module)
+            _unload_source_finder(module)
             for name in tuple(sys.modules):
                 if name.startswith("hermes_plugins.nested_relative_plugin"):
                     sys.modules.pop(name, None)
@@ -462,7 +462,7 @@ class TestPluginLoading:
     ):
         """Canonical bundled imports must execute from pre-read source."""
         from importlib._bootstrap_external import SourceFileLoader
-        from hermes_cli.async_source_loader import unload_source_finder
+        from hermes_cli.async_source_loader import _unload_source_finder
 
         plugins_dir = tmp_path / "plugins"
         category_dir = plugins_dir / "browser"
@@ -509,7 +509,7 @@ class TestPluginLoading:
             assert canonical.__loader__.__class__.__name__ == "_MemorySourceLoader"
             assert canonical.__file__ == str(plugin_dir / "provider.py")
         finally:
-            unload_source_finder(module)
+            _unload_source_finder(module)
             for name in tuple(sys.modules):
                 if (
                     name.startswith("hermes_plugins.browser__absolute_plugin")

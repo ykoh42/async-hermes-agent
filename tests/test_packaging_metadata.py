@@ -8,13 +8,22 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+KITTENTTS_OFFICIAL_WHEEL_URL = (
+    "https://github.com/KittenML/KittenTTS/releases/download/0.8.1/"
+    "kittentts-0.8.1-py3-none-any.whl"
+)
+KITTENTTS_OFFICIAL_WHEEL_SHA256 = (
+    "482a436c4f1f3192153710376e459ff3689517ebcda7c2b051e2fd4187b41851"
+)
 
 
-def test_release_versions_match_across_package_metadata():
-    """Every published surface must report the same release version."""
-    project_version = tomllib.loads(
+def test_release_versions_match_upstream_revision_policy():
+    """Python and private npm metadata must encode one upstream revision."""
+    pyproject = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    )["project"]["version"]
+    )
+    project_version = pyproject["project"]["version"]
+    version_policy = pyproject["tool"]["async-hermes"]
     package = json.loads(
         (REPO_ROOT / "package.json").read_text(encoding="utf-8")
     )
@@ -25,22 +34,31 @@ def test_release_versions_match_across_package_metadata():
     cli_module = ast.parse(
         (REPO_ROOT / "hermes_cli" / "__init__.py").read_text(encoding="utf-8")
     )
-    cli_version = next(
-        node.value.value
+    cli_metadata = {
+        target.id: node.value.value
         for node in cli_module.body
         if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "__version__"
-            for target in node.targets
-        )
+        for target in node.targets
+        if isinstance(target, ast.Name)
         and isinstance(node.value, ast.Constant)
-        and isinstance(node.value.value, str)
-    )
+        and isinstance(node.value.value, (str, int))
+    }
 
-    assert package["version"] == project_version
-    assert package_lock["version"] == project_version
-    assert package_lock["packages"][""]["version"] == project_version
-    assert cli_version == project_version
+    upstream_version = version_policy["upstream_version"]
+    upstream_tag = version_policy["upstream_tag"]
+    async_revision = version_policy["async_revision"]
+    expected_python_version = f"{upstream_version}.{async_revision}"
+    expected_npm_version = f"{upstream_version}-async.{async_revision}"
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", upstream_version)
+    assert re.fullmatch(r"v\d{4}\.\d{1,2}\.\d{1,2}", upstream_tag)
+    assert upstream_tag == f'v{cli_metadata["__release_date__"]}'
+    assert isinstance(async_revision, int) and async_revision > 0
+    assert project_version == expected_python_version
+    assert cli_metadata["__version__"] == expected_python_version
+    assert package["version"] == expected_npm_version
+    assert package_lock["version"] == expected_npm_version
+    assert package_lock["packages"][""]["version"] == expected_npm_version
 
 
 def test_release_workflow_installs_ripgrep_before_testing_source():
@@ -56,20 +74,152 @@ def test_release_workflow_installs_ripgrep_before_testing_source():
     assert "sudo apt-get install --yes ripgrep" in workflow[install_step:test_step]
 
 
-def test_release_workflow_attaches_distributions_without_pypi_publish():
-    """GitHub releases must remain installable without attempting PyPI writes."""
+def test_release_workflow_smokes_every_supported_python_version():
+    """Release artifacts must install under every declared Python runtime."""
     workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
 
-    assert 'gh release upload "$RELEASE_TAG" dist/* --clobber' in workflow
+    assert "uv python install 3.11 3.12 3.13" in workflow
+    assert "for python_version in 3.12 3.13; do" in workflow
+    assert 'uv pip check --python "$compat_venv/bin/python"' in workflow
+    assert '.release-venv/bin/python -I - <<\'PY\'' in workflow
+    assert '"$compat_venv/bin/python" -I - <<\'PY\'' in workflow
+
+
+def test_pages_workflow_validates_pull_requests_without_deploying_them():
+    """Trusted PRs build in isolation, while only merged main may deploy."""
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "deploy-site.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "pull_request:\n    paths:\n      - 'website/**'" in workflow
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in workflow
+    assert "group: pages-${{ github.event_name == 'pull_request'" in workflow
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
+    assert "github.event_name != 'pull_request' &&" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "uses: actions/deploy-pages@" in workflow
+
+
+def test_release_workflow_publishes_verified_artifacts_with_least_privilege():
+    """One verified tag build must feed PyPI and the GitHub release."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    lint_step = workflow.index("- name: Lint released source")
+    audit_step = workflow.index("- name: Audit the native async runtime")
+    test_step = workflow.index("- name: Test released source")
+    build_step = workflow.index("- name: Build distributions")
+    stage_step = workflow.index("- name: Stage a private GitHub draft release")
+    publish_step = workflow.index("- name: Publish verified distributions to PyPI")
+    verify_step = workflow.index("- name: Verify published PyPI digests")
+    release_step = workflow.index("- name: Publish the staged GitHub release")
+    preflight_step = workflow.index("- name: Refuse an existing GitHub release")
+    preflight_job = workflow[
+        preflight_step : workflow.index("- name: Verify lockfile")
+    ]
+    stage_job = workflow[
+        workflow.index("  stage-release:") : workflow.index("  publish-pypi:")
+    ]
+    publish_job = workflow[
+        workflow.index("  publish-pypi:") : workflow.index("  verify-pypi:")
+    ]
+    verify_job = workflow[
+        workflow.index("  verify-pypi:") : workflow.index("  publish-release:")
+    ]
+    release_tag_pattern = r"v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"
+
+    assert "push:\n    tags:\n      - 'v*.*.*.*'" in workflow
+    assert workflow.count(
+        f"re.fullmatch(r'{release_tag_pattern}', tag)"
+    ) == 2
+    assert re.fullmatch(release_tag_pattern, "v0.20.0.5")
+    assert not any(
+        re.fullmatch(release_tag_pattern, tag)
+        for tag in ("v0.20.5", "v0.20.0.5.1", "v0.20.0.5rc1", "0.20.0.5")
+    )
+    assert "release:\n    types: [published]" not in workflow
+    assert (
+        'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"'
+        in workflow
+    )
+    assert "git merge-base --is-ancestor HEAD origin/main" not in workflow
+    assert (
+        preflight_step
+        < lint_step
+        < audit_step
+        < test_step
+        < build_step
+        < stage_step
+        < publish_step
+        < verify_step
+        < release_step
+    )
+    assert 'gh release create "$RELEASE_TAG" \\' in workflow
+    assert 'gh release view "$RELEASE_TAG" --repo "$GH_REPO"' in workflow
+    assert workflow.count('gh release view "$RELEASE_TAG" --repo "$GH_REPO"') == 2
+    assert 'if gh release view "$RELEASE_TAG" --repo "$GH_REPO"' in preflight_job
+    assert "--json isDraft" not in preflight_job
+    assert "Refusing to rebuild an existing draft or published release" in workflow
+    assert "Rerun only the failed jobs" in workflow
+    assert "stage-release:\n    needs: build" in workflow
+    assert "--json isDraft" in stage_job
+    assert 'test "$is_draft" = true' in stage_job
+    assert "--draft \\" in stage_job
+    assert 'if [ "$RELEASE_TAG" = "v0.20.0.5" ]; then' in stage_job
+    assert 'uv pip install --reinstall "async-hermes-agent==0.20.0.5"' in stage_job
+    assert '--notes "$release_notes" \\' in stage_job
+    assert 'gh release upload "$RELEASE_TAG" dist/* \\' in stage_job
+    assert "--clobber \\" in stage_job
+    assert '--verify-tag \\\n' in workflow
+    assert '--repo "$GH_REPO"' in workflow
+    assert "GH_REPO: ${{ github.repository }}" in workflow
+    assert "publish-pypi:\n    needs: stage-release" in workflow
+    assert "verify-pypi:\n    needs: publish-pypi" in workflow
+    assert "publish-release:\n    needs: verify-pypi" in workflow
+    assert (
+        'gh release edit "$RELEASE_TAG" --draft=false --repo "$GH_REPO"'
+        in workflow
+    )
+    assert "name: pypi" in workflow
+    assert "url: https://pypi.org/p/async-hermes-agent" in workflow
+    assert (
+        "pypa/gh-action-pypi-publish@"
+        "cef221092ed1bacb1cc03d23a2d87d1d172e277b"
+    ) in workflow
+    assert "packages-dir: dist/" in workflow
+    assert "skip-existing: true" in publish_job
+    assert "permissions: {}" in verify_job
+    assert "hashlib.sha256(path.read_bytes()).hexdigest()" in verify_job
+    assert 'if published == expected:' in verify_job
+    assert 'wheels = [name for name in expected if name.endswith(".whl")]' in verify_job
+    assert (
+        'sdists = [name for name in expected if name.endswith(".tar.gz")]'
+        in verify_job
+    )
+    assert "if len(wheels) != 1 or len(sdists) != 1:" in verify_job
+    assert "pypi.org/pypi/async-hermes-agent/" in verify_job
+    assert "time.sleep(5)" in verify_job
+    assert "PYPI_TOKEN" not in workflow
+    assert "TWINE_" not in workflow
+    assert "password:" not in workflow
+    assert "${{ secrets." not in publish_job
+    assert re.search(
+        r"uses: pypa/gh-action-pypi-publish@[0-9a-f]{40}(?:\s|$)",
+        publish_job,
+    )
+    assert workflow.count("id-token: write") == 1
+    assert "permissions:\n      id-token: write" in workflow
+    assert "permissions:\n  id-token: write" not in workflow
     assert "sha256sum *.whl *.tar.gz > SHA256SUMS" in workflow
-    assert "attach:\n    needs: build" in workflow
-    assert workflow.count("contents: write") == 1
+    assert (
+        "path: |\n            dist/*.whl\n            dist/*.tar.gz"
+        in workflow
+    )
+    assert workflow.count("contents: write") == 2
     assert "permissions:\n  contents: read" in workflow
-    assert "gh-action-pypi-publish" not in workflow
-    assert "upload.pypi.org" not in workflow
-    assert "id-token: write" not in workflow
 
 
 def test_release_documentation_uses_current_package_version():
@@ -86,6 +236,12 @@ def test_release_documentation_uses_current_package_version():
 
     for page in release_pages:
         assert pinned_install in page.read_text(encoding="utf-8"), page
+
+    readmes = (REPO_ROOT / "README.md", REPO_ROOT / "README.es.md")
+    for readme_path in readmes:
+        readme = readme_path.read_text(encoding="utf-8")
+        assert pinned_install in readme, readme_path
+        assert "not published to PyPI" not in readme, readme_path
 
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
@@ -197,7 +353,10 @@ def test_provider_extras_only_publish_native_async_dependencies():
         "azure-identity==1.25.3",
         "aiohttp==3.14.3",
     ]
-    assert extras["hindsight"] == ["hindsight-client==0.6.1"]
+    assert extras["hindsight"] == [
+        "hindsight-client==0.6.1",
+        "packaging==26.0",
+    ]
     assert extras["honcho"] == ["honcho-ai==2.2.0"]
     assert "google-auth" in declared
     assert "azure-identity" in declared
@@ -205,6 +364,33 @@ def test_provider_extras_only_publish_native_async_dependencies():
     assert "hindsight-client" in declared
     assert "honcho-ai" in declared
     assert "boto3" not in declared
+
+
+def test_retained_runtime_dependencies_are_declared_and_exact_pinned():
+    """Direct retained imports must not drift through transitive resolution."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = data["project"]["dependencies"]
+    extras = data["project"]["optional-dependencies"]
+
+    assert "certifi==2026.5.20" in core
+    assert "cryptography==48.0.1" in core
+    assert "packaging==26.0" in extras["hindsight"]
+
+
+def test_retained_no_op_compatibility_extras_are_published():
+    """Upstream extra names survive when native transports moved deps to core."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = data["project"]["optional-dependencies"]
+
+    for extra in (
+        "computer-use",
+        "exa",
+        "firecrawl",
+        "homeassistant",
+        "mcp",
+        "vision",
+    ):
+        assert extras[extra] == []
 
 
 
@@ -257,6 +443,34 @@ def _locked_versions(package: str) -> set[str]:
         for pkg in lock.get("package", [])
         if _canonical(pkg["name"]) == _canonical(package)
     }
+
+
+def test_local_tts_install_metadata_is_publishable_and_exact():
+    """Local TTS guidance must use the reviewed, compatible artifacts."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = data["project"]["optional-dependencies"]
+    extra_requirements = [spec for specs in extras.values() for spec in specs]
+
+    assert extras["piper-tts"] == ["piper-tts==1.6.0"]
+    assert _locked_versions("piper-tts") == {"1.6.0"}
+    assert all("://" not in spec for spec in extra_requirements)
+    assert all(
+        _canonical(re.split(r"[<>=!~;\[ @]", spec, maxsplit=1)[0].strip())
+        != "kittentts"
+        for spec in extra_requirements
+    )
+
+    docs = (REPO_ROOT / "website/docs/getting-started/installation.md").read_text(
+        encoding="utf-8"
+    )
+    install_url = (
+        f"{KITTENTTS_OFFICIAL_WHEEL_URL}"
+        f"#sha256={KITTENTTS_OFFICIAL_WHEEL_SHA256}"
+    )
+    assert f"python -m pip install \\\n  '{install_url}'" in docs
+    assert "package named `kittentts` is not the compatible KittenML 0.8.1" in docs
+    assert "pip install kittentts" not in docs
+    assert f"'{install_url}' \\\n  soundfile" not in docs
 
 
 def _pyproject_pinned_specs():

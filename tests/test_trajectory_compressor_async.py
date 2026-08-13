@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from blockbuster import BlockBuster
 
+from agent import secret_scope
+
 
 class TestAsyncClientLazyCreation:
     """trajectory_compressor.py — lazy native-async client ownership."""
@@ -29,7 +31,6 @@ class TestAsyncClientLazyCreation:
         comp._client_api_key = "test-key"
 
         assert comp.client is None
-
     @pytest.mark.asyncio
     async def test_get_client_creates_new_client(self):
         """_get_client() should create a fresh AsyncOpenAI instance."""
@@ -304,3 +305,138 @@ async def test_generate_summary_async_public_moonshot_cn_kimi_k2_5_omits_tempera
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in async_client.chat.completions.create.call_args.kwargs
+
+
+@pytest.fixture
+def _restore_secret_scope():
+    previous_multiplex = secret_scope.is_multiplex_active()
+    scope_token = secret_scope.set_secret_scope(None)
+    try:
+        yield
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+
+@pytest.mark.asyncio
+async def test_custom_summarizer_api_key_is_profile_scoped(
+    monkeypatch,
+    _restore_secret_scope,
+):
+    from trajectory_compressor import CompressionConfig, TrajectoryCompressor
+
+    monkeypatch.setenv("CUSTOM_SUMMARY_KEY", "process-key")
+    secret_scope.set_multiplex_active(True)
+
+    async def initialize(api_key: str) -> str:
+        token = secret_scope.set_secret_scope({"CUSTOM_SUMMARY_KEY": api_key})
+        try:
+            compressor = TrajectoryCompressor(
+                CompressionConfig(
+                    base_url="https://custom.summary.test/v1",
+                    api_key_env="CUSTOM_SUMMARY_KEY",
+                )
+            )
+            await asyncio.sleep(0)
+            compressor._init_summarizer()
+            return compressor._client_api_key
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    key_a, key_b = await asyncio.gather(
+        initialize("profile-a-key"),
+        initialize("profile-b-key"),
+    )
+
+    assert key_a == "profile-a-key"
+    assert key_b == "profile-b-key"
+
+
+@pytest.mark.asyncio
+async def test_huggingface_tokenizer_auth_is_profile_scoped(
+    monkeypatch,
+    _restore_secret_scope,
+):
+    import trajectory_compressor as compressor_module
+
+    captured: list[str | None] = []
+
+    class Response:
+        status_code = 200
+        content = b"{}"
+        headers = {"etag": "test-etag"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class Client:
+        def __init__(self, authorization: str | None) -> None:
+            self.authorization = authorization
+
+        async def __aenter__(self):
+            captured.append(self.authorization)
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url: str, *, headers: dict[str, str]):
+            return Response()
+
+    async def create_client(**kwargs):
+        headers = kwargs.get("headers") or {}
+        return Client(headers.get("Authorization"))
+
+    monkeypatch.setattr(
+        "agent.ssl_verify._create_httpx_client",
+        create_client,
+    )
+    monkeypatch.setattr(
+        compressor_module,
+        "_read_optional_bytes",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        compressor_module,
+        "_atomic_write_bytes",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setenv("HF_TOKEN", "process-token")
+    secret_scope.set_multiplex_active(True)
+
+    async def load(token_value: str) -> None:
+        token = secret_scope.set_secret_scope({"HF_TOKEN": token_value})
+        try:
+            await compressor_module._load_hf_tokenizer_assets(
+                "owner/tokenizer",
+                ("tokenizer.json",),
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    await asyncio.gather(load("profile-a-token"), load("profile-b-token"))
+
+    assert sorted(captured) == [
+        "Bearer profile-a-token",
+        "Bearer profile-b-token",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_compressor_credentials_fail_closed_without_profile_scope(
+    monkeypatch,
+    _restore_secret_scope,
+):
+    from trajectory_compressor import CompressionConfig, TrajectoryCompressor
+
+    monkeypatch.setenv("CUSTOM_SUMMARY_KEY", "process-key")
+    secret_scope.set_multiplex_active(True)
+    compressor = TrajectoryCompressor(
+        CompressionConfig(
+            base_url="https://custom.summary.test/v1",
+            api_key_env="CUSTOM_SUMMARY_KEY",
+        )
+    )
+
+    with pytest.raises(secret_scope.UnscopedSecretError, match="CUSTOM_SUMMARY_KEY"):
+        compressor._init_summarizer()

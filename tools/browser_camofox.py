@@ -27,24 +27,169 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import contextvars
 import json
 import logging
 import os
+import threading
 import uuid
-from typing import Any, Dict, Optional
+from collections.abc import MutableMapping
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, TYPE_CHECKING
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import aiofiles
 import aiofiles.os
-import httpx
 
+if TYPE_CHECKING:
+    import httpx
 from agent.secret_scope import get_secret
 from agent.ssl_verify import _create_httpx_client
+from hermes_constants import get_hermes_home, get_hermes_home_override
 from hermes_cli.config import cfg_get, load_config_readonly
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+_CamofoxScopeKey = tuple[object, str]
+_CAMOFOX_NO_LOOP = object()
+_camofox_scope_context: contextvars.ContextVar[
+    tuple[str, _CamofoxScopeKey] | None
+] = contextvars.ContextVar("camofox_profile_scope", default=None)
+_camofox_scope_aliases: dict[_CamofoxScopeKey, _CamofoxScopeKey] = {}
+_camofox_scope_lock = threading.RLock()
+
+
+def _lexical_camofox_profile_identity() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_camofox_scope_key() -> _CamofoxScopeKey:
+    lexical = _lexical_camofox_profile_identity()
+    try:
+        loop: object = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _CAMOFOX_NO_LOOP
+    active = _camofox_scope_context.get()
+    if active is not None and active[0] == lexical and active[1][0] is loop:
+        return active[1]
+    with _camofox_scope_lock:
+        return _camofox_scope_aliases.get((loop, lexical), (loop, lexical))
+
+
+@dataclass
+class _CamofoxProfileState:
+    profile_home: str
+    sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sessions_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    vnc_url: str | None = None
+    vnc_url_checked: bool = False
+    cached_cmd_timeout: int | None = None
+    cmd_timeout_resolved: bool = False
+
+
+_camofox_states: dict[_CamofoxScopeKey, _CamofoxProfileState] = {}
+
+
+def _camofox_state_for(scope: _CamofoxScopeKey) -> _CamofoxProfileState:
+    with _camofox_scope_lock:
+        return _camofox_states.setdefault(
+            scope,
+            _CamofoxProfileState(profile_home=scope[1]),
+        )
+
+
+def _camofox_state() -> _CamofoxProfileState:
+    return _camofox_state_for(_current_camofox_scope_key())
+
+
+def _merge_camofox_state(
+    source: _CamofoxScopeKey,
+    target: _CamofoxScopeKey,
+) -> None:
+    if source == target:
+        return
+    with _camofox_scope_lock:
+        staged = _camofox_states.pop(source, None)
+        if staged is None:
+            return
+        current = _camofox_states.get(target)
+        if current is None:
+            staged.profile_home = target[1]
+            _camofox_states[target] = staged
+            return
+        current.sessions.update(staged.sessions)
+
+
+async def _activate_camofox_scope() -> _CamofoxScopeKey:
+    lexical = _lexical_camofox_profile_identity()
+    loop = asyncio.get_running_loop()
+    active = _camofox_scope_context.get()
+    if active is not None and active[0] == lexical and active[1][0] is loop:
+        return active[1]
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = str(await expanduser(lexical))
+    is_absolute = (
+        expanded.startswith(("/", "\\\\"))
+        or (len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in "/\\")
+    )
+    if not is_absolute:
+        expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical = os.path.normcase(str(await realpath(expanded)))
+    scope: _CamofoxScopeKey = (loop, canonical)
+    with _camofox_scope_lock:
+        _camofox_scope_aliases[(loop, lexical)] = scope
+    _camofox_scope_context.set((lexical, scope))
+    _merge_camofox_state((loop, lexical), scope)
+    _merge_camofox_state((_CAMOFOX_NO_LOOP, lexical), scope)
+    _camofox_state_for(scope)
+    return scope
+
+
+class _ScopedCamofoxSessions(MutableMapping):
+    """Dict-compatible current-profile view for the historical private map."""
+
+    def _active(self) -> dict:
+        return _camofox_state().sessions
+
+    def __getitem__(self, key):
+        return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        del self._active()[key]
+
+    def __iter__(self):
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def clear(self) -> None:
+        self._active().clear()
+
+    def copy(self) -> dict:
+        return self._active().copy()
+
+
+def __getattr__(name: str):
+    """Resolve httpx lazily while preserving the module patch surface."""
+    if name == "httpx":
+        module = _get_httpx_module()
+        globals()["httpx"] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _get_httpx_module():
+    import httpx as httpx_module
+
+    return httpx_module
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -68,7 +213,16 @@ async def _get_command_timeout() -> int:
     Result is cached after the first call.
     """
     global _cached_cmd_timeout, _cmd_timeout_resolved
-    if _cmd_timeout_resolved and _cached_cmd_timeout is not None:
+    scoped_state: _CamofoxProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_camofox_scope()
+        scoped_state = _camofox_state()
+        if (
+            scoped_state.cmd_timeout_resolved
+            and scoped_state.cached_cmd_timeout is not None
+        ):
+            return scoped_state.cached_cmd_timeout
+    elif _cmd_timeout_resolved and _cached_cmd_timeout is not None:
         return _cached_cmd_timeout
 
     result = _DEFAULT_TIMEOUT
@@ -79,8 +233,12 @@ async def _get_command_timeout() -> int:
             result = max(int(val), 5)  # floor at 5s
     except Exception as exc:
         logger.debug("Could not read browser.command_timeout: %s", exc)
-    _cached_cmd_timeout = result
-    _cmd_timeout_resolved = True
+    if scoped_state is None:
+        _cached_cmd_timeout = result
+        _cmd_timeout_resolved = True
+    else:
+        scoped_state.cached_cmd_timeout = result
+        scoped_state.cmd_timeout_resolved = True
     return result
 
 
@@ -135,13 +293,22 @@ async def is_camofox_mode() -> bool:
 async def check_camofox_available() -> bool:
     """Verify the Camofox server is reachable."""
     global _vnc_url, _vnc_url_checked
+    scoped_state: _CamofoxProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_camofox_scope()
+        scoped_state = _camofox_state()
     url = get_camofox_url()
     if not url:
         return False
     try:
         async with (await _create_httpx_client(timeout=5)) as client:
             resp = await client.get(f"{url}/health")
-        if resp.status_code == 200 and not _vnc_url_checked:
+        already_checked = (
+            _vnc_url_checked
+            if scoped_state is None
+            else scoped_state.vnc_url_checked
+        )
+        if resp.status_code == 200 and not already_checked:
             try:
                 data = resp.json()
                 vnc_port = data.get("vncPort")
@@ -150,10 +317,17 @@ async def check_camofox_available() -> bool:
 
                     parsed = urlparse(url)
                     host = parsed.hostname or "localhost"
-                    _vnc_url = f"http://{host}:{vnc_port}"
+                    resolved_vnc_url = f"http://{host}:{vnc_port}"
+                    if scoped_state is None:
+                        _vnc_url = resolved_vnc_url
+                    else:
+                        scoped_state.vnc_url = resolved_vnc_url
             except (ValueError, KeyError):
                 pass
-            _vnc_url_checked = True
+            if scoped_state is None:
+                _vnc_url_checked = True
+            else:
+                scoped_state.vnc_url_checked = True
         return resp.status_code == 200
     except Exception:
         return False
@@ -161,6 +335,12 @@ async def check_camofox_available() -> bool:
 
 async def get_vnc_url() -> Optional[str]:
     """Return the VNC URL if the Camofox server exposes one, or None."""
+    if get_hermes_home_override() is not None:
+        await _activate_camofox_scope()
+        state = _camofox_state()
+        if not state.vnc_url_checked:
+            await check_camofox_available()
+        return state.vnc_url
     if not _vnc_url_checked:
         await check_camofox_available()
     return _vnc_url
@@ -330,8 +510,11 @@ async def _rewrite_loopback_url_for_camofox(
 # Session management
 # ---------------------------------------------------------------------------
 # Maps task_id -> {"user_id": str, "tab_id": str|None}
-_sessions: Dict[str, Dict[str, Any]] = {}
-_sessions_lock = asyncio.Lock()
+_sessions: MutableMapping[str, Dict[str, Any]] = _ScopedCamofoxSessions()
+
+
+def _sessions_lock_for_profile() -> asyncio.Lock:
+    return _camofox_state().sessions_lock
 
 
 async def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -385,8 +568,9 @@ async def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     derived from the Hermes profile so the Camofox server can map it
     to the same persistent browser profile across restarts.
     """
+    await _activate_camofox_scope()
     task_id = task_id or "default"
-    async with _sessions_lock:
+    async with _sessions_lock_for_profile():
         if task_id in _sessions:
             return await _adopt_existing_tab(_sessions[task_id])
 
@@ -449,8 +633,9 @@ async def _ensure_tab(
 
 async def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
+    await _activate_camofox_scope()
     task_id = task_id or "default"
-    async with _sessions_lock:
+    async with _sessions_lock_for_profile():
         return _sessions.pop(task_id, None)
 
 
@@ -535,6 +720,7 @@ async def _delete(
 
 async def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
+    httpx = _get_httpx_module()
     try:
         browser_url, rewrite_info = await _rewrite_loopback_url_for_camofox(url)
         session = await _get_session(task_id)

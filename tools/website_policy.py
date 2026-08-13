@@ -13,6 +13,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +38,9 @@ _CACHE_TTL_SECONDS = 30.0
 _cached_policy: Optional[Dict[str, Any]] = None
 _cached_policy_path: Optional[str] = None
 _cached_policy_time: float = 0.0
+_policy_cache_by_path: Dict[str, Tuple[Dict[str, Any], float]] = {}
+_policy_path_aliases: Dict[str, str] = {}
+_policy_cache_guard = threading.RLock()
 
 
 def _get_default_config_path() -> Path:
@@ -68,8 +72,53 @@ def _normalize_rule(rule: Any) -> Optional[str]:
 
 def invalidate_cache() -> None:
     """Force the next ``check_website_access`` call to re-read config."""
-    global _cached_policy
-    _cached_policy = None
+    global _cached_policy, _cached_policy_path, _cached_policy_time
+    with _policy_cache_guard:
+        _policy_cache_by_path.clear()
+        _cached_policy = None
+        _cached_policy_path = None
+        _cached_policy_time = 0.0
+
+
+async def _canonical_policy_path(path: Path) -> str:
+    """Resolve a loop-neutral physical cache key for one policy file."""
+    lexical = os.path.normcase(os.fspath(path))
+    with _policy_cache_guard:
+        cached = _policy_path_aliases.get(lexical)
+    if cached is not None:
+        return cached
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = str(await expanduser(lexical))
+    is_absolute = (
+        expanded.startswith(("/", "\\\\"))
+        or (
+            len(expanded) >= 3
+            and expanded[1] == ":"
+            and expanded[2] in "/\\"
+        )
+    )
+    if not is_absolute:
+        expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical = os.path.normcase(str(await realpath(expanded)))
+    with _policy_cache_guard:
+        _policy_path_aliases[lexical] = canonical
+    return canonical
+
+
+def _publish_policy_cache(
+    cache_key: str,
+    display_path: str,
+    policy: Dict[str, Any],
+    cached_at: float,
+) -> None:
+    """Store one profile policy and update historical private snapshots."""
+    global _cached_policy, _cached_policy_path, _cached_policy_time
+    with _policy_cache_guard:
+        _policy_cache_by_path[cache_key] = (policy, cached_at)
+        _cached_policy = policy
+        _cached_policy_path = display_path
+        _cached_policy_time = cached_at
 
 
 def _match_host_against_rule(host: str, pattern: str) -> bool:
@@ -105,34 +154,22 @@ async def check_website_access(
     ``aiofiles``; parsing/matching stays local and deterministic.  No async
     caller needs to invoke the synchronous policy loader or a thread fallback.
     """
-    if config_path is None:
-        cache_fresh = (time.monotonic() - _cached_policy_time) < _CACHE_TTL_SECONDS
-        if _cached_policy is not None and cache_fresh:
-            if not _cached_policy.get("enabled"):
-                return None
-            policy = _cached_policy
-        else:
-            policy = None
-    else:
-        policy = None
-
     host = _extract_host_from_urlish(url)
     if not host:
         return None
 
-    if policy is None:
-        try:
-            policy = await load_website_blocklist(config_path)
-        except WebsitePolicyError as exc:
-            if config_path is not None:
-                raise
-            logger.warning("Website policy config error (failing open): %s", exc)
-            return None
-        except Exception as exc:
-            logger.warning(
-                "Unexpected error loading website policy (failing open): %s", exc
-            )
-            return None
+    try:
+        policy = await load_website_blocklist(config_path)
+    except WebsitePolicyError as exc:
+        if config_path is not None:
+            raise
+        logger.warning("Website policy config error (failing open): %s", exc)
+        return None
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error loading website policy (failing open): %s", exc
+        )
+        return None
 
     if not policy.get("enabled"):
         return None
@@ -160,16 +197,17 @@ async def check_website_access(
 
 async def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Load the website blocklist through native async file I/O."""
-    global _cached_policy, _cached_policy_path, _cached_policy_time
     config_path = config_path or _get_default_config_path()
     resolved_path = str(config_path)
-    if (
-        resolved_path == str(_get_default_config_path())
-        and _cached_policy is not None
-        and _cached_policy_path == resolved_path
-        and (time.monotonic() - _cached_policy_time) < _CACHE_TTL_SECONDS
-    ):
-        return _cached_policy
+    cache_key: str | None = None
+    if config_path == _get_default_config_path():
+        cache_key = await _canonical_policy_path(config_path)
+        with _policy_cache_guard:
+            cached = _policy_cache_by_path.get(cache_key)
+        if cached is not None:
+            cached_policy, cached_at = cached
+            if (time.monotonic() - cached_at) < _CACHE_TTL_SECONDS:
+                return cached_policy
     if not await aiofiles.os.path.exists(config_path):
         policy = dict(_DEFAULT_WEBSITE_BLOCKLIST)
     else:
@@ -245,8 +283,11 @@ async def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str
                 seen.add(key)
 
     result = {"enabled": enabled, "rules": rules}
-    if config_path == _get_default_config_path():
-        _cached_policy = result
-        _cached_policy_path = resolved_path
-        _cached_policy_time = time.monotonic()
+    if cache_key is not None:
+        _publish_policy_cache(
+            cache_key,
+            resolved_path,
+            result,
+            time.monotonic(),
+        )
     return result

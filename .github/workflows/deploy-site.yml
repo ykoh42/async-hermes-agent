@@ -1,6 +1,10 @@
 name: Deploy Documentation
 
 on:
+  pull_request:
+    paths:
+      - 'website/**'
+      - '.github/workflows/deploy-site.yml'
   push:
     branches: [main]
     paths:
@@ -12,12 +16,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
+    # image-size 2.0.2 has no patched release yet and Docusaurus invokes it
+    # for local Markdown images. Do not execute untrusted fork content until
+    # the upstream ICNS/JXL/HEIF infinite-loop fixes are available.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -58,6 +67,9 @@ jobs:
           include-hidden-files: true
 
   deploy:
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10

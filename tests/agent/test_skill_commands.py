@@ -1,12 +1,17 @@
 """Behavior contracts for native-async skill command helpers."""
 
 import inspect
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import agent.skill_commands as skill_commands
+from hermes_constants import (
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 def _write_skill(root: Path, name: str, body: str) -> Path:
@@ -27,9 +32,11 @@ def _write_skill(root: Path, name: str, body: str) -> Path:
 def _clear_command_cache():
     skill_commands._skill_commands = {}
     skill_commands._skill_commands_platform = None
+    skill_commands._skill_commands_by_scope.clear()
     yield
     skill_commands._skill_commands = {}
     skill_commands._skill_commands_platform = None
+    skill_commands._skill_commands_by_scope.clear()
 
 
 def test_io_backed_skill_command_interfaces_are_coroutines():
@@ -44,6 +51,25 @@ def test_io_backed_skill_command_interfaces_are_coroutines():
         "build_preloaded_skills_prompt",
     ):
         assert inspect.iscoroutinefunction(getattr(skill_commands, name)), name
+
+
+@pytest.mark.asyncio
+async def test_skill_command_cache_is_profile_isolated(tmp_path):
+    homes = {name: tmp_path / name for name in ("a", "b")}
+    for name, home in homes.items():
+        _write_skill(home / "skills", f"skill-{name}", f"Body {name}.")
+
+    async def load(name: str):
+        token = set_hermes_home_override(str(homes[name]))
+        try:
+            return await skill_commands.get_skill_commands()
+        finally:
+            reset_hermes_home_override(token)
+
+    commands_a, commands_b = await asyncio.gather(load("a"), load("b"))
+
+    assert list(commands_a) == ["/skill-a"]
+    assert list(commands_b) == ["/skill-b"]
 
 
 @pytest.mark.asyncio

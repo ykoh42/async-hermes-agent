@@ -475,16 +475,33 @@ class TestLegacyToolsetMap:
 # =========================================================================
 
 class TestBackwardCompat:
-    def test_get_all_tool_names_returns_list(self):
-        names = get_all_tool_names()
+    @pytest.mark.asyncio
+    async def test_lazy_discovery_updates_public_maps_in_place(self):
+        import model_tools
+        from tools.registry import registry
+
+        tool_map = model_tools.TOOL_TO_TOOLSET_MAP
+        requirements = model_tools.TOOLSET_REQUIREMENTS
+
+        await model_tools.get_all_tool_names()
+
+        assert model_tools.TOOL_TO_TOOLSET_MAP is tool_map
+        assert model_tools.TOOLSET_REQUIREMENTS is requirements
+        assert tool_map == registry.get_tool_to_toolset_map()
+        assert requirements == registry.get_toolset_requirements()
+
+    @pytest.mark.asyncio
+    async def test_get_all_tool_names_returns_list(self):
+        names = await get_all_tool_names()
         assert isinstance(names, list)
         assert len(names) > 0
         # Should contain well-known tools
         assert "web_search" in names
         assert "terminal" in names
 
-    def test_get_toolset_for_tool(self):
-        result = get_toolset_for_tool("web_search")
+    @pytest.mark.asyncio
+    async def test_get_toolset_for_tool(self):
+        result = await get_toolset_for_tool("web_search")
         assert result is not None
         assert isinstance(result, str)
 

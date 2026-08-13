@@ -7,10 +7,14 @@ writers must never race into ``database is locked`` failures.
 """
 
 import asyncio
+import gc
+import threading
+import weakref
 
 import pytest
 import pytest_asyncio
 
+from plugins.memory.holographic import store as store_module
 from plugins.memory.holographic.store import MemoryStore
 
 pytestmark = pytest.mark.asyncio
@@ -105,6 +109,34 @@ class TestSharedConnection:
 
 
 class TestCloseSemantics:
+    async def test_close_waits_for_concurrent_initialize(self, db_path, monkeypatch):
+        store = MemoryStore(db_path)
+        mkdir_started = asyncio.Event()
+        release_mkdir = asyncio.Event()
+        original_makedirs = store_module.aiofiles.os.makedirs
+
+        async def paused_makedirs(*args, **kwargs):
+            mkdir_started.set()
+            await release_mkdir.wait()
+            await original_makedirs(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "plugins.memory.holographic.store.aiofiles.os.makedirs",
+            paused_makedirs,
+        )
+        initialize = asyncio.create_task(store._initialize())
+        await mkdir_started.wait()
+        close = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+        assert not close.done()
+        release_mkdir.set()
+
+        await initialize
+        await close
+        assert store._closed is True
+        assert store._entry is None
+        assert MemoryStore._shared == {}
+
     async def test_closing_one_instance_keeps_sibling_alive(self, db_path):
         a = MemoryStore(db_path)
         b = MemoryStore(db_path)
@@ -149,6 +181,92 @@ class TestCloseSemantics:
         async with MemoryStore(db_path) as store:
             facts = await store.list_facts()
         assert [fact["content"] for fact in facts] == ["first lifetime"]
+
+    async def test_concurrent_close_finishes_once_through_repeated_cancellation(
+        self,
+        db_path,
+        monkeypatch,
+    ):
+        store = MemoryStore(db_path)
+        await store._initialize()
+        connection = store._conn
+        original_close = connection.close
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        close_calls = 0
+
+        async def paused_close():
+            nonlocal close_calls
+            close_calls += 1
+            close_started.set()
+            await allow_close.wait()
+            await original_close()
+
+        monkeypatch.setattr(connection, "close", paused_close)
+        first = asyncio.create_task(store.close())
+        second = asyncio.create_task(store.close())
+        await close_started.wait()
+        first.cancel()
+        await asyncio.sleep(0)
+        first.cancel()
+        assert not first.done()
+        allow_close.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+        assert close_calls == 1
+        assert store._entry is None
+        assert MemoryStore._shared == {}
+
+
+async def test_contended_guard_does_not_retain_closed_event_loop(tmp_path):
+    loop_refs = []
+    errors = []
+
+    def run_once() -> None:
+        loop = asyncio.new_event_loop()
+        loop_refs.append(weakref.ref(loop))
+
+        async def contend() -> None:
+            guard = MemoryStore._shared_guard_for_loop(loop)
+            acquired = asyncio.Event()
+            release = asyncio.Event()
+
+            async def owner() -> None:
+                async with guard:
+                    acquired.set()
+                    await release.wait()
+
+            async def waiter() -> None:
+                await acquired.wait()
+                async with guard:
+                    return None
+
+            owner_task = asyncio.create_task(owner())
+            waiter_task = asyncio.create_task(waiter())
+            await acquired.wait()
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(owner_task, waiter_task)
+
+        try:
+            loop.run_until_complete(contend())
+        except BaseException as exc:  # noqa: ASYNC103 - report worker failure
+            errors.append(exc)
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=run_once)
+    thread.start()
+    while thread.is_alive():
+        await asyncio.sleep(0.01)
+    thread.join()
+    assert not errors
+
+    for _ in range(3):
+        gc.collect()
+    assert loop_refs[0]() is None
 
 
 class TestConcurrency:
@@ -198,6 +316,41 @@ class TestConcurrency:
 
 
 class TestProviderShutdown:
+    async def test_concurrent_initialize_releases_replaced_store(
+        self,
+        db_path,
+        monkeypatch,
+    ):
+        from plugins.memory.holographic import HolographicMemoryProvider
+
+        provider = HolographicMemoryProvider(config={"db_path": str(db_path)})
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        original_initialize = MemoryStore._initialize
+        call_count = 0
+
+        async def paused_first_initialize(store):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                first_started.set()
+                await release_first.wait()
+            await original_initialize(store)
+
+        monkeypatch.setattr(MemoryStore, "_initialize", paused_first_initialize)
+        first = asyncio.create_task(provider.initialize("first"))
+        await first_started.wait()
+        second = asyncio.create_task(provider.initialize("second"))
+        await asyncio.sleep(0)
+        release_first.set()
+        await asyncio.gather(first, second)
+
+        assert call_count == 2
+        assert provider._session_id == "second"
+        assert MemoryStore._shared[provider._store._registry_key]["refs"] == 1
+        await provider.shutdown()
+        assert MemoryStore._shared == {}
+
     async def test_shutdown_releases_shared_connection(self, db_path):
         from plugins.memory.holographic import HolographicMemoryProvider
 

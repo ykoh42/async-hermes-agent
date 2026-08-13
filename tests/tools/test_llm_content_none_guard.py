@@ -10,7 +10,6 @@ and that ``extract_content_or_reasoning()`` falls back to structured
 reasoning fields when content is empty.
 """
 
-import asyncio
 import types
 
 import pytest
@@ -29,11 +28,6 @@ def _make_response(content, **msg_attrs):
     message = types.SimpleNamespace(content=content, tool_calls=None, **msg_attrs)
     choice = types.SimpleNamespace(message=message)
     return types.SimpleNamespace(choices=[choice])
-
-
-def _run(coro):
-    """Run an async coroutine synchronously."""
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 # ── web_tools — LLM content processor (line 419) ─────────────────────────

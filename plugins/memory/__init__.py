@@ -34,7 +34,7 @@ import aiofiles
 import aiofiles.os
 
 from hermes_cli.config import cfg_get
-from hermes_cli.async_source_loader import load_source_package
+from hermes_cli.async_source_loader import _load_source_package
 
 if TYPE_CHECKING:
     from agent.memory_provider import MemoryProvider
@@ -294,7 +294,7 @@ async def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvide
             _register_synthetic_package(_USER_NAMESPACE, [])
 
         try:
-            mod = await load_source_package(module_name, init_file)
+            mod = await _load_source_package(module_name, init_file)
         except asyncio.CancelledError:
             sys.modules.pop(module_name, None)
             for loaded_name in tuple(sys.modules):

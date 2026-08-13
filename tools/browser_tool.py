@@ -50,6 +50,7 @@ Usage:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -59,26 +60,29 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import MutableMapping, MutableSet
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 
 import aiofiles
 import aiofiles.os
-import httpx
-
 from agent.redact import redact_cdp_url
+from agent.secret_scope import get_secret
 from agent.ssl_verify import _create_httpx_client
 from hermes_constants import (
     agent_browser_runnable,
     get_hermes_home,
     get_hermes_home_override,
+    reset_hermes_home_override,
+    set_hermes_home_override,
 )
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get, load_config_readonly
 from hermes_cli._subprocess_compat import windows_hide_flags
-
 
 def __getattr__(name: str):
     """Lazy module attributes (PEP 562) — import diet for cold start.
@@ -87,6 +91,38 @@ def __getattr__(name: str):
     paths, so it loads on first use. The module-level name is preserved for the
     test-patch surface.
     """
+    if name == "httpx":
+        import httpx as _httpx
+
+        globals()["httpx"] = _httpx
+        return _httpx
+    provider_exports = {
+        "BrowserbaseProvider": (
+            "plugins.browser.browserbase.provider",
+            "BrowserbaseBrowserProvider",
+            "browserbase",
+        ),
+        "BrowserUseProvider": (
+            "plugins.browser.browser_use.provider",
+            "BrowserUseBrowserProvider",
+            "browser-use",
+        ),
+        "FirecrawlProvider": (
+            "plugins.browser.firecrawl.provider",
+            "FirecrawlBrowserProvider",
+            "firecrawl",
+        ),
+    }
+    provider_export = provider_exports.get(name)
+    if provider_export is not None:
+        module_name, class_name, registry_name = provider_export
+        from importlib import import_module
+
+        provider_class = getattr(import_module(module_name), class_name)
+        globals()[name] = provider_class
+        _PROVIDER_REGISTRY[registry_name] = provider_class
+        _DEFAULT_PROVIDER_REGISTRY[registry_name] = provider_class
+        return provider_class
     if name == "call_llm":
         from agent.auxiliary_client import call_llm as _call_llm
 
@@ -169,8 +205,10 @@ async def _build_browser_env() -> dict:
 
     env = await hermes_subprocess_env(inherit_credentials=False)
     for _key in _BROWSER_PASSTHROUGH_KEYS:
-        if _key in os.environ:
-            env[_key] = os.environ[_key]
+        value = get_secret(_key)
+        env.pop(_key, None)
+        if value is not None:
+            env[_key] = value
     return env
 
 
@@ -190,15 +228,6 @@ from agent.browser_provider import BrowserProvider as CloudBrowserProvider  # no
 from agent.browser_registry import (  # noqa: F401  (test-patchable surface)
     get_provider as _registry_get_browser_provider,
 )
-from plugins.browser.browserbase.provider import (  # noqa: F401  (legacy import surface)
-    BrowserbaseBrowserProvider as BrowserbaseProvider,
-)
-from plugins.browser.browser_use.provider import (  # noqa: F401
-    BrowserUseBrowserProvider as BrowserUseProvider,
-)
-from plugins.browser.firecrawl.provider import (  # noqa: F401
-    FirecrawlBrowserProvider as FirecrawlProvider,
-)
 from tools.tool_backend_helpers import normalize_browser_cloud_provider
 
 # Camofox local anti-detection browser backend.
@@ -208,6 +237,208 @@ from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
 
 
 logger = logging.getLogger(__name__)
+
+
+# Browser runtime ownership is scoped by both event loop and canonical Hermes
+# profile.  A service may multiplex profiles on one loop while reusing the same
+# upstream task IDs; those IDs are not process-global resource identifiers.
+_BrowserScopeKey = tuple[object, str]
+_BROWSER_NO_LOOP = object()
+_browser_scope_context: contextvars.ContextVar[
+    tuple[str, _BrowserScopeKey] | None
+] = contextvars.ContextVar("browser_profile_scope", default=None)
+_browser_scope_aliases: dict[_BrowserScopeKey, _BrowserScopeKey] = {}
+_browser_scope_lock = threading.RLock()
+
+
+def _lexical_browser_profile_identity() -> str:
+    """Return a no-I/O marker for the active Hermes profile."""
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_browser_scope_key() -> _BrowserScopeKey:
+    """Return the active browser scope without performing filesystem I/O."""
+    lexical = _lexical_browser_profile_identity()
+    try:
+        loop: object = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _BROWSER_NO_LOOP
+    active = _browser_scope_context.get()
+    if active is not None and active[0] == lexical and active[1][0] is loop:
+        return active[1]
+    with _browser_scope_lock:
+        return _browser_scope_aliases.get((loop, lexical), (loop, lexical))
+
+
+@dataclass
+class _BrowserProfileState:
+    """Event-loop resources and caches owned by one canonical profile."""
+
+    profile_home: str
+    active_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    recording_sessions: set[str] = field(default_factory=set)
+    last_active_session_key: dict[str, str] = field(default_factory=dict)
+    session_last_activity: dict[str, float] = field(default_factory=dict)
+    supervisor_keys: dict[str, str] = field(default_factory=dict)
+    cleanup_task: asyncio.Task[None] | None = None
+    cleanup_running: bool = False
+    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    recording_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    inactivity_timeout: int | None = None
+    cached_command_timeout: int | None = None
+    command_timeout_resolved: bool = False
+    cached_cloud_provider: CloudBrowserProvider | None = None
+    cloud_provider_resolved: bool = False
+    cached_allow_private_urls: bool | None = None
+    allow_private_urls_resolved: bool = False
+    cached_agent_browser: str | None = None
+    agent_browser_resolved: bool = False
+    cached_browser_engine: str | None = None
+    browser_engine_resolved: bool = False
+    cached_auto_local_for_private_urls: bool = True
+    auto_local_for_private_urls_resolved: bool = False
+    cached_headed_mode: bool | None = None
+    headed_mode_resolved: bool = False
+
+
+_browser_states: dict[_BrowserScopeKey, _BrowserProfileState] = {}
+
+
+def _browser_state_for(scope: _BrowserScopeKey) -> _BrowserProfileState:
+    with _browser_scope_lock:
+        return _browser_states.setdefault(
+            scope,
+            _BrowserProfileState(profile_home=scope[1]),
+        )
+
+
+def _browser_state() -> _BrowserProfileState:
+    return _browser_state_for(_current_browser_scope_key())
+
+
+def _merge_browser_state(
+    source: _BrowserScopeKey,
+    target: _BrowserScopeKey,
+) -> None:
+    """Move compatibility staging state into its canonical awaited scope."""
+    if source == target:
+        return
+    with _browser_scope_lock:
+        staged = _browser_states.pop(source, None)
+        if staged is None:
+            return
+        current = _browser_states.get(target)
+        if current is None:
+            staged.profile_home = target[1]
+            _browser_states[target] = staged
+            return
+        current.active_sessions.update(staged.active_sessions)
+        current.recording_sessions.update(staged.recording_sessions)
+        current.last_active_session_key.update(staged.last_active_session_key)
+        current.session_last_activity.update(staged.session_last_activity)
+        current.supervisor_keys.update(staged.supervisor_keys)
+        if current.cleanup_task is None:
+            current.cleanup_task = staged.cleanup_task
+            current.cleanup_running = staged.cleanup_running
+
+
+async def _activate_browser_scope() -> _BrowserScopeKey:
+    """Resolve and install the canonical loop/profile browser scope."""
+    lexical = _lexical_browser_profile_identity()
+    loop = asyncio.get_running_loop()
+    active = _browser_scope_context.get()
+    if active is not None and active[0] == lexical and active[1][0] is loop:
+        return active[1]
+
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = str(await expanduser(lexical))
+    is_absolute = (
+        expanded.startswith(("/", "\\\\"))
+        or (len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in "/\\")
+    )
+    if not is_absolute:
+        expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical = os.path.normcase(str(await realpath(expanded)))
+    scope: _BrowserScopeKey = (loop, canonical)
+    with _browser_scope_lock:
+        _browser_scope_aliases[(loop, lexical)] = scope
+    _browser_scope_context.set((lexical, scope))
+    _merge_browser_state((loop, lexical), scope)
+    _merge_browser_state((_BROWSER_NO_LOOP, lexical), scope)
+    _browser_state_for(scope)
+    return scope
+
+
+class _ScopedBrowserDict(MutableMapping):
+    """Dict-compatible active-profile view retained for private test hooks."""
+
+    def __init__(self, field_name: str) -> None:
+        self._field_name = field_name
+
+    def _active(self) -> dict:
+        return getattr(_browser_state(), self._field_name)
+
+    def __getitem__(self, key):
+        return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        del self._active()[key]
+
+    def __iter__(self):
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def clear(self) -> None:
+        self._active().clear()
+
+    def copy(self) -> dict:
+        return self._active().copy()
+
+
+class _ScopedBrowserSet(MutableSet):
+    """Set-compatible active-profile view retained for private test hooks."""
+
+    def __init__(self, field_name: str) -> None:
+        self._field_name = field_name
+
+    def _active(self) -> set:
+        return getattr(_browser_state(), self._field_name)
+
+    def __contains__(self, value) -> bool:
+        return value in self._active()
+
+    def __iter__(self):
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def add(self, value) -> None:
+        self._active().add(value)
+
+    def discard(self, value) -> None:
+        self._active().discard(value)
+
+    def update(self, *others) -> None:
+        self._active().update(*others)
+
+    def remove(self, value) -> None:
+        self._active().remove(value)
+
+    def pop(self):
+        return self._active().pop()
+
+    def clear(self) -> None:
+        self._active().clear()
+
+    def copy(self) -> set:
+        return self._active().copy()
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
 # Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
@@ -342,8 +573,18 @@ async def _get_command_timeout() -> int:
     cached after the first call and cleared by ``cleanup_all_browsers()``.
     """
     global _cached_command_timeout, _command_timeout_resolved
+    scoped_state: _BrowserProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_browser_scope()
+        scoped_state = _browser_state()
+        if (
+            scoped_state.command_timeout_resolved
+            and scoped_state.cached_command_timeout is not None
+        ):
+            return scoped_state.cached_command_timeout
     if _command_timeout_resolved and _cached_command_timeout is not None:
-        return _cached_command_timeout
+        if scoped_state is None:
+            return _cached_command_timeout
 
     result = DEFAULT_COMMAND_TIMEOUT
     try:
@@ -356,8 +597,12 @@ async def _get_command_timeout() -> int:
     # Assign the cached value BEFORE flipping the resolved flag so a
     # concurrent reader cannot observe ``resolved=True`` while the cache
     # is still ``None`` (see issue #14331).
-    _cached_command_timeout = result
-    _command_timeout_resolved = True
+    if scoped_state is None:
+        _cached_command_timeout = result
+        _command_timeout_resolved = True
+    else:
+        scoped_state.cached_command_timeout = result
+        scoped_state.command_timeout_resolved = True
     return result
 
 
@@ -474,12 +719,14 @@ async def _format_browser_timeout_error(
 
 def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
-    return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    return (get_secret("AUXILIARY_VISION_MODEL", "") or "").strip() or None
 
 
 def _get_extraction_model() -> Optional[str]:
     """Model for page snapshot text summarization — same as web_extract."""
-    return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
+    return (
+        get_secret("AUXILIARY_WEB_EXTRACT_MODEL", "") or ""
+    ).strip() or None
 
 
 async def _resolve_cdp_override(cdp_url: str) -> str:
@@ -666,11 +913,12 @@ async def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
+    await _activate_browser_scope()
     cdp_url = await _get_cdp_override()
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
         # cloud provider (Browserbase sets this).
-        async with _cleanup_lock:
+        async with _cleanup_lock_for_profile():
             session_info = _active_sessions.get(task_id, {})
         maybe = str(session_info.get("cdp_url") or "")
         if maybe:
@@ -681,12 +929,13 @@ async def _ensure_cdp_supervisor(task_id: str) -> None:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
         policy, timeout_s = await _get_dialog_policy_config()
-        await SUPERVISOR_REGISTRY.get_or_start(
+        supervisor = await SUPERVISOR_REGISTRY.get_or_start(
             task_id=task_id,
             cdp_url=cdp_url,
             dialog_policy=policy,
             dialog_timeout_s=timeout_s,
         )
+        _browser_state().supervisor_keys[task_id] = supervisor.task_id
     except Exception as exc:
         logger.debug(
             "CDP supervisor attach for task=%s failed (non-fatal): %s",
@@ -697,10 +946,12 @@ async def _ensure_cdp_supervisor(task_id: str) -> None:
 
 async def _stop_cdp_supervisor(task_id: str) -> None:
     """Stop the CDP supervisor for ``task_id`` if one exists. No-op otherwise."""
+    await _activate_browser_scope()
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
-        await SUPERVISOR_REGISTRY.stop(task_id)
+        registry_key = _browser_state().supervisor_keys.pop(task_id, task_id)
+        await SUPERVISOR_REGISTRY.stop(registry_key)
     except Exception as exc:
         logger.debug(
             "CDP supervisor stop for task=%s failed (non-fatal): %s", task_id, exc
@@ -724,11 +975,7 @@ async def _stop_cdp_supervisor(task_id: str) -> None:
 # wins. This keeps the test surface stable while letting third-party
 # plugins drop in under ``~/.hermes/plugins/browser/<vendor>/``.
 
-_PROVIDER_REGISTRY: Dict[str, type] = {
-    "browserbase": BrowserbaseProvider,
-    "browser-use": BrowserUseProvider,
-    "firecrawl": FirecrawlProvider,
-}
+_PROVIDER_REGISTRY: Dict[str, type] = {}
 # Frozen copy of the import-time _PROVIDER_REGISTRY, used by
 # ``_is_legacy_provider_registry_overridden`` to detect test-time
 # monkeypatching. NEVER mutate this dict.
@@ -786,6 +1033,13 @@ async def _ensure_browser_plugins_loaded() -> None:
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         await _ensure_plugins_discovered()
+        for export_name in (
+            "BrowserbaseProvider",
+            "BrowserUseProvider",
+            "FirecrawlProvider",
+        ):
+            if export_name not in globals():
+                __getattr__(export_name)
     except Exception as exc:
         logger.debug("Browser plugin discovery failed (non-fatal): %s", exc)
 
@@ -807,7 +1061,13 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     ``_is_legacy_provider_registry_overridden``.
     """
     global _cached_cloud_provider, _cloud_provider_resolved
-    if _cloud_provider_resolved:
+    scoped_state: _BrowserProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_browser_scope()
+        scoped_state = _browser_state()
+        if scoped_state.cloud_provider_resolved:
+            return scoped_state.cached_cloud_provider
+    elif _cloud_provider_resolved:
         return _cached_cloud_provider
 
     resolved: Optional[CloudBrowserProvider] = None
@@ -820,8 +1080,12 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
                 browser_cfg.get("cloud_provider")
             )
             if provider_key == "local":
-                _cached_cloud_provider = None
-                _cloud_provider_resolved = True
+                if scoped_state is None:
+                    _cached_cloud_provider = None
+                    _cloud_provider_resolved = True
+                else:
+                    scoped_state.cached_cloud_provider = None
+                    scoped_state.cloud_provider_resolved = True
                 return None
         if provider_key:
             try:
@@ -872,11 +1136,18 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
         # mirroring the firecrawl gate documented on
         # :data:`agent.browser_registry._LEGACY_PREFERENCE`.
         try:
-            fallback_provider = BrowserUseProvider()
+            await _ensure_browser_plugins_loaded()
+            fallback_provider_class = globals().get("BrowserUseProvider")
+            if fallback_provider_class is None:
+                fallback_provider_class = __getattr__("BrowserUseProvider")
+            fallback_provider = fallback_provider_class()
             if await fallback_provider.is_available():
                 resolved = fallback_provider
             else:
-                fallback_provider = BrowserbaseProvider()
+                fallback_provider_class = globals().get("BrowserbaseProvider")
+                if fallback_provider_class is None:
+                    fallback_provider_class = __getattr__("BrowserbaseProvider")
+                fallback_provider = fallback_provider_class()
                 if await fallback_provider.is_available():
                     resolved = fallback_provider
         except Exception:  # pragma: no cover - defensive: never poison cache
@@ -887,9 +1158,13 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
         # Transient None — credentials may self-heal. Don't poison the cache.
         return None
 
-    _cached_cloud_provider = resolved
-    _cloud_provider_resolved = True
-    return _cached_cloud_provider
+    if scoped_state is None:
+        _cached_cloud_provider = resolved
+        _cloud_provider_resolved = True
+        return _cached_cloud_provider
+    scoped_state.cached_cloud_provider = resolved
+    scoped_state.cloud_provider_resolved = True
+    return scoped_state.cached_cloud_provider
 
 
 from hermes_constants import is_termux as _is_termux_environment
@@ -975,38 +1250,54 @@ async def _get_browser_engine() -> str:
     renderer (no screenshots).
     """
     global _cached_browser_engine, _browser_engine_resolved
-    if _browser_engine_resolved and _cached_browser_engine is not None:
-        return _cached_browser_engine
-
-    _browser_engine_resolved = True
-    _cached_browser_engine = "auto"  # safe default
+    scoped_state: _BrowserProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_browser_scope()
+        scoped_state = _browser_state()
+        if (
+            scoped_state.browser_engine_resolved
+            and scoped_state.cached_browser_engine is not None
+        ):
+            return scoped_state.cached_browser_engine
+        value = "auto"
+    else:
+        if _browser_engine_resolved and _cached_browser_engine is not None:
+            return _cached_browser_engine
+        _browser_engine_resolved = True
+        _cached_browser_engine = "auto"  # safe default
+        value = _cached_browser_engine
 
     # Config file takes priority
     try:
         cfg = await load_config_readonly()
         val = cfg.get("browser", {}).get("engine")
         if val and str(val).strip():
-            _cached_browser_engine = str(val).strip().lower()
+            value = str(val).strip().lower()
     except Exception as e:
         logger.debug("Could not read browser.engine from config: %s", e)
 
     # Fall back to env var (only if config didn't set a value)
-    if _cached_browser_engine == "auto":
+    if value == "auto":
         env_val = os.environ.get("AGENT_BROWSER_ENGINE", "").strip().lower()
         if env_val:
-            _cached_browser_engine = env_val
+            value = env_val
 
     # Validate: agent-browser only accepts "chrome" and "lightpanda".
     _VALID_ENGINES = {"auto", "lightpanda", "chrome"}
-    if _cached_browser_engine not in _VALID_ENGINES:
+    if value not in _VALID_ENGINES:
         logger.warning(
             "Unknown browser engine %r (valid: %s), falling back to 'auto'",
-            _cached_browser_engine,
+            value,
             ", ".join(sorted(_VALID_ENGINES)),
         )
-        _cached_browser_engine = "auto"
+        value = "auto"
 
-    return _cached_browser_engine
+    if scoped_state is None:
+        _cached_browser_engine = value
+        return _cached_browser_engine
+    scoped_state.cached_browser_engine = value
+    scoped_state.browser_engine_resolved = True
+    return value
 
 
 _cached_headed_mode: Optional[bool] = None
@@ -1020,26 +1311,42 @@ async def _is_headed_mode() -> bool:
     var as fallback.  Result is cached after the first call.
     """
     global _cached_headed_mode, _headed_mode_resolved
-    if _headed_mode_resolved and _cached_headed_mode is not None:
-        return _cached_headed_mode
-
-    _headed_mode_resolved = True
-    _cached_headed_mode = False
+    scoped_state: _BrowserProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_browser_scope()
+        scoped_state = _browser_state()
+        if (
+            scoped_state.headed_mode_resolved
+            and scoped_state.cached_headed_mode is not None
+        ):
+            return scoped_state.cached_headed_mode
+        value = False
+    else:
+        if _headed_mode_resolved and _cached_headed_mode is not None:
+            return _cached_headed_mode
+        _headed_mode_resolved = True
+        _cached_headed_mode = False
+        value = _cached_headed_mode
 
     try:
         cfg = await load_config_readonly()
         val = cfg.get("browser", {}).get("headed")
         if val is not None:
-            _cached_headed_mode = str(val).strip().lower() in ("true", "1", "yes")
+            value = str(val).strip().lower() in ("true", "1", "yes")
     except Exception as e:
         logger.debug("Could not read browser.headed from config: %s", e)
 
-    if not _cached_headed_mode:
+    if not value:
         env_val = os.environ.get("AGENT_BROWSER_HEADED", "").strip()
         if env_val and env_val.lower() in ("true", "1", "yes"):
-            _cached_headed_mode = True
+            value = True
 
-    return _cached_headed_mode
+    if scoped_state is None:
+        _cached_headed_mode = value
+        return _cached_headed_mode
+    scoped_state.cached_headed_mode = value
+    scoped_state.headed_mode_resolved = True
+    return value
 
 
 async def _should_inject_engine(engine: str) -> bool:
@@ -1413,10 +1720,18 @@ async def _auto_local_for_private_urls() -> bool:
     to use the cloud provider in the same conversation.
     """
     global _auto_local_for_private_urls_resolved, _cached_auto_local_for_private_urls
-    if _auto_local_for_private_urls_resolved:
-        return _cached_auto_local_for_private_urls
-
-    _auto_local_for_private_urls_resolved = True
+    scoped_state: _BrowserProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_browser_scope()
+        scoped_state = _browser_state()
+        if scoped_state.auto_local_for_private_urls_resolved:
+            return scoped_state.cached_auto_local_for_private_urls
+        value = True
+    else:
+        if _auto_local_for_private_urls_resolved:
+            return _cached_auto_local_for_private_urls
+        _auto_local_for_private_urls_resolved = True
+        value = _cached_auto_local_for_private_urls
     try:
         cfg = await load_config_readonly()
         browser_cfg = cfg.get("browser", {})
@@ -1424,12 +1739,15 @@ async def _auto_local_for_private_urls() -> bool:
             isinstance(browser_cfg, dict)
             and "auto_local_for_private_urls" in browser_cfg
         ):
-            _cached_auto_local_for_private_urls = bool(
-                browser_cfg.get("auto_local_for_private_urls")
-            )
+            value = bool(browser_cfg.get("auto_local_for_private_urls"))
     except Exception as e:
         logger.debug("Could not read auto_local_for_private_urls from config: %s", e)
-    return _cached_auto_local_for_private_urls
+    if scoped_state is None:
+        _cached_auto_local_for_private_urls = value
+        return _cached_auto_local_for_private_urls
+    scoped_state.cached_auto_local_for_private_urls = value
+    scoped_state.auto_local_for_private_urls_resolved = True
+    return value
 
 
 async def _url_is_private(url: str) -> bool:
@@ -1519,6 +1837,7 @@ async def _navigation_session_key(task_id: str, url: str) -> str:
     path spawns a local Chromium sidecar while the cloud session (if any)
     continues to serve public URLs.
     """
+    await _activate_browser_scope()
     if task_id is None:
         task_id = "default"
     if await _get_cdp_override_raw():
@@ -1594,6 +1913,12 @@ def _last_session_key(task_id: str) -> str:
     return task_id
 
 
+async def _resolve_last_session_key(task_id: str) -> str:
+    """Resolve ``task_id`` after activating its canonical profile scope."""
+    await _activate_browser_scope()
+    return _last_session_key(task_id)
+
+
 async def _allow_private_urls() -> bool:
     """Return whether the browser is allowed to navigate to private/internal addresses.
 
@@ -1655,15 +1980,21 @@ async def _socket_safe_tmpdir() -> str:
 # cleanup_browser code paths — the key is opaque to those internals.
 #
 # Stores: session_name (always), bb_session_id + cdp_url (cloud mode only)
-_active_sessions: Dict[str, Dict[str, Any]] = {}  # session_key -> {session_name, ...}
-_recording_sessions: set = set()  # session_keys with active recordings
+_active_sessions: MutableMapping[str, Dict[str, Any]] = _ScopedBrowserDict(
+    "active_sessions"
+)  # session_key -> {session_name, ...}
+_recording_sessions: MutableSet[str] = _ScopedBrowserSet(
+    "recording_sessions"
+)  # session_keys with active recordings
 
 # Tracks the most recent session_key used per task_id. Set by browser_navigate()
 # after it chooses a backend for a URL; read by every non-nav browser tool
 # (snapshot/click/fill/eval/...) so they target the session that served the last
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
-_last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+_last_active_session_key: MutableMapping[str, str] = _ScopedBrowserDict(
+    "last_active_session_key"
+)  # task_id -> session_key
 _LOCAL_SUFFIX = "::local"
 
 # Flag to track if cleanup has been done
@@ -1696,7 +2027,9 @@ async def _get_session_inactivity_timeout() -> int:
 BROWSER_SESSION_INACTIVITY_TIMEOUT = DEFAULT_SESSION_INACTIVITY_TIMEOUT
 
 # Track last activity time per session
-_session_last_activity: Dict[str, float] = {}
+_session_last_activity: MutableMapping[str, float] = _ScopedBrowserDict(
+    "session_last_activity"
+)
 
 # Background cleanup task state
 _cleanup_task: Optional[asyncio.Task[None]] = None
@@ -1704,8 +2037,14 @@ _cleanup_running = False
 # Protects browser session maps across coroutine suspension points. Recording
 # transitions use a dedicated lock because starting/stopping invokes the
 # browser command path, which itself may resolve session state.
-_cleanup_lock = asyncio.Lock()
-_recording_lock = asyncio.Lock()
+
+
+def _cleanup_lock_for_profile() -> asyncio.Lock:
+    return _browser_state().cleanup_lock
+
+
+def _recording_lock_for_profile() -> asyncio.Lock:
+    return _browser_state().recording_lock
 
 
 def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
@@ -1758,21 +2097,62 @@ async def _emergency_cleanup_all_sessions() -> None:
         return
     _cleanup_done = True
 
+    current_scope = await _activate_browser_scope()
+    loop = asyncio.get_running_loop()
+    with _browser_scope_lock:
+        owned_scopes = [
+            scope
+            for scope, state in _browser_states.items()
+            if scope[0] is loop
+            and (
+                state.active_sessions
+                or state.recording_sessions
+                or state.cleanup_task is not None
+            )
+        ]
+    if _active_sessions and current_scope not in owned_scopes:
+        owned_scopes.append(current_scope)
+
     # Clean up this process's own sessions first, so their owner_pid files
     # are removed before the reaper scans.
-    if _active_sessions:
+    if owned_scopes:
         logger.info(
-            "Emergency cleanup: closing %s active session(s)...", len(_active_sessions)
+            "Emergency cleanup: closing browser sessions in %s profile(s)...",
+            len(owned_scopes),
         )
-        try:
-            await cleanup_all_browsers()
-        except Exception as e:
-            logger.error("Emergency cleanup error: %s", e)
-        finally:
-            async with _cleanup_lock:
-                _active_sessions.clear()
-                _session_last_activity.clear()
-                _recording_sessions.clear()
+        for scope in owned_scopes:
+            state = _browser_state_for(scope)
+            profile_token = set_hermes_home_override(state.profile_home)
+            context_token = _browser_scope_context.set((state.profile_home, scope))
+            try:
+                await cleanup_all_browsers()
+            except Exception as e:
+                logger.error("Emergency cleanup error: %s", e)
+            finally:
+                async with state.cleanup_lock:
+                    state.active_sessions.clear()
+                    state.session_last_activity.clear()
+                    state.recording_sessions.clear()
+                _browser_scope_context.reset(context_token)
+                reset_hermes_home_override(profile_token)
+
+        # Compatibility when a caller replaced the private mapping proxies.
+        if not isinstance(_active_sessions, _ScopedBrowserDict):
+            _active_sessions.clear()
+        if not isinstance(_session_last_activity, _ScopedBrowserDict):
+            _session_last_activity.clear()
+        if not isinstance(_recording_sessions, _ScopedBrowserSet):
+            _recording_sessions.clear()
+
+    # This is the one process-final boundary where stopping every registry
+    # entry is intentional. Ordinary per-agent/profile cleanup above never
+    # calls ``stop_all`` because another profile may still own a supervisor.
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        await SUPERVISOR_REGISTRY.stop_all()
+    except Exception as exc:
+        logger.debug("Emergency CDP supervisor cleanup failed: %s", exc)
 
     # Sweep orphans from other crashed hermes processes.  Safe even if we
     # never used the browser — uses owner_pid liveness to avoid reaping
@@ -1796,18 +2176,22 @@ async def _cleanup_inactive_browser_sessions() -> None:
     automatically close sessions that haven't been used recently, preventing
     orphaned sessions (local or Browserbase) from accumulating.
     """
+    await _activate_browser_scope()
     current_time = time.time()
     sessions_to_cleanup = []
 
-    async with _cleanup_lock:
+    async with _cleanup_lock_for_profile():
         activity_snapshot = list(_session_last_activity.items())
+    timeout = _browser_state().inactivity_timeout
+    if timeout is None:
+        timeout = BROWSER_SESSION_INACTIVITY_TIMEOUT
     for task_id, last_time in activity_snapshot:
-        if current_time - last_time > BROWSER_SESSION_INACTIVITY_TIMEOUT:
+        if current_time - last_time > timeout:
             sessions_to_cleanup.append(task_id)
 
     for task_id in sessions_to_cleanup:
         try:
-            async with _cleanup_lock:
+            async with _cleanup_lock_for_profile():
                 last_activity = _session_last_activity.get(task_id, current_time)
             elapsed = int(current_time - last_activity)
             logger.info(
@@ -1816,7 +2200,7 @@ async def _cleanup_inactive_browser_sessions() -> None:
                 elapsed,
             )
             await cleanup_browser(task_id)
-            async with _cleanup_lock:
+            async with _cleanup_lock_for_profile():
                 _session_last_activity.pop(task_id, None)
         except Exception as e:
             logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
@@ -1977,6 +2361,38 @@ async def _verify_reapable_browser_daemon(
     return True
 
 
+async def _all_tracked_browser_session_names() -> set[str]:
+    """Snapshot live session names from every profile on the current loop."""
+    loop = asyncio.get_running_loop()
+    with _browser_scope_lock:
+        states = tuple(
+            state for key, state in _browser_states.items() if key[0] is loop
+        )
+
+    tracked: set[str] = set()
+    seen_states: set[int] = set()
+    for state in states:
+        if id(state) in seen_states:
+            continue
+        seen_states.add(id(state))
+        async with state.cleanup_lock:
+            tracked.update(
+                str(info["session_name"])
+                for info in state.active_sessions.values()
+                if info.get("session_name")
+            )
+
+    # Compatibility for tests/callers that replace the private mapping with a
+    # plain dict. Normal runtime uses the scoped proxy and is already covered.
+    if not isinstance(_active_sessions, _ScopedBrowserDict):
+        tracked.update(
+            str(info["session_name"])
+            for info in _active_sessions.values()
+            if info.get("session_name")
+        )
+    return tracked
+
+
 async def _reap_orphaned_browser_sessions() -> None:
     """Scan for orphaned agent-browser daemon processes from previous runs.
 
@@ -2000,6 +2416,7 @@ async def _reap_orphaned_browser_sessions() -> None:
 
     Safe to call from the owning event loop's cleanup task or on demand.
     """
+    await _activate_browser_scope()
     tmpdir = await _socket_safe_tmpdir()
     try:
         entries = await aiofiles.os.listdir(tmpdir)
@@ -2018,13 +2435,10 @@ async def _reap_orphaned_browser_sessions() -> None:
     if not socket_dirs:
         return
 
-    # Build set of session_names currently tracked by this process (fallback path)
-    async with _cleanup_lock:
-        tracked_names = {
-            info.get("session_name")
-            for info in _active_sessions.values()
-            if info.get("session_name")
-        }
+    # The legacy fallback has no owner_pid file. It therefore must consider
+    # every live profile in this process, not only the profile whose cleanup
+    # task happened to run the scan.
+    tracked_names = await _all_tracked_browser_session_names()
 
     reaped = 0
     for socket_dir in socket_dirs:
@@ -2124,13 +2538,16 @@ async def _browser_cleanup_thread_worker() -> None:
     within the BROWSER_SESSION_INACTIVITY_TIMEOUT period.
     On first run, also reaps orphaned sessions from previous process lifetimes.
     """
+    await _activate_browser_scope()
+    state = _browser_state()
+
     # One-time orphan reap on startup
     try:
         await _reap_orphaned_browser_sessions()
     except Exception as e:
         logger.warning("Orphan reap error: %s", e)
 
-    while _cleanup_running:
+    while state.cleanup_running:
         try:
             await _cleanup_inactive_browser_sessions()
         except Exception as e:
@@ -2143,14 +2560,22 @@ async def _start_browser_cleanup_thread() -> None:
     """Start the background cleanup task if it is not already running."""
     global _cleanup_task, _cleanup_running, BROWSER_SESSION_INACTIVITY_TIMEOUT
 
-    async with _cleanup_lock:
-        if _cleanup_task is not None and not _cleanup_task.done():
+    await _activate_browser_scope()
+    state = _browser_state()
+
+    async with _cleanup_lock_for_profile():
+        if state.cleanup_task is not None and not state.cleanup_task.done():
             return
         BROWSER_SESSION_INACTIVITY_TIMEOUT = await _get_session_inactivity_timeout()
-        _cleanup_running = True
-        _cleanup_task = asyncio.create_task(
+        state.inactivity_timeout = BROWSER_SESSION_INACTIVITY_TIMEOUT
+        state.cleanup_running = True
+        state.cleanup_task = asyncio.create_task(
             _browser_cleanup_thread_worker(), name="browser-cleanup"
         )
+        # Retain the historical private scalar view for single-profile tests;
+        # runtime ownership lives on ``state``.
+        _cleanup_running = False
+        _cleanup_task = None
         logger.info(
             "Started inactivity cleanup task (timeout: %ss)",
             BROWSER_SESSION_INACTIVITY_TIMEOUT,
@@ -2160,9 +2585,19 @@ async def _start_browser_cleanup_thread() -> None:
 async def _stop_browser_cleanup_thread() -> None:
     """Stop the background cleanup task."""
     global _cleanup_task, _cleanup_running
-    async with _cleanup_lock:
+    await _activate_browser_scope()
+    state = _browser_state()
+    async with _cleanup_lock_for_profile():
+        # Older callers/tests may stage these private scalars directly. Consume
+        # them into the active profile at the first awaited lifecycle boundary.
+        if _cleanup_task is not None and state.cleanup_task is None:
+            state.cleanup_task = _cleanup_task
+        if _cleanup_running:
+            state.cleanup_running = True
+        state.cleanup_running = False
+        task = state.cleanup_task
+        state.cleanup_task = None
         _cleanup_running = False
-        task = _cleanup_task
         _cleanup_task = None
     if task is not None and task is not asyncio.current_task():
         task.cancel()
@@ -2385,6 +2820,7 @@ async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     Returns:
         Dict with session_name (always), bb_session_id + cdp_url (cloud only)
     """
+    await _activate_browser_scope()
     if task_id is None:
         task_id = "default"
 
@@ -2394,7 +2830,7 @@ async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # Update activity timestamp for this session
     _update_session_activity(task_id)
 
-    async with _cleanup_lock:
+    async with _cleanup_lock_for_profile():
         existing_session = _active_sessions.get(task_id)
 
     if existing_session is not None:
@@ -2414,7 +2850,7 @@ async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         # already cleaned up the expired session and created a fresh one
         # while we were waiting.  If so, return the live replacement instead
         # of falling through to create yet another session.
-        async with _cleanup_lock:
+        async with _cleanup_lock_for_profile():
             replacement = _active_sessions.get(task_id)
         if replacement is not None and replacement is not existing_session:
             return replacement
@@ -2476,7 +2912,7 @@ async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     # Double-check: another task may have created a session while we were doing
     # the network call. Use the existing one to preserve the upstream contract.
-    async with _cleanup_lock:
+    async with _cleanup_lock_for_profile():
         if task_id in _active_sessions:
             return _active_sessions[task_id]
         session_info = dict(session_info)
@@ -2520,15 +2956,35 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
         FileNotFoundError: If agent-browser is not installed
     """
     global _cached_agent_browser, _agent_browser_resolved
-    if _agent_browser_resolved:
-        if _cached_agent_browser is None:
+    scoped_state: _BrowserProfileState | None = None
+    if get_hermes_home_override() is not None:
+        await _activate_browser_scope()
+        scoped_state = _browser_state()
+        resolved = scoped_state.agent_browser_resolved
+        cached = scoped_state.cached_agent_browser
+    else:
+        resolved = _agent_browser_resolved
+        cached = _cached_agent_browser
+
+    if resolved:
+        if cached is None:
             raise FileNotFoundError(
                 "agent-browser CLI not found (cached). Install it with: "
                 f"{_browser_install_hint()}\n"
                 "Or run 'npm install' in the repo root to install locally.\n"
                 "Or ensure npx is available in your PATH."
             )
-        return _cached_agent_browser
+        return cached
+
+    def remember(value: str | None) -> str | None:
+        global _cached_agent_browser, _agent_browser_resolved
+        if scoped_state is None:
+            _cached_agent_browser = value
+            _agent_browser_resolved = True
+        else:
+            scoped_state.cached_agent_browser = value
+            scoped_state.agent_browser_resolved = True
+        return value
 
     # Note: _agent_browser_resolved is set at each return site below
     # (not before the search) to prevent a race where a concurrent thread
@@ -2554,9 +3010,7 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
     ):
         if not validate:
             return which_result
-        _cached_agent_browser = which_result
-        _agent_browser_resolved = True
-        return which_result
+        return str(remember(which_result))
 
     # Build an extended search PATH including Hermes-managed Node, macOS
     # versioned Homebrew installs, and fallback system dirs like Termux.
@@ -2570,9 +3024,7 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
         ):
             if not validate:
                 return which_result
-            _cached_agent_browser = which_result
-            _agent_browser_resolved = True
-            return which_result
+            return str(remember(which_result))
 
     # Check local node_modules/.bin/ (npm install in repo root).
     # On Windows, npm drops three shims in .bin: an extensionless POSIX shell
@@ -2593,9 +3045,7 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
         ):
             if not validate:
                 return local_which
-            _cached_agent_browser = local_which
-            _agent_browser_resolved = True
-            return _cached_agent_browser
+            return str(remember(local_which))
 
     # Check common npx locations (also search the extended fallback PATH)
     npx_path = await which("npx")
@@ -2604,14 +3054,12 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
     if npx_path:
         if not validate:
             return "npx agent-browser"
-        _cached_agent_browser = "npx agent-browser"
-        _agent_browser_resolved = True
-        return _cached_agent_browser
+        return str(remember("npx agent-browser"))
 
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")
 
-    _agent_browser_resolved = True
+    remember(None)
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: "
         f"{_browser_install_hint()}\n"
@@ -2664,6 +3112,7 @@ async def _run_browser_command(
     Returns:
         Parsed JSON response from agent-browser
     """
+    await _activate_browser_scope()
     if timeout is None:
         timeout = await _safe_command_timeout()
     args = args or []
@@ -2792,7 +3241,10 @@ async def _run_browser_command(
         # — the daemon kills itself and its Chrome children when no CLI
         # commands arrive within the window.  Added in agent-browser 0.24.
         if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
-            idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
+            inactivity_timeout = _browser_state().inactivity_timeout
+            if inactivity_timeout is None:
+                inactivity_timeout = BROWSER_SESSION_INACTIVITY_TIMEOUT
+            idle_ms = str(inactivity_timeout * 1000)
             browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
 
         # Inject --no-sandbox when needed (issue #15765):
@@ -3423,7 +3875,7 @@ async def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Remember only a successful, non-blocked navigation as the task owner.
         # Failed opens and blocked redirects must not retarget follow-up clicks
         # or snapshots to a newly-created but irrelevant session.
-        async with _cleanup_lock:
+        async with _cleanup_lock_for_profile():
             _last_active_session_key[effective_task_id] = nav_session_key
         _copy_fallback_warning(response, result)
 
@@ -3512,7 +3964,7 @@ async def browser_snapshot(
 
         return await camofox_snapshot(full, task_id, user_task)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
 
     # Build command args based on full flag
     args = []
@@ -3619,7 +4071,7 @@ async def browser_click(ref: str, task_id: Optional[str] = None) -> str:
 
         return await camofox_click(ref, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
     blocked = await _blocked_private_page_action(effective_task_id, "click")
     if blocked is not None:
         return blocked
@@ -3658,7 +4110,7 @@ async def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> st
 
         return await camofox_type(ref, text, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
     blocked = await _blocked_private_page_action(effective_task_id, "type")
     if blocked is not None:
         return blocked
@@ -3738,7 +4190,7 @@ async def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
             result = await camofox_scroll(direction, task_id)
         return result
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
 
     result = await _run_browser_command(
         effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)]
@@ -3769,7 +4221,7 @@ async def browser_back(task_id: Optional[str] = None) -> str:
 
         return await camofox_back(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
     result = await _run_browser_command(effective_task_id, "back", [])
 
     if result.get("success"):
@@ -3819,7 +4271,7 @@ async def browser_press(key: str, task_id: Optional[str] = None) -> str:
 
         return await camofox_press(key, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
     blocked = await _blocked_private_page_action(effective_task_id, "press")
     if blocked is not None:
         return blocked
@@ -3892,7 +4344,7 @@ async def browser_console(
 
         return await camofox_console(clear, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
 
     if await _eval_ssrf_guard_active(effective_task_id):
         _blocked_url = await _current_page_private_url(effective_task_id)
@@ -4203,7 +4655,7 @@ async def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
 
 async def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
 
     if await _eval_ssrf_guard_active(effective_task_id):
         blocked_literal = await _expression_targets_private_url(expression)
@@ -4467,7 +4919,8 @@ async def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 async def _maybe_start_recording(task_id: str) -> None:
     """Start recording if browser.record_sessions is enabled in config."""
-    async with _recording_lock:
+    await _activate_browser_scope()
+    async with _recording_lock_for_profile():
         if task_id in _recording_sessions:
             return
         try:
@@ -4509,7 +4962,8 @@ async def _maybe_start_recording(task_id: str) -> None:
 
 async def _maybe_stop_recording(task_id: str) -> None:
     """Stop recording if one is active for this session."""
-    async with _recording_lock:
+    await _activate_browser_scope()
+    async with _recording_lock_for_profile():
         if task_id not in _recording_sessions:
             return
         try:
@@ -4540,7 +4994,7 @@ async def browser_get_images(task_id: Optional[str] = None) -> str:
 
         return await camofox_get_images(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
 
     # Use eval to run JavaScript that extracts images
     js_code = """JSON.stringify(
@@ -4645,7 +5099,7 @@ async def browser_vision(
 
     screenshots_dir = await get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = await _resolve_last_session_key(task_id or "default")
     result: Dict[str, Any] = {}
 
     # ── Private-network guard: block vision from eval-navigated private pages ──
@@ -5033,6 +5487,7 @@ async def cleanup_browser(task_id: Optional[str] = None) -> None:
     Args:
         task_id: Task identifier (or explicit session key)
     """
+    await _activate_browser_scope()
     if task_id is None:
         task_id = "default"
 
@@ -5044,7 +5499,7 @@ async def cleanup_browser(task_id: Optional[str] = None) -> None:
     else:
         session_keys = [task_id]
         sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
-        async with _cleanup_lock:
+        async with _cleanup_lock_for_profile():
             if sidecar_key in _active_sessions:
                 session_keys.append(sidecar_key)
         bare_task_id = task_id
@@ -5056,7 +5511,7 @@ async def cleanup_browser(task_id: Optional[str] = None) -> None:
     # cleaning a sidecar drops the binding only if that sidecar was still the
     # recorded owner. This prevents a later click/snapshot from resurrecting a
     # cleaned sidecar on about:blank while preserving a primary-session binding.
-    async with _cleanup_lock:
+    async with _cleanup_lock_for_profile():
         if _is_local_sidecar_key(task_id):
             if _last_active_session_key.get(bare_task_id) == task_id:
                 _last_active_session_key.pop(bare_task_id, None)
@@ -5070,6 +5525,7 @@ async def cleanup_browser(task_id: Optional[str] = None) -> None:
 
 async def _cleanup_single_browser_session(task_id: str) -> None:
     """Internal: reap a single browser session by its exact session key."""
+    await _activate_browser_scope()
     # Stop the CDP supervisor for this task FIRST so we close our WebSocket
     # before the backend tears down the underlying CDP endpoint.
     await _stop_cdp_supervisor(task_id)
@@ -5088,7 +5544,7 @@ async def _cleanup_single_browser_session(task_id: str) -> None:
             logger.debug("Camofox cleanup for task %s: %s", task_id, e)
 
     logger.debug("cleanup_browser called for task_id: %s", task_id)
-    async with _cleanup_lock:
+    async with _cleanup_lock_for_profile():
         logger.debug("Active sessions: %s", list(_active_sessions.keys()))
         # Check if session exists, but don't remove yet -
         # _run_browser_command needs it to build the close command.
@@ -5121,7 +5577,7 @@ async def _cleanup_single_browser_session(task_id: str) -> None:
             except Exception as e:
                 logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
-        async with _cleanup_lock:
+        async with _cleanup_lock_for_profile():
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
 
@@ -5170,16 +5626,22 @@ async def cleanup_all_browsers() -> None:
 
     Useful for cleanup on shutdown.
     """
-    async with _cleanup_lock:
+    await _activate_browser_scope()
+    async with _cleanup_lock_for_profile():
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
         await cleanup_browser(task_id)
 
-    # Tear down CDP supervisors for all tasks so background tasks exit.
+    # Tear down only supervisors owned by this profile. The registry itself is
+    # process-global, so ``stop_all`` would let profile B terminate A's live
+    # browser when both reuse the same public task ID.
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
-        await SUPERVISOR_REGISTRY.stop_all()
+        registry_keys = tuple(_browser_state().supervisor_keys.values())
+        _browser_state().supervisor_keys.clear()
+        for registry_key in registry_keys:
+            await SUPERVISOR_REGISTRY.stop(registry_key)
     except Exception:
         pass
 
@@ -5189,18 +5651,26 @@ async def cleanup_all_browsers() -> None:
     global _cached_chromium_installed
     global _cached_browser_engine, _browser_engine_resolved
     global _cached_homebrew_node_dirs
-    _cached_agent_browser = None
-    _agent_browser_resolved = False
+    state = _browser_state()
+    state.cached_agent_browser = None
+    state.agent_browser_resolved = False
+    state.cached_command_timeout = None
+    state.command_timeout_resolved = False
+    state.cached_browser_engine = None
+    state.browser_engine_resolved = False
+    if get_hermes_home_override() is None:
+        _cached_agent_browser = None
+        _agent_browser_resolved = False
+        # Flip the resolved flag BEFORE nulling the cache so a concurrent
+        # reader never sees ``resolved=True`` with ``cache=None`` (#14331).
+        _command_timeout_resolved = False
+        _cached_command_timeout = None
+        _cached_browser_engine = None
+        _browser_engine_resolved = False
     _cached_homebrew_node_dirs = None
-    # Flip the resolved flag BEFORE nulling the cache so a concurrent
-    # reader never sees ``resolved=True`` with ``cache=None`` (#14331).
-    _command_timeout_resolved = False
-    _cached_command_timeout = None
     _cached_chromium_installed = None
     global _chromium_autoinstall_attempted
     _chromium_autoinstall_attempted = False
-    _cached_browser_engine = None
-    _browser_engine_resolved = False
     await _stop_browser_cleanup_thread()
 
 

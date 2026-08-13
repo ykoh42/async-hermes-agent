@@ -1,9 +1,13 @@
 """Honcho client initialization and configuration.
 
-Resolution order for config file:
+Single-profile resolution order for config file:
   1. $HERMES_HOME/honcho.json  (instance-local, enables isolated Hermes instances)
-  2. ~/.honcho/config.json     (global, shared across all Honcho-enabled apps)
-  3. Environment variables     (HONCHO_API_KEY, HONCHO_ENVIRONMENT)
+  2. ~/.hermes/honcho.json     (legacy default-profile host blocks)
+  3. ~/.honcho/config.json     (global, shared across all Honcho-enabled apps)
+  4. Environment variables     (HONCHO_API_KEY, HONCHO_ENVIRONMENT)
+
+Multiplexed profiles use only their profile-local ``honcho.json`` and scoped
+environment values; legacy OS-user config files are not profile-safe.
 
 Resolution order for host-specific settings:
   1. Explicit host block fields (always win)
@@ -19,6 +23,9 @@ import logging
 import hashlib
 import ipaddress
 import asyncio
+import contextvars
+import threading
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,7 +33,7 @@ from urllib.parse import urlparse
 import aiofiles
 import aiofiles.os
 
-from agent.secret_scope import get_secret
+from agent.secret_scope import get_secret, is_multiplex_active
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from plugins.plugin_utils import SingletonSlot
 from typing import Any, TYPE_CHECKING
@@ -106,7 +113,7 @@ async def resolve_active_host() -> str:
       3. defaultHost from the active config, but only for the default profile
       4. Fallback: ``"hermes"`` (default profile)
     """
-    explicit = os.environ.get("HERMES_HONCHO_HOST", "").strip()
+    explicit = str(get_secret("HERMES_HONCHO_HOST", "") or "").strip()
     if explicit:
         return explicit
 
@@ -144,15 +151,25 @@ def resolve_global_config_path() -> Path:
 async def resolve_config_path() -> Path:
     """Return the active Honcho config path.
 
-    Resolution order:
+    Single-profile resolution order:
       1. $HERMES_HOME/honcho.json      (profile-local, if it exists)
       2. ~/.hermes/honcho.json          (default profile — shared host blocks live here)
       3. ~/.honcho/config.json          (global, cross-app interop)
 
-    Returns the global path if none exist (for first-time setup writes).
+    Multiplexed profiles never inspect the default or global legacy files.  A
+    missing local path is returned so config loading falls back to the active
+    profile's scoped environment and OAuth refreshes cannot read or write a
+    different profile's credentials.  An explicit ``config_path`` supplied to
+    :meth:`HonchoClientConfig.from_global_config` remains caller-controlled.
+
+    In single-profile mode, returns the global path if none exist (for
+    first-time setup writes).
     """
     local_path = get_hermes_home() / "honcho.json"
     if await aiofiles.os.path.exists(local_path):
+        return local_path
+
+    if is_multiplex_active():
         return local_path
 
     # Default profile's config — host blocks accumulate here via setup/clone
@@ -515,13 +532,13 @@ class HonchoClientConfig:
         """Create config from environment variables (fallback)."""
         resolved_host = host or await resolve_active_host()
         api_key = get_secret("HONCHO_API_KEY")
-        base_url = os.environ.get("HONCHO_BASE_URL", "").strip() or None
-        timeout = _resolve_optional_float(os.environ.get("HONCHO_TIMEOUT"))
+        base_url = str(get_secret("HONCHO_BASE_URL", "") or "").strip() or None
+        timeout = _resolve_optional_float(get_secret("HONCHO_TIMEOUT"))
         return cls(
             host=resolved_host,
             workspace_id=workspace_id,
             api_key=api_key,
-            environment=os.environ.get("HONCHO_ENVIRONMENT", "production"),
+            environment=str(get_secret("HONCHO_ENVIRONMENT", "production")),
             base_url=base_url,
             timeout=timeout,
             ai_peer=resolved_host,
@@ -536,13 +553,15 @@ class HonchoClientConfig:
     ) -> HonchoClientConfig:
         """Create config from the resolved Honcho config path.
 
-        Resolution: $HERMES_HOME/honcho.json -> ~/.honcho/config.json -> env vars.
-        When host is None, derives it from the active Hermes profile.
+        Single-profile resolution is $HERMES_HOME/honcho.json -> legacy
+        default/global config -> env vars. Multiplexed resolution is the
+        profile-local file -> scoped env vars. When host is None, derives it
+        from the active Hermes profile.
         """
         resolved_host = host or await resolve_active_host()
         path = config_path or await resolve_config_path()
         if not await aiofiles.os.path.exists(path):
-            logger.debug("No global Honcho config at %s, falling back to env", path)
+            logger.debug("No Honcho config at %s, falling back to env", path)
             return await cls.from_env(host=resolved_host)
 
         try:
@@ -582,7 +601,7 @@ class HonchoClientConfig:
         base_url = (
             raw.get("baseUrl")
             or raw.get("base_url")
-            or os.environ.get("HONCHO_BASE_URL", "").strip()
+            or str(get_secret("HONCHO_BASE_URL", "") or "").strip()
             or None
         )
         # Host config wins over flat/global config and environment.
@@ -591,7 +610,7 @@ class HonchoClientConfig:
             host_block.get("requestTimeout"),
             raw.get("timeout"),
             raw.get("requestTimeout"),
-            os.environ.get("HONCHO_TIMEOUT"),
+            get_secret("HONCHO_TIMEOUT"),
         )
 
         # Auto-enable when API key or base_url is present (unless explicitly disabled)
@@ -862,7 +881,7 @@ class HonchoClientConfig:
         import re
 
         if not cwd:
-            cwd = os.getcwd()
+            cwd = await aiofiles.os.getcwd()
 
         # Gateway per-chat key wins everywhere — gateways (telegram/discord/…)
         # need per-chat isolation no cwd/strategy name can provide.
@@ -910,7 +929,100 @@ class HonchoClientConfig:
         return self.workspace_id
 
 
-_honcho_client_slot: SingletonSlot = SingletonSlot()
+@dataclass
+class _HonchoClientState:
+    profile_home: str
+    slot: SingletonSlot[Any] = field(default_factory=SingletonSlot)
+    cached_timeout: float | None = None
+    json_timeout_memo: tuple[int | None, float | None] = (None, None)
+    consumers: weakref.WeakSet[object] = field(default_factory=weakref.WeakSet)
+    operation_lock: asyncio.Lock | None = None
+
+
+_honcho_client_states: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, _HonchoClientState]
+] = weakref.WeakKeyDictionary()
+_honcho_client_owners: weakref.WeakKeyDictionary[
+    object, tuple[weakref.ReferenceType[asyncio.AbstractEventLoop], str]
+] = weakref.WeakKeyDictionary()
+_honcho_client_state_guard = threading.RLock()
+_honcho_client_context: contextvars.ContextVar[
+    tuple[weakref.ReferenceType[asyncio.AbstractEventLoop], str, _HonchoClientState]
+    | None
+] = contextvars.ContextVar("honcho_client_profile_state", default=None)
+_expand_honcho_home = aiofiles.os.wrap(os.path.expanduser)
+_realpath_honcho_home = aiofiles.os.wrap(os.path.realpath)
+
+
+def _lexical_honcho_home() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+async def _activate_honcho_client_state() -> _HonchoClientState:
+    loop = asyncio.get_running_loop()
+    lexical = _lexical_honcho_home()
+    active = _honcho_client_context.get()
+    if (
+        active is not None
+        and active[0]() is loop
+        and active[1] == lexical
+    ):
+        return active[2]
+
+    expanded = str(await _expand_honcho_home(lexical))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(str(await aiofiles.os.getcwd()), expanded)
+    canonical = os.path.normcase(str(await _realpath_honcho_home(expanded)))
+
+    with _honcho_client_state_guard:
+        for old_loop in tuple(_honcho_client_states):
+            if old_loop.is_closed():
+                _honcho_client_states.pop(old_loop, None)
+        state = _honcho_client_states.setdefault(loop, {}).setdefault(
+            canonical,
+            _HonchoClientState(canonical),
+        )
+    _honcho_client_context.set((weakref.ref(loop), lexical, state))
+    return state
+
+
+def _honcho_state_lock(state: _HonchoClientState) -> asyncio.Lock:
+    with _honcho_client_state_guard:
+        if state.operation_lock is None:
+            state.operation_lock = asyncio.Lock()
+        return state.operation_lock
+
+
+def _active_honcho_client_state() -> _HonchoClientState | None:
+    active = _honcho_client_context.get()
+    if active is None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if active[0]() is loop and active[1] == _lexical_honcho_home():
+        return active[2]
+    return None
+
+
+class _ScopedHonchoClientSlot:
+    """Preserve the historical private test seam over the active scope."""
+
+    async def get(self, factory):
+        state = await _activate_honcho_client_state()
+        return await state.slot.get(factory)
+
+    def peek(self):
+        state = _active_honcho_client_state()
+        return state.slot.peek() if state is not None else None
+
+    async def reset(self) -> None:
+        state = await _activate_honcho_client_state()
+        await state.slot.reset()
+
+
+_honcho_client_slot = _ScopedHonchoClientSlot()
 _cached_timeout: float | None = None
 # Memo for the honcho.json-derived timeout, keyed on the file's mtime_ns so
 # the staleness check on every get_honcho_client() call costs one stat()
@@ -940,14 +1052,15 @@ async def _config_yaml_timeout() -> float | None:
 async def _honcho_json_timeout() -> float | None:
     """Read timeout/requestTimeout from honcho.json (host block wins), memoized on mtime."""
     global _honcho_json_timeout_memo
+    state = await _activate_honcho_client_state()
     try:
         path = await resolve_config_path()
         try:
             mtime_ns: int = (await aiofiles.os.stat(path)).st_mtime_ns
         except OSError:
             mtime_ns = -1
-        if _honcho_json_timeout_memo[0] == mtime_ns:
-            return _honcho_json_timeout_memo[1]
+        if state.json_timeout_memo[0] == mtime_ns:
+            return state.json_timeout_memo[1]
 
         timeout = None
         if mtime_ns != -1:
@@ -960,7 +1073,8 @@ async def _honcho_json_timeout() -> float | None:
                 raw.get("timeout"),
                 raw.get("requestTimeout"),
             )
-        _honcho_json_timeout_memo = (mtime_ns, timeout)
+        state.json_timeout_memo = (mtime_ns, timeout)
+        _honcho_json_timeout_memo = state.json_timeout_memo
         return timeout
     except Exception:
         return None
@@ -981,7 +1095,7 @@ async def _resolve_timeout_from_sources(config: HonchoClientConfig | None) -> fl
     else:
         timeout = await _honcho_json_timeout()
         if timeout is None:
-            timeout = _resolve_optional_float(os.environ.get("HONCHO_TIMEOUT"))
+            timeout = _resolve_optional_float(get_secret("HONCHO_TIMEOUT"))
     if timeout is None:
         timeout = await _config_yaml_timeout()
     return timeout if timeout is not None else _DEFAULT_HTTP_TIMEOUT
@@ -1005,7 +1119,11 @@ async def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
         logger.warning("Honcho OAuth pre-build refresh failed", exc_info=True)
 
 
-async def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -> None:
+async def _refresh_cached_oauth(
+    client: "Honcho",
+    config: HonchoClientConfig | None,
+    state: _HonchoClientState,
+) -> None:
     """Rotate the cached client's Bearer in place when its OAuth token is stale.
 
     If the SDK shape changed and the in-place rotation can't apply, the slot is
@@ -1020,7 +1138,7 @@ async def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | N
         )
         if refreshed and token and not oauth.apply_token_to_client(client, token):
             await _close_honcho_client(client)
-            await _honcho_client_slot.reset()
+            await state.slot.reset()
     except Exception:
         logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
 
@@ -1028,155 +1146,148 @@ async def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | N
 async def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     """Get or create the Honcho client singleton.
 
-    When no config is provided, attempts to load ~/.honcho/config.json
-    first, falling back to environment variables.
+    When no config is provided, loads the path from :func:`resolve_config_path`
+    before falling back to environment variables. Multiplexed callers are
+    therefore confined to their profile-local file and scoped environment.
 
     Thread-safe: the client is built exactly once even under concurrent
     first calls (double-checked locking via ``SingletonSlot``), so racing
     threads can't each construct a client and leak the loser's connection.
     """
     global _cached_timeout
-    cached = _honcho_client_slot.peek()
-    if cached is not None:
-        # Detect timeout config changes in long-lived processes (gateway,
-        # dashboard).  If the user changed the timeout after the client was
-        # built, rebuild with the new value.
-        new_timeout = await _resolve_timeout_from_sources(config)
-        if new_timeout != _cached_timeout:
-            await _close_honcho_client(cached)
-            await _honcho_client_slot.reset()
-            _cached_timeout = None
-            cached = None
-        else:
-            await _refresh_cached_oauth(cached, config)
-            return cached
+    state = await _activate_honcho_client_state()
+    async with _honcho_state_lock(state):
+        cached = state.slot.peek()
+        if cached is not None:
+            # Detect timeout config changes in long-lived processes (gateway,
+            # dashboard).  If the user changed the timeout after the client was
+            # built, rebuild with the new value.
+            new_timeout = await _resolve_timeout_from_sources(config)
+            if new_timeout != state.cached_timeout:
+                await _close_honcho_client(cached)
+                await state.slot.reset()
+                state.cached_timeout = None
+                _cached_timeout = None
+                cached = None
+            else:
+                await _refresh_cached_oauth(cached, config, state)
+                return cached
 
-    if config is None:
-        config = await HonchoClientConfig.from_global_config()
+        if config is None:
+            config = await HonchoClientConfig.from_global_config()
 
-    # Refresh a near-expiry OAuth grant before the first build so the client
-    # starts with a live access token rather than 401ing an hour in.
-    await _apply_fresh_oauth_token(config)
+        # Refresh a near-expiry OAuth grant before the first build so the client
+        # starts with a live access token rather than 401ing an hour in.
+        await _apply_fresh_oauth_token(config)
 
-    if not config.api_key and not config.base_url:
-        raise ValueError(
-            "Honcho API key not found. "
-            "Get your API key at https://app.honcho.dev, "
-            "then run 'hermes honcho setup' or set HONCHO_API_KEY. "
-            "For local instances, set HONCHO_BASE_URL instead."
-        )
-
-    # Build inside the singleton factory so racing callers share one client.
-    async def _build() -> "Honcho":
-        # Lazy dependency failures fall through to the canonical import error.
-        try:
-            from tools.lazy_deps import FeatureUnavailable, ensure as _lazy_ensure
-            _lazy_ensure("memory.honcho", prompt=False)
-        except ImportError:
-            # lazy_deps module missing — fall through to the raw import below.
-            pass
-        except Exception:
-            # FeatureUnavailable or unexpected error. Don't crash here; let the
-            # actual import attempt produce the canonical error message.
-            pass
-
-        try:
-            from honcho import Honcho
-        except ImportError:
-            raise ImportError(
-                "honcho-ai is required for Honcho integration. "
-                "Install it with: pip install honcho-ai  "
-                "(or run `hermes honcho setup` to configure)."
+        if not config.api_key and not config.base_url:
+            raise ValueError(
+                "Honcho API key not found. "
+                "Get your API key at https://app.honcho.dev, "
+                "then run 'hermes honcho setup' or set HONCHO_API_KEY. "
+                "For local instances, set HONCHO_BASE_URL instead."
             )
 
-        # Allow config.yaml honcho.base_url to override the SDK's environment
-        # mapping, enabling remote self-hosted Honcho deployments without
-        # requiring the server to live on localhost.
-        resolved_base_url = config.base_url
-        resolved_timeout = config.timeout
-        if not resolved_base_url or resolved_timeout is None:
+        # Build inside the singleton factory so racing callers share one client.
+        async def _build() -> "Honcho":
+            global _cached_timeout
+            # Lazy dependency failures fall through to the canonical import error.
             try:
-                from hermes_cli.config import load_config_readonly
-                hermes_cfg = await load_config_readonly()
-                honcho_cfg = hermes_cfg.get("honcho", {})
-                if isinstance(honcho_cfg, dict):
-                    if not resolved_base_url:
-                        resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
-                    if resolved_timeout is None:
-                        resolved_timeout = _resolve_optional_float(
-                            honcho_cfg.get("timeout"),
-                            honcho_cfg.get("request_timeout"),
-                        )
+                from tools.lazy_deps import FeatureUnavailable, ensure as _lazy_ensure
+                _lazy_ensure("memory.honcho", prompt=False)
+            except ImportError:
+                # lazy_deps module missing — fall through to the raw import below.
+                pass
             except Exception:
+                # FeatureUnavailable or unexpected error. Don't crash here; let the
+                # actual import attempt produce the canonical error message.
                 pass
 
-        # Fall back to the default so an unconfigured install cannot hang
-        # indefinitely on a stalled Honcho request.
-        if resolved_timeout is None:
-            resolved_timeout = _DEFAULT_HTTP_TIMEOUT
+            try:
+                from honcho import Honcho
+            except ImportError:
+                raise ImportError(
+                    "honcho-ai is required for Honcho integration. "
+                    "Install it with: pip install honcho-ai  "
+                    "(or run `hermes honcho setup` to configure)."
+                )
 
-        if resolved_base_url:
-            logger.info("Initializing Honcho client (base_url: %s, workspace: %s)", resolved_base_url, config.workspace_id)
-        else:
-            logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
+            # Allow config.yaml honcho.base_url to override the SDK's environment
+            # mapping, enabling remote self-hosted Honcho deployments without
+            # requiring the server to live on localhost.
+            resolved_base_url = config.base_url
+            resolved_timeout = config.timeout
+            if not resolved_base_url or resolved_timeout is None:
+                try:
+                    from hermes_cli.config import load_config_readonly
+                    hermes_cfg = await load_config_readonly()
+                    honcho_cfg = hermes_cfg.get("honcho", {})
+                    if isinstance(honcho_cfg, dict):
+                        if not resolved_base_url:
+                            resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
+                        if resolved_timeout is None:
+                            resolved_timeout = _resolve_optional_float(
+                                honcho_cfg.get("timeout"),
+                                honcho_cfg.get("request_timeout"),
+                            )
+                except Exception:
+                    pass
 
-        # Local Honcho instances don't require an API key, but the SDK
-        # expects a non-empty string.  Use a placeholder for local URLs.
-        # For local: only use config.api_key if the host block explicitly
-        # sets apiKey (meaning the user wants local auth). Otherwise skip
-        # the stored key -- it's likely a cloud key that would break local.
-        _is_local = _is_local_base_url(resolved_base_url)
-        if _is_local:
-            # Check if the host block has its own apiKey (explicit local auth).
-            # For local/LAN/VPN self-hosts, a stored root key is likely a cloud
-            # key that would break a no-auth local server, so we substitute the
-            # SDK's required-non-empty placeholder unless the host block opts in.
-            _raw = config.raw or {}
-            _host_block = (_raw.get("hosts") or {}).get(config.host, {})
-            _host_has_key = bool(_host_block.get("apiKey"))
-            effective_api_key = config.api_key if _host_has_key else "local"
-        else:
-            effective_api_key = config.api_key
+            # Fall back to the default so an unconfigured install cannot hang
+            # indefinitely on a stalled Honcho request.
+            if resolved_timeout is None:
+                resolved_timeout = _DEFAULT_HTTP_TIMEOUT
 
-        # The Honcho SDK's route builders (e.g. routes.workspaces()) already
-        # include the version prefix (e.g. "/v3/workspaces").  When a user-supplied
-        # base_url already ends in a version segment (e.g.
-        # "http://localhost:38000/v3", "https://honcho.my.ts.net/v3"), concatenating
-        # the two produces "/v3/v3/workspaces" → 404 on every call.  This is a pure
-        # routing concern independent of host, so strip a trailing version segment
-        # from ANY base_url — loopback, LAN, custom domain, or cloud alike.  The
-        # SDK then appends its own versioned paths correctly.
-        if resolved_base_url:
-            import re as _re
-            resolved_base_url = _re.sub(r"/v\d+/*$", "", resolved_base_url).rstrip("/")
+            if resolved_base_url:
+                logger.info("Initializing Honcho client (base_url: %s, workspace: %s)", resolved_base_url, config.workspace_id)
+            else:
+                logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
 
-        global _cached_timeout
-        _cached_timeout = resolved_timeout
-        from honcho.http import AsyncHonchoHTTPClient
+            # Local Honcho instances don't require an API key, but the SDK
+            # expects a non-empty string.  Use a placeholder for local URLs.
+            # For local: only use config.api_key if the host block explicitly
+            # sets apiKey (meaning the user wants local auth). Otherwise skip
+            # the stored key -- it's likely a cloud key that would break local.
+            is_local = _is_local_base_url(resolved_base_url)
+            if is_local:
+                # Check if the host block has its own apiKey (explicit local auth).
+                raw_config = config.raw or {}
+                host_block = (raw_config.get("hosts") or {}).get(config.host, {})
+                host_has_key = bool(host_block.get("apiKey"))
+                effective_api_key = config.api_key if host_has_key else "local"
+            else:
+                effective_api_key = config.api_key
 
-        # honcho-ai exposes native async operations through ``Honcho.aio`` but
-        # its public constructor always allocates a synchronous HTTP client.
-        # Build the same model state directly so this library owns only the
-        # native async transport. The dependency is pinned to the SDK version
-        # whose private state contract is verified by our tests.
-        client = Honcho.model_construct(workspace_id=config.workspace_id)
-        base_url = resolved_base_url
-        if not base_url:
-            from honcho.client import ENVIRONMENTS
+            # The SDK route builders already include the version prefix.
+            if resolved_base_url:
+                import re as _re
+                resolved_base_url = _re.sub(
+                    r"/v\d+/*$", "", resolved_base_url
+                ).rstrip("/")
 
-            base_url = ENVIRONMENTS[config.environment]
-        http_config = {
-            "base_url": base_url,
-            "api_key": effective_api_key,
-            "timeout": resolved_timeout,
-        }
-        client._base_url = base_url
-        client._http_config = dict(http_config)
-        client._async_http = AsyncHonchoHTTPClient(**http_config)
-        client._workspace_ensured = False
-        return client
+            state.cached_timeout = resolved_timeout
+            _cached_timeout = resolved_timeout
+            from honcho.http import AsyncHonchoHTTPClient
 
-    return await _honcho_client_slot.get(_build)
+            # Build only the native async SDK transport.
+            client = Honcho.model_construct(workspace_id=config.workspace_id)
+            base_url = resolved_base_url
+            if not base_url:
+                from honcho.client import ENVIRONMENTS
+
+                base_url = ENVIRONMENTS[config.environment]
+            http_config = {
+                "base_url": base_url,
+                "api_key": effective_api_key,
+                "timeout": resolved_timeout,
+            }
+            client._base_url = base_url
+            client._http_config = dict(http_config)
+            client._async_http = AsyncHonchoHTTPClient(**http_config)
+            client._workspace_ensured = False
+            return client
+
+        return await state.slot.get(_build)
 
 
 async def _close_honcho_client(client: Any) -> None:
@@ -1185,12 +1296,100 @@ async def _close_honcho_client(client: Any) -> None:
         await async_http.close()
 
 
+async def _reset_honcho_client_state_unlocked(state: _HonchoClientState) -> None:
+    global _cached_timeout, _honcho_json_timeout_memo
+    client = state.slot.peek()
+    try:
+        if client is not None:
+            await _close_honcho_client(client)
+    finally:
+        await state.slot.reset()
+        state.cached_timeout = None
+        state.json_timeout_memo = (None, None)
+        _cached_timeout = None
+        _honcho_json_timeout_memo = (None, None)
+
+
+async def _await_honcho_cleanup(task: asyncio.Task[None]) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _retain_honcho_client_lifecycle(owner: object) -> None:
+    state = await _activate_honcho_client_state()
+    loop = asyncio.get_running_loop()
+    async with _honcho_state_lock(state):
+        with _honcho_client_state_guard:
+            previous = _honcho_client_owners.get(owner)
+            if previous is not None:
+                previous_loop = previous[0]()
+                if previous_loop is loop and previous[1] == state.profile_home:
+                    return
+                raise RuntimeError("Honcho lifecycle owner is already retained")
+            state.consumers.add(owner)
+            _honcho_client_owners[owner] = (weakref.ref(loop), state.profile_home)
+
+
+async def _release_honcho_client_lifecycle(owner: object) -> None:
+    with _honcho_client_state_guard:
+        owned = _honcho_client_owners.get(owner)
+        if owned is None:
+            return
+        owner_loop = owned[0]()
+        states = _honcho_client_states.get(owner_loop) if owner_loop is not None else None
+        state = states.get(owned[1]) if states is not None else None
+    if state is None:
+        with _honcho_client_state_guard:
+            _honcho_client_owners.pop(owner, None)
+        return
+    if owner_loop is not asyncio.get_running_loop():
+        raise RuntimeError("Honcho lifecycle must close on its owning event loop")
+
+    async def release_owned() -> None:
+        async with _honcho_state_lock(state):
+            with _honcho_client_state_guard:
+                current = _honcho_client_owners.get(owner)
+                if current != owned:
+                    return
+                _honcho_client_owners.pop(owner, None)
+                state.consumers.discard(owner)
+                last_consumer = not state.consumers
+            if last_consumer:
+                await _reset_honcho_client_state_unlocked(state)
+                with _honcho_client_state_guard:
+                    loop_states = _honcho_client_states.get(owner_loop)
+                    if loop_states is not None and loop_states.get(owned[1]) is state:
+                        loop_states.pop(owned[1], None)
+                        if not loop_states:
+                            _honcho_client_states.pop(owner_loop, None)
+
+    await _await_honcho_cleanup(
+        asyncio.create_task(release_owned(), name="honcho-client-release")
+    )
+
+
 async def reset_honcho_client() -> None:
     """Reset the Honcho client singleton (useful for testing)."""
-    global _cached_timeout, _honcho_json_timeout_memo
-    client = _honcho_client_slot.peek()
-    if client is not None:
-        await _close_honcho_client(client)
-    await _honcho_client_slot.reset()
-    _cached_timeout = None
-    _honcho_json_timeout_memo = (None, None)
+    state = await _activate_honcho_client_state()
+
+    async def reset_owned() -> None:
+        async with _honcho_state_lock(state):
+            await _reset_honcho_client_state_unlocked(state)
+
+    await _await_honcho_cleanup(
+        asyncio.create_task(reset_owned(), name="honcho-client-reset")
+    )

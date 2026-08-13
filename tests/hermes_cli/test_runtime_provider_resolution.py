@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import time
 from types import SimpleNamespace
@@ -6,6 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.secret_scope import (
+    is_multiplex_active,
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
 from hermes_cli import runtime_provider as rp
 
 pytestmark = pytest.mark.asyncio
@@ -1451,6 +1458,37 @@ async def test_resolve_runtime_provider_bedrock_nova_uses_converse(monkeypatch):
 
     assert runtime["api_mode"] == "bedrock_converse"
     assert "bedrock_anthropic" not in runtime
+
+
+async def test_bedrock_bearer_route_is_profile_scoped(monkeypatch):
+    _patch_bedrock(monkeypatch)
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "foreign-process-token")
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+
+    async def resolve(secrets):
+        token = set_secret_scope(secrets)
+        try:
+            await asyncio.sleep(0)
+            return await rp.resolve_runtime_provider(
+                requested="bedrock",
+                target_model="global.anthropic.claude-sonnet-4-6",
+            )
+        finally:
+            reset_secret_scope(token)
+
+    try:
+        bearer, sigv4 = await asyncio.gather(
+            resolve({"AWS_BEARER_TOKEN_BEDROCK": "profile-token"}),
+            resolve({}),
+        )
+    finally:
+        set_multiplex_active(previous)
+
+    assert bearer["api_mode"] == "bedrock_converse"
+    assert "bedrock_anthropic" not in bearer
+    assert sigv4["api_mode"] == "anthropic_messages"
+    assert sigv4["bedrock_anthropic"] is True
 
 
 async def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):

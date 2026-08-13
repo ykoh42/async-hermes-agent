@@ -30,8 +30,10 @@ import stat
 import base64
 import hashlib
 import subprocess
+import threading
 import time
 import uuid
+import weakref
 import webbrowser
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -48,12 +50,15 @@ from typing import (
     List,
     Optional,
     Tuple,
+    TYPE_CHECKING,
 )
 from urllib.parse import parse_qs, urlencode, urlparse
 
-import httpx
 import aiofiles
 import aiofiles.os
+
+if TYPE_CHECKING:
+    import httpx
 
 from hermes_cli.config import (
     get_hermes_home,
@@ -63,11 +68,22 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
+from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 from agent.ssl_verify import (
     _create_httpx_client,
     _resolve_httpx_client_verify,
     resolve_httpx_verify,
 )
+
+
+def __getattr__(name: str):
+    """Preserve the HTTP test-patch surface without eager SDK imports."""
+    if name == "httpx":
+        import httpx as httpx_module
+
+        globals()["httpx"] = httpx_module
+        return httpx_module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 from utils import env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -209,6 +225,8 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Qwen OAuth",
         auth_type="oauth_external",
         inference_base_url=DEFAULT_QWEN_BASE_URL,
+        api_key_env_vars=("QWEN_API_KEY",),
+        base_url_env_var="HERMES_QWEN_BASE_URL",
     ),
     "lmstudio": ProviderConfig(
         id="lmstudio",
@@ -533,6 +551,27 @@ _inject_profile_provider_registry()
 # Anthropic Key Helper
 # =============================================================================
 
+
+async def get_anthropic_key() -> str:
+    """Return the first usable Anthropic credential, or ``""``.
+
+    Checks both the ``.env`` file and the process environment, preferring
+    ``~/.hermes/.env`` so a deliberate key rotation isn't shadowed by a stale
+    shell export (matches the api-key resolution path — see #20591).  The
+    order mirrors the ``PROVIDER_REGISTRY["anthropic"].api_key_env_vars``
+    tuple:
+
+        ANTHROPIC_API_KEY -> ANTHROPIC_TOKEN -> CLAUDE_CODE_OAUTH_TOKEN
+    """
+    from hermes_cli.config import get_env_value_prefer_dotenv
+
+    for var in PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
+        value = await get_env_value_prefer_dotenv(var) or ""
+        if value:
+            return value
+    return ""
+
+
 # =============================================================================
 # Kimi Code Endpoint Detection
 # =============================================================================
@@ -641,7 +680,7 @@ async def resolve_api_key_provider_credentials(
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        env_url = (_get_secret(pconfig.base_url_env_var, "") or "").strip()
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(
             api_key,
@@ -685,16 +724,16 @@ async def resolve_external_process_provider_credentials(
         )
 
     base_url = (
-        os.getenv(pconfig.base_url_env_var, "").strip()
+        (_get_secret(pconfig.base_url_env_var, "") or "").strip()
         if pconfig.base_url_env_var
         else ""
     ) or pconfig.inference_base_url
     command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        (_get_secret("HERMES_COPILOT_ACP_COMMAND", "") or "").strip()
+        or (_get_secret("COPILOT_CLI_PATH", "") or "").strip()
         or "copilot"
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    raw_args = (_get_secret("HERMES_COPILOT_ACP_ARGS", "") or "").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = (
         await aiofiles.os.wrap(shutil.which)(command) if command else None
@@ -1086,7 +1125,11 @@ async def _global_auth_file_path() -> Optional[Path]:
     return global_root / "auth.json"
 
 
-_auth_store_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
+_auth_store_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    Dict[str, weakref.ReferenceType[asyncio.Lock]],
+] = weakref.WeakKeyDictionary()
+_auth_store_locks_guard = threading.RLock()
 
 
 async def _auth_store_lock_for(target_path: Path) -> asyncio.Lock:
@@ -1102,8 +1145,17 @@ async def _auth_store_lock_for(target_path: Path) -> asyncio.Lock:
         path_key = await aiofiles.os.wrap(os.path.realpath)(target_path)
     except Exception:
         path_key = str(target_path)
-    key = (id(loop), path_key)
-    return _auth_store_locks.setdefault(key, asyncio.Lock())
+    with _auth_store_locks_guard:
+        for candidate in tuple(_auth_store_locks):
+            if candidate.is_closed():
+                _auth_store_locks.pop(candidate, None)
+        locks = _auth_store_locks.setdefault(loop, {})
+        lock_ref = locks.get(path_key)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[path_key] = weakref.ref(lock)
+        return lock
 
 
 @asynccontextmanager
@@ -1576,6 +1628,51 @@ async def write_credential_pool(
         return await _save_auth_store(auth_store)
 
 
+async def suppress_credential_source(provider_id: str, source: str) -> None:
+    """Mark a credential source as suppressed so it won't be re-seeded."""
+    async with _auth_store_transaction():
+        auth_store = await _load_auth_store()
+        suppressed = auth_store.setdefault("suppressed_sources", {})
+        provider_sources = suppressed.setdefault(provider_id, [])
+        if source not in provider_sources:
+            provider_sources.append(source)
+        await _save_auth_store(auth_store)
+
+
+async def is_source_suppressed(provider_id: str, source: str) -> bool:
+    """Check if a credential source has been suppressed by the user."""
+    try:
+        auth_store = await _load_auth_store()
+        suppressed = auth_store.get("suppressed_sources", {})
+        return source in suppressed.get(provider_id, [])
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def unsuppress_credential_source(provider_id: str, source: str) -> bool:
+    """Clear a suppression marker so the source will be re-seeded on the next load.
+
+    Returns True if a marker was cleared, False if no marker existed.
+    """
+    async with _auth_store_transaction():
+        auth_store = await _load_auth_store()
+        suppressed = auth_store.get("suppressed_sources")
+        if not isinstance(suppressed, dict):
+            return False
+        provider_sources = suppressed.get(provider_id)
+        if not isinstance(provider_sources, list) or source not in provider_sources:
+            return False
+        provider_sources.remove(source)
+        if not provider_sources:
+            suppressed.pop(provider_id, None)
+        if not suppressed:
+            auth_store.pop("suppressed_sources", None)
+        await _save_auth_store(auth_store)
+        return True
+
+
 def _merge_credential_pool_entries(
     auth_store: Dict[str, Any],
     provider_id: str,
@@ -1788,8 +1885,8 @@ async def resolve_provider(
             "Could not read config.yaml model.provider for auto-resolution: %s", e
         )
 
-    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(
-        os.getenv("OPENROUTER_API_KEY")
+    if has_usable_secret(_get_secret("OPENAI_API_KEY")) or has_usable_secret(
+        _get_secret("OPENROUTER_API_KEY")
     ):
         return "openrouter"
 
@@ -1830,7 +1927,7 @@ async def resolve_provider(
         if pid in {"copilot", "lmstudio"}:
             continue
         for env_var in pconfig.api_key_env_vars:
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(_get_secret(env_var, "")):
                 # An exported API key now wins over a logged-in OAuth provider
                 # (the #29285 fix). Surface that so a user who deliberately uses
                 # OAuth but has a stale key in ~/.hermes/.env isn't silently
@@ -2012,13 +2109,14 @@ def _nous_inference_env_override() -> Optional[str]:
     Returns a trailing-slash-stripped non-empty string, or ``None`` when
     the env var is unset/blank.
     """
-    return _optional_base_url(os.getenv("NOUS_INFERENCE_BASE_URL"))
+    return _optional_base_url(_get_secret("NOUS_INFERENCE_BASE_URL"))
 
 
 def _nous_portal_env_override() -> Optional[str]:
     """Return the trusted operator Portal URL override, if configured."""
     return _optional_base_url(
-        os.getenv("HERMES_PORTAL_BASE_URL") or os.getenv("NOUS_PORTAL_BASE_URL")
+        _get_secret("HERMES_PORTAL_BASE_URL")
+        or _get_secret("NOUS_PORTAL_BASE_URL")
     )
 
 
@@ -2226,7 +2324,20 @@ def _qwen_cli_auth_path() -> Path:
     return Path.home() / ".qwen" / "oauth_creds.json"
 
 
+def _reject_global_qwen_cli_store_in_multiplex() -> None:
+    """Keep Qwen CLI's OS-user credential store out of profile multiplexing."""
+    if is_multiplex_active():
+        raise AuthError(
+            "Qwen CLI's global ~/.qwen OAuth credentials are unavailable while "
+            "Hermes profile multiplexing is active; configure a profile-scoped "
+            "QWEN_API_KEY instead.",
+            provider="qwen-oauth",
+            code="qwen_global_credentials_unsafe",
+        )
+
+
 async def _read_qwen_cli_tokens() -> Dict[str, Any]:
+    _reject_global_qwen_cli_store_in_multiplex()
     auth_path = _qwen_cli_auth_path()
     if not await aiofiles.os.path.exists(auth_path):
         raise AuthError(
@@ -2252,7 +2363,34 @@ async def _read_qwen_cli_tokens() -> Dict[str, Any]:
     return data
 
 
+async def _finish_qwen_temp_cleanup(tmp_path: Path) -> None:
+    """Remove one owned Qwen temp file despite repeated caller cancellation."""
+    async def remove() -> None:
+        try:
+            await aiofiles.os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+    cleanup_task = asyncio.create_task(
+        remove(),
+        name="qwen-oauth-temp-cleanup",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+    if cancellation is not None:
+        raise cancellation
+
+
 async def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
+    _reject_global_qwen_cli_store_in_multiplex()
     auth_path = _qwen_cli_auth_path()
     await aiofiles.os.makedirs(auth_path.parent, exist_ok=True)
     await secure_parent_dir(auth_path)
@@ -2280,10 +2418,7 @@ async def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
         await aiofiles.os.replace(tmp_path, auth_path)
         return auth_path
     finally:
-        try:
-            await aiofiles.os.remove(tmp_path)
-        except FileNotFoundError:
-            pass
+        await _finish_qwen_temp_cleanup(tmp_path)
 
 
 def _qwen_access_token_is_expiring(
@@ -2301,6 +2436,7 @@ async def _refresh_qwen_cli_tokens(
     tokens: Dict[str, Any],
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    _reject_global_qwen_cli_store_in_multiplex()
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     if not refresh_token:
         raise AuthError(
@@ -2394,6 +2530,33 @@ async def resolve_qwen_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> Dict[str, Any]:
+    if is_multiplex_active():
+        # The Qwen CLI has only one OS-user store and therefore cannot identify
+        # which Hermes profile owns ~/.qwen/oauth_creds.json. The provider
+        # profile already declares QWEN_API_KEY as its explicit env source; use
+        # only that task-local value in a multiplexed service.
+        scoped_api_key = str(_get_secret("QWEN_API_KEY", "") or "").strip()
+        if not scoped_api_key:
+            raise AuthError(
+                "Qwen OAuth requires a non-empty profile-scoped QWEN_API_KEY "
+                "while Hermes profile multiplexing is active; the global "
+                "~/.qwen OAuth credential cannot be borrowed safely.",
+                provider="qwen-oauth",
+                code="qwen_profile_credentials_required",
+            )
+        base_url = (
+            (_get_secret("HERMES_QWEN_BASE_URL", "") or "").strip().rstrip("/")
+            or DEFAULT_QWEN_BASE_URL
+        )
+        return {
+            "provider": "qwen-oauth",
+            "base_url": base_url,
+            "api_key": scoped_api_key,
+            "source": "env:QWEN_API_KEY",
+            "expires_at_ms": None,
+            "auth_file": "",
+        }
+
     tokens = await _read_qwen_cli_tokens()
     access_token = str(tokens.get("access_token", "") or "").strip()
     should_refresh = bool(force_refresh)
@@ -2413,7 +2576,7 @@ async def resolve_qwen_runtime_credentials(
         )
 
     base_url = (
-        os.getenv("HERMES_QWEN_BASE_URL", "").strip().rstrip("/")
+        (_get_secret("HERMES_QWEN_BASE_URL", "") or "").strip().rstrip("/")
         or DEFAULT_QWEN_BASE_URL
     )
     return {
@@ -2442,7 +2605,7 @@ async def refresh_codex_oauth_pure(
             relogin_required=True,
         )
 
-    timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
+    timeout = max(5.0, float(timeout_seconds))
     async with (await _create_httpx_client(
         timeout=timeout,
         headers={
@@ -2610,7 +2773,7 @@ def _codex_usage_probe_url(base_url: Optional[str]) -> str:
     normalized = str(base_url or "").strip().rstrip("/")
     if not normalized:
         normalized = (
-            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            (_get_secret("HERMES_CODEX_BASE_URL", "") or "").strip().rstrip("/")
             or DEFAULT_CODEX_BASE_URL
         )
     if normalized.endswith("/codex"):
@@ -2868,7 +3031,7 @@ async def resolve_codex_runtime_credentials(
     return {
         "provider": "openai-codex",
         "base_url": (
-            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            (_get_secret("HERMES_CODEX_BASE_URL", "") or "").strip().rstrip("/")
             or entry.runtime_base_url
             or DEFAULT_CODEX_BASE_URL
         ),
@@ -3082,7 +3245,7 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
 async def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
     try:
         async with (await _create_httpx_client(
-            timeout=httpx.Timeout(timeout_seconds),
+            timeout=timeout_seconds,
             headers={"Accept": "application/json"},
             verify=await _resolve_httpx_client_verify(),
         )) as client:
@@ -3153,7 +3316,7 @@ async def refresh_xai_oauth_pure(
     if not endpoint:
         endpoint = (await _xai_oauth_discovery(timeout_seconds))["token_endpoint"]
     _xai_validate_oauth_endpoint(endpoint, field="token_endpoint")
-    timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
+    timeout = max(5.0, float(timeout_seconds))
     async with (await _create_httpx_client(
         timeout=timeout,
         headers={"Accept": "application/json"},
@@ -3292,9 +3455,10 @@ async def resolve_xai_oauth_runtime_credentials(
         entry = refreshed
 
     base_url = _xai_validate_inference_base_url(
-        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
-        or os.getenv("XAI_BASE_URL", "").strip().rstrip("/")
-        or entry.runtime_base_url,
+        (_get_secret("HERMES_XAI_BASE_URL", "") or "").strip().rstrip("/")
+        or (_get_secret("XAI_BASE_URL", "") or "").strip().rstrip("/")
+        or entry.runtime_base_url
+        or "",
         fallback=DEFAULT_XAI_OAUTH_BASE_URL,
     )
     state = await get_provider_auth_state("xai-oauth") or {}
@@ -3729,9 +3893,7 @@ async def refresh_nous_oauth_pure(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     force_refresh: bool = False,
-    on_state_update: Optional[
-        Callable[[Dict[str, Any], str], Optional[Awaitable[None]]]
-    ] = None,
+    on_state_update: Optional[Callable[[Dict[str, Any], str], None]] = None,
 ) -> Dict[str, Any]:
     """Refresh Nous OAuth without owning a particular credential store."""
     state: Dict[str, Any] = {
@@ -3755,7 +3917,7 @@ async def refresh_nous_oauth_pure(
         ca_bundle=ca_bundle,
         auth_state=state,
     )
-    timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
+    timeout = timeout_seconds if timeout_seconds else 15.0
     async with (await _create_httpx_client(
         timeout=timeout,
         headers={"Accept": "application/json"},
@@ -3819,9 +3981,7 @@ async def refresh_nous_oauth_from_state(
     *,
     timeout_seconds: float = 15.0,
     force_refresh: bool = False,
-    on_state_update: Optional[
-        Callable[[Dict[str, Any], str], Optional[Awaitable[None]]]
-    ] = None,
+    on_state_update: Optional[Callable[[Dict[str, Any], str], None]] = None,
 ) -> Dict[str, Any]:
     tls = state.get("tls") or {}
     return await refresh_nous_oauth_pure(
@@ -4062,7 +4222,7 @@ async def resolve_nous_runtime_credentials(
     }
 
 
-_RESOLVE_TOKEN_CACHE: tuple[float, str] | None = None
+_RESOLVE_TOKEN_CACHE: tuple[str, float, str] | None = None
 _RESOLVE_TOKEN_CACHE_TTL_S = 5.0
 
 
@@ -4075,12 +4235,16 @@ async def resolve_nous_access_token(
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for account lookup."""
     global _RESOLVE_TOKEN_CACHE
+    local_path = await _auth_file_path()
+    cache_key = os.path.normcase(os.fspath(local_path))
     if not insecure and ca_bundle is None and _RESOLVE_TOKEN_CACHE is not None:
-        cached_at, cached_token = _RESOLVE_TOKEN_CACHE
-        if (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S:
+        cached_key, cached_at, cached_token = _RESOLVE_TOKEN_CACHE
+        if (
+            cached_key == cache_key
+            and (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S
+        ):
             return cached_token
 
-    local_path = await _auth_file_path()
     local_store = await _load_auth_store(local_path)
     target_path: Optional[Path] = local_path
     if _load_provider_state(local_store, "nous") is None:
@@ -4098,8 +4262,11 @@ async def resolve_nous_access_token(
         timeout_seconds=lock_timeout,
     ):
         if not insecure and ca_bundle is None and _RESOLVE_TOKEN_CACHE is not None:
-            cached_at, cached_token = _RESOLVE_TOKEN_CACHE
-            if (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S:
+            cached_key, cached_at, cached_token = _RESOLVE_TOKEN_CACHE
+            if (
+                cached_key == cache_key
+                and (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S
+            ):
                 return cached_token
 
         auth_store = await _load_auth_store(target_path)
@@ -4180,7 +4347,7 @@ async def resolve_nous_access_token(
                         provider="nous",
                         relogin_required=True,
                     )
-                timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
+                timeout = timeout_seconds if timeout_seconds else 15.0
                 async with (await _create_httpx_client(
                     timeout=timeout,
                     headers={"Accept": "application/json"},
@@ -4257,7 +4424,7 @@ async def resolve_nous_access_token(
                         logger.debug("Failed to mirror resolved Nous state: %s", exc)
 
     if not insecure and ca_bundle is None:
-        _RESOLVE_TOKEN_CACHE = (time.monotonic(), access_token)
+        _RESOLVE_TOKEN_CACHE = (cache_key, time.monotonic(), access_token)
     return access_token
 
 
@@ -4302,7 +4469,7 @@ async def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        env_url = (_get_secret(pconfig.base_url_env_var, "") or "").strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -4448,7 +4615,7 @@ async def _refresh_minimax_oauth_state(
             )
 
         async with (await _create_httpx_client(
-            timeout=httpx.Timeout(timeout_seconds),
+            timeout=timeout_seconds,
             follow_redirects=True,
             verify=await _resolve_httpx_client_verify(),
         )) as client:

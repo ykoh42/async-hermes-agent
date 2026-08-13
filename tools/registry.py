@@ -14,7 +14,10 @@ Import chain (circular-import safe):
     run_agent.py, cli.py, batch_runner.py, etc.
 """
 
-import importlib
+import ast
+import asyncio
+import concurrent.futures
+import functools
 import inspect
 import json
 import logging
@@ -22,64 +25,254 @@ import os
 import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+import aiofiles
 import aiofiles.os
+
+from hermes_cli.async_source_loader import (
+    _locate_source_module,
+    _load_source_module,
+    _unload_source_finder,
+)
 
 logger = logging.getLogger(__name__)
 _realpath = aiofiles.os.wrap(os.path.realpath)
+_builtin_import_guard = threading.RLock()
+_builtin_import_claim: concurrent.futures.Future[bool] | None = None
 
 
-# This checkout uses the registry as the async training/runtime waist. Keep the
-# model-visible built-ins to the local harness capabilities needed for
-# trajectories (terminal, files, memory, skills, planning, and clarification).
-# MCP tools are registered separately by ``tools.mcp_tool`` from configured
-# servers.
-#
-# Keeping the restriction here (before imports) matters: tool modules register
-# their schemas as import side effects, so filtering later would still load
-# optional SDKs and their operational dependencies on every worker.
-_TRAINING_RUNTIME_TOOL_MODULES = frozenset({
-    "browser_cdp_tool",
-    "browser_dialog_tool",
-    "browser_tool",
-    "clarify_tool",
-    "delegate_tool",
-    "file_tools",
-    "image_generation_tool",
-    "memory_tool",
-    "process_registry",
-    "skill_manager_tool",
-    "skills_tool",
-    "session_search_tool",
-    "terminal_tool",
-    "todo_tool",
-    "video_generation_tool",
-    "vision_tools",
-    "web_tools",
-})
+def _claim_builtin_import() -> tuple[concurrent.futures.Future[bool], bool]:
+    """Claim the process-global module import phase without binding a loop."""
+    global _builtin_import_claim
+    with _builtin_import_guard:
+        claim = _builtin_import_claim
+        if claim is None:
+            claim = concurrent.futures.Future()
+            _builtin_import_claim = claim
+            return claim, True
+        return claim, False
 
-_BUILTIN_TOOL_MODULES = tuple(
-    f"tools.{module_name}" for module_name in sorted(_TRAINING_RUNTIME_TOOL_MODULES)
-)
 
-def discover_builtin_tools(tools_dir=None) -> List[str]:
-    """Import the retained built-in tool modules and return their names.
+def _finish_builtin_import_claim(
+    claim: concurrent.futures.Future[bool],
+    *,
+    completed: bool,
+) -> None:
+    """Publish import completion and release the claim for future refreshes."""
+    global _builtin_import_claim
+    with _builtin_import_guard:
+        if _builtin_import_claim is claim:
+            _builtin_import_claim = None
+        if not claim.done():
+            claim.set_result(completed)
 
-    ``tools_dir`` remains accepted for source compatibility but is intentionally
-    unused: the async runtime has a fixed, audited tool waist and performs no
-    import-time filesystem scan. Plugins and MCP tools still register through
-    the same registry at runtime.
+
+def _active_mcp_registry_scope() -> object | None:
+    """Return the loaded MCP loop/profile scope without importing eagerly."""
+    mcp_module = sys.modules.get("tools.mcp_tool")
+    current_scope = getattr(mcp_module, "_current_mcp_scope_key", None)
+    if not callable(current_scope):
+        return None
+    try:
+        return current_scope()
+    except RuntimeError:
+        return None
+
+
+def _active_plugin_registry_scope(*, registration: bool = False) -> object | None:
+    """Return the current plugin profile scope without importing eagerly."""
+    plugin_module = sys.modules.get("hermes_cli.plugins")
+    current_scope = getattr(plugin_module, "_current_plugin_registry_scope", None)
+    if not callable(current_scope):
+        return None
+    try:
+        return current_scope(registration=registration)
+    except RuntimeError:
+        return None
+
+
+def _is_registry_register_call(node: ast.AST) -> bool:
+    """Return True when *node* is a ``registry.register(...)`` expression."""
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    function = node.value.func
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr == "register"
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "registry"
+    )
+
+
+async def _module_registers_tools(module_path: Path) -> bool:
+    """Return whether a module has a top-level registry registration."""
+    try:
+        async with aiofiles.open(module_path, encoding="utf-8") as handle:
+            source = await handle.read()
+    except OSError:
+        return False
+    if "registry" not in source or "register" not in source:
+        return False
+    try:
+        tree = ast.parse(source, filename=str(module_path))
+    except SyntaxError:
+        return False
+    return any(_is_registry_register_call(statement) for statement in tree.body)
+
+
+async def discover_builtin_tools(
+    tools_dir: Optional[Path] = None,
+) -> List[str]:
+    """Import built-in self-registering modules and return their names.
+
+    Filesystem discovery and its verdict cache use awaited file APIs. Module
+    imports happen only at this explicit lazy boundary; importing this module
+    itself remains state-only.
     """
-    del tools_dir
-    imported: List[str] = []
-    for mod_name in _BUILTIN_TOOL_MODULES:
+    tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).parent
+    cache = await _load_discovery_cache()
+    fresh_cache: Dict[str, list] = {}
+    cache_dirty = False
+
+    try:
+        filenames = sorted(await aiofiles.os.listdir(tools_path))
+    except OSError:
+        filenames = []
+    module_names: List[str] = []
+    for filename in filenames:
+        path = tools_path / filename
+        if path.suffix != ".py" or filename in {
+            "__init__.py",
+            "registry.py",
+            "mcp_tool.py",
+        }:
+            continue
+        absolute_path = await _realpath(path)
         try:
-            importlib.import_module(mod_name)
-            imported.append(mod_name)
-        except Exception as e:
-            logger.warning("Could not import tool module %s: %s", mod_name, e)
+            stat_result = await aiofiles.os.stat(path)
+        except OSError:
+            continue
+        stat_key = (stat_result.st_mtime_ns, stat_result.st_size)
+        cached = cache.get(absolute_path)
+        if (
+            isinstance(cached, (list, tuple))
+            and len(cached) == 3
+            and (cached[0], cached[1]) == stat_key
+        ):
+            registers = bool(cached[2])
+        else:
+            registers = await _module_registers_tools(path)
+            cache_dirty = True
+        fresh_cache[absolute_path] = [stat_key[0], stat_key[1], registers]
+        if registers:
+            module_names.append(f"tools.{path.stem}")
+
+    if cache_dirty or set(fresh_cache) != set(cache):
+        await _save_discovery_cache(fresh_cache)
+
+    claim, owner = _claim_builtin_import()
+    if not owner:
+        completed = await asyncio.shield(asyncio.wrap_future(claim))
+        if not completed:
+            # The owner was cancelled before completing its import phase.
+            # Retry as a fresh claimant; no thread or executor is involved.
+            return await discover_builtin_tools(tools_dir)
+        return [name for name in module_names if name in sys.modules]
+
+    imported: List[str] = []
+    completed = False
+    try:
+        package_finder_owner = None
+        for module_name in module_names:
+            await asyncio.sleep(0)
+            existing = sys.modules.get(module_name)
+            if existing is not None:
+                imported.append(module_name)
+                continue
+            try:
+                located = await _locate_source_module(module_name)
+                if located is None:
+                    raise ModuleNotFoundError(f"No module named {module_name!r}")
+                source_file, is_package = located
+                if is_package:
+                    raise ImportError(
+                        f"Expected source module for built-in tool {module_name!r}"
+                    )
+                module = await _load_source_module(
+                    module_name,
+                    source_file,
+                    package_dir=(
+                        source_file.parent
+                        if package_finder_owner is None
+                        else None
+                    ),
+                )
+                if package_finder_owner is None:
+                    # The first successful load owns a finder containing the
+                    # full tools source tree. Keep it for later lazy imports;
+                    # one-module finders created afterward can be removed.
+                    package_finder_owner = module
+                else:
+                    _unload_source_finder(module)
+                imported.append(module_name)
+            except Exception as exc:
+                logger.warning(
+                    "Could not import tool module %s: %s",
+                    module_name,
+                    exc,
+                )
+        completed = True
+    finally:
+        _finish_builtin_import_claim(claim, completed=completed)
     return imported
+
+
+def _discovery_cache_path() -> Optional[Path]:
+    """Return the discovery verdict cache path, or None if unavailable."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "cache" / "tool_discovery_cache.json"
+    except Exception:
+        return None
+
+
+async def _load_discovery_cache() -> Dict[str, list]:
+    """Read the discovery cache; malformed or unavailable data is a miss."""
+    path = _discovery_cache_path()
+    if path is None:
+        return {}
+    try:
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            data = json.loads(await handle.read())
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _save_discovery_cache(cache: Dict[str, list]) -> None:
+    """Best-effort atomic persistence for discovery verdicts."""
+    path = _discovery_cache_path()
+    if path is None:
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        await aiofiles.os.makedirs(path.parent, exist_ok=True)
+        async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+            await handle.write(json.dumps(cache, indent=0))
+            await handle.flush()
+            await aiofiles.os.wrap(os.fsync)(handle.fileno())
+        await aiofiles.os.replace(temporary, path)
+    except Exception as exc:
+        logger.debug("Could not write tool discovery cache %s: %s", path, exc)
+    finally:
+        try:
+            await aiofiles.os.remove(temporary)
+        except OSError:
+            pass
 
 
 class ToolEntry:
@@ -270,14 +463,19 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
-        # Durable map: plugin module namespace (handler.__globals__["__name__"])
-        # -> operator opt-in for built-in override. Populated at plugin load and
-        # never cleared, so a plugin's override authorization is bound to the
-        # code that defined the handler, independent of WHEN the register() call
-        # happens (sync during load, or a delayed/threaded callback afterwards).
+        self._mcp_tools: Dict[object, Dict[str, ToolEntry]] = {}
+        self._plugin_tools: Dict[object, Dict[str, ToolEntry]] = {}
+        # Plugin module namespace (handler.__globals__["__name__"]) -> operator
+        # opt-in for built-in override. It remains valid for the owning
+        # manager's lifetime, so delayed callbacks retain the same authority;
+        # manager cleanup retires both this policy and its profile scope.
         self._plugin_override_policy: Dict[str, bool] = {}
+        self._plugin_module_scopes: Dict[str, object | None] = {}
         self._toolset_checks: Dict[str, Callable] = {}
+        self._plugin_toolset_checks: Dict[object, Dict[str, Callable]] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        self._plugin_toolset_aliases: Dict[object, Dict[str, str]] = {}
+        self._mcp_toolset_aliases: Dict[object, Dict[str, str]] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -292,7 +490,29 @@ class ToolRegistry:
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
-            return list(self._tools.values()), dict(self._toolset_checks)
+            effective = dict(self._tools)
+            plugin_scope = _active_plugin_registry_scope()
+            if plugin_scope is not None:
+                effective.update(self._plugin_tools.get(plugin_scope, {}))
+            entries = list(effective.values())
+            scope = _active_mcp_registry_scope()
+            if scope is not None:
+                entries.extend(
+                    entry
+                    for name, entry in self._mcp_tools.get(scope, {}).items()
+                    if name not in effective
+                )
+            elif not self._tools:
+                # Pure synchronous compatibility inspection (not a runtime
+                # dispatch boundary) may occur just after ``asyncio.run``.
+                # Expose the one populated MCP scope when it is unambiguous.
+                populated = [values for values in self._mcp_tools.values() if values]
+                if len(populated) == 1:
+                    entries.extend(populated[0].values())
+            checks = dict(self._toolset_checks)
+            if plugin_scope is not None:
+                checks.update(self._plugin_toolset_checks.get(plugin_scope, {}))
+            return entries, checks
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
@@ -325,7 +545,20 @@ class ToolRegistry:
     def get_entry(self, name: str) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
         with self._lock:
-            return self._tools.get(name)
+            plugin_scope = _active_plugin_registry_scope()
+            if plugin_scope is not None:
+                plugin = self._plugin_tools.get(plugin_scope, {}).get(name)
+                if plugin is not None:
+                    return plugin
+            builtin = self._tools.get(name)
+            if builtin is not None:
+                return builtin
+            scope = _active_mcp_registry_scope()
+            if scope is not None:
+                entry = self._mcp_tools.get(scope, {}).get(name)
+                if entry is not None:
+                    return entry
+            return None
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -341,23 +574,66 @@ class ToolRegistry:
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""
         with self._lock:
-            existing = self._toolset_aliases.get(alias)
+            mcp_scope = (
+                _active_mcp_registry_scope() if toolset.startswith("mcp-") else None
+            )
+            plugin_scope = (
+                _active_plugin_registry_scope(registration=True)
+                if mcp_scope is None
+                else None
+            )
+            if plugin_scope is None and mcp_scope is None:
+                caller_module = self._caller_module()
+                caller_namespace = self._plugin_namespace_for_module(caller_module)
+                if caller_module.startswith("hermes_plugins.") and (
+                    caller_namespace is None
+                ):
+                    raise RuntimeError(
+                        f"Plugin module {caller_module!r} is no longer attached "
+                        "to an active plugin manager"
+                    )
+                if caller_namespace is not None:
+                    plugin_scope = self._plugin_module_scopes.get(caller_namespace)
+            if mcp_scope is not None:
+                aliases = self._mcp_toolset_aliases.setdefault(mcp_scope, {})
+            elif plugin_scope is not None:
+                aliases = self._plugin_toolset_aliases.setdefault(plugin_scope, {})
+            else:
+                aliases = self._toolset_aliases
+            existing = aliases.get(alias)
             if existing and existing != toolset:
                 logger.warning(
                     "Toolset alias collision: '%s' (%s) overwritten by %s",
                     alias, existing, toolset,
                 )
-            self._toolset_aliases[alias] = toolset
+            aliases[alias] = toolset
             self._generation += 1
 
     def get_registered_toolset_aliases(self) -> Dict[str, str]:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
         with self._lock:
-            return dict(self._toolset_aliases)
+            aliases = dict(self._toolset_aliases)
+            plugin_scope = _active_plugin_registry_scope()
+            if plugin_scope is not None:
+                aliases.update(self._plugin_toolset_aliases.get(plugin_scope, {}))
+            scope = _active_mcp_registry_scope()
+            if scope is not None:
+                aliases.update(self._mcp_toolset_aliases.get(scope, {}))
+            return aliases
 
     def get_toolset_alias_target(self, alias: str) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
+            plugin_scope = _active_plugin_registry_scope()
+            if plugin_scope is not None:
+                target = self._plugin_toolset_aliases.get(plugin_scope, {}).get(alias)
+                if target is not None:
+                    return target
+            scope = _active_mcp_registry_scope()
+            if scope is not None:
+                target = self._mcp_toolset_aliases.get(scope, {}).get(alias)
+                if target is not None:
+                    return target
             return self._toolset_aliases.get(alias)
 
     # ------------------------------------------------------------------
@@ -366,12 +642,52 @@ class ToolRegistry:
 
     def register_plugin_override_policy(self, module_namespace: str, allowed: bool) -> None:
         """Bind a plugin module namespace to its operator opt-in for built-in
-        override. Called once per plugin at load time. Durable: never cleared,
-        so later (even threaded/delayed) register() calls from that module are
-        still gated by the same policy.
+        override. Called once per plugin at load time. Later delayed
+        ``register()`` calls remain gated until the owning manager is cleaned
+        up, after which registrations from the retired module fail closed.
         """
         with self._lock:
             self._plugin_override_policy[module_namespace] = bool(allowed)
+
+    def _bind_plugin_scope(
+        self,
+        module_namespace: str,
+        scope: object | None,
+    ) -> None:
+        """Associate one loaded plugin namespace with its profile overlay."""
+        with self._lock:
+            self._plugin_module_scopes[module_namespace] = scope
+
+    def _unbind_plugin_namespaces(self, module_namespaces: Set[str]) -> None:
+        """Retire module namespaces whose owning manager was cleaned up."""
+        with self._lock:
+            for namespace in module_namespaces:
+                self._plugin_module_scopes.pop(namespace, None)
+                self._plugin_override_policy.pop(namespace, None)
+
+    def _plugin_namespace_for_module(self, module_name: str) -> Optional[str]:
+        matches = (
+            namespace
+            for namespace in self._plugin_override_policy
+            if module_name == namespace or module_name.startswith(f"{namespace}.")
+        )
+        return max(matches, key=len, default=None)
+
+    def _clear_plugin_scope(self, scope: object) -> None:
+        """Remove all registry state owned by one plugin profile."""
+        with self._lock:
+            self._plugin_tools.pop(scope, None)
+            self._plugin_toolset_checks.pop(scope, None)
+            self._plugin_toolset_aliases.pop(scope, None)
+            namespaces = [
+                namespace
+                for namespace, owner_scope in self._plugin_module_scopes.items()
+                if owner_scope is scope
+            ]
+            for namespace in namespaces:
+                self._plugin_module_scopes.pop(namespace, None)
+                self._plugin_override_policy.pop(namespace, None)
+            self._generation += 1
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -385,12 +701,17 @@ class ToolRegistry:
         handlers live outside the plugin namespace and return None (unchanged
         behavior).
         """
+        target = handler
+        while isinstance(target, functools.partial):
+            target = target.func
+        target = getattr(target, "__func__", target)
         try:
-            mod = handler.__globals__.get("__name__", "")  # type: ignore[attr-defined]
+            mod = target.__globals__.get("__name__", "")  # type: ignore[attr-defined]
         except AttributeError:
             return None
-        if mod in self._plugin_override_policy:
-            return mod
+        namespace = self._plugin_namespace_for_module(mod)
+        if namespace is not None:
+            return namespace
         # Also gate plugin modules currently loading but not yet policy-recorded
         # (defensive: a handler defined in the plugin namespace is plugin code).
         if isinstance(mod, str) and mod.startswith("hermes_plugins."):
@@ -419,13 +740,13 @@ class ToolRegistry:
         toolset: str,
         schema: dict,
         handler: Callable,
-        check_fn: Optional[Callable] = None,
-        requires_env: Optional[list] = None,
+        check_fn: Callable = None,
+        requires_env: list = None,
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
-        dynamic_schema_overrides: Optional[Callable] = None,
+        dynamic_schema_overrides: Callable = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -442,10 +763,38 @@ class ToolRegistry:
             )
 
         with self._lock:
-            existing = self._tools.get(name)
+            mcp_scope = (
+                _active_mcp_registry_scope()
+                if toolset.startswith("mcp-")
+                else None
+            )
+            owner = self._plugin_owner_of(handler)
+            if owner is not None and owner not in self._plugin_override_policy:
+                raise RuntimeError(
+                    f"Plugin module {owner!r} is no longer attached to an "
+                    "active plugin manager"
+                )
+            plugin_scope = (
+                _active_plugin_registry_scope(registration=True)
+                if mcp_scope is None
+                else None
+            )
+            if owner is not None and mcp_scope is None and plugin_scope is None:
+                plugin_scope = self._plugin_module_scopes.get(owner)
+            if mcp_scope is not None:
+                target = self._mcp_tools.setdefault(mcp_scope, {})
+            elif plugin_scope is not None:
+                target = self._plugin_tools.setdefault(plugin_scope, {})
+            else:
+                target = self._tools
+            existing = target.get(name)
+            if existing is None and (mcp_scope is not None or plugin_scope is not None):
+                # MCP tools never shadow retained built-ins, even though MCP
+                # entries themselves are isolated by profile.
+                existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
                 if override:
-                    _owner = self._plugin_owner_of(handler)
+                    _owner = owner
                     if _owner is not None and not self._plugin_override_policy.get(_owner, False):
                         logger.error(
                             "Tool registration REJECTED: plugin %r attempted to "
@@ -479,7 +828,7 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            self._tools[name] = ToolEntry(
+            target[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -500,8 +849,13 @@ class ToolRegistry:
             # banner.py reads (presence only, never called) to classify an
             # already-unavailable toolset as lazy-init vs disabled. Keep the
             # write path for that classification.
-            if check_fn and toolset not in self._toolset_checks:
-                self._toolset_checks[toolset] = check_fn
+            checks = (
+                self._plugin_toolset_checks.setdefault(plugin_scope, {})
+                if plugin_scope is not None
+                else self._toolset_checks
+            )
+            if check_fn and toolset not in checks:
+                checks[toolset] = check_fn
             self._generation += 1
 
     def deregister(self, name: str) -> None:
@@ -521,7 +875,19 @@ class ToolRegistry:
         every refresh and has no plugin-override concept.
         """
         with self._lock:
-            entry = self._tools.get(name)
+            mcp_scope = _active_mcp_registry_scope()
+            mcp_tools = (
+                self._mcp_tools.get(mcp_scope, {})
+                if mcp_scope is not None
+                else {}
+            )
+            plugin_scope = _active_plugin_registry_scope()
+            plugin_tools = (
+                self._plugin_tools.get(plugin_scope, {})
+                if plugin_scope is not None
+                else {}
+            )
+            entry = plugin_tools.get(name) or mcp_tools.get(name) or self._tools.get(name)
             if entry is None:
                 return
             if not entry.toolset.startswith("mcp-"):
@@ -534,13 +900,12 @@ class ToolRegistry:
                 # string equality would wrongly block root-module cleanup code
                 # from removing tools registered by a submodule of the same
                 # plugin (egilewski review on #55840).
-                caller_root = ".".join(caller_mod.split(".")[:2])
-                owner_root = ".".join(owner.split(".")[:2]) if owner else ""
-                same_plugin = bool(owner and caller_root == owner_root)
+                caller_root = self._plugin_namespace_for_module(caller_mod)
+                same_plugin = bool(owner and caller_root == owner)
                 if (
                     caller_mod.startswith("hermes_plugins.")
                     and not same_plugin
-                    and not self._plugin_override_policy.get(caller_root, False)
+                    and not self._plugin_override_policy.get(caller_root or "", False)
                 ):
                     logger.error(
                         "Tool deregistration REJECTED: plugin %r attempted to "
@@ -555,19 +920,56 @@ class ToolRegistry:
                         f"{name!r} (toolset {entry.toolset!r}) without operator "
                         f"opt-in (allow_tool_override)."
                     )
-            del self._tools[name]
+            if name in plugin_tools:
+                target = plugin_tools
+                target_kind = "plugin"
+            elif name in mcp_tools:
+                target = mcp_tools
+                target_kind = "mcp"
+            else:
+                target = self._tools
+                target_kind = "shared"
+            del target[name]
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
             toolset_still_exists = any(
-                e.toolset == entry.toolset for e in self._tools.values()
+                e.toolset == entry.toolset for e in target.values()
             )
             if not toolset_still_exists:
-                self._toolset_checks.pop(entry.toolset, None)
-                self._toolset_aliases = {
-                    alias: target
-                    for alias, target in self._toolset_aliases.items()
-                    if target != entry.toolset
-                }
+                if target_kind == "plugin" and plugin_scope is not None:
+                    self._plugin_toolset_checks.get(plugin_scope, {}).pop(
+                        entry.toolset, None
+                    )
+                    aliases = self._plugin_toolset_aliases.get(plugin_scope, {})
+                    self._plugin_toolset_aliases[plugin_scope] = {
+                        alias: alias_target
+                        for alias, alias_target in aliases.items()
+                        if alias_target != entry.toolset
+                    }
+                else:
+                    self._toolset_checks.pop(entry.toolset, None)
+                if target_kind == "mcp" and mcp_scope is not None:
+                    aliases = self._mcp_toolset_aliases.get(mcp_scope, {})
+                    self._mcp_toolset_aliases[mcp_scope] = {
+                        alias: alias_target
+                        for alias, alias_target in aliases.items()
+                        if alias_target != entry.toolset
+                    }
+                elif target_kind == "shared":
+                    self._toolset_aliases = {
+                        alias: alias_target
+                        for alias, alias_target in self._toolset_aliases.items()
+                        if alias_target != entry.toolset
+                    }
+            if mcp_scope is not None and not mcp_tools:
+                self._mcp_tools.pop(mcp_scope, None)
+                if not self._mcp_toolset_aliases.get(mcp_scope):
+                    self._mcp_toolset_aliases.pop(mcp_scope, None)
+            if plugin_scope is not None and not plugin_tools:
+                self._plugin_tools.pop(plugin_scope, None)
+                self._plugin_toolset_checks.pop(plugin_scope, None)
+                if not self._plugin_toolset_aliases.get(plugin_scope):
+                    self._plugin_toolset_aliases.pop(plugin_scope, None)
             self._generation += 1
         logger.debug("Deregistered tool: %s", name)
 

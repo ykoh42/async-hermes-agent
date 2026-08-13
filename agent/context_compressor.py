@@ -1204,6 +1204,13 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             goal = goal[:57] + "..."
         return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
 
+    if tool_name == "execute_code":
+        code_str = _str_arg(args, "code")
+        code_preview = code_str[:60].replace("\n", " ")
+        if len(code_str) > 60:
+            code_preview += "..."
+        return f"[execute_code] `{code_preview}` ({line_count} lines output)"
+
     if tool_name == "skill_view":
         name = args.get("name", "?")
         if content_len > _SKILL_VIEW_PRUNE_MIN_CHARS:
@@ -1234,6 +1241,9 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
 
     if tool_name == "clarify":
         return "[clarify] asked user a question"
+
+    if tool_name == "text_to_speech":
+        return f"[text_to_speech] generated audio ({content_len:,} chars)"
 
     if tool_name == "process":
         action = args.get("action", "?")

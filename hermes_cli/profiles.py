@@ -89,7 +89,7 @@ async def _resolve_profile_context() -> tuple[Path, Path | None]:
     """Resolve the process root and cwd used for synchronous profile lookups."""
     default_root = await get_default_hermes_root()
     try:
-        cwd = Path(await aiofiles.os.wrap(os.getcwd)())
+        cwd = Path(await aiofiles.os.getcwd())
     except OSError:
         cwd = None
     return default_root, cwd

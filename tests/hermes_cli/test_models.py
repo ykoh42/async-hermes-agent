@@ -1,19 +1,27 @@
 """Tests for retained runtime behavior in :mod:`hermes_cli.models`."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import hermes_cli.models as models
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from hermes_cli.nous_account import NousPortalAccountInfo
 
 
 @pytest.fixture(autouse=True)
 def _clear_nous_model_caches():
     models._free_tier_cache = None
+    models._free_tier_cache_by_profile.clear()
     models._nous_recommended_cache.clear()
     yield
     models._free_tier_cache = None
+    models._free_tier_cache_by_profile.clear()
     models._nous_recommended_cache.clear()
 
 
@@ -52,6 +60,53 @@ async def test_check_nous_free_tier_force_fresh_bypasses_cache():
 
     assert get_account_info.await_count == 2
     get_account_info.assert_awaited_with(force_fresh=True)
+
+
+@pytest.mark.asyncio
+async def test_check_nous_free_tier_isolates_concurrent_profiles(
+    tmp_path,
+):
+    both_started = asyncio.Event()
+    starts = 0
+    calls: dict[str, int] = {"profile-a": 0, "profile-b": 0}
+
+    async def get_account_info(*, force_fresh=False):
+        nonlocal starts
+        assert force_fresh is False
+        profile = get_hermes_home().name
+        calls[profile] += 1
+        starts += 1
+        if starts == 2:
+            both_started.set()
+        await both_started.wait()
+        return NousPortalAccountInfo(
+            logged_in=True,
+            source="jwt",
+            fresh=False,
+            paid_service_access=profile == "profile-b",
+        )
+
+    async def check(profile: str) -> tuple[bool, bool]:
+        token = set_hermes_home_override(tmp_path / profile)
+        try:
+            first = await models.check_nous_free_tier()
+            second = await models.check_nous_free_tier()
+            return first, second
+        finally:
+            reset_hermes_home_override(token)
+
+    with patch(
+        "hermes_cli.nous_account.get_nous_portal_account_info",
+        new=get_account_info,
+    ):
+        free_result, paid_result = await asyncio.gather(
+            check("profile-a"),
+            check("profile-b"),
+        )
+
+    assert free_result == (True, True)
+    assert paid_result == (False, False)
+    assert calls == {"profile-a": 1, "profile-b": 1}
 
 
 @pytest.mark.asyncio

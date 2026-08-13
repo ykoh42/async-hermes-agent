@@ -35,7 +35,11 @@ def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
     register = MagicMock(return_value=["srv__send_message"])
     monkeypatch.setattr(mcp_tool, "_register_server_tools", register)
 
-    asyncio.run(server._discover_tools())
+    async def discover_in_active_scope():
+        mcp_tool._servers[server.name] = server
+        await server._discover_tools()
+
+    asyncio.run(discover_in_active_scope())
 
     register.assert_called_once_with(server.name, server, server._config)
     assert server._registered_tool_names == ["srv__send_message"]

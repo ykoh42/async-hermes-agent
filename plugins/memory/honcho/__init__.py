@@ -387,6 +387,11 @@ class HonchoMemoryProvider(MemoryProvider):
         memory migration, and optional dialectic prewarming.
         """
         try:
+            from plugins.memory.honcho.client import (
+                _retain_honcho_client_lifecycle,
+            )
+
+            await _retain_honcho_client_lifecycle(self)
             agent_context = kwargs.get("agent_context", "")
             platform = kwargs.get("platform", "cli")
             if agent_context in {"cron", "flush"} or platform == "cron":
@@ -1588,34 +1593,34 @@ class HonchoMemoryProvider(MemoryProvider):
     async def shutdown(self) -> None:
         self._shutdown = True
         tasks = tuple(task for task in self._owned_tasks if not task.done())
-        manager_shutdown_started = False
-        try:
-            if tasks:
-                _, pending = await asyncio.wait(tasks, timeout=5.0)
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-            self._owned_tasks.clear()
+        from plugins.memory.honcho.client import (
+            _await_honcho_cleanup,
+            _release_honcho_client_lifecycle,
+        )
 
-            if self._manager:
-                manager_shutdown_started = True
-                try:
-                    await self._manager.shutdown()
-                except Exception:
-                    logger.debug("Honcho manager shutdown failed", exc_info=True)
-        except asyncio.CancelledError:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._owned_tasks.clear()
-            if self._manager and not manager_shutdown_started:
-                await self._manager.shutdown()
-            raise
-        finally:
-            from plugins.memory.honcho.client import reset_honcho_client
+        async def finish_shutdown() -> None:
+            try:
+                if tasks:
+                    _, pending = await asyncio.wait(tasks, timeout=5.0)
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                self._owned_tasks.clear()
 
-            await reset_honcho_client()
+                if self._manager:
+                    try:
+                        await self._manager.shutdown()
+                    except Exception:
+                        logger.debug("Honcho manager shutdown failed", exc_info=True)
+            finally:
+                await _release_honcho_client_lifecycle(self)
+
+        await _await_honcho_cleanup(
+            asyncio.create_task(
+                finish_shutdown(),
+                name="honcho-provider-shutdown",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

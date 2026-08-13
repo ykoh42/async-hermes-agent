@@ -23,7 +23,6 @@ API:  https://docs.krea.ai/api-reference/krea/krea-2-large
 from __future__ import annotations
 
 import logging
-import os
 import asyncio
 import time
 import uuid
@@ -144,7 +143,7 @@ async def _resolve_model(
     if isinstance(explicit, str) and explicit.strip() in _MODELS:
         return explicit.strip(), _MODELS[explicit.strip()]
 
-    env_override = os.environ.get("KREA_IMAGE_MODEL")
+    env_override = get_secret("KREA_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
         return env_override, _MODELS[env_override]
 

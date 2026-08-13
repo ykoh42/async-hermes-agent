@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import inspect
+import sys
 from typing import Dict, List, Optional
 
 from agent.image_gen_provider import ImageGenProvider
@@ -30,6 +31,32 @@ logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, ImageGenProvider] = {}
+_plugin_providers: Dict[object, Dict[str, ImageGenProvider]] = {}
+
+
+def _plugin_scope(
+    *, registration: bool = False, module_name: str = ""
+) -> object | None:
+    module = sys.modules.get("hermes_cli.plugins")
+    current = getattr(module, "_current_plugin_registry_scope", None)
+    scope = current(registration=registration) if callable(current) else None
+    if scope is None and registration and module_name:
+        resolve = getattr(module, "_plugin_registry_scope_for_module", None)
+        if callable(resolve):
+            return resolve(module_name)
+    return scope
+
+
+def _provider_snapshot() -> Dict[str, ImageGenProvider]:
+    providers = dict(_providers)
+    scope = _plugin_scope()
+    if scope is not None:
+        providers.update(_plugin_providers.get(scope, {}))
+    return providers
+
+
+def _clear_plugin_scope(scope: object) -> None:
+    _plugin_providers.pop(scope, None)
 
 
 def register_provider(provider: ImageGenProvider) -> None:
@@ -57,8 +84,13 @@ def register_provider(provider: ImageGenProvider) -> None:
     ):
         if not inspect.iscoroutinefunction(getattr(provider, method_name)):
             raise TypeError(f"Image gen provider .{method_name} must be async")
-    existing = _providers.get(name)
-    _providers[name] = provider
+    scope = _plugin_scope(
+        registration=True,
+        module_name=type(provider).__module__,
+    )
+    target = _plugin_providers.setdefault(scope, {}) if scope is not None else _providers
+    existing = target.get(name)
+    target[name] = provider
     if existing is not None:
         logger.debug("Image gen provider '%s' re-registered (was %r)", name, type(existing).__name__)
     else:
@@ -67,7 +99,7 @@ def register_provider(provider: ImageGenProvider) -> None:
 
 def list_providers() -> List[ImageGenProvider]:
     """Return all registered providers, sorted by name."""
-    items = list(_providers.values())
+    items = list(_provider_snapshot().values())
     return sorted(items, key=lambda p: p.name)
 
 
@@ -75,7 +107,7 @@ def get_provider(name: str) -> Optional[ImageGenProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    return _providers.get(name.strip())
+    return _provider_snapshot().get(name.strip())
 
 
 async def get_active_provider() -> Optional[ImageGenProvider]:
@@ -108,7 +140,7 @@ async def get_active_provider() -> Optional[ImageGenProvider]:
     except Exception as exc:
         logger.debug("Could not read image_gen.provider from config: %s", exc)
 
-    snapshot = dict(_providers)
+    snapshot = _provider_snapshot()
 
     async def _is_available_safe(p: ImageGenProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
@@ -147,3 +179,4 @@ async def get_active_provider() -> Optional[ImageGenProvider]:
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
     _providers.clear()
+    _plugin_providers.clear()

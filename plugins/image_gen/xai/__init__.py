@@ -18,7 +18,6 @@ Selection precedence (first hit wins):
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +25,7 @@ import aiofiles
 import aiofiles.os
 import httpx
 
+from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
@@ -105,7 +105,7 @@ async def _load_xai_config() -> Dict[str, Any]:
 
 async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     """Decide which model to use and return ``(model_id, meta)``."""
-    env_override = os.environ.get("XAI_IMAGE_MODEL")
+    env_override = get_secret("XAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
         return env_override, _MODELS[env_override]
 

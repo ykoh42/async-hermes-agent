@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,18 +13,16 @@ from agent import lsp as lsp_module
 
 @pytest.fixture(autouse=True)
 def _reset_singleton():
-    """Force clean process-global state around every lifecycle test."""
-    lsp_module._service = None
-    lsp_module._service_lock = None
-    lsp_module._service_loop = None
-    lsp_module._service_shutdown_task = None
-    lsp_module._lifecycle_consumers.clear()
+    """Force clean scoped state around every lifecycle test."""
+    with lsp_module._lsp_state_guard:
+        lsp_module._lsp_loop_states.clear()
+        lsp_module._lsp_scope_aliases.clear()
+        lsp_module._lsp_owner_scopes.clear()
     yield
-    lsp_module._service = None
-    lsp_module._service_lock = None
-    lsp_module._service_loop = None
-    lsp_module._service_shutdown_task = None
-    lsp_module._lifecycle_consumers.clear()
+    with lsp_module._lsp_state_guard:
+        lsp_module._lsp_loop_states.clear()
+        lsp_module._lsp_scope_aliases.clear()
+        lsp_module._lsp_owner_scopes.clear()
 
 
 @pytest.mark.asyncio
@@ -58,9 +58,7 @@ async def test_shutdown_service_idempotent(monkeypatch):
     await lsp_module.shutdown_service()
 
     fake_service.shutdown.assert_awaited_once_with()
-    assert lsp_module._service is None
-    assert lsp_module._service_lock is None
-    assert lsp_module._service_loop is None
+    assert not lsp_module._lsp_loop_states
 
 
 @pytest.mark.asyncio
@@ -125,10 +123,7 @@ async def test_cancelled_global_shutdown_finishes_cleanup_before_reraise(
     with pytest.raises(asyncio.CancelledError):
         await shutdown
     fake_service.shutdown.assert_awaited_once_with()
-    assert lsp_module._service is None
-    assert lsp_module._service_shutdown_task is None
-    assert lsp_module._service_lock is None
-    assert lsp_module._service_loop is None
+    assert not lsp_module._lsp_loop_states
 
 
 @pytest.mark.asyncio
@@ -182,7 +177,7 @@ async def test_final_agent_lease_owns_service_shutdown(monkeypatch):
     first = Owner()
     second = Owner()
     shutdown = AsyncMock()
-    monkeypatch.setattr(lsp_module, "shutdown_service", shutdown)
+    monkeypatch.setattr(lsp_module, "_shutdown_scope", shutdown)
 
     await lsp_module._retain_lsp_lifecycle(first)
     await lsp_module._retain_lsp_lifecycle(second)
@@ -190,7 +185,7 @@ async def test_final_agent_lease_owns_service_shutdown(monkeypatch):
     shutdown.assert_not_awaited()
 
     await lsp_module._release_lsp_lifecycle(second)
-    shutdown.assert_awaited_once_with()
+    shutdown.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -200,47 +195,39 @@ async def test_releasing_same_agent_lease_twice_is_safe(monkeypatch):
 
     owner = Owner()
     shutdown = AsyncMock()
-    monkeypatch.setattr(lsp_module, "shutdown_service", shutdown)
+    monkeypatch.setattr(lsp_module, "_shutdown_scope", shutdown)
 
     await lsp_module._retain_lsp_lifecycle(owner)
     await lsp_module._release_lsp_lifecycle(owner)
     await lsp_module._release_lsp_lifecycle(owner)
 
-    shutdown.assert_awaited_once_with()
+    shutdown.assert_awaited_once()
 
 
-def test_state_only_singleton_can_rebind_between_sequential_loops(monkeypatch):
-    service = lsp_module.LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=0,
-    )
-    create = AsyncMock(return_value=service)
+def test_state_only_services_do_not_retain_sequential_loops(monkeypatch):
+    services = [
+        lsp_module.LSPService(
+            enabled=True,
+            wait_mode="document",
+            wait_timeout=1.0,
+            install_strategy="manual",
+            idle_timeout=0,
+        )
+        for _ in range(2)
+    ]
+    create = AsyncMock(side_effect=services)
     monkeypatch.setattr(lsp_module.LSPService, "create_from_config", create)
 
-    assert asyncio.run(lsp_module.get_service()) is service
-    assert asyncio.run(lsp_module.get_service()) is service
-    assert service._has_owned_resources() is False
-    asyncio.run(lsp_module.shutdown_service())
+    loop_refs: list[weakref.ReferenceType[asyncio.AbstractEventLoop]] = []
 
+    async def get_once():
+        loop_refs.append(weakref.ref(asyncio.get_running_loop()))
+        return await lsp_module.get_service()
 
-def test_started_singleton_rejects_cross_loop_reuse(monkeypatch):
-    service = lsp_module.LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=0,
-    )
-    service._started = True
-    monkeypatch.setattr(
-        lsp_module.LSPService,
-        "create_from_config",
-        AsyncMock(return_value=service),
-    )
-
-    assert asyncio.run(lsp_module.get_service()) is service
-    with pytest.raises(RuntimeError, match="another event loop"):
-        asyncio.run(lsp_module.get_service())
+    assert asyncio.run(get_once()) is services[0]
+    gc.collect()
+    assert loop_refs[0]() is None
+    assert asyncio.run(get_once()) is services[1]
+    gc.collect()
+    assert all(loop_ref() is None for loop_ref in loop_refs)
+    assert create.await_count == 2

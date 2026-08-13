@@ -137,9 +137,21 @@ class MemoryStore:
     # refcounted, so closing
     # one instance never tears the connection out from under a live sibling.
     _shared: dict = {}
-    _shared_guards: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    _shared_guards: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]]" = (
         weakref.WeakKeyDictionary()
     )
+
+    @classmethod
+    def _shared_guard_for_loop(
+        cls,
+        loop: asyncio.AbstractEventLoop,
+    ) -> asyncio.Lock:
+        guard_ref = cls._shared_guards.get(loop)
+        guard = guard_ref() if guard_ref is not None else None
+        if guard is None:
+            guard = asyncio.Lock()
+            cls._shared_guards[loop] = weakref.ref(guard)
+        return guard
 
     def __init__(
         self,
@@ -160,6 +172,7 @@ class MemoryStore:
         self._conn: aiosqlite.Connection | None = None
         self._lock: asyncio.Lock | None = None
         self._initialize_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
     async def _initialize(self) -> None:
@@ -172,14 +185,13 @@ class MemoryStore:
         async with self._initialize_lock:
             if self._entry is not None:
                 return
+            if self._closed:
+                raise RuntimeError("MemoryStore is closed")
             await aiofiles.os.makedirs(self.db_path.parent, exist_ok=True)
             self._key = await aiofiles.os.wrap(os.path.realpath)(self.db_path)
             loop = asyncio.get_running_loop()
             registry_key = (loop, self._key)
-            guard = MemoryStore._shared_guards.get(loop)
-            if guard is None:
-                guard = asyncio.Lock()
-                MemoryStore._shared_guards[loop] = guard
+            guard = MemoryStore._shared_guard_for_loop(loop)
 
             async with guard:
                 entry = MemoryStore._shared.get(registry_key)
@@ -845,33 +857,41 @@ class MemoryStore:
         referencing the same database is closed, so closing one instance can
         never break sibling instances that still hold it. Idempotent.
         """
-        entry = self._entry
-        registry_key = self._registry_key
-        if entry is None or registry_key is None:
-            return
-        loop = asyncio.get_running_loop()
-        guard = MemoryStore._shared_guards.get(loop)
-        if guard is None:
-            guard = asyncio.Lock()
-            MemoryStore._shared_guards[loop] = guard
-        async with guard:
-            if self._entry is None:
-                return
-            entry["refs"] -= 1
-            try:
-                if entry["refs"] <= 0:
-                    from hermes_state import _close_owned_connection
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_owned(),
+                name="holographic-store-close",
+            )
+        await _finish_owned_task(self._close_task)
 
-                    try:
-                        await _close_owned_connection(entry["conn"])
-                    finally:
-                        MemoryStore._shared.pop(registry_key, None)
-            finally:
-                self._entry = None
-                self._registry_key = None
-                self._conn = None
-                self._lock = None
+    async def _close_owned(self) -> None:
+        async with self._initialize_lock:
+            entry = self._entry
+            registry_key = self._registry_key
+            if entry is None or registry_key is None:
                 self._closed = True
+                return
+            loop = asyncio.get_running_loop()
+            guard = MemoryStore._shared_guard_for_loop(loop)
+            async with guard:
+                if self._entry is None:
+                    self._closed = True
+                    return
+                entry["refs"] -= 1
+                try:
+                    if entry["refs"] <= 0:
+                        from hermes_state import _close_owned_connection
+
+                        try:
+                            await _close_owned_connection(entry["conn"])
+                        finally:
+                            MemoryStore._shared.pop(registry_key, None)
+                finally:
+                    self._entry = None
+                    self._registry_key = None
+                    self._conn = None
+                    self._lock = None
+                    self._closed = True
 
     async def __aenter__(self) -> "MemoryStore":
         await self._initialize()

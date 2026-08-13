@@ -13,8 +13,8 @@ Public API (names and arguments preserved from the original 2,400-line version):
     await handle_function_call(function_name, function_args, task_id, user_task) -> str
     TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
     TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
-    get_all_tool_names() -> list
-    get_toolset_for_tool(name) -> str
+    await get_all_tool_names() -> list
+    await get_toolset_for_tool(name) -> str
     await get_available_toolsets() -> dict
     await check_toolset_requirements() -> dict
     await check_tool_availability(quiet) -> tuple
@@ -27,6 +27,14 @@ import re
 import logging
 import time
 import aiofiles.os
+
+# Built-in discovery executes tool source from an async in-memory loader, but
+# ``terminal_tool``'s retained lifecycle graph imports httpx.  httpx imports
+# Rich, whose module initializer snapshots ``os.getcwd()`` synchronously.
+# Prime only that fixed transport dependency at this process import boundary;
+# user/plugin discovery stays lazy and awaited, and cold tool discovery does
+# not call a blocking cwd helper from the event-loop thread.
+import httpx as _httpx_bootstrap  # noqa: F401
 from contextvars import ContextVar
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -57,7 +65,25 @@ _WARNED_DISABLED_BUNDLES: set = set()
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+_builtin_tools_discovered = False
+_public_maps_generation = -1
+
+
+async def _ensure_builtin_tools_discovered() -> None:
+    """Discover built-ins once at the first awaited model-tool boundary."""
+    global _builtin_tools_discovered, _public_maps_generation
+    if not _builtin_tools_discovered:
+        # ``discover_builtin_tools`` owns the process-wide, loop-neutral import
+        # claim.  Keeping a second import-time asyncio.Lock here binds this
+        # public library module to whichever loop happens to discover first.
+        await discover_builtin_tools()
+        _builtin_tools_discovered = True
+    if _public_maps_generation != registry._generation:
+        TOOL_TO_TOOLSET_MAP.clear()
+        TOOL_TO_TOOLSET_MAP.update(registry.get_tool_to_toolset_map())
+        TOOLSET_REQUIREMENTS.clear()
+        TOOLSET_REQUIREMENTS.update(registry.get_toolset_requirements())
+        _public_maps_generation = registry._generation
 
 # MCP discovery is deliberately lazy.  A conversation's async turn prologue
 # awaits it after the agent has entered its own event loop, avoiding import-time
@@ -94,6 +120,7 @@ _LEGACY_TOOLSET_MAP = {
         "browser_vision", "browser_console"
     ],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
+    "tts_tools": ["text_to_speech"],
 }
 
 
@@ -151,6 +178,7 @@ async def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    await _ensure_builtin_tools_discovered()
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -287,6 +315,29 @@ async def _compute_tool_definitions(
         tools_to_include,
         quiet=quiet_mode,
     )
+
+    available_tool_names = {
+        tool["function"]["name"] for tool in filtered_tools
+    }
+    if "execute_code" in available_tool_names:
+        from tools.code_execution_tool import (
+            SANDBOX_ALLOWED_TOOLS,
+            _get_execution_mode,
+            build_execute_code_schema,
+        )
+
+        sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
+        dynamic_schema = await build_execute_code_schema(
+            sandbox_enabled,
+            mode=await _get_execution_mode(),
+        )
+        for index, definition in enumerate(filtered_tools):
+            if definition.get("function", {}).get("name") == "execute_code":
+                filtered_tools[index] = {
+                    "type": "function",
+                    "function": dynamic_schema,
+                }
+                break
 
     if not quiet_mode:
         if filtered_tools:
@@ -850,6 +901,7 @@ async def handle_function_call(
     own those phases use the existing ``skip_*`` arguments so each phase fires
     exactly once.
     """
+    await _ensure_builtin_tools_discovered()
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
@@ -1099,26 +1151,31 @@ async def handle_function_call(
 # Backward-compat wrapper functions
 # =============================================================================
 
-def get_all_tool_names() -> List[str]:
+async def get_all_tool_names() -> List[str]:
     """Return all registered tool names."""
+    await _ensure_builtin_tools_discovered()
     return registry.get_all_tool_names()
 
 
-def get_toolset_for_tool(tool_name: str) -> Optional[str]:
+async def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     """Return the toolset a tool belongs to."""
+    await _ensure_builtin_tools_discovered()
     return registry.get_toolset_for_tool(tool_name)
 
 
 async def get_available_toolsets() -> Dict[str, dict]:
     """Return toolset availability info for UI display."""
+    await _ensure_builtin_tools_discovered()
     return await registry.get_available_toolsets()
 
 
 async def check_toolset_requirements() -> Dict[str, bool]:
     """Return {toolset: available_bool} for every registered toolset."""
+    await _ensure_builtin_tools_discovered()
     return await registry.check_toolset_requirements()
 
 
 async def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """Return (available_toolsets, unavailable_info)."""
+    await _ensure_builtin_tools_discovered()
     return await registry.check_tool_availability(quiet=quiet)

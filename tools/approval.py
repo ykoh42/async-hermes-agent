@@ -16,10 +16,13 @@ import os
 import re
 import shlex
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
-from collections.abc import Iterable
+import weakref
+from collections.abc import Iterable, MutableMapping, MutableSet
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiofiles
@@ -32,8 +35,186 @@ from tools import ansi_strip as _ansi_strip_bootstrap  # noqa: F401
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
-_approval_config_snapshot: dict = {}
 _YOLO_MODE_FROZEN = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
+_approval_profile_context: contextvars.ContextVar[
+    tuple[str, str] | None
+] = contextvars.ContextVar("approval_profile_scope", default=None)
+_approval_profile_aliases: dict[str, str] = {}
+_approval_profile_aliases_lock = threading.RLock()
+
+
+def _lexical_approval_profile_identity() -> str:
+    from hermes_constants import get_hermes_home
+
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_approval_profile_identity() -> str:
+    lexical = _lexical_approval_profile_identity()
+    active = _approval_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    with _approval_profile_aliases_lock:
+        return _approval_profile_aliases.get(lexical, lexical)
+
+
+@dataclass
+class _ApprovalProfileState:
+    config_snapshot: dict = field(default_factory=dict)
+    session_approved: dict[str, set[str]] = field(default_factory=dict)
+    session_yolo: set[str] = field(default_factory=set)
+    permanent_approved: set[str] = field(default_factory=set)
+
+
+_approval_profile_states: dict[str, _ApprovalProfileState] = {}
+
+
+def _approval_profile_state() -> _ApprovalProfileState:
+    identity = _current_approval_profile_identity()
+    with _approval_profile_aliases_lock:
+        return _approval_profile_states.setdefault(
+            identity,
+            _ApprovalProfileState(),
+        )
+
+
+async def _activate_approval_profile() -> str:
+    """Activate the canonical profile at an existing awaited policy edge."""
+    lexical = _lexical_approval_profile_identity()
+    active = _approval_profile_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = str(await expanduser(lexical))
+        is_absolute = (
+            expanded.startswith(("/", "\\\\"))
+            or (len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in "/\\")
+        )
+        if not is_absolute:
+            expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        canonical = os.path.normcase(str(await realpath(expanded)))
+    with _approval_profile_aliases_lock:
+        _approval_profile_aliases[lexical] = canonical
+        if lexical != canonical and lexical in _approval_profile_states:
+            staged = _approval_profile_states.pop(lexical)
+            target = _approval_profile_states.setdefault(
+                canonical,
+                _ApprovalProfileState(),
+            )
+            if staged.config_snapshot:
+                target.config_snapshot.clear()
+                target.config_snapshot.update(staged.config_snapshot)
+            for session_key, approvals in staged.session_approved.items():
+                target.session_approved.setdefault(session_key, set()).update(
+                    approvals
+                )
+            target.session_yolo.update(staged.session_yolo)
+            target.permanent_approved.update(staged.permanent_approved)
+    _approval_profile_context.set((lexical, canonical))
+    return canonical
+
+
+class _ScopedApprovalMapping(MutableMapping):
+    """Dict-compatible view preserving existing private test patch points."""
+
+    def __init__(self, field_name: str) -> None:
+        self._field_name = field_name
+
+    def _active(self) -> dict:
+        return getattr(_approval_profile_state(), self._field_name)
+
+    def __getitem__(self, key):
+        return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        del self._active()[key]
+
+    def __iter__(self):
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def clear(self) -> None:
+        self._active().clear()
+
+
+class _ScopedApprovalSet(MutableSet):
+    """Set-compatible view over the active profile's approval state."""
+
+    def __init__(self, field_name: str) -> None:
+        self._field_name = field_name
+
+    def _active(self) -> set:
+        return getattr(_approval_profile_state(), self._field_name)
+
+    def __contains__(self, value) -> bool:
+        return value in self._active()
+
+    def __iter__(self):
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def add(self, value) -> None:
+        self._active().add(value)
+
+    def discard(self, value) -> None:
+        self._active().discard(value)
+
+    def clear(self) -> None:
+        self._active().clear()
+
+    def update(self, values) -> None:
+        self._active().update(values)
+
+
+class _ScopedApprovalLock:
+    """Per-loop/profile async lock with no closed-loop ownership."""
+
+    def __init__(self) -> None:
+        self._locks: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            dict[str, weakref.ReferenceType[asyncio.Lock]],
+        ] = weakref.WeakKeyDictionary()
+        self._locks_guard = threading.RLock()
+        self._acquired: contextvars.ContextVar[asyncio.Lock | None] = (
+            contextvars.ContextVar("approval_allowlist_lock", default=None)
+        )
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        profile = _current_approval_profile_identity()
+        with self._locks_guard:
+            locks = self._locks.setdefault(loop, {})
+            lock_ref = locks.get(profile)
+            lock = lock_ref() if lock_ref is not None else None
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[profile] = weakref.ref(lock)
+            return lock
+
+    async def __aenter__(self) -> None:
+        lock = self._lock()
+        await lock.acquire()
+        self._acquired.set(lock)
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        lock = self._acquired.get()
+        self._acquired.set(None)
+        if lock is not None:
+            lock.release()
+
+
+_approval_config_snapshot: MutableMapping = _ScopedApprovalMapping(
+    "config_snapshot"
+)
 _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
@@ -49,10 +230,14 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _elicitation_approval_callback: contextvars.ContextVar[object | None] = (
     contextvars.ContextVar("elicitation_approval_callback", default=None)
 )
-_session_approved: dict[str, set[str]] = {}
-_session_yolo: set[str] = set()
-_permanent_approved: set[str] = set()
-_allowlist_write_lock = asyncio.Lock()
+_session_approved: MutableMapping[str, set[str]] = _ScopedApprovalMapping(
+    "session_approved"
+)
+_session_yolo: MutableSet[str] = _ScopedApprovalSet("session_yolo")
+_permanent_approved: MutableSet[str] = _ScopedApprovalSet(
+    "permanent_approved"
+)
+_allowlist_write_lock = _ScopedApprovalLock()
 
 
 def set_current_session_key(session_key: str) -> contextvars.Token[str]:
@@ -151,9 +336,15 @@ def get_current_session_key(default: str = "default") -> str:
     try:
         from gateway.session_context import get_session_env
 
-        return get_session_env("HERMES_SESSION_KEY", default)
+        gateway_key = get_session_env("HERMES_SESSION_KEY", "")
+        if gateway_key:
+            return gateway_key
+        library_session_id = get_session_env("HERMES_SESSION_ID", "")
+        if library_session_id:
+            return library_session_id
     except Exception:
-        return os.getenv("HERMES_SESSION_KEY", default)
+        pass
+    return os.getenv("HERMES_SESSION_KEY", default)
 
 
 def approve_session(session_key: str, pattern_key: str) -> None:
@@ -161,24 +352,44 @@ def approve_session(session_key: str, pattern_key: str) -> None:
     _session_approved.setdefault(session_key, set()).add(pattern_key)
 
 
-def enable_session_yolo(session_key: str) -> None:
+async def _release_permission_mode_dependents(session_key: str) -> None:
+    """Drop resources whose immutable mode is derived from Hermes YOLO."""
+    try:
+        from tools.computer_use import release_computer_use_session
+
+        await release_computer_use_session(session_key)
+    except Exception:
+        logger.debug(
+            "Failed to release permission-mode dependent resources for %s",
+            session_key,
+            exc_info=True,
+        )
+
+
+async def enable_session_yolo(session_key: str) -> None:
     """Enable approval bypass for one session."""
+    await _activate_approval_profile()
     if session_key:
         _session_yolo.add(session_key)
+        await _release_permission_mode_dependents(session_key)
 
 
-def disable_session_yolo(session_key: str) -> None:
+async def disable_session_yolo(session_key: str) -> None:
     """Disable approval bypass for one session."""
+    await _activate_approval_profile()
     if session_key:
         _session_yolo.discard(session_key)
+        await _release_permission_mode_dependents(session_key)
 
 
-def clear_session(session_key: str) -> None:
+async def clear_session(session_key: str) -> None:
     """Remove all in-memory approval state for one session."""
+    await _activate_approval_profile()
     if not session_key:
         return
     _session_approved.pop(session_key, None)
     _session_yolo.discard(session_key)
+    await _release_permission_mode_dependents(session_key)
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -218,12 +429,23 @@ def approve_permanent(pattern_key: str) -> None:
     _permanent_approved.add(pattern_key)
 
 
-def load_permanent(patterns: set[str]) -> None:
+def load_permanent(patterns: set):
     _permanent_approved.update(patterns)
+
+
+def _replace_permanent(patterns: set[str]) -> None:
+    _permanent_approved.clear()
+    _permanent_approved.update(patterns)
+
+
+def _replace_approval_config(snapshot: dict) -> None:
+    _approval_config_snapshot.clear()
+    _approval_config_snapshot.update(snapshot)
 
 
 async def load_permanent_allowlist() -> set[str]:
     """Load the root ``command_allowlist`` config and sync in-memory state."""
+    await _activate_approval_profile()
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -232,21 +454,26 @@ async def load_permanent_allowlist() -> set[str]:
         patterns = {
             value for value in values if isinstance(value, str) and value.strip()
         }
-        load_permanent(patterns)
+        _replace_permanent(patterns)
         return patterns
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.warning("Failed to load permanent allowlist: %s", exc)
         return set()
 
 
-async def save_permanent_allowlist(patterns: set[str]) -> None:
+async def save_permanent_allowlist(patterns: set):
     """Atomically persist the root ``command_allowlist`` without blocking I/O."""
     from hermes_constants import get_config_path
     from utils import IndentDumper
 
+    await _activate_approval_profile()
     config_path = get_config_path()
-    async with _allowlist_write_lock:
-        try:
+    stored_patterns = set(patterns)
+
+    async def persist() -> None:
+        async with _allowlist_write_lock:
             raw_config: dict = {}
             if await aiofiles.os.path.isfile(config_path):
                 async with aiofiles.open(config_path, encoding="utf-8") as handle:
@@ -254,7 +481,7 @@ async def save_permanent_allowlist(patterns: set[str]) -> None:
                 if isinstance(loaded, dict):
                     raw_config = loaded
 
-            raw_config["command_allowlist"] = sorted(patterns)
+            raw_config["command_allowlist"] = sorted(stored_patterns)
             serialized = yaml.dump(
                 raw_config,
                 Dumper=IndentDumper,
@@ -288,8 +515,26 @@ async def save_permanent_allowlist(patterns: set[str]) -> None:
                     await aiofiles.os.remove(temp_path)
                 except FileNotFoundError:
                     pass
+
+    task = asyncio.create_task(
+        persist(),
+        name="approval-allowlist-save",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
         except Exception as exc:
             logger.warning("Could not save allowlist: %s", exc)
+            break
+    if cancellation is not None:
+        raise cancellation
 
 
 # Sensitive write targets that should trigger approval even when referenced
@@ -540,7 +785,12 @@ async def _check_sudo_stdin_guard(command: str) -> tuple:
     Returns:
         (is_blocked: bool, description: str | None)
     """
-    if "SUDO_PASSWORD" in os.environ:
+    from agent.secret_scope import get_secret
+
+    # Presence, including an explicitly empty value, is the upstream contract.
+    # Resolve it through the active profile so a foreign process-global value
+    # cannot disable this hard guard for another multiplexed agent.
+    if get_secret("SUDO_PASSWORD") is not None:
         return (False, None)
     normalized = (await _normalize_command_for_detection(command)).lower()
     if _SUDO_STDIN_RE.search(normalized):
@@ -2414,22 +2664,29 @@ def _should_skip_container_guards(
 
 async def _load_approval_config_snapshot() -> None:
     """Refresh approval configuration at an async command boundary."""
-    global _approval_config_snapshot
+    await _activate_approval_profile()
 
     try:
         from hermes_cli.config import load_config_readonly
 
         config = await load_config_readonly()
         approvals = config.get("approvals", {}) if isinstance(config, dict) else {}
-        _approval_config_snapshot = approvals if isinstance(approvals, dict) else {}
+        _replace_approval_config(
+            approvals if isinstance(approvals, dict) else {}
+        )
         allowlist = config.get("command_allowlist") or []
-        if isinstance(allowlist, list):
-            load_permanent(
-                {entry for entry in allowlist if isinstance(entry, str) and entry}
-            )
+        patterns = (
+            {entry for entry in allowlist if isinstance(entry, str) and entry}
+            if isinstance(allowlist, list)
+            else set()
+        )
+        _replace_permanent(patterns)
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.warning("Failed to load approval config", exc_info=True)
-        _approval_config_snapshot = {}
+        _replace_approval_config({})
+        _replace_permanent(set())
 
 
 def _format_tirith_description(tirith_result: dict) -> str:
@@ -2742,6 +2999,156 @@ async def check_all_command_guards(
         "message": (
             f"BLOCKED: Command {outcome} by the user. The user has NOT consented "
             "to this action. Do NOT retry or rephrase it."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": outcome,
+        "user_consent": False,
+    }
+
+
+async def check_execute_code_guard(
+    code: str,
+    env_type: str,
+    has_host_access: bool = False,
+) -> dict:
+    """Approve a whole execute_code script before its child is spawned."""
+    await _load_approval_config_snapshot()
+    pattern_key = "execute_code"
+    description = (
+        "execute_code script execution. The script can spawn subprocesses or "
+        "mutate files without passing through terminal command approval; "
+        "approval is one-shot for this run."
+    )
+
+    if env_type == "vercel_sandbox" or _should_skip_container_guards(
+        env_type, has_host_access=has_host_access
+    ):
+        return {"approved": True, "message": None}
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or _get_approval_mode() == "off"
+    ):
+        return {"approved": True, "message": None}
+
+    cron_context = is_truthy_value(os.getenv("HERMES_CRON_SESSION", ""))
+    cron_mode = str(_get_approval_config().get("cron_mode", "deny")).lower()
+    if cron_context:
+        if cron_mode == "deny":
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: execute_code runs arbitrary local Python "
+                    "(including subprocess calls that bypass shell-string "
+                    "approval checks). Cron jobs run without a user present "
+                    "to approve it. Use normal tools instead, or set "
+                    "approvals.cron_mode: approve only if this cron profile "
+                    "is intentionally trusted."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
+        return {"approved": True, "message": None}
+
+    ask = is_truthy_value(os.getenv("HERMES_EXEC_ASK", ""))
+    gateway = is_truthy_value(os.getenv("HERMES_GATEWAY_SESSION", ""))
+    # Match upstream's whole-script gate: ordinary interactive sessions rely
+    # on the per-call terminal guards inside execute_code. Only gateway/ask
+    # contexts approve the script as a whole before spawning it.
+    if not ask and not gateway:
+        return {"approved": True, "message": None}
+
+    session_key = get_current_session_key()
+    if is_approved(session_key, pattern_key):
+        return {"approved": True, "message": None}
+
+    command = f"execute_code <<'PY'\n{code}\nPY"
+    smart_denied = False
+    if _get_approval_mode() == "smart":
+        observer_payload = await _prepare_smart_approval_observer(
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+        )
+        verdict = await _smart_approve(command, description)
+        await _observe_smart_approval_verdict(observer_payload, verdict)
+        if verdict == "approve":
+            return {
+                "approved": True,
+                "message": None,
+                "smart_approved": True,
+                "description": description,
+            }
+        smart_denied = verdict == "deny"
+
+    try:
+        from tools.terminal_tool import _get_approval_callback
+
+        approval_callback = _get_approval_callback()
+    except Exception:
+        approval_callback = None
+    if approval_callback is None:
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: approval required ({description}) but no native async "
+                "approval callback is registered."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    await _fire_approval_hook(
+        "pre_approval_request",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+    )
+    choice = await prompt_dangerous_approval(
+        command,
+        description,
+        approval_callback=approval_callback,
+        allow_permanent=not smart_denied,
+        smart_denied=smart_denied,
+    )
+    await _fire_approval_hook(
+        "post_approval_response",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
+    )
+    normalized = str(choice).strip().lower()
+    if normalized in {"once", "session", "always"}:
+        if not smart_denied and normalized in {"session", "always"}:
+            approve_session(session_key, pattern_key)
+            if normalized == "always":
+                approve_permanent(pattern_key)
+                await save_permanent_allowlist(_permanent_approved)
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": description,
+        }
+
+    outcome = "timeout" if normalized == "timeout" else "denied"
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: execute_code script {outcome} by the user. The user has "
+            "NOT consented to running this code. Do NOT retry or rephrase it."
         ),
         "pattern_key": pattern_key,
         "description": description,

@@ -142,6 +142,34 @@ async def test_build_system_prompt_records_stable_prefix():
 
 
 @pytest.mark.asyncio
+async def test_nous_subscription_block_order_and_stable_prefix():
+    agent = _make_agent(
+        valid_tool_names=["computer_use"],
+        _parallel_tool_call_guidance=False,
+        _tool_use_enforcement=True,
+    )
+    subscription_prompt = AsyncMock(return_value="NOUS_SUBSCRIPTION")
+
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", subscription_prompt),
+        patch(
+            "agent.prompt_builder.computer_use_guidance",
+            return_value="COMPUTER_USE",
+        ),
+    ):
+        first = (await build_system_prompt_parts(agent))["stable"]
+        second = (await build_system_prompt_parts(agent))["stable"]
+
+    assert first.encode() == second.encode()
+    assert first.index("COMPUTER_USE") < first.index("NOUS_SUBSCRIPTION")
+    assert first.index("NOUS_SUBSCRIPTION") < first.index("# Tool-use enforcement")
+    assert subscription_prompt.await_args_list[0].args == (agent.valid_tool_names,)
+
+
+@pytest.mark.asyncio
 async def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt

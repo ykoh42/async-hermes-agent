@@ -78,6 +78,7 @@ def test_two_processes_each_complete_local_mcp_discovery(tmp_path):
             mcp_tool._load_mcp_config = load_mcp_config
 
             async def fake_register_mcp_servers(servers):
+                await mcp_tool._activate_mcp_scope()
                 tool_name = "mcp__test_srv__ping"
                 mcp_tool._servers["test_srv"] = SimpleNamespace(
                     _registered_tool_names=[tool_name],
@@ -96,8 +97,10 @@ def test_two_processes_each_complete_local_mcp_discovery(tmp_path):
             mcp_tool.register_mcp_servers = fake_register_mcp_servers
             started.write_text("1", encoding="utf-8")
 
-            result = asyncio.run(mcp_tool.discover_mcp_tools())
-            server = mcp_tool._servers.get("test_srv")
+            async def run_discovery():
+                result = await mcp_tool.discover_mcp_tools()
+                return result, mcp_tool._servers.get("test_srv")
+            result, server = asyncio.run(run_discovery())
             output.write_text(
                 json.dumps(
                     {

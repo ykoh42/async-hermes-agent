@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
@@ -156,9 +157,7 @@ async def _load_image_gen_config() -> Dict[str, Any]:
 
 async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
-    import os
-
-    env_override = os.environ.get("OPENAI_IMAGE_MODEL")
+    env_override = get_secret("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
         return env_override, _MODELS[env_override]
 

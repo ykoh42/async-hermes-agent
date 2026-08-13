@@ -1008,7 +1008,7 @@ async def canonical_custom_identity(
         except Exception:
             candidate = ""
     if not candidate:
-        candidate = os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip()
+        candidate = _getenv("HERMES_INFERENCE_PROVIDER", "").strip()
 
     candidate_norm = _normalize_custom_provider_name(candidate)
     # A bare/non-routable candidate cannot heal a bare custom override.
@@ -2171,7 +2171,7 @@ async def resolve_runtime_provider(
             target_model or model_cfg.get("default") or ""
         ).strip()
         has_bearer_token = bool(
-            os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip()
+            _getenv("AWS_BEARER_TOKEN_BEDROCK", "").strip()
         )
         use_anthropic = (
             is_anthropic_bedrock_model(current_model) and not has_bearer_token

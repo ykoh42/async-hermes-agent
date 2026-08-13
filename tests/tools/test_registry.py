@@ -1,17 +1,24 @@
 """Tests for the central tool registry."""
 
 import asyncio
+import contextvars
+import inspect
 import json
 import logging
+import os
+import subprocess
+import sys
 import threading
-from unittest.mock import patch
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tools.registry import (
     ToolRegistry,
-    _BUILTIN_TOOL_MODULES,
     _check_fn_cached,
+    _module_registers_tools,
     discover_builtin_tools,
     get_cached_check_fn_result,
     invalidate_check_fn_cache,
@@ -87,6 +94,9 @@ class TestRegisterAndDispatch:
     @pytest.mark.asyncio
     async def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
         """Parallel MCP registrations with one name leave exactly one owner."""
+        from tools.mcp_tool import _activate_mcp_scope
+
+        await _activate_mcp_scope()
         reg = ToolRegistry()
         barrier = threading.Barrier(3)
         errors = []
@@ -108,8 +118,14 @@ class TestRegisterAndDispatch:
                 errors.append(exc)
 
         threads = [
-            threading.Thread(target=_register, args=("mcp-foo-bar", "dash")),
-            threading.Thread(target=_register, args=("mcp-foo_bar", "underscore")),
+            threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(_register, "mcp-foo-bar", "dash"),
+            ),
+            threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(_register, "mcp-foo_bar", "underscore"),
+            ),
         ]
 
         with caplog.at_level(logging.ERROR, logger="tools.registry"):
@@ -312,17 +328,263 @@ class TestCheckFnExceptionHandling:
 
 
 class TestBuiltinDiscovery:
-    def test_imports_the_fixed_async_runtime_tool_modules(self):
-        with patch("tools.registry.importlib.import_module"):
-            imported = discover_builtin_tools()
+    def test_public_signature_preserves_upstream_arguments(self):
+        signature = inspect.signature(discover_builtin_tools)
 
-        assert imported == list(_BUILTIN_TOOL_MODULES)
+        assert list(signature.parameters) == ["tools_dir"]
+        assert signature.parameters["tools_dir"].default is None
+        assert inspect.iscoroutinefunction(discover_builtin_tools)
 
-    def test_tools_dir_argument_does_not_expand_the_audited_surface(self, tmp_path):
-        with patch("tools.registry.importlib.import_module"):
-            imported = discover_builtin_tools(tmp_path)
+    @pytest.mark.asyncio
+    async def test_discovers_all_real_self_registering_builtin_modules(self):
+        tools_dir = Path(__file__).resolve().parents[2] / "tools"
+        expected = []
+        for path in sorted(tools_dir.glob("*.py")):
+            if path.name in {"__init__.py", "registry.py", "mcp_tool.py"}:
+                continue
+            if await _module_registers_tools(path):
+                expected.append(f"tools.{path.stem}")
 
-        assert imported == list(_BUILTIN_TOOL_MODULES)
+        with (
+            patch("tools.registry._load_discovery_cache", AsyncMock(return_value={})),
+            patch("tools.registry._save_discovery_cache", AsyncMock()),
+            patch(
+                "tools.registry._locate_source_module",
+                AsyncMock(
+                    side_effect=lambda name: (
+                        tools_dir / f"{name.rsplit('.', 1)[-1]}.py",
+                        False,
+                    )
+                ),
+            ),
+            patch(
+                "tools.registry._load_source_module",
+                AsyncMock(side_effect=lambda name, *_a, **_k: ModuleType(name)),
+            ),
+        ):
+            imported = await discover_builtin_tools(tools_dir)
+
+        assert imported == expected
+        assert "tools.computer_use_tool" in imported
+        assert "tools.tts_tool" in imported
+
+    @pytest.mark.asyncio
+    async def test_skips_mcp_tool_and_honors_tools_dir(self, tmp_path):
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "__init__.py").write_text("", encoding="utf-8")
+        registration = (
+            "from tools.registry import registry\n"
+            "registry.register(name='x', toolset='x', schema={}, handler=None)\n"
+        )
+        (tools_dir / "mcp_tool.py").write_text(registration, encoding="utf-8")
+        (tools_dir / "alpha.py").write_text(registration, encoding="utf-8")
+
+        loader = AsyncMock(
+            side_effect=lambda name, *_a, **_k: ModuleType(name),
+        )
+        with (
+            patch("tools.registry._load_discovery_cache", AsyncMock(return_value={})),
+            patch("tools.registry._save_discovery_cache", AsyncMock()),
+            patch(
+                "tools.registry._locate_source_module",
+                AsyncMock(
+                    side_effect=lambda name: (
+                        tools_dir / f"{name.rsplit('.', 1)[-1]}.py",
+                        False,
+                    )
+                ),
+            ),
+            patch("tools.registry._load_source_module", loader),
+        ):
+            imported = await discover_builtin_tools(tools_dir)
+
+        assert imported == ["tools.alpha"]
+        assert loader.await_count == 1
+        assert loader.await_args.args == ("tools.alpha", tools_dir / "alpha.py")
+        assert loader.await_args.kwargs == {"package_dir": tools_dir}
+
+    @pytest.mark.asyncio
+    async def test_cached_verdict_avoids_source_rescan(self, tmp_path):
+        source_file = tmp_path / "alpha.py"
+        source_file.write_text(
+            "from tools.registry import registry\nregistry.register()\n",
+            encoding="utf-8",
+        )
+        stat_result = source_file.stat()
+        absolute_path = str(source_file.resolve())
+        cached = {
+            absolute_path: [
+                stat_result.st_mtime_ns,
+                stat_result.st_size,
+                True,
+            ]
+        }
+
+        scanner = AsyncMock()
+        with (
+            patch("tools.registry._load_discovery_cache", AsyncMock(return_value=cached)),
+            patch("tools.registry._save_discovery_cache", AsyncMock()) as save_cache,
+            patch("tools.registry._module_registers_tools", scanner),
+            patch(
+                "tools.registry._locate_source_module",
+                AsyncMock(return_value=(source_file, False)),
+            ),
+            patch(
+                "tools.registry._load_source_module",
+                AsyncMock(
+                    side_effect=lambda name, *_a, **_k: ModuleType(name),
+                ),
+            ),
+        ):
+            imported = await discover_builtin_tools(tmp_path)
+
+        assert imported == ["tools.alpha"]
+        scanner.assert_not_awaited()
+        save_cache.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_import_failure_isolated_and_excluded(self, tmp_path, caplog):
+        for name in ("alpha", "beta"):
+            (tmp_path / f"{name}.py").write_text(
+                "from tools.registry import registry\nregistry.register()\n",
+                encoding="utf-8",
+            )
+
+        async def load(name, *_args, **_kwargs):
+            if name == "tools.alpha":
+                raise RuntimeError("broken")
+            return ModuleType(name)
+
+        with (
+            patch("tools.registry._load_discovery_cache", AsyncMock(return_value={})),
+            patch("tools.registry._save_discovery_cache", AsyncMock()),
+            patch(
+                "tools.registry._locate_source_module",
+                AsyncMock(
+                    side_effect=lambda name: (
+                        tmp_path / f"{name.rsplit('.', 1)[-1]}.py",
+                        False,
+                    )
+                ),
+            ),
+            patch("tools.registry._load_source_module", AsyncMock(side_effect=load)),
+            caplog.at_level(logging.WARNING, logger="tools.registry"),
+        ):
+            imported = await discover_builtin_tools(tmp_path)
+
+        assert imported == ["tools.beta"]
+        assert "Could not import tool module tools.alpha" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_concurrent_discovery_executes_each_module_once(self, tmp_path):
+        source_file = tmp_path / "async_registry_probe.py"
+        source_file.write_text(
+            "from tools.registry import registry\nregistry.register()\n",
+            encoding="utf-8",
+        )
+        module_name = "tools.async_registry_probe"
+
+        async def load(name, *_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            module = ModuleType(name)
+            sys.modules[name] = module
+            return module
+
+        loader = AsyncMock(side_effect=load)
+        try:
+            with (
+                patch(
+                    "tools.registry._load_discovery_cache",
+                    AsyncMock(return_value={}),
+                ),
+                patch("tools.registry._save_discovery_cache", AsyncMock()),
+                patch(
+                    "tools.registry._locate_source_module",
+                    AsyncMock(return_value=(source_file, False)),
+                ),
+                patch("tools.registry._load_source_module", loader),
+            ):
+                first, second = await asyncio.gather(
+                    discover_builtin_tools(tmp_path),
+                    discover_builtin_tools(tmp_path),
+                )
+        finally:
+            sys.modules.pop(module_name, None)
+
+        assert first == [module_name]
+        assert second == [module_name]
+        assert loader.await_count == 1
+
+    def test_cold_model_tools_discovery_is_non_blocking_and_complete(
+        self,
+        tmp_path,
+    ):
+        repository = Path(__file__).resolve().parents[2]
+        script = """
+import asyncio
+import os
+import traceback
+from pathlib import Path
+
+from blockbuster import BlockBuster
+import model_tools
+from tools.registry import _module_registers_tools, registry
+
+
+async def main():
+    tools_dir = Path(model_tools.__file__).parent / "tools"
+    guard = BlockBuster()
+    guard.activate()
+    try:
+        expected = []
+        for filename in sorted(await __import__("aiofiles.os").os.listdir(tools_dir)):
+            path = tools_dir / filename
+            if path.suffix != ".py" or path.name in {
+                "__init__.py", "registry.py", "mcp_tool.py"
+            }:
+                continue
+            if await _module_registers_tools(path):
+                expected.append(f"tools.{path.stem}")
+        discovered = await model_tools.discover_builtin_tools(tools_dir)
+        names = await model_tools.get_all_tool_names()
+    finally:
+        guard.deactivate()
+
+    assert discovered == expected
+    assert len(discovered) == 24
+    assert len(names) == 48
+    assert "computer_use" in names
+    assert "text_to_speech" in names
+    for name in names:
+        entry = registry.get_entry(name)
+        assert entry is not None
+        assert entry.schema["name"] == name
+
+
+try:
+    asyncio.run(main())
+except BaseException:
+    traceback.print_exc()
+    os._exit(1)
+# ``forbiddenfruit`` (used internally by BlockBuster) segfaults during a
+# pristine macOS interpreter shutdown after restoring cursed built-in types.
+# Assertions and cleanup have completed; avoid that third-party finalizer.
+os._exit(0)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", script],
+            cwd=repository,
+            env={**os.environ, "HERMES_HOME": str(tmp_path / "hermes")},
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert completed.returncode == 0, (
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
 
 
 class TestEmojiMetadata:

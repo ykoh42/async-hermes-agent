@@ -36,8 +36,10 @@ import os
 import re
 import shutil
 import stat
+import threading
 import time
 import uuid
+import weakref
 import zipfile
 from collections.abc import Awaitable
 from pathlib import Path
@@ -52,7 +54,9 @@ import yaml
 
 from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider
+from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active
 from agent.skill_commands import extract_user_instruction_from_skill_message
+from tools.environments.local import build_subprocess_env
 from tools.registry import tool_error
 from utils import env_var_enabled
 
@@ -170,7 +174,26 @@ _LEGACY_RECOVERY_LOCK_FILENAME = "legacy-recovery.lock"
 _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
 _INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
 _ENDPOINT_SAFETY_CACHE: dict[str, bool] = {}
-_ENDPOINT_SAFETY_LOCK = asyncio.Lock()
+_ENDPOINT_SAFETY_CACHE_GUARD = threading.RLock()
+_ENDPOINT_SAFETY_LOCKS_GUARD = threading.RLock()
+_ENDPOINT_SAFETY_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _endpoint_safety_lock() -> asyncio.Lock:
+    """Return a live endpoint-cache lock for the current event loop."""
+    loop = asyncio.get_running_loop()
+    with _ENDPOINT_SAFETY_LOCKS_GUARD:
+        for candidate in tuple(_ENDPOINT_SAFETY_LOCKS):
+            if candidate.is_closed():
+                _ENDPOINT_SAFETY_LOCKS.pop(candidate, None)
+        lock_ref = _ENDPOINT_SAFETY_LOCKS.get(loop)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            _ENDPOINT_SAFETY_LOCKS[loop] = weakref.ref(lock)
+        return lock
 
 
 class _OpenVikingHTTPError(RuntimeError):
@@ -212,6 +235,27 @@ def _format_openviking_exception(error: Exception) -> str:
         response = getattr(error, "response", None)
         status_code = getattr(response, "status_code", None)
     return _sanitize_openviking_error_message(str(error), status_code)
+
+
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned OpenViking cleanup through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 def _derive_openviking_user_text(content: Any) -> str:
@@ -295,9 +339,13 @@ class _VikingClient:
         # Account/user are local/trusted-mode tenant identity. API-key requests
         # omit these headers by default; trusted-mode retry may send them only
         # after OpenViking explicitly asks for asserted tenant identity.
-        self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
-        self._user = user or os.environ.get("OPENVIKING_USER", "default")
-        self._agent = agent if agent is not None else os.environ.get("OPENVIKING_AGENT", _DEFAULT_AGENT)
+        self._account = account or get_secret("OPENVIKING_ACCOUNT", "default")
+        self._user = user or get_secret("OPENVIKING_USER", "default")
+        self._agent = (
+            agent
+            if agent is not None
+            else get_secret("OPENVIKING_AGENT", _DEFAULT_AGENT)
+        )
         self._httpx = _get_httpx()
         if self._httpx is None:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
@@ -473,7 +521,12 @@ class _VikingClient:
         return await self.get("/api/v1/admin/accounts")
 
     async def close(self) -> None:
-        await self._http.aclose()
+        await _finish_owned_task(
+            asyncio.create_task(
+                self._http.aclose(),
+                name="openviking-http-client-close",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -812,11 +865,19 @@ def _default_ovcli_config_path() -> Path:
 
 
 def _resolve_ovcli_config_path(config_path: str = "") -> Path:
-    env_path = os.environ.get(_OVCLI_CONFIG_ENV, "").strip()
+    env_path = str(get_secret(_OVCLI_CONFIG_ENV, "") or "").strip()
     if env_path:
         return Path(env_path).expanduser()
     if config_path:
         return Path(config_path).expanduser()
+    if is_multiplex_active():
+        # The process user's ~/.openviking config is shared across profiles.
+        # Use the current profile home for the implicit default so one profile
+        # cannot borrow another account or root key. Explicit env/config paths
+        # above retain their upstream precedence.
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / _OVCLI_DEFAULT_RELATIVE_PATH
     return _default_ovcli_config_path()
 
 
@@ -890,20 +951,24 @@ async def _openviking_endpoint_is_always_blocked(candidate: str) -> bool:
     """
     from tools.url_safety import is_always_blocked_url
 
-    cached = _ENDPOINT_SAFETY_CACHE.get(candidate)
+    with _ENDPOINT_SAFETY_CACHE_GUARD:
+        cached = _ENDPOINT_SAFETY_CACHE.get(candidate)
     if cached is not None:
         return cached
-    async with _ENDPOINT_SAFETY_LOCK:
-        cached = _ENDPOINT_SAFETY_CACHE.get(candidate)
+    async with _endpoint_safety_lock():
+        with _ENDPOINT_SAFETY_CACHE_GUARD:
+            cached = _ENDPOINT_SAFETY_CACHE.get(candidate)
         if cached is not None:
             return cached
         blocked = await is_always_blocked_url(candidate)
-        _ENDPOINT_SAFETY_CACHE[candidate] = blocked
+        with _ENDPOINT_SAFETY_CACHE_GUARD:
+            _ENDPOINT_SAFETY_CACHE[candidate] = blocked
         return blocked
 
 
 def _clear_openviking_endpoint_safety_cache() -> None:
-    _ENDPOINT_SAFETY_CACHE.clear()
+    with _ENDPOINT_SAFETY_CACHE_GUARD:
+        _ENDPOINT_SAFETY_CACHE.clear()
 
 
 _openviking_endpoint_is_always_blocked.cache_clear = (  # type: ignore[attr-defined]
@@ -1044,7 +1109,8 @@ async def _load_hermes_openviking_config() -> dict:
 
 
 def _env_value(name: str) -> Optional[str]:
-    return os.environ[name].strip() if name in os.environ else None
+    value = get_secret(name)
+    return value.strip() if value is not None else None
 
 
 def _first_nonempty(*values: Optional[str], default: str = "") -> str:
@@ -1113,6 +1179,8 @@ async def _validate_openviking_reachability(endpoint: str) -> tuple[bool, str]:
             return False, "OpenViking server responded, but its /health response is not valid OpenViking."
         elif await client.health():
             return True, ""
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         if _status_code_from_error(e) is not None:
             return False, f"OpenViking server responded with {_format_openviking_exception(e)}."
@@ -1136,6 +1204,23 @@ async def _local_openviking_bind(endpoint: str) -> tuple[str, int]:
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 1933
     return host, port
+
+
+async def _build_openviking_subprocess_env(
+    provider_env: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Build a scrubbed child env with only this profile's OpenViking data."""
+    base = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("OPENVIKING_")
+    }
+    env = await build_subprocess_env(base=base, scrub_secrets=True)
+    resolved = provider_env or {}
+    for name in _OPENVIKING_ENV_KEYS:
+        if name in resolved:
+            env[name] = resolved[name]
+    return env
 
 
 def _openviking_server_log_path() -> Path:
@@ -1170,10 +1255,12 @@ async def _local_openviking_port_is_open(host: str, port: int) -> bool:
 async def _describe_local_port_listener(host: str, port: int) -> str:
     """Best-effort process identity for an occupied local TCP port."""
     try:
+        env = await _build_openviking_subprocess_env()
         lsof = await asyncio.create_subprocess_exec(
             "lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
         stdout, _stderr = await lsof.communicate()
         pid_lines = stdout.decode(errors="replace").splitlines()
@@ -1183,6 +1270,7 @@ async def _describe_local_port_listener(host: str, port: int) -> str:
                 "ps", "-p", str(pid), "-o", "comm=",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=env,
             )
             process_stdout, _process_stderr = await process.communicate()
             process_name = re.sub(
@@ -1213,7 +1301,11 @@ async def _local_listener_suffix(endpoint: str) -> str:
     return f" The listener on {host}:{port} is {listener}."
 
 
-async def _start_local_openviking_server(endpoint: str) -> tuple[str, str]:
+async def _start_local_openviking_server(
+    endpoint: str,
+    *,
+    provider_env: Optional[dict[str, str]] = None,
+) -> tuple[str, str]:
     try:
         host, port = await _local_openviking_bind(endpoint)
     except ValueError as e:
@@ -1238,6 +1330,10 @@ async def _start_local_openviking_server(endpoint: str) -> tuple[str, str]:
         )
     log_path = _openviking_server_log_path()
     try:
+        # The daemon is third-party code. Start from the shared scrubbed child
+        # environment and explicitly inject only OpenViking values resolved for
+        # this profile; never hand it the parent process credential union.
+        env = await _build_openviking_subprocess_env(provider_env)
         await aiofiles.os.makedirs(log_path.parent, exist_ok=True)
         async with aiofiles.open(log_path, "ab") as log_file:
             await log_file.flush()
@@ -1247,6 +1343,7 @@ async def _start_local_openviking_server(endpoint: str) -> tuple[str, str]:
                 stderr=log_file._file,
                 stdin=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
     except FileNotFoundError:
         return (
@@ -1366,6 +1463,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             # the user's home; an env override pointing elsewhere is skipped
             # there rather than here.
             return [str(cfg)]
+        except UnscopedSecretError:
+            raise
         except Exception:
             return []
 
@@ -1427,7 +1526,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     async def is_available(self) -> bool:
         """Check if OpenViking endpoint is configured. No network calls."""
-        if os.environ.get("OPENVIKING_ENDPOINT"):
+        if get_secret("OPENVIKING_ENDPOINT"):
             return True
         provider_config = await _load_hermes_openviking_config()
         # A non-secret endpoint saved to config.yaml counts as configured even
@@ -1442,6 +1541,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 await _load_ovcli_config(ovcli_path)
             )
             return bool(values.get("endpoint"))
+        except UnscopedSecretError:
+            raise
         except Exception:
             return False
 
@@ -1616,6 +1717,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             ovcli_path = _resolve_ovcli_config_path(str(provider_config.get("ovcli_config_path") or ""))
             try:
                 settings = await _resolve_connection_settings(provider_config)
+            except UnscopedSecretError:
+                raise
             except Exception as e:
                 return {
                     "use_ovcli_config": True,
@@ -1725,6 +1828,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             except ImportError:
                 logger.warning("httpx not installed — OpenViking plugin disabled")
                 return
+            except UnscopedSecretError:
+                raise
             except Exception as e:
                 warning_message = (
                     f"OpenViking server at {endpoint} could not be attached after auto-start: {e}. "
@@ -1780,7 +1885,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return
 
             self._runtime_start_pending = True
-            start_state, start_message = await _start_local_openviking_server(endpoint)
+            provider_env = {
+                "OPENVIKING_ENDPOINT": endpoint,
+                "OPENVIKING_API_KEY": self._api_key,
+                "OPENVIKING_ACCOUNT": self._account,
+                "OPENVIKING_USER": self._user,
+                "OPENVIKING_AGENT": self._agent,
+            }
+            start_state, start_message = await _start_local_openviking_server(
+                endpoint,
+                provider_env=provider_env,
+            )
             if start_state != _LOCAL_SERVER_STARTED:
                 self._runtime_start_pending = False
                 warning_message = (
@@ -1861,57 +1976,83 @@ class OpenVikingMemoryProvider(MemoryProvider):
         await self._acquire_run_lock()
         self._profile_prefetched_sessions.clear()
         await self._discard_client()
+        self._conn_snapshot = None
 
-        if connection_error:
-            self._failed_refresh = (
-                ("invalid-endpoint", connection_error),
-                time.monotonic(),
-            )
-            _emit_runtime_warning(
-                f"{connection_error} OpenViking memory is temporarily unavailable; "
-                "correct the endpoint and reload the configuration.",
-                warning_callback,
-            )
-            self._client = None
-        else:
-            candidate: Optional[_VikingClient] = None
-            try:
-                candidate = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
+        try:
+            if connection_error:
+                self._failed_refresh = (
+                    ("invalid-endpoint", connection_error),
+                    time.monotonic(),
                 )
-                health_state, health_message = await _classify_runtime_openviking_health(
-                    candidate,
-                    self._endpoint,
+                _emit_runtime_warning(
+                    f"{connection_error} OpenViking memory is temporarily unavailable; "
+                    "correct the endpoint and reload the configuration.",
+                    warning_callback,
                 )
-                if health_state == "healthy":
-                    self._client = candidate
-                    candidate = None
-                elif health_state == "unreachable":
-                    await self._handle_runtime_openviking_unreachable(
-                        status_callback=status_callback,
-                        warning_callback=warning_callback,
-                    )
-                elif health_state != "healthy":
-                    _emit_runtime_warning(
-                        f"{health_message} OpenViking memory is temporarily unavailable; "
-                        "Hermes will retry on a later access or when the config changes.",
-                        warning_callback,
-                    )
-                    self._client = None
-            except ImportError:
-                logger.warning("httpx not installed — OpenViking plugin disabled")
                 self._client = None
-            finally:
-                if candidate is not None:
-                    await candidate.close()
+            else:
+                candidate: Optional[_VikingClient] = None
+                try:
+                    candidate = _VikingClient(
+                        self._endpoint, self._api_key,
+                        account=self._account, user=self._user, agent=self._agent,
+                    )
+                    health_state, health_message = await _classify_runtime_openviking_health(
+                        candidate,
+                        self._endpoint,
+                    )
+                    if health_state == "healthy":
+                        self._client = candidate
+                        candidate = None
+                    elif health_state == "unreachable":
+                        await self._handle_runtime_openviking_unreachable(
+                            status_callback=status_callback,
+                            warning_callback=warning_callback,
+                        )
+                    elif health_state != "healthy":
+                        _emit_runtime_warning(
+                            f"{health_message} OpenViking memory is temporarily unavailable; "
+                            "Hermes will retry on a later access or when the config changes.",
+                            warning_callback,
+                        )
+                        self._client = None
+                except ImportError:
+                    logger.warning("httpx not installed — OpenViking plugin disabled")
+                    self._client = None
+                finally:
+                    if candidate is not None:
+                        await candidate.close()
 
-        if self._client:
-            self._conn_snapshot = (
-                self._endpoint, self._api_key, self._account, self._user, self._agent,
-            )
-            await self._recover_pending_sessions()
-            await self._refresh_system_prompt_cache()
+            if self._client:
+                self._conn_snapshot = (
+                    self._endpoint,
+                    self._api_key,
+                    self._account,
+                    self._user,
+                    self._agent,
+                )
+                await self._recover_pending_sessions()
+                await self._refresh_system_prompt_cache()
+        except BaseException:
+            async def cleanup_failed_initialize() -> None:
+                await self._discard_client()
+                await self._release_run_lock()
+
+            try:
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        cleanup_failed_initialize(),
+                        name="openviking-initialize-cleanup",
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "OpenViking initialization cleanup failed",
+                    exc_info=True,
+                )
+            raise
 
     async def _ensure_client(self) -> Optional["_VikingClient"]:
         """Return the active client, rebuilding it if the resolved config changed.
@@ -2719,6 +2860,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 try:
                     client = self._new_client()
                     owned_client = True
+                except UnscopedSecretError:
+                    raise
                 except Exception as error:
                     logger.debug("OpenViking prefetch client build failed: %s", error)
                     return ""
@@ -2767,6 +2910,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 full_read_limit=cfg["full_read_limit"],
             )
             return "\n".join(parts)
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             logger.debug("OpenViking context search failed: %s", e)
             return ""
@@ -2784,7 +2929,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _setting_value(env_name: str, config_value: Any) -> tuple[Any, str]:
-        env_value = os.environ.get(env_name)
+        env_value = get_secret(env_name)
         if env_value is not None and env_value.strip():
             return env_value, env_name
         config_key = env_name.removeprefix("OPENVIKING_").lower()
@@ -3772,11 +3917,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
             try:
                 client = self._new_client()
                 await _post_turn(client)
+            except UnscopedSecretError:
+                raise
             except Exception as e:
                 logger.debug("OpenViking sync_turn failed, reconnecting: %s", e)
                 try:
                     retry_client = self._new_client()
                     await _post_turn(retry_client)
+                except UnscopedSecretError:
+                    raise
                 except Exception as retry_error:
                     if (
                         retry_client is not None
@@ -3980,6 +4129,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "mode": "create",
             })
         except asyncio.CancelledError:
+            raise
+        except UnscopedSecretError:
             raise
         except Exception as error:
             logger.debug("OpenViking memory mirror failed: %s", error)

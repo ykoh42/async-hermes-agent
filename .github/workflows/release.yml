@@ -1,26 +1,26 @@
-name: Build GitHub release
+name: Build and publish release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*.*.*.*'
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   build:
-    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Check out the released tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
 
       - name: Install uv
@@ -30,7 +30,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python
-        run: uv python install 3.11
+        run: uv python install 3.11 3.12 3.13
 
       - name: Install ripgrep
         run: |
@@ -39,7 +39,7 @@ jobs:
 
       - name: Verify release identity
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           uv run --no-project python - <<'PY'
           import os
@@ -49,18 +49,54 @@ jobs:
 
           tag = os.environ['RELEASE_TAG']
           version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
-          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag):
               raise SystemExit(f'Unsupported release tag: {tag!r}')
           if tag != f'v{version}':
               raise SystemExit(f'Release tag {tag!r} does not match package version {version!r}')
           PY
-          git merge-base --is-ancestor HEAD origin/main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+
+      - name: Refuse an existing GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "Refusing to rebuild an existing draft or published release for $RELEASE_TAG" >&2
+            echo "Rerun only the failed jobs from the original workflow run." >&2
+            exit 1
+          fi
 
       - name: Verify lockfile
         run: uv lock --check
 
       - name: Install project and test dependencies
         run: uv sync --locked --python 3.11 --extra dev --extra bedrock --extra hindsight
+
+      - name: Lint released source
+        run: uv run ruff check .
+
+      - name: Audit the native async runtime
+        shell: bash
+        run: |
+          {
+            printf '%s\0' run_agent.py model_tools.py mini_swe_runner.py batch_runner.py \
+              hermes_state.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
+            rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
+          } | xargs -0 -n 50 uv run ruff check --select F821
+          {
+            printf '%s\0' run_agent.py model_tools.py mini_swe_runner.py batch_runner.py \
+              hermes_state.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
+            rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
+          } | xargs -0 -n 50 uv run flake8-async --asyncio \
+            --enable=ASYNC102,ASYNC103,ASYNC104,ASYNC105,ASYNC200,ASYNC210,ASYNC211,ASYNC212,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC231,ASYNC232,ASYNC240,ASYNC250,ASYNC251,ASYNC300 \
+            --async200-blocking-calls='shutil.which->aiofiles.os.wrap(shutil.which)'
+          {
+            printf '%s\0' run_agent.py model_tools.py mini_swe_runner.py batch_runner.py \
+              hermes_state.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
+            rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
+          } | xargs -0 -n 50 uv run flake8-async --asyncio --enable=ASYNC120
 
       - name: Test released source
         run: scripts/run_tests.sh -j 4 -- -q -W error::pytest.PytestUnhandledThreadExceptionWarning
@@ -78,7 +114,8 @@ jobs:
           test -n "$wheel"
           uv venv .release-venv --python 3.11
           uv pip install --python .release-venv/bin/python "$wheel"
-          .release-venv/bin/python - <<'PY'
+          uv pip check --python .release-venv/bin/python
+          .release-venv/bin/python -I - <<'PY'
           import inspect
           from importlib.metadata import version
 
@@ -120,7 +157,8 @@ jobs:
 
           uv venv .release-hindsight-venv --python 3.11
           uv pip install --python .release-hindsight-venv/bin/python "${wheel}[hindsight]"
-          .release-hindsight-venv/bin/python - <<'PY'
+          uv pip check --python .release-hindsight-venv/bin/python
+          .release-hindsight-venv/bin/python -I - <<'PY'
           import inspect
 
           from hindsight_client import Hindsight
@@ -133,18 +171,58 @@ jobs:
           assert inspect.iscoroutinefunction(HindsightMemoryProvider.shutdown)
           PY
 
-      - name: Generate distribution checksums
-        run: cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS
+          for python_version in 3.12 3.13; do
+            compact_version="${python_version/./}"
+            compat_venv=".release-venv-${compact_version}"
+            uv venv "$compat_venv" --python "$python_version"
+            uv pip install --python "$compat_venv/bin/python" "$wheel"
+            uv pip check --python "$compat_venv/bin/python"
+            "$compat_venv/bin/python" -I - <<'PY'
+          import asyncio
+          import inspect
+
+          from run_agent import AIAgent
+          from batch_runner import BatchRunner
+          from hermes_state import SessionDB
+          from mini_swe_runner import MiniSWERunner
+
+          assert inspect.iscoroutinefunction(AIAgent.run_conversation)
+          assert inspect.iscoroutinefunction(BatchRunner.run)
+          assert inspect.iscoroutinefunction(SessionDB.close)
+          assert inspect.iscoroutinefunction(MiniSWERunner.run_task)
+
+          async def main():
+              agent = AIAgent(
+                  base_url="http://127.0.0.1:1/v1",
+                  api_key="release-smoke",
+                  model="release-smoke",
+                  skip_memory=True,
+              )
+              assert agent.client is None
+              await agent.close()
+              current = asyncio.current_task()
+              pending = [
+                  task
+                  for task in asyncio.all_tasks()
+                  if task is not current and not task.done()
+              ]
+              assert pending == [], pending
+
+          asyncio.run(main())
+          PY
+          done
 
       - name: Upload distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: python-distributions
-          path: dist/
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-  attach:
+  stage-release:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -157,8 +235,136 @@ jobs:
           name: python-distributions
           path: dist/
 
-      - name: Attach distributions to GitHub release
+      - name: Generate distribution checksums
+        run: cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS
+
+      - name: Stage a private GitHub draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/* --clobber
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          release_notes=""
+          if [ "$RELEASE_TAG" = "v0.20.0.5" ]; then
+            release_notes='Versioning migration: releases through v0.20.4 used the legacy fork-only sequence. Python version ordering will not select 0.20.0.5 as an upgrade from 0.20.4, so replace old pins and run `uv pip install --reinstall "async-hermes-agent==0.20.0.5"` once. Future versions use upstream X.Y.Z plus a fourth async revision.'
+          fi
+          if is_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            test "$is_draft" = true
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --generate-notes \
+              --notes "$release_notes" \
+              --title "$RELEASE_TAG" \
+              --verify-tag \
+              --repo "$GH_REPO"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* \
+            --clobber \
+            --repo "$GH_REPO"
+
+  publish-pypi:
+    needs: stage-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/async-hermes-agent
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+
+      - name: Publish verified distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        with:
+          packages-dir: dist/
+          skip-existing: true
+
+  verify-pypi:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+
+      - name: Verify published PyPI digests
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag):
+              raise SystemExit(f"Unsupported release tag: {tag!r}")
+
+          expected = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in Path("dist").iterdir()
+              if path.name.endswith((".whl", ".tar.gz"))
+          }
+          wheels = [name for name in expected if name.endswith(".whl")]
+          sdists = [name for name in expected if name.endswith(".tar.gz")]
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(
+                  "Expected exactly one wheel and one sdist, got "
+                  f"{sorted(expected)!r}"
+              )
+
+          url = f"https://pypi.org/pypi/async-hermes-agent/{tag[1:]}/json"
+          last_mismatch = "PyPI metadata was not available"
+          for attempt in range(12):
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "async-hermes-agent-release-verifier"},
+                  )
+                  with urllib.request.urlopen(request, timeout=10) as response:
+                      payload = json.load(response)
+                  published = {
+                      item["filename"]: item["digests"]["sha256"]
+                      for item in payload["urls"]
+                  }
+                  if published == expected:
+                      break
+                  last_mismatch = (
+                      f"published distributions {published!r} do not match "
+                      f"the verified build {expected!r}"
+                  )
+              except Exception as exc:
+                  last_mismatch = f"PyPI metadata check failed: {exc}"
+
+              if attempt == 11:
+                  raise SystemExit(last_mismatch)
+              time.sleep(5)
+          PY
+
+  publish-release:
+    needs: verify-pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the staged GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --repo "$GH_REPO"

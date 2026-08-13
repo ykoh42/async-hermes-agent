@@ -1,4 +1,4 @@
-"""Task identity is preserved by the local-only async terminal runtime."""
+"""Upstream task ids share sandboxes unless isolation is requested."""
 
 import pytest
 
@@ -28,27 +28,41 @@ def test_empty_task_id_maps_to_default():
     assert terminal_tool._resolve_container_task_id("") == "default"
 
 
-@pytest.mark.asyncio
-async def test_cwd_override_keeps_own_session_id(tmp_path):
+def test_cwd_override_collapses_to_shared_environment(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    await terminal_tool.register_task_env_overrides(
+    terminal_tool.register_task_env_overrides(
         "session-abc", {"cwd": str(workspace)}
     )
     try:
-        assert terminal_tool._resolve_container_task_id("session-abc") == "session-abc"
+        assert terminal_tool._resolve_container_task_id("session-abc") == "default"
     finally:
         terminal_tool.clear_task_env_overrides("session-abc")
 
 
-@pytest.mark.asyncio
-async def test_clear_override_removes_cwd_anchor(tmp_path):
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"docker_image": "image"},
+        {"modal_image": "image"},
+        {"singularity_image": "image"},
+        {"daytona_image": "image"},
+        {"env_type": "docker"},
+    ],
+)
+def test_backend_override_keeps_isolated_task_id(override):
+    terminal_tool.register_task_env_overrides("rollout", override)
+
+    assert terminal_tool._resolve_container_task_id("rollout") == "rollout"
+
+
+def test_clear_override_removes_cwd_anchor(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    await terminal_tool.register_task_env_overrides(
+    terminal_tool.register_task_env_overrides(
         "session", {"cwd": str(workspace)}
     )
     terminal_tool.clear_task_env_overrides("session")
 
     assert terminal_tool.resolve_task_overrides("session") == {}
-    assert await terminal_tool.get_session_cwd("session") != str(workspace)
+    assert terminal_tool.get_session_cwd("session") != str(workspace)

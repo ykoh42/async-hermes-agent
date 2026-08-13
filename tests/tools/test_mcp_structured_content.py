@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from tools import mcp_tool
 
@@ -31,14 +32,15 @@ class _FakeCallToolResult:
         self.structuredContent = structuredContent
 
 
-@pytest.fixture
-def _patch_mcp_server():
+@pytest_asyncio.fixture
+async def _patch_mcp_server():
     """Patch _servers and the MCP event loop so _make_tool_handler can run."""
     fake_session = MagicMock()
     # `_rpc_lock` is acquired by _make_tool_handler's call path (mcp_tool.py
     # ~L2008) to serialize JSON-RPC against the server — build it inside the
     # fresh loop that _fake_await_mcp_operation spins up, not at fixture import.
     fake_server = SimpleNamespace(session=fake_session, _rpc_lock=asyncio.Lock())
+    await mcp_tool._activate_mcp_scope()
     with patch.dict(mcp_tool._servers, {"test-server": fake_server}):
         yield fake_session
 

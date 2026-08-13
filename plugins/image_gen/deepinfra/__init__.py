@@ -27,14 +27,15 @@ When all three are absent (catalog unreachable, nothing configured),
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
+    _close_owned_client,
     error_response,
     resolve_aspect_ratio,
     save_b64_image,
@@ -43,6 +44,24 @@ from agent.image_gen_provider import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_client_after_request(
+    client: Any,
+    cancellation: asyncio.CancelledError | None,
+) -> None:
+    """Finish client close without replacing the request's cancellation."""
+    try:
+        await _close_owned_client(client)
+    except asyncio.CancelledError:  # noqa: ASYNC103 - request cancellation wins below
+        if cancellation is None:
+            raise
+    except Exception as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    if cancellation is not None:
+        raise cancellation
 
 
 # DeepInfra accepts standard OpenAI ``size`` strings. Mirrors the
@@ -110,7 +129,7 @@ def _resolve_model(catalog: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Option
     Takes the already-loaded ``image_gen.deepinfra`` config so ``generate()``
     reads config once instead of via a second ``load_config`` deepcopy.
     """
-    env_override = os.environ.get("DEEPINFRA_IMAGE_MODEL", "").strip()
+    env_override = (get_secret("DEEPINFRA_IMAGE_MODEL", "") or "").strip()
     if env_override:
         return env_override
     cfg_model = cfg.get("model") if isinstance(cfg, dict) else None
@@ -253,6 +272,7 @@ class DeepInfraImageGenProvider(ImageGenProvider):
             api_key=api_key,
             base_url=base_url,
         )
+        cancellation: asyncio.CancelledError | None = None
         try:
             response = await client.images.generate(
                 model=model_id,
@@ -260,6 +280,8 @@ class DeepInfraImageGenProvider(ImageGenProvider):
                 size=size,  # type: ignore[arg-type]  # _SIZES values are valid OpenAI image sizes
                 n=1,
             )
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - closed below
+            cancellation = exc
         except Exception as exc:
             logger.debug("DeepInfra image generation failed", exc_info=True)
             return error_response(
@@ -271,9 +293,7 @@ class DeepInfraImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                await close()
+            await _close_client_after_request(client, cancellation)
 
         data = getattr(response, "data", None) or []
         if not data:

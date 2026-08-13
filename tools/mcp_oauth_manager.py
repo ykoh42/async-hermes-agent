@@ -464,6 +464,54 @@ class MCPOAuthManager:
         # and leave `await pending` waiters hanging forever.
         self._inflight_tasks: set[asyncio.Task] = set()
 
+    async def _shutdown(self) -> None:
+        """Cancel owned recovery work and discard process-lifecycle providers."""
+        async with self._entries_lock:
+            entries = tuple(self._entries.values())
+            self._entries.clear()
+
+        for entry in entries:
+            for pending in tuple(entry.pending_401.values()):
+                if not pending.done():
+                    pending.cancel()
+            entry.pending_401.clear()
+
+        tasks = tuple(self._inflight_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight_tasks.clear()
+
+    async def _shutdown_profile(
+        self,
+        hermes_home: str | Path | None = None,
+    ) -> None:
+        """Discard OAuth state owned by one active Hermes profile only."""
+        profile_home, _ = await self._resolve_key("", hermes_home)
+        async with self._entries_lock:
+            selected = {
+                key: entry
+                for key, entry in self._entries.items()
+                if key[0] == profile_home
+            }
+            for key in selected:
+                self._entries.pop(key, None)
+            last_profile = not self._entries
+
+        for entry in selected.values():
+            for pending in tuple(entry.pending_401.values()):
+                if not pending.done():
+                    pending.cancel()
+            entry.pending_401.clear()
+        if last_profile:
+            tasks = tuple(self._inflight_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._inflight_tasks.clear()
+
     # -- Provider construction / caching -------------------------------------
 
     async def get_or_build_provider(
@@ -802,3 +850,19 @@ def reset_manager_for_tests() -> None:
     """Test-only helper: drop the singleton so fixtures start clean."""
     global _MANAGER
     _MANAGER = None
+
+
+async def _shutdown_manager() -> None:
+    """End the process MCP OAuth lifecycle without retaining provider state."""
+    global _MANAGER
+    manager = _MANAGER
+    _MANAGER = None
+    if manager is not None:
+        await manager._shutdown()
+
+
+async def _shutdown_profile() -> None:
+    """End only the active profile's MCP OAuth lifecycle."""
+    manager = _MANAGER
+    if manager is not None:
+        await manager._shutdown_profile()

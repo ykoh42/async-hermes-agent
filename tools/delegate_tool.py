@@ -29,8 +29,9 @@ _delegation_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextV
     default={},
 )
 import os
-import shutil
+import stat
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -49,6 +50,40 @@ from tools.terminal_tool import (
     set_approval_callback as _set_subagent_approval_cb,
 )
 from utils import base_url_hostname, is_truthy_value
+
+
+async def _executable_on_path(command: str) -> bool:
+    """Return whether *command* resolves to an executable without blocking."""
+    if not command:
+        return False
+    command_path = Path(command).expanduser()
+    if command_path.parent != Path("."):
+        candidates = [command_path]
+    else:
+        suffixes = [""]
+        if os.name == "nt":
+            suffixes = [
+                suffix.lower()
+                for suffix in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+                if suffix
+            ]
+            if command_path.suffix.lower() in suffixes:
+                suffixes = [""]
+        candidates = [
+            Path(directory) / f"{command}{suffix}"
+            for directory in os.get_exec_path()
+            for suffix in suffixes
+        ]
+    for candidate in candidates:
+        try:
+            mode = (await aiofiles.os.stat(candidate)).st_mode
+            if stat.S_ISREG(mode) and (
+                os.name == "nt" or await aiofiles.os.access(candidate, os.X_OK)
+            ):
+                return True
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+            continue
+    return False
 
 
 # Tools that children must never have access to
@@ -525,6 +560,23 @@ def _get_max_concurrent_children() -> int:
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
 
 
+_LEGACY_MAX_ASYNC_WARNED = False
+
+
+def _get_max_async_children() -> int:
+    """Return upstream's unified background delegation capacity."""
+    global _LEGACY_MAX_ASYNC_WARNED
+    cfg = _load_config()
+    if cfg.get("max_async_children") is not None and not _LEGACY_MAX_ASYNC_WARNED:
+        _LEGACY_MAX_ASYNC_WARNED = True
+        logger.warning(
+            "delegation.max_async_children is deprecated and ignored; "
+            "delegation.max_concurrent_children now caps background "
+            "delegations too. Remove the stale key from config.yaml."
+        )
+    return _get_max_concurrent_children()
+
+
 def _get_child_timeout() -> Optional[float]:
     """Read delegation.child_timeout_seconds from config.
 
@@ -855,8 +907,13 @@ async def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         except Exception:
             pass
 
+    from agent.runtime_cwd import resolve_context_cwd
+
+    configured_cwd = await resolve_context_cwd()
+    if configured_cwd is not None:
+        return str(configured_cwd)
+
     candidates = [
-        os.getenv("TERMINAL_CWD"),
         getattr(tracker, "working_dir", None),
         getattr(parent_agent, "terminal_cwd", None),
         getattr(parent_agent, "cwd", None),
@@ -1241,11 +1298,11 @@ async def _build_child_agent(
         # enabled_toolsets is None (all tools) — derive from loaded tool names
         import model_tools
 
-        parent_toolsets = {
-            ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
+        parent_toolsets = set()
+        for name in parent_agent.valid_tool_names:
+            toolset = await model_tools.get_toolset_for_tool(name)
+            if toolset is not None:
+                parent_toolsets.add(toolset)
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
@@ -1382,7 +1439,7 @@ async def _build_child_agent(
     # honoring it. Stale config should not force a child onto the ACP transport
     # and then fail at subprocess startup.
     if override_acp_command:
-        if not await aiofiles.os.wrap(shutil.which)(override_acp_command):
+        if not await _executable_on_path(override_acp_command):
             logger.warning(
                 "Ignoring acp_command=%r: binary not found on PATH; "
                 "falling back to default transport.",
@@ -1938,9 +1995,7 @@ async def _run_single_child(
         try:
             from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            await record_session_cwd(
-                child_task_id, await get_session_cwd(parent_task_id)
-            )
+            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
@@ -2640,6 +2695,12 @@ async def delegate_task(
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
+    # Capture the originating API-session wake target before child
+    # construction can replace the current child session identity.
+    from tools.async_delegation import _current_origin_session_id
+
+    origin_wake_session_id = _current_origin_session_id()
+
     # Construct children before scheduling them so the returned result order
     # always matches the model's task order.
     children = []
@@ -2725,138 +2786,149 @@ async def delegate_task(
         }
 
     if background:
-        background_tasks = parent_agent._background_delegations
-        active_count = sum(not task.done() for task in background_tasks)
-        if active_count < max_children:
-            import uuid as _uuid
+        from tools.approval import get_current_session_key
+        from tools.async_delegation import dispatch_async_delegation_batch
 
-            delegation_id = f"deleg_{_uuid.uuid4().hex[:12]}"
-            dispatched_at = time.time()
+        try:
+            from gateway.session_context import async_delivery_supported
 
-            async def _run_in_background() -> None:
-                execution_error: Exception | None = None
-                try:
-                    combined = await _execute_and_aggregate()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    execution_error = exc
-                    logger.exception(
-                        "Background delegation %s failed",
-                        delegation_id,
-                    )
-                    combined = {
-                        "results": [],
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "total_duration_seconds": round(
-                            time.time() - dispatched_at,
-                            2,
-                        ),
-                    }
+            async_delivery_ok = async_delivery_supported()
+        except Exception:
+            async_delivery_ok = True
 
-                completion = _format_background_completion(
-                    delegation_id,
-                    task_list,
-                    combined,
-                    context=context,
-                    role=top_role,
-                    model=creds["model"],
-                    dispatched_at=dispatched_at,
-                )
-                if getattr(parent_agent, "_closed", False):
-                    return
-                try:
-                    response = await parent_agent.run_conversation(
-                        completion,
-                        persist_user_display_kind="async_delegation_complete",
-                        persist_user_display_metadata={
-                            "delegation_id": delegation_id,
-                            "count": n_tasks,
-                        },
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.exception(
-                        "Background delegation %s completion delivery failed",
-                        delegation_id,
-                    )
-                    callback = getattr(parent_agent, "event_callback", None)
-                    if callback:
-                        try:
-                            callback(
-                                "delegation:error",
-                                {
-                                    "delegation_id": delegation_id,
-                                    "error": str(exc),
-                                },
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Background delegation error callback failed",
-                                exc_info=True,
-                            )
-                    return
+        wake_session_id = ""
+        if not async_delivery_ok:
+            wake_session_id = origin_wake_session_id
+            async_delivery_ok = bool(wake_session_id)
 
-                callback = getattr(parent_agent, "event_callback", None)
-                if not callback:
-                    return
-                if execution_error is not None:
-                    callback(
-                        "delegation:error",
-                        {
-                            "delegation_id": delegation_id,
-                            "error": str(execution_error),
-                        },
-                    )
-                else:
-                    callback(
-                        "delegation:complete",
-                        {
-                            "delegation_id": delegation_id,
-                            "results": combined["results"],
-                            "response": response,
-                        },
-                    )
-
-            task = asyncio.create_task(
-                _run_in_background(),
-                name=f"delegate-background-{delegation_id}",
+        if not async_delivery_ok:
+            combined = await _execute_and_aggregate()
+            combined["note"] = (
+                "background=true is not available in this session — it cannot "
+                "receive a detached subagent result after the turn ends. The "
+                "subagent(s) ran SYNCHRONOUSLY and the result is included above."
             )
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
-            for _index, _task_spec, child in children:
+            return json.dumps(combined, ensure_ascii=False)
+
+        session_key = get_current_session_key(default="")
+        origin_ui_session_id = ""
+        try:
+            from gateway.session_context import get_session_env
+
+            source = get_session_env("HERMES_SESSION_SOURCE", "")
+            origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+            if source == "tui":
+                current_session_id = str(
+                    getattr(parent_agent, "session_id", "") or ""
+                )
+                if current_session_id:
+                    session_key = current_session_id
+        except Exception:
+            origin_ui_session_id = ""
+        if not session_key:
+            session_key = str(getattr(parent_agent, "session_id", "") or "")
+
+        child_agents = [child for _index, _task, child in children]
+
+        def _batch_interrupt() -> None:
+            from agent.interrupt_compat import request_hard_interrupt
+
+            for child in child_agents:
+                try:
+                    interrupted = request_hard_interrupt(
+                        child, "Async delegation cancelled"
+                    )
+                    if not interrupted and hasattr(child, "_interrupt_requested"):
+                        child._interrupt_requested = True
+                except Exception:
+                    logger.debug(
+                        "Async delegation child interrupt failed", exc_info=True
+                    )
+
+        def _batch_progress() -> tuple:
+            parts = []
+            in_tool = False
+            for child in child_agents:
+                try:
+                    summary = child.get_activity_summary()
+                    current_tool = summary.get("current_tool")
+                    parts.append(
+                        (
+                            summary.get("api_call_count", 0),
+                            current_tool,
+                            summary.get("last_activity_ts"),
+                        )
+                    )
+                    in_tool = in_tool or bool(current_tool)
+                except Exception:
+                    parts.append(None)
+            return tuple(parts), in_tool
+
+        goals = [task["goal"] for task in task_list]
+        dispatch = await dispatch_async_delegation_batch(
+            goals=goals,
+            context=context,
+            toolsets=None,
+            role=top_role,
+            model=creds["model"],
+            session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
+            origin_session_id=wake_session_id,
+            parent_session_id=str(getattr(parent_agent, "session_id", "") or "")
+            or None,
+            runner=_execute_and_aggregate,
+            interrupt_fn=_batch_interrupt,
+            max_async_children=_get_max_async_children(),
+            progress_fn=_batch_progress,
+        )
+        if dispatch.get("status") == "dispatched":
+            # Keep the existing agent-owned task set as a cleanup index only.
+            # Completion publication and restart recovery remain owned by the
+            # durable registry; no result is injected directly from this task.
+            from tools import async_delegation as async_delegation_registry
+
+            registry_task = async_delegation_registry._tasks.get(
+                dispatch["delegation_id"]
+            )
+            background_tasks = getattr(parent_agent, "_background_delegations", None)
+            if registry_task is not None and background_tasks is not None:
+                background_tasks.add(registry_task)
+                registry_task.add_done_callback(background_tasks.discard)
+            for child in child_agents:
                 try:
                     parent_agent._active_children.remove(child)
                 except ValueError:
                     pass
+            note = (
+                "Subagent is running in the background. You and the user can "
+                "keep working; its full result re-enters the conversation as a "
+                "new message when it finishes. Do not wait or poll — just continue."
+                if n_tasks == 1
+                else f"{n_tasks} subagents are running in parallel in the "
+                "background. You and the user can keep working; they wait on "
+                "each other and their consolidated results re-enter the "
+                "conversation as a single message once ALL of them finish. "
+                "Do not wait or poll — just continue."
+            )
             return json.dumps(
                 {
                     "status": "dispatched",
                     "mode": "background",
                     "count": n_tasks,
-                    "delegation_id": delegation_id,
-                    "goals": [task["goal"] for task in task_list],
-                    "note": (
-                        "Subagent is running in the background. You and the user can "
-                        "keep working; its full result re-enters the conversation as a "
-                        "new message when it finishes. Do not wait or poll — just "
-                        "continue."
-                        if n_tasks == 1
-                        else f"{n_tasks} subagents are running in parallel in the "
-                        f"background. You and the user can keep working; they wait on "
-                        f"each other and their consolidated results re-enter the "
-                        f"conversation as a single message once ALL of them finish. "
-                        f"Do not wait or poll — just continue."
-                    ),
+                    "delegation_id": dispatch["delegation_id"],
+                    "goals": goals,
+                    "note": note,
                 },
                 ensure_ascii=False,
             )
 
         combined = await _execute_and_aggregate()
         combined["note"] = (
-            "The background delegation limit was reached, so this work was "
-            "awaited and its result is included above."
+            "The background delegation pool was at capacity "
+            "(delegation.max_concurrent_children), so the subagent(s) ran "
+            "SYNCHRONOUSLY and the result is included above. Raise "
+            "delegation.max_concurrent_children in config.yaml to allow more "
+            "concurrent background delegations."
         )
         return json.dumps(combined, ensure_ascii=False)
 

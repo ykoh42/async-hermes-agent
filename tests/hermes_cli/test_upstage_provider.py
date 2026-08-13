@@ -16,6 +16,7 @@ import types
 if "dotenv" not in sys.modules:
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    fake_dotenv.dotenv_values = lambda *args, **kwargs: {}
     sys.modules["dotenv"] = fake_dotenv
 
 

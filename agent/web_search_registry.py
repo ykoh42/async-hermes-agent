@@ -33,6 +33,7 @@ extract-capable backend.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from typing import Dict, List, Optional
 
@@ -42,7 +43,35 @@ logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, WebSearchProvider] = {}
+_plugin_providers: Dict[object, Dict[str, WebSearchProvider]] = {}
 _lock = threading.Lock()
+
+
+def _plugin_scope(
+    *, registration: bool = False, module_name: str = ""
+) -> object | None:
+    module = sys.modules.get("hermes_cli.plugins")
+    current = getattr(module, "_current_plugin_registry_scope", None)
+    scope = current(registration=registration) if callable(current) else None
+    if scope is None and registration and module_name:
+        resolve = getattr(module, "_plugin_registry_scope_for_module", None)
+        if callable(resolve):
+            return resolve(module_name)
+    return scope
+
+
+def _provider_snapshot() -> Dict[str, WebSearchProvider]:
+    with _lock:
+        providers = dict(_providers)
+        scope = _plugin_scope()
+        if scope is not None:
+            providers.update(_plugin_providers.get(scope, {}))
+        return providers
+
+
+def _clear_plugin_scope(scope: object) -> None:
+    with _lock:
+        _plugin_providers.pop(scope, None)
 
 
 def register_provider(provider: WebSearchProvider) -> None:
@@ -61,8 +90,17 @@ def register_provider(provider: WebSearchProvider) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Web provider .name must be a non-empty string")
     with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+        scope = _plugin_scope(
+            registration=True,
+            module_name=type(provider).__module__,
+        )
+        target = (
+            _plugin_providers.setdefault(scope, {})
+            if scope is not None
+            else _providers
+        )
+        existing = target.get(name)
+        target[name] = provider
     if existing is not None:
         logger.debug(
             "Web provider '%s' re-registered (was %r)",
@@ -77,8 +115,7 @@ def register_provider(provider: WebSearchProvider) -> None:
 
 def list_providers() -> List[WebSearchProvider]:
     """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
+    items = list(_provider_snapshot().values())
     return sorted(items, key=lambda p: p.name)
 
 
@@ -86,8 +123,7 @@ def get_provider(name: str) -> Optional[WebSearchProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    with _lock:
-        return _providers.get(name.strip())
+    return _provider_snapshot().get(name.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +185,7 @@ async def _resolve(
     matches the legacy preference; the dispatcher then returns a "set up a
     provider" error to the user.
     """
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = _provider_snapshot()
 
     def _capable(p: WebSearchProvider) -> bool:
         if capability == "search":
@@ -291,3 +326,4 @@ def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
     with _lock:
         _providers.clear()
+        _plugin_providers.clear()

@@ -32,6 +32,11 @@ def _provider_kwargs(model: str) -> dict:
         "quiet_mode": True,
         "skip_context_files": True,
     }
+    if PROVIDER == "lmstudio":
+        # This path validates state and memory rather than reasoning depth.
+        # GPT-OSS is less likely to emit a reasoning-only turn at low effort,
+        # avoiding a model-parser retry that is unrelated to persistence.
+        kwargs["reasoning_config"] = {"enabled": True, "effort": "low"}
     if PROVIDER == "openrouter":
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:

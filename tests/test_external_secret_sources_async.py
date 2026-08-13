@@ -163,7 +163,12 @@ async def test_disk_cache_round_trip_is_awaitable_and_private(tmp_path):
 
 @pytest.mark.asyncio
 async def test_bitwarden_encrypted_cache_round_trip(tmp_path):
-    cache_key = ("fingerprint", "project", "https://vault.example")
+    cache_key = (
+        "fingerprint",
+        "project",
+        "https://vault.example",
+        str(tmp_path),
+    )
     entry = CachedFetch(secrets={"OPENAI_API_KEY": "secret"}, fetched_at=time.time())
     await _write_encrypted_disk_cache(
         cache_key=cache_key,

@@ -138,6 +138,19 @@ blindly:
 5. Keep upstream attribution and record the new upstream baseline in the
    README when the migration is complete.
 
+## Release versioning
+
+The Python package uses four numeric release segments:
+`<upstream-major>.<upstream-minor>.<upstream-patch>.<async-revision>`. Keep the
+first three segments equal to the upstream Python package version recorded in
+`[tool.async-hermes]` in `pyproject.toml`. Increment only the fourth segment
+for fork-only releases; after porting a new upstream version, update the first
+three segments and reset the async revision to `1`. The private root npm
+metadata represents the same release as `<upstream-version>-async.<revision>`.
+
+Release tags exactly match the Python version with a `v` prefix. Never move or
+reuse an existing tag.
+
 Git history and the upstream tag are the source of removed implementation and
 documentation. Stale descriptions must not be kept in the live documentation
 as a substitute for history.

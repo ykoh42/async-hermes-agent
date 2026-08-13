@@ -104,13 +104,13 @@ _GLOBAL_ENV_EXACT = frozenset({
     "HERMES_MAX_ITERATIONS", "HERMES_MAX_TOKENS", "HERMES_API_TIMEOUT",
     "HERMES_REDACT_SECRETS", "HERMES_NOUS_TIMEOUT_SECONDS",
     "_HERMES_GATEWAY",
+    # Import-time terminal safety policy (module-level upstream constants)
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT", "TERMINAL_DISK_WARNING_GB",
     # OS / interpreter
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "PWD", "SHELL", "TMPDIR",
     "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE",
 })
-_GLOBAL_ENV_PREFIXES = (
-    "TERMINAL_",          # terminal/sandbox backend settings
-)
+_GLOBAL_ENV_PREFIXES: tuple[str, ...] = ()
 
 
 def _is_global_env(name: str) -> bool:

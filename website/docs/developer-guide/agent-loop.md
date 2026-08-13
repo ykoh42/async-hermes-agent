@@ -142,12 +142,19 @@ contracts:
 Provider, tool, compression, and persistence awaits remain cancellation
 points. Cleanup tasks are awaited so they do not leak into the host loop.
 
-## No hidden synchronous fallback
+## Synchronous fallback audit
 
-The retained active path does not call `asyncio.to_thread()`,
+The retained provider and tool transports do not call `asyncio.to_thread()`,
 `run_in_executor()`, `run_until_complete()`, or blocking future `.result()` to
-make a synchronous implementation look asynchronous. A retained provider or
-tool without a supported native-async path fails explicitly.
+hide a synchronous SDK. A retained provider or tool without a supported
+native-async path fails explicitly.
+
+The persistence layer has a documented implementation boundary:
+`aiofiles` implements regular-file operations through an executor, and
+`aiosqlite` queues embedded SQLite work to a connection thread. CPython has no
+portable asyncio API for regular files, metadata, durability operations, or
+embedded SQLite. These operations remain directly awaitable and do not block
+the host event loop, but zero-thread persistence is not a package guarantee.
 
 This rule applies to I/O. Keeping a short deterministic calculation as a
 normal `def` is expected and avoids coroutine overhead with no concurrency

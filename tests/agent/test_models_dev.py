@@ -1,7 +1,10 @@
 """Tests for agent.models_dev — models.dev registry integration."""
 import asyncio
+import gc
 import json
+import threading
 import time
+import weakref
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -153,12 +156,14 @@ class TestFetchModelsDev:
         md._models_dev_retry_after = 0
         md._models_dev_lock = None
         md._models_dev_refresh_task = None
+        md._models_dev_update_claim = None
         yield
         md._models_dev_cache = {}
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
         md._models_dev_lock = None
         md._models_dev_refresh_task = None
+        md._models_dev_update_claim = None
 
     @pytest.mark.asyncio
     async def test_disk_cache_short_circuits_network(self, tmp_path, monkeypatch):
@@ -354,6 +359,125 @@ class TestFetchModelsDev:
 
         assert network.await_count == 2
         assert md._models_dev_retry_after == 0
+
+    def test_cold_fetch_singleflight_is_loop_neutral(self, tmp_path, monkeypatch):
+        """Two event-loop threads share one public catalogue request safely."""
+        import agent.models_dev as md
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        calls_guard = threading.Lock()
+
+        async def fetch_network():
+            nonlocal calls
+            with calls_guard:
+                calls += 1
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.001)
+            return SAMPLE_REGISTRY
+
+        results = []
+        errors = []
+        loops = []
+
+        def runner():
+            loop = asyncio.new_event_loop()
+            loops.append(weakref.ref(loop))
+            try:
+                results.append(loop.run_until_complete(fetch_models_dev()))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                loop.close()
+
+        # Patch once in the owning test thread. Concurrent nested patch
+        # contexts race their restoration order and can leak an AsyncMock into
+        # later tests even when the runtime itself is correct.
+        with (
+            patch.object(md, "_disk_cache_age_seconds", new=AsyncMock(return_value=None)),
+            patch.object(md, "_load_disk_cache", new=AsyncMock(return_value={})),
+            patch.object(md, "_save_disk_cache", new=AsyncMock()),
+            patch.object(md, "_fetch_models_dev_from_network", new=fetch_network),
+        ):
+            first = threading.Thread(target=runner)
+            second = threading.Thread(target=runner)
+            first.start()
+            assert entered.wait(timeout=1)
+            second.start()
+            time.sleep(0.02)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert errors == []
+        assert results == [SAMPLE_REGISTRY, SAMPLE_REGISTRY]
+        assert calls == 1
+        gc.collect()
+        assert all(loop_ref() is None for loop_ref in loops)
+
+    def test_cancelled_owner_releases_cross_loop_waiter(self, tmp_path, monkeypatch):
+        """Owner cancellation never strands a waiter on another event loop."""
+        import agent.models_dev as md
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        owner_entered = threading.Event()
+        cancel_owner = threading.Event()
+        calls = 0
+        calls_guard = threading.Lock()
+        results = []
+        errors = []
+
+        async def fetch_network():
+            nonlocal calls
+            with calls_guard:
+                calls += 1
+                ordinal = calls
+            if ordinal == 1:
+                owner_entered.set()
+                while not cancel_owner.is_set():
+                    await asyncio.sleep(0.001)
+                raise asyncio.CancelledError
+            return SAMPLE_REGISTRY
+
+        def owner_runner():
+            try:
+                asyncio.run(fetch_models_dev())
+            except asyncio.CancelledError:
+                results.append("cancelled")
+            except BaseException as exc:
+                errors.append(exc)
+
+        def waiter_runner():
+            try:
+                results.append(asyncio.run(fetch_models_dev()))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch.object(md, "_disk_cache_age_seconds", new=AsyncMock(return_value=None)),
+            patch.object(md, "_load_disk_cache", new=AsyncMock(return_value={})),
+            patch.object(md, "_save_disk_cache", new=AsyncMock()),
+            patch.object(md, "_fetch_models_dev_from_network", new=fetch_network),
+        ):
+            owner = threading.Thread(target=owner_runner)
+            waiter = threading.Thread(target=waiter_runner)
+            owner.start()
+            assert owner_entered.wait(timeout=1)
+            waiter.start()
+            time.sleep(0.02)
+            cancel_owner.set()
+            owner.join(timeout=2)
+            waiter.join(timeout=2)
+
+        assert not owner.is_alive() and not waiter.is_alive()
+        assert errors == []
+        assert "cancelled" in results
+        assert SAMPLE_REGISTRY in results
+        assert calls == 2
 
 
 # ---------------------------------------------------------------------------

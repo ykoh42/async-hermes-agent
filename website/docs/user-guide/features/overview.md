@@ -15,12 +15,12 @@ generation while moving the retained I/O path to native async APIs.
 | Surface | What it provides |
 | --- | --- |
 | Agent loop | Interleaved reasoning, model calls, tool calls, observations, compression, and finalization |
-| Providers | Native async model transports and lazily discovered profiles |
+| Providers | Awaitable model transports and lazily discovered profiles, with documented SDK boundaries |
 | Tools | File, local terminal, web, browser, vision/media, planning, clarify, delegation, memory, and session search |
 | Skills | On-demand procedural instructions from local or shared directories |
 | MCP | Stdio and HTTP external tool servers with async lifecycle ownership |
 | Memory | Bounded file-backed memory plus optional external providers |
-| Sessions | Explicit native-async SQLite persistence and resume helpers |
+| Sessions | Explicit awaitable SQLite persistence and resume helpers |
 | Training data | Ordered trajectories, batch generation, checkpoints, statistics, and compression utilities |
 
 Learn more in [Tools](./tools.md), [Skills](./skills.md), [MCP](./mcp.md),
@@ -37,10 +37,13 @@ answer = await agent.chat("Follow-up")
 await agent.close()
 ```
 
-The retained runtime directly awaits model, tool, MCP, database, and file I/O.
-It does not use `asyncio.to_thread()`, `run_in_executor()`,
-`run_until_complete()`, or blocking `.result()` as a compatibility bridge.
-Unsupported synchronous extensions fail explicitly.
+The retained runtime directly awaits model, tool, MCP, subprocess, and database
+entry points. Unsupported synchronous provider and tool transports fail
+explicitly. Regular-file operations currently use executor-backed `aiofiles`,
+and the awaitable SQLite facade uses `aiosqlite`'s connection worker thread.
+Supported CPython versions expose no portable asyncio regular-file or embedded
+SQLite API. The package therefore guarantees directly awaitable,
+event-loop-nonblocking entry points, not zero-thread or OS-native persistence.
 
 Native async allows independent I/O-bound work to overlap; it is not a promise
 that every workload will use less CPU or memory. Provider latency, model cost,

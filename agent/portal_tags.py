@@ -78,7 +78,7 @@ def get_conversation_context() -> Optional[str]:
 
 
 def _hermes_version() -> str:
-    """Return the current Hermes release version, e.g. ``"0.13.0"``.
+    """Return the current PEP 440 package version, e.g. ``"0.20.0.5"``.
 
     Falls back to ``"unknown"`` if ``hermes_cli`` cannot be imported (should
     never happen in a real install — guarded for defensive testing).
@@ -93,7 +93,8 @@ def _hermes_version() -> str:
 def hermes_client_tag() -> str:
     """Return the ``client=...`` tag for Nous Portal requests.
 
-    Format: ``client=hermes-client-v<MAJOR>.<MINOR>.<PATCH>``.
+    The suffix is the installed package version. Async Hermes releases use
+    ``<UPSTREAM_MAJOR>.<UPSTREAM_MINOR>.<UPSTREAM_PATCH>.<ASYNC_REVISION>``.
     """
     return f"client=hermes-client-v{_hermes_version()}"
 

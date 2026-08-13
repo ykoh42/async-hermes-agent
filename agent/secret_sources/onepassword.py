@@ -53,6 +53,7 @@ from agent.secret_sources._cache import (
     CachedFetch,
     DiskCache,
     FetchResult,
+    _canonical_cache_home,
     is_valid_env_name,
 )
 from agent.secret_sources.base import (
@@ -113,10 +114,11 @@ _OP_ENV_ALLOWLIST = (
 # Cache
 # ---------------------------------------------------------------------------
 
-# In-process cache.  The key folds in str(home_path) so a HERMES_HOME switch
-# inside one long-lived process (e.g. the gateway) can't return another
-# profile's secrets from L1.  The disk layer omits home from its serialized
-# key because the file already lives under the home dir (see _disk_key_str).
+# In-process cache.  The key folds in the canonical profile home so direct
+# callers that omit home_path and callers using symlink aliases remain
+# isolated without duplicating one physical profile's entries.  The disk
+# layer omits home from its serialized key because the file already lives
+# under the home dir (see _disk_key_str).
 _CacheKey = Tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
 _CACHE: Dict[_CacheKey, CachedFetch] = {}
 
@@ -359,11 +361,12 @@ async def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
+    home_key, cache_home = await _canonical_cache_home(home_path)
     token_value = get_source_environment().get(token_env, "").strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",
-        str(home_path) if home_path is not None else "",
+        home_key,
         _refs_fingerprint(valid),
     )
 
@@ -371,7 +374,11 @@ async def fetch_onepassword_secrets(
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return dict(cached.secrets), warnings
-        disk_cached = await _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
+        disk_cached = await _DISK_CACHE.read(
+            cache_key,
+            cache_ttl_seconds,
+            cache_home,
+        )
         if disk_cached is not None:
             # Promote into L1 so later fetches in this process skip the disk read.
             _CACHE[cache_key] = disk_cached
@@ -399,7 +406,12 @@ async def fetch_onepassword_secrets(
     if use_cache and not read_errors and secrets:
         entry = CachedFetch(secrets=dict(secrets), fetched_at=time.time())
         _CACHE[cache_key] = entry
-        await _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
+        await _DISK_CACHE.write(
+            cache_key,
+            entry,
+            cache_ttl_seconds,
+            cache_home,
+        )
 
     return secrets, warnings
 

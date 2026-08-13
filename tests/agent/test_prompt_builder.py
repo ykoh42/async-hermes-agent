@@ -4,6 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
+from unittest.mock import AsyncMock
 
 import pytest
 from blockbuster import BlockBuster
@@ -17,6 +18,7 @@ from agent.prompt_builder import (
     _find_git_root,
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
+    build_nous_subscription_prompt,
     build_context_files_prompt,
     CONTEXT_FILE_MAX_CHARS,
     _dynamic_context_file_max_chars,
@@ -33,6 +35,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     WSL_ENVIRONMENT_HINT,
 )
+from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
 # =========================================================================
@@ -51,6 +54,149 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+
+def _subscription_features(*, logged_in: bool) -> NousSubscriptionFeatures:
+    return NousSubscriptionFeatures(
+        subscribed=logged_in,
+        nous_auth_present=logged_in,
+        provider_is_nous=logged_in,
+        features={
+            "web": NousFeatureState(
+                "web", "Web tools", True, logged_in, logged_in, logged_in, False, True, "firecrawl"
+            ),
+            "image_gen": NousFeatureState(
+                "image_gen", "Image generation", True, logged_in, logged_in, logged_in, False, True,
+                "Nous Subscription",
+            ),
+            "video_gen": NousFeatureState(
+                "video_gen", "Video generation", False, False, False, False, False, False, ""
+            ),
+            "tts": NousFeatureState(
+                "tts", "OpenAI TTS", True, logged_in, logged_in, logged_in, False, True, "OpenAI TTS"
+            ),
+            "stt": NousFeatureState(
+                "stt", "Speech-to-text", True, logged_in, logged_in, logged_in, False, True,
+                "OpenAI Whisper",
+            ),
+            "browser": NousFeatureState(
+                "browser", "Browser automation", True, logged_in, logged_in, logged_in, False, True,
+                "Browser Use",
+            ),
+            "modal": NousFeatureState(
+                "modal", "Modal execution", False, True, False, False, False, True, "local"
+            ),
+        },
+    )
+
+
+class TestBuildNousSubscriptionPrompt:
+    @pytest.mark.asyncio
+    async def test_includes_active_subscription_features(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features",
+            AsyncMock(return_value=_subscription_features(logged_in=True)),
+        )
+
+        prompt = await build_nous_subscription_prompt(
+            {"web_search", "browser_navigate"}
+        )
+
+        assert "Browser Use" in prompt
+        assert "Modal execution is optional" in prompt
+        assert (
+            "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, "
+            "or Browser-Use API keys" in prompt
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features",
+            AsyncMock(return_value=_subscription_features(logged_in=False)),
+        )
+
+        prompt = await build_nous_subscription_prompt({"image_generate"})
+
+        assert "suggest Nous subscription as one option" in prompt
+        assert "Do not mention subscription unless" in prompt
+
+    @pytest.mark.asyncio
+    async def test_feature_flag_off_returns_empty_prompt(self, monkeypatch):
+        managed = AsyncMock(return_value=False)
+        features = AsyncMock()
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled", managed
+        )
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features", features
+        )
+
+        assert await build_nous_subscription_prompt({"web_search"}) == ""
+        managed.assert_awaited_once_with()
+        features.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_irrelevant_tools_skip_feature_state_after_managed_gate(
+        self, monkeypatch
+    ):
+        managed = AsyncMock(return_value=True)
+        features = AsyncMock()
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled", managed
+        )
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features", features
+        )
+
+        assert await build_nous_subscription_prompt({"memory"}) == ""
+        managed.assert_awaited_once_with()
+        features.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_is_byte_stable(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features",
+            AsyncMock(return_value=_subscription_features(logged_in=True)),
+        )
+
+        first = await build_nous_subscription_prompt({"terminal"})
+        second = await build_nous_subscription_prompt({"terminal"})
+
+        expected = "\n".join(
+            [
+                "# Nous Subscription",
+                "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, OpenAI Whisper STT, and browser automation (Browser Use) by default. Modal execution is optional.",
+                "Current capability status:",
+                "- Web tools: active via Nous subscription",
+                "- Image generation: active via Nous subscription",
+                "- Video generation: not currently available",
+                "- OpenAI TTS: active via Nous subscription",
+                "- Speech-to-text: active via Nous subscription",
+                "- Browser automation: active via Nous subscription",
+                "- Modal execution: optional via Nous subscription",
+                "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.",
+                "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
+                "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
+                "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
+            ]
+        )
+        assert first == expected
+        assert first.encode() == second.encode()
 
 
 # =========================================================================
@@ -737,6 +883,12 @@ class TestOpenAIModelExecutionGuidance:
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "verification" in text or "verify" in text
         assert "correctness" in text
+
+    def test_guidance_preserves_execute_code_for_calculations(self):
+        assert (
+            "Arithmetic, math, calculations → use terminal or execute_code"
+            in OPENAI_MODEL_EXECUTION_GUIDANCE
+        )
 
 
 

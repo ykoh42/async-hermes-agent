@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import gc
 import inspect
 import json
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -60,6 +64,77 @@ async def result_of(*args, **kwargs) -> dict:
     return json.loads(await manager.skill_manage(*args, **kwargs))
 
 
+class TestWriteLockLifecycle:
+    @pytest.mark.asyncio
+    async def test_profiles_use_independent_write_locks(self, tmp_path):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        profile_a.mkdir()
+        profile_b.mkdir()
+
+        async def resolve(profile):
+            token = set_hermes_home_override(profile)
+            try:
+                return await manager._active_skill_write_lock()
+            finally:
+                reset_hermes_home_override(token)
+
+        lock_a, lock_b = await asyncio.gather(
+            resolve(profile_a),
+            resolve(profile_b),
+        )
+        assert lock_a is not lock_b
+
+    @pytest.mark.asyncio
+    async def test_symlink_profile_aliases_share_write_lock(self, tmp_path):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile = tmp_path / "profile"
+        alias = tmp_path / "alias"
+        profile.mkdir()
+        alias.symlink_to(profile, target_is_directory=True)
+
+        async def resolve(home):
+            token = set_hermes_home_override(home)
+            try:
+                return await manager._active_skill_write_lock()
+            finally:
+                reset_hermes_home_override(token)
+
+        assert await resolve(profile) is await resolve(alias)
+
+    def test_write_lock_does_not_retain_closed_loop(self, tmp_path):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        loop_refs = []
+
+        async def resolve(profile):
+            loop_refs.append(weakref.ref(asyncio.get_running_loop()))
+            token = set_hermes_home_override(profile)
+            try:
+                async with await manager._active_skill_write_lock():
+                    await asyncio.sleep(0)
+            finally:
+                reset_hermes_home_override(token)
+
+        asyncio.run(resolve(tmp_path / "profile-a"))
+        asyncio.run(resolve(tmp_path / "profile-b"))
+        gc.collect()
+
+        assert loop_refs[0]() is None
+
+
 @asynccontextmanager
 async def background_review_origin():
     token = set_current_write_origin(BACKGROUND_REVIEW)
@@ -86,6 +161,69 @@ class TestValidation:
     def test_frontmatter_contract(self):
         assert manager._validate_frontmatter(VALID_SKILL, new_skill=True) is None
         assert "frontmatter" in manager._validate_frontmatter("# No metadata")
+
+
+class TestAgentCreatedSecurityGuard:
+    @pytest.mark.asyncio
+    async def test_disabled_guard_short_circuits_scan(self, monkeypatch, tmp_path):
+        enabled = AsyncMock(return_value=False)
+        scan = AsyncMock()
+        monkeypatch.setattr(manager, "_guard_agent_created_enabled", enabled)
+        monkeypatch.setattr(manager, "scan_skill", scan)
+        assert await manager._security_scan_skill(tmp_path) is None
+        enabled.assert_awaited_once_with()
+        scan.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dangerous_agent_skill_is_blocked(self, monkeypatch, tmp_path):
+        from tools.skills_guard import Finding, ScanResult
+
+        result = ScanResult(
+            skill_name="bad",
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[
+                Finding(
+                    "env_exfil_curl",
+                    "critical",
+                    "exfiltration",
+                    "SKILL.md",
+                    1,
+                    "curl $TOKEN",
+                    "exfiltration",
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            manager, "_guard_agent_created_enabled", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(manager, "scan_skill", AsyncMock(return_value=result))
+        error = await manager._security_scan_skill(tmp_path)
+        assert "Security scan blocked this skill" in error
+        assert "env_exfil_curl" not in error  # report remains compact upstream shape
+
+    @pytest.mark.asyncio
+    async def test_config_error_disables_optional_guard(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        assert await manager._guard_agent_created_enabled() is False
+
+    @pytest.mark.asyncio
+    async def test_create_rolls_back_when_guard_blocks(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(
+            manager,
+            "_security_scan_skill",
+            AsyncMock(return_value="blocked by guard"),
+        )
+        async with isolated_skills(monkeypatch, tmp_path):
+            result = await manager._create_skill("test-skill", VALID_SKILL)
+        assert result == {"success": False, "error": "blocked by guard"}
+        assert not (tmp_path / "test-skill").exists()
 
 
 class TestSkillCrud:
@@ -548,6 +686,36 @@ class TestAsyncContract:
         assert entry.schema == manager.SKILL_MANAGE_SCHEMA
 
     @pytest.mark.asyncio
+    async def test_atomic_write_preserves_symlink_and_cross_device_fallback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target = tmp_path / "target.md"
+        target.write_text("old", encoding="utf-8")
+        link = tmp_path / "link.md"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+        original_replace = manager.aiofiles.os.replace
+
+        async def cross_device_for_target(source, destination):
+            if Path(destination) == target:
+                raise OSError(errno.EXDEV, "cross-device link")
+            await original_replace(source, destination)
+
+        monkeypatch.setattr(
+            manager.aiofiles.os,
+            "replace",
+            cross_device_for_target,
+        )
+        await manager._atomic_write_text(link, "new content")
+
+        assert link.is_symlink()
+        assert target.read_text(encoding="utf-8") == "new content"
+
+    @pytest.mark.asyncio
     async def test_repeated_cancellation_waits_for_single_delete_task(
         self,
         monkeypatch,
@@ -581,6 +749,46 @@ class TestAsyncContract:
             with pytest.raises(asyncio.CancelledError):
                 await task
             await asyncio.wait_for(delete_completed.wait(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_agent_created_scan_rolls_back_before_reraising(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        scan_started = asyncio.Event()
+        rollback_started = asyncio.Event()
+        release_rollback = asyncio.Event()
+        original_remove_tree = manager._remove_tree
+
+        async def blocked_scan(_skill_dir):
+            scan_started.set()
+            await asyncio.Event().wait()
+
+        async def controlled_remove_tree(path):
+            rollback_started.set()
+            await release_rollback.wait()
+            await original_remove_tree(path)
+
+        monkeypatch.setattr(manager, "_security_scan_skill", blocked_scan)
+        monkeypatch.setattr(manager, "_remove_tree", controlled_remove_tree)
+        async with isolated_skills(monkeypatch, tmp_path):
+            task = asyncio.create_task(manager._create_skill("test-skill", VALID_SKILL))
+            await scan_started.wait()
+            assert (tmp_path / "test-skill" / "SKILL.md").exists()
+            task.cancel()
+            await rollback_started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+
+            try:
+                assert task.done() is False
+            finally:
+                release_rollback.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        assert not (tmp_path / "test-skill").exists()
 
     @pytest.mark.asyncio
     async def test_active_path_never_calls_to_thread(

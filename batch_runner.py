@@ -42,6 +42,7 @@ import errno
 import logging
 import os
 import stat
+import subprocess
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -57,7 +58,7 @@ from toolset_distributions import (
     sample_toolsets_from_distribution,
     validate_distribution
 )
-from model_tools import TOOL_TO_TOOLSET_MAP
+from model_tools import TOOL_TO_TOOLSET_MAP, get_all_tool_names
 
 
 # Global configuration for worker processes
@@ -189,6 +190,107 @@ async def _append_jsonl_line(path: Path, payload: Dict[str, Any]) -> None:
                 cancellation = exc
     if cancellation is not None:
         raise cancellation
+
+
+async def _await_owned_batch_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned batch subprocess task through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _finish_batch_subprocess(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Kill, drain, and reap one Docker probe owned by a batch row."""
+    async def _cleanup() -> tuple[bytes | None, bytes | None]:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    return await _await_owned_batch_task(
+        asyncio.create_task(_cleanup(), name="batch-docker-probe-cleanup")
+    )
+
+
+async def _run_docker_image_command(
+    argv: List[Any],
+    *,
+    timeout: int,
+    text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run an upstream Docker image probe with native asyncio subprocess I/O."""
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    communicate_task = asyncio.create_task(
+        process.communicate(),
+        name="batch-docker-probe-communicate",
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            asyncio.shield(communicate_task),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        stdout, stderr = await _finish_batch_subprocess(  # noqa: ASYNC120 - cancellation wins
+            process, communicate_task
+        )
+        raise subprocess.TimeoutExpired(
+            argv,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    except asyncio.CancelledError as cancellation:
+        cleanup = asyncio.create_task(
+            _finish_batch_subprocess(process, communicate_task),
+            name="batch-docker-probe-cancel-cleanup",
+        )
+        try:
+            await _await_owned_batch_task(cleanup)
+        except asyncio.CancelledError:  # noqa: ASYNC103 - original re-raised
+            pass
+        raise cancellation
+    except BaseException:
+        await _finish_batch_subprocess(  # noqa: ASYNC120 - cancellation wins
+            process, communicate_task
+        )
+        raise
+
+    if text:
+        stdout = (stdout or b"").decode("utf-8", errors="replace")
+        stderr = (stderr or b"").decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(
+        argv,
+        int(process.returncode or 0),
+        stdout,
+        stderr,
+    )
 
 
 async def _list_batch_files(directory: Path) -> List[Path]:
@@ -401,10 +503,90 @@ async def _process_single_prompt(
         Dict: Result containing trajectory, stats, and metadata
     """
     prompt = prompt_data["prompt"]
-    task_id = f"task_{prompt_index}"
-    
+    run_name = config.get("run_name")
+    task_id = (
+        f"{run_name}:task_{prompt_index}"
+        if run_name
+        else f"task_{prompt_index}"
+    )
+
     agent = None
+    overrides_registered = False
     try:
+        # Per-prompt container image override: if the dataset row has an
+        # ``image`` field, register it for this task's sandbox.  This is the
+        # retained upstream edge for Docker, Modal, Singularity, and Daytona.
+        container_image = prompt_data.get("image") or prompt_data.get(
+            "docker_image"
+        )
+        if container_image:
+            # Docker checks its local cache and pulls on a miss.  Other
+            # backends resolve the image server-side and skip this host probe.
+            from agent.secret_scope import get_secret
+
+            env_type = get_secret("TERMINAL_ENV", "local")
+            if env_type == "docker":
+                try:
+                    probe = await _run_docker_image_command(
+                        ["docker", "image", "inspect", container_image],
+                        timeout=10,
+                    )
+                    if probe.returncode != 0:
+                        if config.get("verbose"):
+                            print(
+                                f"   Prompt {prompt_index}: Pulling docker image "
+                                f"{container_image}...",
+                                flush=True,
+                            )
+                        pull = await _run_docker_image_command(
+                            ["docker", "pull", container_image],
+                            timeout=600,
+                            text=True,
+                        )
+                        if pull.returncode != 0:
+                            return {
+                                "success": False,
+                                "prompt_index": prompt_index,
+                                "error": (
+                                    "Docker image not available: "
+                                    f"{container_image}\n{pull.stderr[:500]}"
+                                ),
+                                "trajectory": None,
+                                "tool_stats": {},
+                                "toolsets_used": [],
+                                "metadata": {
+                                    "batch_num": batch_num,
+                                    "timestamp": datetime.now().isoformat(),
+                                },
+                            }
+                except FileNotFoundError:
+                    pass
+                except Exception as img_err:
+                    if config.get("verbose"):
+                        print(
+                            f"   Prompt {prompt_index}: Docker image check "
+                            f"failed: {img_err}",
+                            flush=True,
+                        )
+
+            from tools.terminal_tool import register_task_env_overrides
+
+            overrides = {
+                "docker_image": container_image,
+                "modal_image": container_image,
+                "singularity_image": f"docker://{container_image}",
+                "daytona_image": container_image,
+            }
+            if prompt_data.get("cwd"):
+                overrides["cwd"] = prompt_data["cwd"]
+            register_task_env_overrides(task_id, overrides)
+            overrides_registered = True
+            if config.get("verbose"):
+                print(
+                    f"   Prompt {prompt_index}: Using container image "
+                    f"{container_image}"
+                )
+
         # Sample toolsets from distribution for this prompt
         selected_toolsets = sample_toolsets_from_distribution(config["distribution"])
         
@@ -487,8 +669,18 @@ async def _process_single_prompt(
             }
         }
     finally:
-        if agent is not None:
-            await agent.close()
+        try:
+            if agent is not None:
+                close_task = asyncio.create_task(
+                    agent.close(),
+                    name=f"batch-agent-close-{task_id}",
+                )
+                await _await_owned_batch_task(close_task)
+        finally:
+            if overrides_registered:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(task_id)
 
 
 async def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
@@ -895,6 +1087,10 @@ class BatchRunner:
         Args:
             resume (bool): Whether to resume from checkpoint
         """
+        # Built-in discovery is an awaited lazy boundary. Mutate the existing
+        # public set so helpers that imported it retain their object identity.
+        ALL_POSSIBLE_TOOLS.clear()
+        ALL_POSSIBLE_TOOLS.update(await get_all_tool_names())
         if not self._initialized:
             await aiofiles.os.makedirs(self.output_dir, exist_ok=True)
             self.dataset = await self._load_dataset()
@@ -983,6 +1179,7 @@ class BatchRunner:
             worker_api_key = self.api_key
 
         config = {
+            "run_name": self.run_name,
             "distribution": self.distribution,
             "model": self.model,
             "max_iterations": self.max_iterations,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import os
@@ -242,6 +243,18 @@ async def resolve_xai_http_credentials(
     api_key_hint: Optional[str] = None,
 ) -> Dict[str, str]:
     """Resolve xAI credentials through coroutine-native pool operations."""
+    from agent.secret_scope import (
+        UnscopedSecretError,
+        get_secret,
+        is_multiplex_active,
+    )
+
+    if is_multiplex_active():
+        # Validate the request scope before the OAuth pool reads or refreshes
+        # profile-owned auth state.  The value itself remains a fallback: OAuth
+        # keeps its upstream precedence when the active profile has both.
+        get_secret("XAI_API_KEY")
+
     try:
         from agent.credential_pool import load_pool
         import hermes_cli.auth as auth_mod
@@ -280,6 +293,10 @@ async def resolve_xai_http_credentials(
                 "api_key": access_token,
                 "base_url": base_url,
             }
+    except asyncio.CancelledError:
+        raise
+    except UnscopedSecretError:
+        raise
     except Exception:
         # Match the synchronous resolver's contract: an unavailable OAuth
         # pool falls through to the explicit API-key resolver.

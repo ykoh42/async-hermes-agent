@@ -277,3 +277,86 @@ async def test_standalone_failed_connect_cleanup_preserves_new_cancellation(monk
             await connect
 
     assert shutdown_cancelled.is_set()
+
+@pytest.mark.asyncio
+async def test_global_shutdown_closes_owned_stderr_log():
+    """The shared subprocess stderr descriptor ends with the MCP lifecycle."""
+    from unittest.mock import AsyncMock
+
+    from tools import mcp_tool
+
+    stderr_log = AsyncMock()
+    scope = await mcp_tool._activate_mcp_scope()
+    mcp_tool._mcp_stderr_log_fhs[scope] = stderr_log
+
+    await mcp_tool.shutdown_mcp_servers()
+
+    stderr_log.flush.assert_awaited_once_with()
+    stderr_log.close.assert_awaited_once_with()
+    assert scope not in mcp_tool._mcp_stderr_log_fhs
+
+
+@pytest.mark.asyncio
+async def test_global_shutdown_closes_unconsumed_oauth_port_reservations():
+    """A provider built without starting auth releases its reserved socket."""
+    from unittest.mock import MagicMock
+
+    from tools import mcp_oauth, mcp_tool
+
+    reserved_socket = MagicMock()
+    mcp_oauth._reserved_sockets[49399] = reserved_socket
+    mcp_oauth._oauth_port = 49399
+
+    await mcp_tool.shutdown_mcp_servers()
+
+    reserved_socket.close.assert_called_once_with()
+    assert mcp_oauth._reserved_sockets == {}
+    assert mcp_oauth._oauth_port is None
+
+
+@pytest.mark.asyncio
+async def test_global_shutdown_cancels_owned_oauth_manager_work():
+    """The manager cache and deduplicated recovery tasks end with MCP."""
+    from tools import mcp_oauth_manager, mcp_tool
+
+    mcp_oauth_manager.reset_manager_for_tests()
+    manager = mcp_oauth_manager.get_manager()
+    entry = mcp_oauth_manager._ProviderEntry(
+        server_url="https://mcp.example.invalid",
+        oauth_config=None,
+    )
+    pending = asyncio.get_running_loop().create_future()
+    entry.pending_401["token"] = pending
+    manager._entries[manager._key("server")] = entry
+    recovery_task = asyncio.create_task(asyncio.Event().wait())
+    manager._inflight_tasks.add(recovery_task)
+
+    await mcp_tool.shutdown_mcp_servers()
+
+    assert pending.cancelled()
+    assert recovery_task.cancelled()
+    assert manager._entries == {}
+    assert manager._inflight_tasks == set()
+    assert mcp_oauth_manager._MANAGER is manager
+
+
+def test_stderr_log_is_owned_and_closed_by_each_runtime_loop(tmp_path, monkeypatch):
+    """Sequential asyncio runtimes never reuse an obsolete aiofiles wrapper."""
+    from tools import mcp_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    async def exercise_runtime(name):
+        await mcp_tool._write_stderr_log_header(name)
+        scope = await mcp_tool._activate_mcp_scope()
+        stderr_log = mcp_tool._mcp_stderr_log_fhs[scope]
+        await mcp_tool.shutdown_mcp_servers()
+        assert scope not in mcp_tool._mcp_stderr_log_fhs
+        return stderr_log
+
+    first_log = asyncio.run(exercise_runtime("first-loop"))
+    second_log = asyncio.run(exercise_runtime("second-loop"))
+
+    assert first_log.closed is True
+    assert second_log.closed is True
+    assert first_log is not second_log

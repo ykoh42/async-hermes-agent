@@ -7,7 +7,7 @@ module path so core imports remain stable across Hermes releases.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Set
 
 
 def _parse_enabled_flag(value: Any, default: bool = True) -> bool:
@@ -27,7 +27,7 @@ def _parse_enabled_flag(value: Any, default: bool = True) -> bool:
     return default
 
 
-def enabled_mcp_server_names(config: dict[str, Any]) -> set[str]:
+def enabled_mcp_server_names(config: dict) -> Set[str]:
     """Return MCP server names not explicitly disabled in *config*."""
     servers = (config or {}).get("mcp_servers") or {}
     return {

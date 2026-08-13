@@ -10,8 +10,11 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
 import re
+import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -93,11 +96,55 @@ _model_metadata_cache_time: float = 0
 _novita_metadata_cache: Dict[str, Dict[str, Any]] = {}
 _novita_metadata_cache_time: float = 0
 _MODEL_CACHE_TTL = 3600
-_endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
-_endpoint_model_metadata_cache_time: Dict[str, float] = {}
+_EndpointMetadataCacheKey = tuple[str, str]
+_endpoint_model_metadata_cache: Dict[
+    _EndpointMetadataCacheKey, Dict[str, Dict[str, Any]]
+] = {}
+_endpoint_model_metadata_cache_time: Dict[_EndpointMetadataCacheKey, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
-_context_cache_lock = asyncio.Lock()
-_local_probe_disk_lock = asyncio.Lock()
+
+
+class _PerPathAsyncLocks:
+    """Return loop-local locks keyed by one canonical cache path.
+
+    The weak loop and lock references keep a completed ``asyncio.run()`` from
+    pinning its closed loop while canonical paths make symlinked profile homes
+    share one read-modify-write critical section.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.RLock()
+        self._locks: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            dict[str, weakref.ReferenceType[asyncio.Lock]],
+        ] = weakref.WeakKeyDictionary()
+
+    async def for_path(self, path: Path) -> asyncio.Lock:
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        path_key = os.path.normcase(str(await realpath(path)))
+        loop = asyncio.get_running_loop()
+        with self._guard:
+            locks = self._locks.setdefault(loop, {})
+            for stale_key, stale_ref in tuple(locks.items()):
+                if stale_ref() is None:
+                    locks.pop(stale_key, None)
+            lock_ref = locks.get(path_key)
+            lock = lock_ref() if lock_ref is not None else None
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[path_key] = weakref.ref(lock)
+            return lock
+
+
+def _credential_cache_key(api_key: str) -> str:
+    """Return a stable non-secret discriminator for account-scoped metadata."""
+    if not api_key:
+        return ""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+_context_cache_lock = _PerPathAsyncLocks()
+_local_probe_disk_lock = _PerPathAsyncLocks()
 # Bounded-lifetime cache: after the first successful probe we remember the
 # server type so subsequent refreshes skip the full waterfall (no more 404
 # spam every 5 minutes on non-matching endpoints like /api/v1/models on vllm).
@@ -199,7 +246,8 @@ async def _local_probe_disk_get(kind: str, key: str) -> Optional[Any]:
 async def _local_probe_disk_put(kind: str, key: str, value: Any) -> None:
     """Persist a successful probe result. Best-effort; prunes stale entries."""
     try:
-        async with _local_probe_disk_lock:
+        path = _local_probe_disk_cache_path()
+        async with await _local_probe_disk_lock.for_path(path):
             now = time.time()
             data = await _load_local_probe_disk_cache()
             data = {
@@ -210,7 +258,6 @@ async def _local_probe_disk_put(kind: str, key: str, value: Any) -> None:
                 < _LOCAL_PROBE_DISK_TTL_SECONDS
             }
             data[f"{kind}:{key}"] = {"value": value, "ts": now}
-            path = _local_probe_disk_cache_path()
             await aiofiles.os.makedirs(path.parent, exist_ok=True)
             temporary = path.with_suffix(path.suffix + ".tmp")
             async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
@@ -319,6 +366,21 @@ MINIMUM_CONTEXT_LENGTH = 64_000
 # restart freshness is handled by the reconcile logic re-probing after expiry.
 _LOCAL_CTX_PROBE_TTL_SECONDS = 30.0
 _LOCAL_CTX_PROBE_CACHE: Dict[tuple, tuple] = {}
+
+
+def _local_context_probe_cache_key(
+    kind: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+) -> tuple[str, str, str, str]:
+    """Key live metadata by endpoint and a non-secret credential digest."""
+    return (
+        kind,
+        _strip_provider_prefix(model),
+        base_url.rstrip("/"),
+        _credential_cache_key(api_key),
+    )
 
 # Thin fallback defaults — only broad model family patterns.
 # These fire only when provider is unknown AND models.dev/OpenRouter/Anthropic
@@ -1247,9 +1309,10 @@ async def fetch_endpoint_model_metadata(
     normalized = _localhost_to_ipv4(normalized)
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
+    cache_key = (normalized, _credential_cache_key(api_key))
     if not force_refresh:
-        cached = _endpoint_model_metadata_cache.get(normalized)
-        cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
+        cached = _endpoint_model_metadata_cache.get(cache_key)
+        cached_at = _endpoint_model_metadata_cache_time.get(cache_key, 0)
         if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
             return cached
 
@@ -1315,8 +1378,8 @@ async def fetch_endpoint_model_metadata(
                         and alternate_id != model_id
                     ):
                         _add_model_aliases(cache, alternate_id, entry)
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
+                _endpoint_model_metadata_cache[cache_key] = cache
+                _endpoint_model_metadata_cache_time[cache_key] = time.time()
                 return cache
             except asyncio.CancelledError:
                 raise
@@ -1393,8 +1456,8 @@ async def fetch_endpoint_model_metadata(
             except Exception:
                 pass
 
-    _endpoint_model_metadata_cache[normalized] = cache
-    _endpoint_model_metadata_cache_time[normalized] = time.time()
+    _endpoint_model_metadata_cache[cache_key] = cache
+    _endpoint_model_metadata_cache_time[cache_key] = time.time()
     return cache
 
 
@@ -1458,12 +1521,12 @@ async def save_context_length(model: str, base_url: str, length: int) -> None:
     different providers can have different limits.
     """
     key = _context_cache_key(model, base_url)
-    async with _context_cache_lock:
+    path = _get_context_cache_path()
+    async with await _context_cache_lock.for_path(path):
         cache = await _load_context_cache()
         if cache.get(key) == length:
             return
         cache[key] = length
-        path = _get_context_cache_path()
         try:
             await aiofiles.os.makedirs(path.parent, exist_ok=True)
             serialized = yaml.safe_dump(
@@ -1506,19 +1569,27 @@ async def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     # very value we just declared stale and re-persists it.
     bare = _strip_provider_prefix(model)
     stripped = (base_url or "").rstrip("/")
+    for probe_key in tuple(_LOCAL_CTX_PROBE_CACHE):
+        if (
+            len(probe_key) == 4
+            and probe_key[0] in {"local_context", "ollama_show"}
+            and probe_key[1:3] == (bare, stripped)
+        ):
+            _LOCAL_CTX_PROBE_CACHE.pop(probe_key, None)
+    # Rows from older process state retain their upstream tuple shapes.
     _LOCAL_CTX_PROBE_CACHE.pop((bare, stripped), None)
     _LOCAL_CTX_PROBE_CACHE.pop(("ollama_show", bare, stripped), None)
     # Clear every key shape for this pair: canonical, the caller's literal
     # form, and the slashed legacy form — same set get_cached_context_length
     # consults, so a lookup can never resurrect a row invalidation missed.
     stale_keys = {key, f"{model}@{base_url}", f"{key}/"}
-    async with _context_cache_lock:
+    path = _get_context_cache_path()
+    async with await _context_cache_lock.for_path(path):
         cache = await _load_context_cache()
         if not any(k in cache for k in stale_keys):
             return
         for stale_key in stale_keys:
             cache.pop(stale_key, None)
-        path = _get_context_cache_path()
         try:
             await aiofiles.os.makedirs(path.parent, exist_ok=True)
             temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1819,6 +1890,9 @@ async def query_ollama_num_ctx(
         return None
 
     cache_key = f"{server_url}|{bare_model}"
+    credential_key = _credential_cache_key(api_key)
+    if credential_key:
+        cache_key += f"|auth:{credential_key}"
     disk_hit = await _local_probe_disk_get("ollama_num_ctx", cache_key)
     if isinstance(disk_hit, int) and disk_hit > 0:
         return disk_hit
@@ -1953,7 +2027,9 @@ async def _query_ollama_api_show(
     # Namespaced cache key: shares the TTL store with
     # _query_local_context_length but never collides with its (model, url)
     # keys — the two probes can return different values for the same pair.
-    cache_key = ("ollama_show", _strip_provider_prefix(model), base_url.rstrip("/"))
+    cache_key = _local_context_probe_cache_key(
+        "ollama_show", model, base_url, api_key
+    )
     now = _time.monotonic()
     cached = _LOCAL_CTX_PROBE_CACHE.get(cache_key)
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
@@ -2077,7 +2153,9 @@ async def _query_local_context_length(
     """
     import time as _time
 
-    cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
+    cache_key = _local_context_probe_cache_key(
+        "local_context", model, base_url, api_key
+    )
     now = _time.monotonic()
     cached = _LOCAL_CTX_PROBE_CACHE.get(cache_key)
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:

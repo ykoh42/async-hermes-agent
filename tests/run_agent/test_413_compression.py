@@ -99,6 +99,11 @@ def agent():
         a._tool_snapshot_initialized = True
         a._runtime_config_loaded = True
         a._runtime_config_snapshot = {}
+        # This fixture models an agent whose awaited runtime boundary has
+        # already completed.  Keep its deliberately injected compression
+        # limits stable instead of letting first-turn lazy initialization
+        # replace them with the host/profile metadata cache.
+        a._context_engine_started = True
         a.provider = a.requested_provider = "openrouter"
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False

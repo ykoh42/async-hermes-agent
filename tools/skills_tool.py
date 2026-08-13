@@ -68,15 +68,18 @@ Usage:
 
 import asyncio
 import concurrent.futures.thread as _thread_backend_bootstrap  # noqa: F401
+import contextvars
 import inspect
 import json
 import logging
+import threading
 import time
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
 from enum import Enum
+from collections.abc import MutableMapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
@@ -84,6 +87,7 @@ import aiofiles
 import aiofiles.os
 
 from agent import skill_preprocessing as _skill_preprocessing
+from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
 from tools import path_security as _path_security
 from tools import skill_manager_tool as _skill_manager_bootstrap  # noqa: F401
@@ -318,6 +322,14 @@ async def load_env() -> Dict[str, str]:
         key, _, value = line.partition("=")
         env_vars[key.strip()] = value.strip().strip("\"'")
     return env_vars
+
+
+def _required_environment_variable_available(
+    name: str,
+    env_snapshot: Dict[str, str],
+) -> bool:
+    """Preserve dotenv-first readiness without crossing profile scopes."""
+    return bool(env_snapshot.get(name) or get_secret(name))
 
 
 class SkillReadinessStatus(str, Enum):
@@ -1276,7 +1288,9 @@ async def skill_view(
             entry["name"]
             for entry in required_environment_variables
             if not entry.get("optional")
-            and not bool(env_snapshot.get(entry["name"]) or os.getenv(entry["name"]))
+            and not _required_environment_variable_available(
+                entry["name"], env_snapshot
+            )
         ]
         missing_entry_names = set(missing_environment_entries)
         capture_result = await _capture_required_environment_variables(
@@ -1296,7 +1310,9 @@ async def skill_view(
             if not entry.get("optional")
             and (
                 entry["name"] in callback_missing
-                or not bool(env_snapshot.get(entry["name"]) or os.getenv(entry["name"]))
+                or not _required_environment_variable_available(
+                    entry["name"], env_snapshot
+                )
             )
         ]
         missing_credential_files = await _missing_required_credential_files(frontmatter)
@@ -1406,6 +1422,8 @@ async def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
         return json.dumps(result, ensure_ascii=False)
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         return tool_error(str(exc), success=False)
 
@@ -1454,7 +1472,92 @@ async def _handle_skills_list(args: dict, **kwargs) -> str:
     return await skills_list(category=args.get("category"), task_id=kwargs.get("task_id"))
 
 
-_skill_view_tracker: dict[str, dict[tuple[str, str], tuple[str, int, int]]] = {}
+_skill_profile_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("skill_view_profile_scope", default=None)
+)
+_skill_profile_aliases: dict[str, str] = {}
+_skill_profile_lock = threading.RLock()
+_skill_view_tracker_states: dict[
+    str,
+    dict[str, dict[tuple[str, str], tuple[str, int, int]]],
+] = {}
+
+
+def _lexical_skill_profile_identity() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_skill_profile_identity() -> str:
+    lexical = _lexical_skill_profile_identity()
+    active = _skill_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    with _skill_profile_lock:
+        return _skill_profile_aliases.get(lexical, lexical)
+
+
+async def _activate_skill_profile_scope() -> str:
+    lexical = _lexical_skill_profile_identity()
+    active = _skill_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = str(await expanduser(lexical))
+    is_absolute = (
+        expanded.startswith(("/", "\\\\"))
+        or (len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in "/\\")
+    )
+    if not is_absolute:
+        expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+    canonical = os.path.normcase(str(await _realpath(expanded)))
+    with _skill_profile_lock:
+        _skill_profile_aliases[lexical] = canonical
+        active_state = _skill_view_tracker_states.setdefault(canonical, {})
+        if lexical != canonical:
+            staged = _skill_view_tracker_states.pop(lexical, None)
+            if staged:
+                for task_id, cache in staged.items():
+                    active_state.setdefault(task_id, {}).update(cache)
+    _skill_profile_context.set((lexical, canonical))
+    return canonical
+
+
+class _ScopedSkillViewTracker(MutableMapping):
+    """Dict-compatible active-profile view retained for private test hooks."""
+
+    def _active(self) -> dict:
+        profile = _current_skill_profile_identity()
+        return _skill_view_tracker_states.setdefault(profile, {})
+
+    def __getitem__(self, key):
+        with _skill_profile_lock:
+            return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        with _skill_profile_lock:
+            self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        with _skill_profile_lock:
+            del self._active()[key]
+
+    def __iter__(self):
+        with _skill_profile_lock:
+            return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        with _skill_profile_lock:
+            return len(self._active())
+
+    def clear(self) -> None:
+        with _skill_profile_lock:
+            self._active().clear()
+
+
+_skill_view_tracker: MutableMapping[
+    str,
+    dict[tuple[str, str], tuple[str, int, int]],
+] = _ScopedSkillViewTracker()
 _SKILL_VIEW_DEDUP_CAP = 200
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "
@@ -1482,11 +1585,13 @@ async def _check_skill_view_dedup(
 ) -> str | None:
     if not task_id:
         return None
-    cache = _skill_view_tracker.get(str(task_id))
-    if not cache:
-        return None
+    with _skill_profile_lock:
+        cache = _skill_view_tracker.get(str(task_id))
+        if not cache:
+            return None
+        entries = list(cache.items())
     requested_file = file_path or ""
-    for key, fingerprint in list(cache.items()):
+    for key, fingerprint in entries:
         recorded_name, recorded_file = key
         if recorded_file != requested_file:
             continue
@@ -1501,10 +1606,12 @@ async def _check_skill_view_dedup(
         try:
             stat_result = await aiofiles.os.stat(source)
         except OSError:
-            cache.pop(key, None)
+            with _skill_profile_lock:
+                cache.pop(key, None)
             return None
         if (stat_result.st_mtime_ns, stat_result.st_size) != (mtime_ns, size):
-            cache.pop(key, None)
+            with _skill_profile_lock:
+                cache.pop(key, None)
             return None
         return json.dumps(
             {
@@ -1533,22 +1640,25 @@ async def _record_skill_view(
     if fingerprint is None:
         return
     key = (str(payload.get("name") or name), file_path or "")
-    cache = _skill_view_tracker.setdefault(str(task_id), {})
-    cache[key] = fingerprint
-    while len(cache) > _SKILL_VIEW_DEDUP_CAP:
-        cache.pop(next(iter(cache)))
+    with _skill_profile_lock:
+        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        cache[key] = fingerprint
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
+            cache.pop(next(iter(cache)))
 
 
 def reset_skill_view_dedup(task_id: str | None = None) -> None:
     """Clear repeat-view state after compression or session teardown."""
-    if task_id is None:
-        _skill_view_tracker.clear()
-    else:
-        _skill_view_tracker.pop(str(task_id), None)
+    with _skill_profile_lock:
+        if task_id is None:
+            _skill_view_tracker.clear()
+        else:
+            _skill_view_tracker.pop(str(task_id), None)
 
 
 async def _handle_skill_view(args: dict, **kwargs) -> str:
     """Adapt the registry's JSON-object contract to ``skill_view``."""
+    await _activate_skill_profile_scope()
     name = args.get("name", "")
     file_path = args.get("file_path")
     task_id = kwargs.get("task_id")

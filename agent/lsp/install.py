@@ -31,6 +31,8 @@ import os
 import shutil
 import signal
 import sys
+import threading
+import weakref
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -112,8 +114,15 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
 }
 
 
-_install_locks: Dict[str, asyncio.Lock] = {}
-_install_results: Dict[str, Optional[str]] = {}
+_install_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, Dict[str, weakref.ReferenceType[asyncio.Lock]]],
+] = weakref.WeakKeyDictionary()
+_install_results: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, Dict[str, Optional[str]]],
+] = weakref.WeakKeyDictionary()
+_install_state_guard = threading.RLock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
 
@@ -190,28 +199,55 @@ async def _existing_binary(name: str) -> Optional[str]:
     return None
 
 
-def _get_lock(pkg: str) -> asyncio.Lock:
-    lock = _install_locks.get(pkg)
-    if lock is None:
-        lock = asyncio.Lock()
-        _install_locks[pkg] = lock
-    return lock
+def _profile_install_state(
+    scope: tuple[asyncio.AbstractEventLoop, str],
+) -> tuple[
+    Dict[str, weakref.ReferenceType[asyncio.Lock]],
+    Dict[str, Optional[str]],
+]:
+    loop, profile = scope
+    with _install_state_guard:
+        known_loops = set(_install_locks) | set(_install_results)
+        for known_loop in known_loops:
+            if known_loop.is_closed():
+                _install_locks.pop(known_loop, None)
+                _install_results.pop(known_loop, None)
+        locks = _install_locks.setdefault(loop, {}).setdefault(profile, {})
+        results = _install_results.setdefault(loop, {}).setdefault(profile, {})
+        return locks, results
+
+
+def _get_lock(
+    pkg: str,
+    locks: Dict[str, weakref.ReferenceType[asyncio.Lock]],
+) -> asyncio.Lock:
+    with _install_state_guard:
+        lock_ref = locks.get(pkg)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[pkg] = weakref.ref(lock)
+        return lock
 
 
 async def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
     """Install ``pkg`` once and return its binary path when available."""
+    from agent.lsp import _activate_lsp_scope
+
+    scope = await _activate_lsp_scope()
+    locks, results = _profile_install_state(scope)
     recipe = INSTALL_RECIPES.get(pkg, {})
     bin_name = recipe.get("bin", pkg)
     if strategy != "auto":
         return await _existing_binary(bin_name)
-    if pkg in _install_results:
-        return _install_results[pkg]
+    if pkg in results:
+        return results[pkg]
 
-    async with _get_lock(pkg):
-        if pkg in _install_results:
-            return _install_results[pkg]
+    async with _get_lock(pkg, locks):
+        if pkg in results:
+            return results[pkg]
         result = await _do_install(pkg)
-        _install_results[pkg] = result
+        results[pkg] = result
         return result
 
 
@@ -248,12 +284,18 @@ async def _run_install(
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
+    from tools.environments.local import build_subprocess_env
+
+    # ``env`` is the installer-specific overlay (currently GOBIN). npm, Go,
+    # and pip otherwise retain the host PATH/environment, after applying the
+    # active Hermes profile and the shared fail-closed credential scrubber.
+    spawn_env = await build_subprocess_env(extra=env)
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=env,
+        env=spawn_env,
         start_new_session=os.name == "posix",
         creationflags=windows_hide_flags(),
     )
@@ -359,11 +401,11 @@ async def _install_go(pkg: str, bin_name: str) -> Optional[str]:
         logger.info("[install] cannot install %s: go not on PATH", pkg)
         return None
     staging = await hermes_lsp_bin_dir()
-    env = dict(os.environ)
-    env["GOBIN"] = str(staging)
     try:
         returncode, stderr = await _run_install(
-            [go, "install", pkg], timeout=600, env=env
+            [go, "install", pkg],
+            timeout=600,
+            env={"GOBIN": str(staging)},
         )
     except TimeoutError:
         logger.warning("[install] go install timed out for %s", pkg)

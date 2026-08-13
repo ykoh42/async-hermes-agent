@@ -215,6 +215,7 @@ def setup_logging(
     log_level: Optional[str] = None,
     max_size_mb: Optional[int] = None,
     backup_count: Optional[int] = None,
+    mode: Optional[str] = None,
     force: bool = False,
 ) -> Path:
     """Configure the Hermes logging subsystem.
@@ -237,6 +238,9 @@ def setup_logging(
     backup_count
         Number of rotated backup files to keep.
         Defaults to 3 or the value from config.yaml ``logging.backup_count``.
+    mode
+        Retained upstream caller context. Removed application-specific log
+        handlers are not installed by this library build.
     force
         Re-run setup even if it has already been called.
 

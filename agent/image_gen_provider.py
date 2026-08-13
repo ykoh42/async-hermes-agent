@@ -42,6 +42,7 @@ produce. The tool wrapper JSON-serializes it. Keys:
 from __future__ import annotations
 
 import abc
+import asyncio
 import base64
 import datetime
 import logging
@@ -399,3 +400,30 @@ def error_response(
         "aspect_ratio": aspect_ratio,
         "provider": provider,
     }
+
+
+async def _close_owned_client(client: Any) -> None:
+    """Close one SDK client before propagating repeated caller cancellation."""
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    close_task = asyncio.create_task(
+        close(),
+        name="image-provider-client-close",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(close_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if close_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation

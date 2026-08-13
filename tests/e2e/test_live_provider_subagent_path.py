@@ -1,4 +1,4 @@
-"""Opt-in live acceptance test for provider → subagent → parent reinjection."""
+"""Opt-in live acceptance test for provider → subagent → queued turn."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
+
+from tests.e2e.trajectory_assertions import split_optional_think
 
 
 LIVE = os.environ.get("HERMES_LIVE_TESTS") == "1"
@@ -26,15 +28,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
-async def test_live_provider_subagent_completion_reenters_parent_and_cleans_up(
+async def test_live_provider_subagent_completion_queue_reenters_parent_and_cleans_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from hermes_state import SessionDB
-    from run_agent import AIAgent
-    from tools.delegate_tool import list_active_subagents
-
     monkeypatch.chdir(tmp_path)
     hermes_home = tmp_path / "hermes-home"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -43,22 +41,31 @@ async def test_live_provider_subagent_completion_reenters_parent_and_cleans_up(
         "delegation:\n  max_iterations: 2\n",
         encoding="utf-8",
     )
+
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from tools.async_delegation import (
+        claim_event_delivery,
+        complete_event_delivery,
+        get_durable_delegation,
+        release_event_delivery,
+    )
+    from tools.delegate_tool import list_active_subagents
+    from tools.process_registry import (
+        format_process_notification,
+        process_registry,
+    )
+
+    # The singleton can have restored events from another test/profile when
+    # this module runs in a shared pytest process. Preserve that queue and give
+    # this live acceptance path a clean, turn-local delivery rail.
+    monkeypatch.setattr(process_registry, "completion_queue", asyncio.Queue())
+
     model = os.environ.get("HERMES_LIVE_MODEL") or DEFAULT_MODELS.get(PROVIDER)
     if not model:
         pytest.fail(
             f"No default model for live provider {PROVIDER!r}; set HERMES_LIVE_MODEL"
         )
-
-    completion = asyncio.Event()
-    completion_payload = None
-    event_names: list[str] = []
-
-    def record_event(name: str, payload: dict) -> None:
-        nonlocal completion_payload
-        event_names.append(name)
-        if name == "delegation:complete":
-            completion_payload = payload
-            completion.set()
 
     kwargs = {
         "provider": PROVIDER,
@@ -70,7 +77,6 @@ async def test_live_provider_subagent_completion_reenters_parent_and_cleans_up(
         "enabled_toolsets": ["delegation"],
         "save_trajectories": True,
         "session_db": SessionDB(tmp_path / "state.db"),
-        "event_callback": record_event,
     }
     if PROVIDER == "openrouter":
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -107,24 +113,53 @@ async def test_live_provider_subagent_completion_reenters_parent_and_cleans_up(
         assert dispatch.get("status") == "dispatched", dispatch
         assert dispatch["mode"] == "background"
         try:
-            await asyncio.wait_for(completion.wait(), timeout=45)
+            async with asyncio.timeout(45):
+                while True:
+                    drained = process_registry.drain_notifications(
+                        session_key=agent.session_id
+                    )
+                    if drained:
+                        assert len(drained) == 1
+                        completion_event, completion_message = drained[0]
+                        break
+                    await asyncio.sleep(0.05)
         except TimeoutError:
             pytest.fail(
-                "background subagent did not reinject completion; "
-                f"events={event_names!r}, "
+                "background subagent did not publish its completion; "
                 f"background={len(agent._background_delegations)}, "
                 f"active_children={len(agent._active_children)}, "
                 f"active_subagents={list_active_subagents()!r}"
             )
-        await asyncio.sleep(0)
 
-        assert completion_payload is not None
-        (child_result,) = completion_payload["results"]
+        assert completion_event["delegation_id"] == dispatch["delegation_id"]
+        (child_result,) = completion_event["results"]
         assert child_result["status"] == "completed"
         assert child_result["summary"].strip() == "LIVE_SUBAGENT_CHILD"
-        reinjected = completion_payload["response"]
+
+        assert completion_message == format_process_notification(completion_event)
+        assert completion_message.startswith("[ASYNC DELEGATION BATCH COMPLETE")
+        assert "LIVE_SUBAGENT_CHILD" in completion_message
+
+        # Match the upstream driver boundary: completion_queue → formatter →
+        # a fresh parent turn. A bare AIAgent does not auto-inject completions
+        # through event_callback.
+        delivery_claim = await claim_event_delivery(
+            completion_event, "live-e2e-subagent"
+        )
+        assert delivery_claim is not None
+        try:
+            reinjected = await agent.run_conversation(completion_message)
+        except BaseException:
+            await release_event_delivery(completion_event, delivery_claim)
+            raise
+        else:
+            await complete_event_delivery(completion_event, delivery_claim)
+        durable = await get_durable_delegation(dispatch["delegation_id"])
+        assert durable is not None
+        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_attempts"] == 1
         assert reinjected["completed"] is True
-        assert "LIVE_SUBAGENT_CHILD" in reinjected["final_response"]
+        assert reinjected["final_response"].strip() == "LIVE_SUBAGENT_PARENT_FINAL"
         assert [message["role"] for message in reinjected["messages"]] == [
             "user",
             "assistant",
@@ -153,15 +188,17 @@ async def test_live_provider_subagent_completion_reenters_parent_and_cleans_up(
     ]
     assert '"name": "delegate_task"' in rows[0]["conversations"][2]["value"]
     assert '"status": "dispatched"' in rows[0]["conversations"][3]["value"]
-    assert rows[0]["conversations"][4]["value"].endswith(
-        "LIVE_SUBAGENT_DISPATCHED"
+    _thinking, visible_dispatch = split_optional_think(
+        rows[0]["conversations"][4]["value"]
     )
+    assert visible_dispatch == "LIVE_SUBAGENT_DISPATCHED"
     assert [turn["from"] for turn in rows[1]["conversations"]] == [
         "system",
         "human",
         "gpt",
     ]
-    assert "LIVE_SUBAGENT_CHILD" in rows[1]["conversations"][1]["value"]
-    assert rows[1]["conversations"][-1]["value"].endswith(
-        reinjected["final_response"]
+    assert rows[1]["conversations"][1]["value"] == completion_message
+    _thinking, visible_parent_final = split_optional_think(
+        rows[1]["conversations"][-1]["value"]
     )
+    assert visible_parent_final == "LIVE_SUBAGENT_PARENT_FINAL"

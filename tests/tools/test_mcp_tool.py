@@ -530,8 +530,14 @@ class TestDiscoverAndRegister:
 
         assert "mcp__fs__read_file" in registered
         assert "mcp__fs__write_file" in registered
-        assert "mcp__fs__read_file" in mock_registry.get_all_tool_names()
-        assert "mcp__fs__write_file" in mock_registry.get_all_tool_names()
+
+        names = {
+            entry.name
+            for entries in mock_registry._mcp_tools.values()
+            for entry in entries.values()
+        }
+        assert "mcp__fs__read_file" in names
+        assert "mcp__fs__write_file" in names
 
         _servers.pop("fs", None)
 
@@ -978,8 +984,11 @@ class TestBuildSafeEnv:
 
         monkeypatch.setattr(
             env_loader,
-            "get_secret_source",
-            lambda key: "command:secret" if key == "MCP_API_TOKEN" else None,
+            "_active_secret_source_snapshot",
+            lambda: (
+                {"MCP_API_TOKEN": "command:secret"},
+                {"MCP_API_TOKEN": "resolved-token"},
+            ),
         )
         with patch.dict(
             "os.environ",
@@ -1396,7 +1405,11 @@ class TestUtilityToolRegistration:
         assert len(registered) == 5
 
         # All in the registry
-        all_names = mock_registry.get_all_tool_names()
+        all_names = {
+            entry.name
+            for entries in mock_registry._mcp_tools.values()
+            for entry in entries.values()
+        }
         for name in registered:
             assert name in all_names
 
@@ -2242,11 +2255,6 @@ class TestMCPBuiltinCollisionGuard:
         async def mcp_handler(_args, **_kwargs):
             return "{}"
 
-        mock_registry.register(
-            name="mcp__srv__do_thing", toolset="mcp-old",
-            schema=mcp_schema, handler=mcp_handler,
-        )
-
         mock_tools = [_make_mcp_tool("do_thing", "Do a thing")]
         mock_session = MagicMock()
 
@@ -2256,19 +2264,35 @@ class TestMCPBuiltinCollisionGuard:
             server._tools = mock_tools
             return server
 
+        async def register_existing_owner():
+            await __import__(
+                "tools.mcp_tool", fromlist=["_activate_mcp_scope"]
+            )._activate_mcp_scope()
+            mock_registry.register(
+                name="mcp__srv__do_thing",
+                toolset="mcp-old",
+                schema=mcp_schema,
+                handler=mcp_handler,
+            )
+            return await _discover_and_register_server(
+                "srv", {"command": "test", "args": []}
+            )
+
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            registered = asyncio.run(
-                _discover_and_register_server("srv", {"command": "test", "args": []})
-            )
+            registered = asyncio.run(register_existing_owner())
 
         # Cross-server MCP collisions fail closed: the existing owner stays active.
         assert "mcp__srv__do_thing" not in registered
-        entry = mock_registry.get_entry("mcp__srv__do_thing")
-        assert entry is not None
-        assert entry.toolset == "mcp-old"
-        assert entry.schema["description"] == "From another MCP server"
-        assert mock_registry.get_toolset_for_tool("mcp__srv__do_thing") == "mcp-old"
+        scoped_entries = [
+            entry
+            for entries in mock_registry._mcp_tools.values()
+            for entry in entries.values()
+            if entry.name == "mcp__srv__do_thing"
+        ]
+        assert len(scoped_entries) == 1
+        assert scoped_entries[0].toolset == "mcp-old"
+        assert scoped_entries[0].schema["description"] == "From another MCP server"
 
         _servers.pop("srv", None)
 

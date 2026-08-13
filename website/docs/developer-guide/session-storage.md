@@ -1,14 +1,16 @@
 ---
 sidebar_position: 5
 title: "Session Storage"
-description: "Native-async SQLite session persistence, search, lineage, and ownership"
+description: "Awaitable SQLite session persistence, search, lineage, and ownership"
 ---
 
 # Session Storage
 
-`SessionDB` in `hermes_state.py` stores conversations in SQLite. Its public
-I/O methods are coroutines backed by `aiosqlite`; callers do not need a thread
-wrapper around database work.
+`SessionDB` in `hermes_state.py` stores conversations in SQLite. Its public I/O
+methods are coroutines backed by `aiosqlite`, so callers do not need to add
+their own thread wrapper. `aiosqlite` itself serializes SQLite calls on a
+connection worker thread; this is an awaitable facade, not a zero-thread native
+SQLite transport.
 
 The default database is:
 
@@ -26,15 +28,23 @@ from hermes_state import SessionDB
 
 
 db = SessionDB("/srv/my-agent/state.db")
-try:
-    await db.create_session("conversation-1", source="api", model="example-model")
-    await db.append_message("conversation-1", "user", "Hello")
-    await db.append_message("conversation-1", "assistant", "Hi")
 
-    session = await db.get_session("conversation-1")
-    messages = await db.get_messages("conversation-1")
-finally:
-    await db.close()
+
+async def inspect_session():
+    try:
+        await db.create_session(
+            "conversation-1",
+            source="api",
+            model="example-model",
+        )
+        await db.append_message("conversation-1", "user", "Hello")
+        await db.append_message("conversation-1", "assistant", "Hi")
+
+        session = await db.get_session("conversation-1")
+        messages = await db.get_messages("conversation-1")
+        return session, messages
+    finally:
+        await db.close()
 ```
 
 Construction records the path only. The connection and schema are initialized
@@ -43,8 +53,10 @@ lazily on the first awaited operation.
 ## Using storage with `AIAgent`
 
 `AIAgent` receives optional storage through the existing `session_db=`
-constructor argument. Without an injected `SessionDB`, the library turn does
-not silently create a global database. With one attached, a turn creates or
+constructor argument. Without an injected `SessionDB`, an ordinary turn does
+not persist a transcript. A recall tool that requires session storage may
+instead open the default `$HERMES_HOME/state.db` lazily; from that point the
+agent owns the handle. With a store attached at construction, a turn creates or
 enriches the session row before its first provider request and incrementally
 persists messages during the tool loop.
 
@@ -101,15 +113,18 @@ transcript order remains deterministic.
 
 `search_messages()` uses the retained FTS5 routing and falls back according to
 the database's available extensions and query shape. Search and index repair
-remain awaited operations. Optional CJK indexing depends on the bundled native
-extension being available for the current platform.
+remain awaited operations. Optional CJK indexing depends on the
+`cjk_unicode61` loadable SQLite extension being built and available for the
+current platform; when it is absent, the retained search fallback remains in
+use.
 
 ```python
-matches = await db.search_messages(
-    "deployment failure",
-    role_filter=["user", "assistant"],
-    limit=10,
-)
+async def find_messages(db):
+    return await db.search_messages(
+        "deployment failure",
+        role_filter=["user", "assistant"],
+        limit=10,
+    )
 ```
 
 `session_search` exposes this storage to the model when its toolset is enabled.
@@ -130,11 +145,12 @@ JSONL trajectories are separate from `state.db`; see
 Always await `close()`. It is safe to call once in a `finally` block:
 
 ```python
-db = SessionDB()
-try:
-    rows = await db.search_sessions(limit=20)
-finally:
-    await db.close()
+async def list_recent_sessions():
+    db = SessionDB()
+    try:
+        return await db.search_sessions(limit=20)
+    finally:
+        await db.close()
 ```
 
 Reusing a closed `SessionDB` raises an error rather than silently opening a new

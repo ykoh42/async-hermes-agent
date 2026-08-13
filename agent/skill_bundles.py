@@ -42,9 +42,13 @@ Public API
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
 import logging
 import os
 import re
+import threading
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +67,26 @@ _BUNDLE_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 _bundles_cache: Dict[str, Dict[str, Any]] = {}
 _bundles_cache_mtime: Optional[float] = None
+_bundles_cache_by_dir: Dict[
+    str,
+    Tuple[Dict[str, Dict[str, Any]], Optional[float]],
+] = {}
+_bundles_cache_projection_key: str | None = None
+_BUNDLE_CACHE_GUARD = threading.RLock()
+
+
+@dataclass
+class _BundleScanClaim:
+    finished: bool = False
+    waiters: list[
+        tuple[
+            weakref.ReferenceType[asyncio.AbstractEventLoop],
+            weakref.ReferenceType[asyncio.Future[None]],
+        ]
+    ] = field(default_factory=list)
+
+
+_BUNDLE_SCAN_CLAIMS: Dict[str, _BundleScanClaim] = {}
 
 
 def _bundles_dir() -> Path:
@@ -75,6 +99,107 @@ def _bundles_dir() -> Path:
     if override:
         return Path(override).expanduser()
     return get_hermes_home() / "skill-bundles"
+
+
+async def _bundle_cache_key() -> str:
+    """Key the cache by the physical bundle directory."""
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    return os.path.normcase(str(await realpath(os.fspath(_bundles_dir()))))
+
+
+async def _active_bundle_cache() -> tuple[
+    str,
+    Dict[str, Dict[str, Any]],
+    Optional[float],
+]:
+    """Project the active profile cache onto the upstream private globals."""
+    global _bundles_cache, _bundles_cache_mtime, _bundles_cache_projection_key
+    cache_key = await _bundle_cache_key()
+    with _BUNDLE_CACHE_GUARD:
+        if (
+            _bundles_cache_projection_key == cache_key
+            and not _bundles_cache
+            and _bundles_cache_mtime is None
+        ):
+            _bundles_cache_by_dir.pop(cache_key, None)
+        cached = _bundles_cache_by_dir.get(cache_key)
+        if cached is None:
+            return cache_key, {}, None
+        _bundles_cache, _bundles_cache_mtime = cached
+        _bundles_cache_projection_key = cache_key
+        return cache_key, _bundles_cache, _bundles_cache_mtime
+
+
+def _store_bundle_cache(
+    key: str,
+    bundles: Dict[str, Dict[str, Any]],
+    mtime: Optional[float],
+) -> Dict[str, Dict[str, Any]]:
+    global _bundles_cache, _bundles_cache_mtime, _bundles_cache_projection_key
+    with _BUNDLE_CACHE_GUARD:
+        _bundles_cache = bundles
+        _bundles_cache_mtime = mtime
+        _bundles_cache_projection_key = key
+        _bundles_cache_by_dir[key] = (bundles, mtime)
+    return bundles
+
+
+def _claim_bundle_scan(
+    cache_key: str,
+) -> tuple[bool, _BundleScanClaim]:
+    """Claim one profile scan without retaining its event loop."""
+    with _BUNDLE_CACHE_GUARD:
+        claim = _BUNDLE_SCAN_CLAIMS.get(cache_key)
+        if claim is None or claim.finished:
+            claim = _BundleScanClaim()
+            _BUNDLE_SCAN_CLAIMS[cache_key] = claim
+            return True, claim
+        return False, claim
+
+
+def _settle_bundle_scan_waiter(waiter: asyncio.Future[None]) -> None:
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+async def _wait_for_bundle_scan(claim: _BundleScanClaim) -> None:
+    loop = asyncio.get_running_loop()
+    waiter = loop.create_future()
+    waiter_refs = (weakref.ref(loop), weakref.ref(waiter))
+    with _BUNDLE_CACHE_GUARD:
+        if claim.finished:
+            return
+        claim.waiters.append(waiter_refs)
+    try:
+        await waiter
+    finally:
+        with _BUNDLE_CACHE_GUARD:
+            try:
+                claim.waiters.remove(waiter_refs)
+            except ValueError:
+                pass
+
+
+def _finish_bundle_scan(
+    cache_key: str,
+    claim: _BundleScanClaim,
+) -> None:
+    """Release a profile scan and wake cross-loop waiters."""
+    with _BUNDLE_CACHE_GUARD:
+        if _BUNDLE_SCAN_CLAIMS.get(cache_key) is claim:
+            _BUNDLE_SCAN_CLAIMS.pop(cache_key, None)
+        claim.finished = True
+        waiters = tuple(claim.waiters)
+        claim.waiters.clear()
+    for loop_ref, waiter_ref in waiters:
+        loop = loop_ref()
+        waiter = waiter_ref()
+        if loop is None or waiter is None:
+            continue
+        try:
+            loop.call_soon_threadsafe(_settle_bundle_scan_waiter, waiter)
+        except RuntimeError:
+            continue
 
 
 def _slugify(name: str) -> str:
@@ -178,24 +303,29 @@ async def scan_bundles() -> Dict[str, Dict[str, Any]]:
     bundle info dict. Later bundles with a duplicate slug are skipped with
     a warning (first wins, alphabetical order).
     """
-    global _bundles_cache, _bundles_cache_mtime
-    files = await _iter_bundle_files()
-    out: Dict[str, Dict[str, Any]] = {}
-    for f in files:
-        info = await _load_bundle_file(f)
-        if not info:
-            continue
-        key = f"/{info['slug']}"
-        if key in out:
-            logger.warning(
-                "Duplicate bundle slug %s from %s; keeping %s",
-                key, f, out[key]["path"],
-            )
-            continue
-        out[key] = info
-    _bundles_cache = out
-    _bundles_cache_mtime = await _max_mtime(files)
-    return out
+    cache_key = await _bundle_cache_key()
+    owner, claim = _claim_bundle_scan(cache_key)
+    if not owner:
+        await _wait_for_bundle_scan(claim)
+        return await scan_bundles()
+    try:
+        files = await _iter_bundle_files()
+        out: Dict[str, Dict[str, Any]] = {}
+        for f in files:
+            info = await _load_bundle_file(f)
+            if not info:
+                continue
+            bundle_key = f"/{info['slug']}"
+            if bundle_key in out:
+                logger.warning(
+                    "Duplicate bundle slug %s from %s; keeping %s",
+                    bundle_key, f, out[bundle_key]["path"],
+                )
+                continue
+            out[bundle_key] = info
+        return _store_bundle_cache(cache_key, out, await _max_mtime(files))
+    finally:
+        _finish_bundle_scan(cache_key, claim)
 
 
 async def get_skill_bundles() -> Dict[str, Dict[str, Any]]:
@@ -204,11 +334,18 @@ async def get_skill_bundles() -> Dict[str, Dict[str, Any]]:
     Cheap to call repeatedly: only rescans when the bundles directory or
     any bundle file's mtime is newer than the cached snapshot.
     """
+    cache_key = await _bundle_cache_key()
+    with _BUNDLE_CACHE_GUARD:
+        active_scan = _BUNDLE_SCAN_CLAIMS.get(cache_key)
+    if active_scan is not None:
+        await _wait_for_bundle_scan(active_scan)
+        return await get_skill_bundles()
     files = await _iter_bundle_files()
     current_mtime = await _max_mtime(files)
-    if not _bundles_cache or _bundles_cache_mtime != current_mtime:
-        await scan_bundles()
-    return _bundles_cache
+    _key, cached, cached_mtime = await _active_bundle_cache()
+    if not cached or cached_mtime != current_mtime:
+        return await scan_bundles()
+    return cached
 
 
 async def resolve_bundle_command_key(command: str) -> Optional[str]:
@@ -234,7 +371,8 @@ async def reload_bundles() -> Dict[str, Any]:
     def _snapshot(cmds: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         return {k.lstrip("/"): (v or {}).get("description", "") for k, v in cmds.items()}
 
-    before = _snapshot(_bundles_cache)
+    _key, cached, _mtime = await _active_bundle_cache()
+    before = _snapshot(cached)
     new = await scan_bundles()
     after = _snapshot(new)
 

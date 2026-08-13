@@ -385,12 +385,32 @@ async def build_turn_context(
         agent, "_tool_snapshot_initialized", False
     )
     initial_lsp_lease = not getattr(agent, "_lsp_lifecycle_retained", False)
+    initial_auxiliary_lease = not getattr(
+        agent,
+        "_auxiliary_lifecycle_retained",
+        False,
+    )
+    initial_parallel_lease = not getattr(
+        agent,
+        "_parallel_lifecycle_retained",
+        False,
+    )
     try:
         if initial_lsp_lease:
             from agent.lsp import _retain_lsp_lifecycle
 
             await _retain_lsp_lifecycle(agent)
             agent._lsp_lifecycle_retained = True
+        if initial_auxiliary_lease:
+            from agent.auxiliary_client import _retain_auxiliary_lifecycle
+
+            await _retain_auxiliary_lifecycle(agent)
+            agent._auxiliary_lifecycle_retained = True
+        if initial_parallel_lease:
+            from plugins.web.parallel.provider import _retain_parallel_lifecycle
+
+            await _retain_parallel_lifecycle(agent)
+            agent._parallel_lifecycle_retained = True
         await _plugins.discover_plugins()
         if not getattr(agent, "_skip_mcp_refresh", False):
             # The first discovery is intentionally lazy: ``AIAgent.__init__``
@@ -419,6 +439,24 @@ async def build_turn_context(
 
             await _release_lsp_lifecycle(agent)  # noqa: ASYNC120
             agent._lsp_lifecycle_retained = False
+        if initial_auxiliary_lease and getattr(
+            agent,
+            "_auxiliary_lifecycle_retained",
+            False,
+        ):
+            from agent.auxiliary_client import _release_auxiliary_lifecycle
+
+            await _release_auxiliary_lifecycle(agent)  # noqa: ASYNC120
+            agent._auxiliary_lifecycle_retained = False
+        if initial_parallel_lease and getattr(
+            agent,
+            "_parallel_lifecycle_retained",
+            False,
+        ):
+            from plugins.web.parallel.provider import _release_parallel_lifecycle
+
+            await _release_parallel_lifecycle(agent)  # noqa: ASYNC120
+            agent._parallel_lifecycle_retained = False
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
                 await _mcp_tool._release_mcp_lifecycle(agent)  # noqa: ASYNC120
@@ -433,6 +471,24 @@ async def build_turn_context(
 
             await _release_lsp_lifecycle(agent)  # noqa: ASYNC120
             agent._lsp_lifecycle_retained = False
+        if initial_auxiliary_lease and getattr(
+            agent,
+            "_auxiliary_lifecycle_retained",
+            False,
+        ):
+            from agent.auxiliary_client import _release_auxiliary_lifecycle
+
+            await _release_auxiliary_lifecycle(agent)  # noqa: ASYNC120
+            agent._auxiliary_lifecycle_retained = False
+        if initial_parallel_lease and getattr(
+            agent,
+            "_parallel_lifecycle_retained",
+            False,
+        ):
+            from plugins.web.parallel.provider import _release_parallel_lifecycle
+
+            await _release_parallel_lifecycle(agent)  # noqa: ASYNC120
+            agent._parallel_lifecycle_retained = False
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
                 await _mcp_tool._release_mcp_lifecycle(agent)  # noqa: ASYNC120

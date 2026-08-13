@@ -13,6 +13,8 @@ from pyleak import no_task_leaks
 from pyleak.eventloop import LeakAction
 from pathlib import Path
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
 from tools.checkpoint_manager import (
     CheckpointManager,
     _shadow_repo_path,
@@ -96,6 +98,30 @@ class TestStorePath:
         assert await _project_hash(str(project)) != await _project_hash(str(fake_home / "other"))
         # ~/project and its expanded form are the same project.
         assert await _project_hash(f"~/{project.name}") == await _project_hash(str(project))
+
+    async def test_default_store_isolated_by_concurrent_profile(self, tmp_path, monkeypatch):
+        import tools.checkpoint_manager as checkpoint_module
+
+        monkeypatch.setattr(
+            checkpoint_module,
+            "CHECKPOINT_BASE",
+            checkpoint_module._IMPORT_CHECKPOINT_BASE,
+        )
+
+        async def resolve(home: Path) -> Path:
+            token = set_hermes_home_override(home)
+            try:
+                await asyncio.sleep(0)
+                return _store_path()
+            finally:
+                reset_hermes_home_override(token)
+
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        store_a, store_b = await asyncio.gather(resolve(home_a), resolve(home_b))
+
+        assert store_a == home_a / "checkpoints" / "store"
+        assert store_b == home_b / "checkpoints" / "store"
 
 
 # =========================================================================

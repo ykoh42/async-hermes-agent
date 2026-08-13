@@ -34,13 +34,17 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
+import hashlib
 import importlib.metadata
 import inspect
 import logging
 import os
 import sys
+import threading
 import types
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -67,6 +71,24 @@ from tools import url_safety as _url_safety_bootstrap  # noqa: F401
 from tools import website_policy as _website_policy_bootstrap  # noqa: F401
 from tools import xai_http as _xai_http_bootstrap  # noqa: F401
 
+# Bundled browser/web plugin packages are executed from asynchronously loaded
+# source during discovery, but their package-level ``from plugins...`` imports
+# still use Python's synchronous import machinery.  Prime that fixed shipped
+# graph when the plugin subsystem itself is imported, before applications
+# enter their event loop.  User and project plugin source remains discovered
+# at the awaited profile boundary below.
+from plugins.browser.browser_use import provider as _browser_use_bootstrap  # noqa: F401
+from plugins.browser.browserbase import provider as _browserbase_bootstrap  # noqa: F401
+from plugins.browser.firecrawl import provider as _browser_firecrawl_bootstrap  # noqa: F401
+from plugins.web.brave_free import provider as _brave_free_bootstrap  # noqa: F401
+from plugins.web.ddgs import provider as _ddgs_bootstrap  # noqa: F401
+from plugins.web.exa import provider as _exa_bootstrap  # noqa: F401
+from plugins.web.firecrawl import provider as _web_firecrawl_bootstrap  # noqa: F401
+from plugins.web.parallel import provider as _parallel_provider_bootstrap  # noqa: F401
+from plugins.web.searxng import provider as _searxng_bootstrap  # noqa: F401
+from plugins.web.tavily import provider as _tavily_bootstrap  # noqa: F401
+from plugins.web.xai import provider as _xai_web_bootstrap  # noqa: F401
+
 try:
     import parallel as _parallel_bootstrap  # noqa: F401
 except Exception:
@@ -77,10 +99,10 @@ from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 from hermes_cli.async_source_loader import (
-    load_source_module,
-    load_source_package,
-    locate_source_module,
-    unload_source_finder,
+    _load_source_module,
+    _load_source_package,
+    _locate_source_module,
+    _unload_source_finder,
 )
 
 
@@ -203,6 +225,88 @@ VALID_HOOKS: Set[str] = {
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+
+_ACTIVE_PLUGIN_MANAGER: contextvars.ContextVar["PluginManager | None"] = (
+    contextvars.ContextVar("active_plugin_manager", default=None)
+)
+_PLUGIN_REGISTRATION_TARGET: contextvars.ContextVar[
+    tuple["PluginManager", str] | None
+] = contextvars.ContextVar("plugin_registration_target", default=None)
+_PLUGIN_MANAGERS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, "PluginManager"]
+] = weakref.WeakKeyDictionary()
+_PLUGIN_MANAGER_INSTANCES: weakref.WeakSet["PluginManager"] = weakref.WeakSet()
+_PLUGIN_MANAGER_GUARD = threading.RLock()
+
+
+def _current_plugin_registry_scope(*, registration: bool = False) -> object | None:
+    """Return the active profile overlay without importing plugin consumers.
+
+    During registration only non-bundled plugins receive an overlay. Bundled
+    registrations intentionally remain process-shared, matching upstream's
+    built-in registry behavior.
+    """
+    target = _PLUGIN_REGISTRATION_TARGET.get()
+    if target is not None:
+        manager, source = target
+        if registration and source not in {"user", "project"}:
+            return None
+        return manager._registry_scope
+    if registration:
+        return None
+    manager = _ACTIVE_PLUGIN_MANAGER.get()
+    return manager._registry_scope if manager is not None else None
+
+
+def _plugin_registry_scope_for_module(module_name: str) -> object | None:
+    """Resolve a delayed registration by its defining plugin namespace."""
+    registry_module = sys.modules.get("tools.registry")
+    registry = getattr(registry_module, "registry", None)
+    namespace_for = getattr(registry, "_plugin_namespace_for_module", None)
+    if not callable(namespace_for):
+        return None
+    namespace = namespace_for(module_name)
+    if namespace is None:
+        if module_name.startswith(f"{_NS_PARENT}."):
+            raise RuntimeError(
+                f"Plugin module {module_name!r} is no longer attached to an "
+                "active plugin manager"
+            )
+        return None
+    return registry._plugin_module_scopes.get(namespace)
+
+
+async def _canonical_plugin_home() -> tuple[str, Path]:
+    """Resolve the current task's canonical plugin home natively async."""
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical = os.path.normcase(await realpath(str(get_hermes_home())))
+    return canonical, Path(canonical)
+
+
+def _plugin_namespace(loop: asyncio.AbstractEventLoop, profile_key: str) -> str:
+    digest = hashlib.sha256(f"{id(loop)}\0{profile_key}".encode()).hexdigest()[:16]
+    return f"{_NS_PARENT}._profile_{digest}"
+
+
+def _clear_profile_registries(scope: object) -> None:
+    """Drop state owned by one user-plugin profile from loaded registries."""
+    registry_modules = (
+        "tools.registry",
+        "agent.image_gen_registry",
+        "agent.video_gen_registry",
+        "agent.web_search_registry",
+        "agent.browser_registry",
+        "agent.tts_registry",
+        "agent.secret_sources.registry",
+    )
+    for module_name in registry_modules:
+        module = sys.modules.get(module_name)
+        clear = getattr(module, "_clear_plugin_scope", None)
+        if not callable(clear):
+            clear = getattr(getattr(module, "registry", None), "_clear_plugin_scope", None)
+        if callable(clear):
+            clear(scope)
 
 
 def _env_enabled(name: str) -> bool:
@@ -335,6 +439,15 @@ class PluginContext:
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
 
+    @contextlib.contextmanager
+    def _registration_scope(self):
+        """Attribute delayed context-facade registrations to this profile."""
+        token = _PLUGIN_REGISTRATION_TARGET.set((self._manager, self.manifest.source))
+        try:
+            yield
+        finally:
+            _PLUGIN_REGISTRATION_TARGET.reset(token)
+
     # -- host-owned LLM access ----------------------------------------------
 
     @property
@@ -412,7 +525,7 @@ class PluginContext:
         emoji: str = "",
         override: bool = False,
     ) -> None:
-        """Register a tool in the global registry **and** track it as plugin-provided.
+        """Register a tool in the active registry **and** track it as plugin-provided.
 
         Pass ``override=True`` to replace an existing built-in tool with the
         same name (e.g. swap the default ``browser_navigate`` for a custom
@@ -438,18 +551,19 @@ class PluginContext:
 
         from tools.registry import registry
 
-        registry.register(
-            name=name,
-            toolset=toolset,
-            schema=schema,
-            handler=handler,
-            check_fn=check_fn,
-            requires_env=requires_env,
-            is_async=is_async,
-            description=description,
-            emoji=emoji,
-            override=override,
-        )
+        with self._registration_scope():
+            registry.register(
+                name=name,
+                toolset=toolset,
+                schema=schema,
+                handler=handler,
+                check_fn=check_fn,
+                requires_env=requires_env,
+                is_async=is_async,
+                description=description,
+                emoji=emoji,
+                override=override,
+            )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
             "Plugin %s registered tool: %s%s",
@@ -628,7 +742,8 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        register_provider(provider)
+        with self._registration_scope():
+            register_provider(provider)
         logger.info(
             "Plugin '%s' registered image_gen provider: %s",
             self.manifest.name, provider.name,
@@ -655,7 +770,8 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_video_provider(provider)
+        with self._registration_scope():
+            _register_video_provider(provider)
         logger.info(
             "Plugin '%s' registered video_gen provider: %s",
             self.manifest.name, provider.name,
@@ -683,7 +799,8 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_web_provider(provider)
+        with self._registration_scope():
+            _register_web_provider(provider)
         logger.info(
             "Plugin '%s' registered web provider: %s",
             self.manifest.name, provider.name,
@@ -715,10 +832,33 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_browser_provider(provider)
+        with self._registration_scope():
+            _register_browser_provider(provider)
         logger.info(
             "Plugin '%s' registered browser provider: %s",
             self.manifest.name, provider.name,
+        )
+
+    # -- TTS provider registration -------------------------------------------
+
+    def register_tts_provider(self, provider) -> None:
+        """Register a text-to-speech backend under the upstream plugin API."""
+        from agent.tts_provider import TTSProvider
+        from agent.tts_registry import register_provider
+
+        if not isinstance(provider, TTSProvider):
+            logger.warning(
+                "Plugin '%s' tried to register a TTS provider that does not "
+                "inherit from TTSProvider. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        with self._registration_scope():
+            register_provider(provider)
+        logger.info(
+            "Plugin '%s' registered TTS provider: %s",
+            self.manifest.name,
+            provider.name,
         )
 
     # -- secret source registration ---------------------------------------
@@ -735,7 +875,9 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        if register_source(source):
+        with self._registration_scope():
+            registered = register_source(source)
+        if registered:
             logger.info(
                 "Plugin '%s' registered secret source: %s",
                 self.manifest.name,
@@ -953,6 +1095,12 @@ class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self) -> None:
+        self._registry_scope = self
+        self._loop_finalizer: weakref.finalize | None = None
+        _PLUGIN_MANAGER_INSTANCES.add(self)
+        self._module_namespace = _NS_PARENT
+        self._owned_module_names: Set[str] = set()
+        self._bound_module_names: Set[str] = set()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
@@ -975,7 +1123,36 @@ class PluginManager:
         for loaded in self._plugins.values():
             module = loaded.module
             if module is not None:
-                unload_source_finder(module)
+                _unload_source_finder(module)
+
+    def _clear_owned_state(self) -> None:
+        """Remove profile-local registrations and imported plugin modules."""
+        self._unload_source_finders()
+        _clear_profile_registries(self._registry_scope)
+        registry_module = sys.modules.get("tools.registry")
+        unbind = getattr(
+            getattr(registry_module, "registry", None),
+            "_unbind_plugin_namespaces",
+            None,
+        )
+        if callable(unbind):
+            unbind(set(self._bound_module_names))
+        self._bound_module_names.clear()
+        for module_name in sorted(self._owned_module_names, reverse=True):
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(
+                    f"{module_name}."
+                ):
+                    sys.modules.pop(loaded_name, None)
+        self._owned_module_names.clear()
+        self._plugins.clear()
+        self._hooks.clear()
+        self._middleware.clear()
+        self._plugin_tool_names.clear()
+        self._plugin_commands.clear()
+        self._plugin_skills.clear()
+        self._aux_tasks.clear()
+        self._context_engine = None
 
     # -----------------------------------------------------------------------
     # Public
@@ -988,30 +1165,36 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        async with self._discovery_lock:
-            if self._discovered and not force:
-                return
-            if env_var_enabled("HERMES_SAFE_MODE"):
-                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+        discovery_lock = self._discovery_lock
+        try:
+            async with discovery_lock:
+                if self._discovered and not force:
+                    return
+                if env_var_enabled("HERMES_SAFE_MODE"):
+                    logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                    self._discovered = True
+                    return
+                if force:
+                    self._clear_owned_state()
+                try:
+                    await self._discover_and_load_inner()
+                except BaseException:
+                    self._clear_owned_state()
+                    self._discovered = False
+                    raise
                 self._discovered = True
-                return
-            if force:
-                self._unload_source_finders()
-                self._plugins.clear()
-                self._hooks.clear()
-                self._middleware.clear()
-                self._plugin_tool_names.clear()
-                self._plugin_commands.clear()
-                self._plugin_skills.clear()
-                self._aux_tasks.clear()
-                self._context_engine = None
-            try:
-                await self._discover_and_load_inner()
-            except BaseException:
-                self._unload_source_finders()
-                self._discovered = False
-                raise
-            self._discovered = True
+                _ACTIVE_PLUGIN_MANAGER.set(self)
+        finally:
+            if (
+                self._discovery_lock is discovery_lock
+                and not discovery_lock.locked()
+                and not getattr(discovery_lock, "_waiters", None)
+            ):
+                # A contended asyncio.Lock retains its event loop even after
+                # all waiters finish. Replace the idle lock so the loop/profile
+                # cache remains weakly owned and loop finalization can unload
+                # this manager's modules and registry overlays.
+                self._discovery_lock = asyncio.Lock()
 
     async def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1391,11 +1574,24 @@ class PluginManager:
         from tools.registry import registry as _registry
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
+        _module_name = f"{self._module_namespace}.{_slug}"
         override_context = PluginContext(manifest, self)
         override_context._profile_context = self._profile_context
         _registry.register_plugin_override_policy(
-            f"{_NS_PARENT}.{_slug}",
+            _module_name,
             override_context._tool_override_allowed(""),
+        )
+        _registry._bind_plugin_scope(
+            _module_name,
+            (
+                self._registry_scope
+                if manifest.source in {"user", "project"}
+                else None
+            ),
+        )
+        self._bound_module_names.add(_module_name)
+        registration_token = _PLUGIN_REGISTRATION_TARGET.set(
+            (self, manifest.source)
         )
         try:
             if manifest.source in {"user", "project", "bundled"}:
@@ -1404,6 +1600,24 @@ class PluginManager:
                 module = await self._load_entrypoint_module(manifest)
 
             loaded.module = module
+            actual_module_name = getattr(module, "__module__", None)
+            if isinstance(module, types.ModuleType):
+                actual_module_name = module.__name__
+            if isinstance(actual_module_name, str) and actual_module_name:
+                _registry.register_plugin_override_policy(
+                    actual_module_name,
+                    override_context._tool_override_allowed(""),
+                )
+                _registry._bind_plugin_scope(
+                    actual_module_name,
+                    (
+                        self._registry_scope
+                        if manifest.source in {"user", "project"}
+                        else None
+                    ),
+                )
+                if manifest.source in {"user", "project", "bundled"}:
+                    self._bound_module_names.add(actual_module_name)
 
             # Call register()
             register_fn = module if callable(module) else getattr(module, "register", None)
@@ -1470,6 +1684,8 @@ class PluginManager:
                 "Failed to load plugin '%s': %s",
                 manifest.name, exc, exc_info=_PLUGINS_DEBUG,
             )
+        finally:
+            _PLUGIN_REGISTRATION_TARGET.reset(registration_token)
         self._plugins[manifest.key or manifest.name] = loaded
 
     async def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
@@ -1483,16 +1699,20 @@ class PluginManager:
         plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
         init_file = plugin_dir / "__init__.py"
 
-        # Ensure the namespace parent package exists
-        if _NS_PARENT not in sys.modules:
-            ns_pkg = types.ModuleType(_NS_PARENT)
-            ns_pkg.__path__ = []  # type: ignore[attr-defined]
-            ns_pkg.__package__ = _NS_PARENT
-            sys.modules[_NS_PARENT] = ns_pkg
+        # Ensure both namespace parents exist. Profile-local package names
+        # prevent same-slug plugins from separate HERMES_HOME values from
+        # sharing ``sys.modules`` state.
+        for namespace in (_NS_PARENT, self._module_namespace):
+            if namespace not in sys.modules:
+                ns_pkg = types.ModuleType(namespace)
+                ns_pkg.__path__ = []  # type: ignore[attr-defined]
+                ns_pkg.__package__ = namespace
+                sys.modules[namespace] = ns_pkg
 
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{_NS_PARENT}.{slug}"
+        module_name = f"{self._module_namespace}.{slug}"
+        self._owned_module_names.add(module_name)
         source_alias = None
         if manifest.source == "bundled":
             key_parts = key.split("/")
@@ -1500,7 +1720,7 @@ class PluginManager:
             if all(part.isidentifier() for part in alias_parts):
                 source_alias = ".".join(alias_parts)
         try:
-            module = await load_source_package(
+            module = await _load_source_package(
                 module_name,
                 init_file,
                 source_alias=source_alias,
@@ -1558,7 +1778,7 @@ class PluginManager:
 
                 module = sys.modules.get(module_name) if module_name else None
                 if module is None and module_name:
-                    source_info = await locate_source_module(
+                    source_info = await _locate_source_module(
                         module_name,
                         distribution=getattr(ep, "dist", None),
                     )
@@ -1566,7 +1786,7 @@ class PluginManager:
                         source_path, is_package = source_info
                         try:
                             if is_package:
-                                module = await load_source_package(module_name, source_path)
+                                module = await _load_source_package(module_name, source_path)
                             else:
                                 parent_name, _, _ = module_name.rpartition(".")
                                 parent_init = source_path.parent / "__init__.py"
@@ -1575,8 +1795,8 @@ class PluginManager:
                                     and parent_name not in sys.modules
                                     and await aiofiles.os.path.isfile(parent_init)
                                 ):
-                                    await load_source_package(parent_name, parent_init)
-                                module = await load_source_module(
+                                    await _load_source_package(parent_name, parent_init)
+                                module = await _load_source_module(
                                     module_name,
                                     source_path,
                                     package_dir=source_path.parent,
@@ -1748,11 +1968,63 @@ _plugin_manager: Optional[PluginManager] = None
 
 
 def get_plugin_manager() -> PluginManager:
-    """Return (and lazily create) the global PluginManager singleton."""
+    """Return the active profile manager, with a no-loop legacy projection."""
     global _plugin_manager
+    active = _ACTIVE_PLUGIN_MANAGER.get()
+    if active is not None:
+        return active
     if _plugin_manager is None:
         _plugin_manager = PluginManager()
     return _plugin_manager
+
+
+async def _get_profile_plugin_manager() -> PluginManager:
+    """Return the loop + canonical-HERMES_HOME manager for this task."""
+    global _plugin_manager
+    loop = asyncio.get_running_loop()
+    profile_key, _profile_home = await _canonical_plugin_home()
+    with _PLUGIN_MANAGER_GUARD:
+        per_loop = _PLUGIN_MANAGERS.setdefault(loop, {})
+        manager = per_loop.get(profile_key)
+        if manager is None:
+            legacy = _plugin_manager
+            if (
+                legacy is not None
+                and getattr(legacy, "_profile_key", None) is None
+                and getattr(legacy, "_owner_loop_ref", None) is None
+            ):
+                manager = legacy
+            else:
+                manager = PluginManager()
+            manager._profile_key = profile_key
+            manager._owner_loop_ref = weakref.ref(loop)
+            manager._module_namespace = _plugin_namespace(loop, profile_key)
+            manager._loop_finalizer = weakref.finalize(
+                loop,
+                manager._clear_owned_state,
+            )
+            per_loop[profile_key] = manager
+        _plugin_manager = manager
+    _ACTIVE_PLUGIN_MANAGER.set(manager)
+    return manager
+
+
+def _reset_plugin_profiles_for_tests() -> None:
+    """Clear all plugin profile state. Test-only."""
+    global _plugin_manager
+    with _PLUGIN_MANAGER_GUARD:
+        managers = set(_PLUGIN_MANAGER_INSTANCES)
+        if _plugin_manager is not None:
+            managers.add(_plugin_manager)
+        for manager in managers:
+            if manager._loop_finalizer is not None:
+                manager._loop_finalizer.detach()
+                manager._loop_finalizer = None
+            manager._clear_owned_state()
+            manager._discovered = False
+        _PLUGIN_MANAGERS.clear()
+        _plugin_manager = None
+    _ACTIVE_PLUGIN_MANAGER.set(None)
 
 
 async def discover_plugins(force: bool = False) -> None:
@@ -1761,7 +2033,8 @@ async def discover_plugins(force: bool = False) -> None:
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
     """
-    await get_plugin_manager().discover_and_load(force=force)
+    manager = await _get_profile_plugin_manager()
+    await manager.discover_and_load(force=force)
 
 
 class _PluginContractError(RuntimeError):
@@ -2023,11 +2296,11 @@ async def get_pre_verify_continue_message(
 
 
 async def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
-    """Return the global manager after ensuring plugin discovery has run.
+    """Return the current profile manager after ensuring discovery has run.
 
     Pass ``force=True`` to rescan in the current process.
     """
-    manager = get_plugin_manager()
+    manager = await _get_profile_plugin_manager()
     await manager.discover_and_load(force=force)
     return manager
 

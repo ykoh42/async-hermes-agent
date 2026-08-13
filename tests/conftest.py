@@ -26,6 +26,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,28 @@ async def provider_profiles_loaded():
     import providers
 
     await providers._ensure_provider_profiles_loaded()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _owned_policy_event_loop():
+    """Give pytest-asyncio an explicitly owned pre-existing policy loop.
+
+    On Python 3.11 the plugin snapshots the current policy loop before each
+    temporary test loop.  If no loop is installed, ``get_event_loop()``
+    implicitly creates one that neither pytest-asyncio nor asyncio owns, and
+    its selector sockets survive until a later ``gc.collect()``.  Installing
+    one session loop makes ownership deterministic without providing a loop
+    to individual tests or changing their strict-mode isolation.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        yield
+    finally:
+        try:
+            loop.close()
+        finally:
+            asyncio.set_event_loop(None)
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -200,6 +223,47 @@ _CREDENTIAL_NAMES = frozenset({
     "AI_GATEWAY_BASE_URL",
     "ANTHROPIC_BASE_URL",
 })
+
+_LIVE_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e"
+_COPILOT_LIVE_CREDENTIAL_NAMES = frozenset(
+    {"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}
+)
+
+
+def _live_e2e_credential_names(
+    environment: Mapping[str, str],
+    node_path: Path,
+) -> frozenset[str]:
+    """Return credentials explicitly enabled for one gated live E2E file.
+
+    Ordinary tests remain hermetic even when a developer happens to export a
+    provider key.  A credential crosses the fixture boundary only when the
+    collected test is one of this repository's opt-in ``test_live_*`` E2E
+    modules and its corresponding live/provider selector is explicit.
+    """
+    if node_path.parent != _LIVE_E2E_ROOT or not node_path.name.startswith(
+        "test_live_"
+    ):
+        return frozenset()
+
+    allowed: set[str] = set()
+    if environment.get("HERMES_LIVE_TESTS") == "1":
+        provider = (environment.get("HERMES_LIVE_PROVIDER") or "copilot").strip()
+        provider = provider.lower()
+        if provider == "openrouter":
+            allowed.add("OPENROUTER_API_KEY")
+        elif provider == "copilot":
+            allowed.update(_COPILOT_LIVE_CREDENTIAL_NAMES)
+
+    if environment.get("HERMES_LIVE_REASONING_TESTS") == "1":
+        allowed.add("HERMES_LIVE_REASONING_API_KEY")
+        provider = (
+            environment.get("HERMES_LIVE_REASONING_PROVIDER") or "lmstudio"
+        ).strip().lower()
+        if provider == "openrouter":
+            allowed.add("OPENROUTER_API_KEY")
+
+    return frozenset(allowed)
 
 
 def _looks_like_credential(name: str) -> bool:
@@ -368,7 +432,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_environment(tmp_path, monkeypatch):
+def _hermetic_environment(tmp_path, monkeypatch, request):
     """Blank out all credential/behavioral env vars so local and CI match.
 
     Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
@@ -376,8 +440,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     datetime/locale-sensitive tests are deterministic.
     """
     # 1. Blank every credential-shaped env var that's currently set.
+    live_e2e_credentials = _live_e2e_credential_names(
+        os.environ, Path(str(request.node.path))
+    )
     for name in list(os.environ.keys()):
-        if _looks_like_credential(name):
+        if _looks_like_credential(name) and name not in live_e2e_credentials:
             monkeypatch.delenv(name, raising=False)
 
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
@@ -671,50 +738,6 @@ def mock_config():
 # The subprocess-per-test plugin enforces the configured ``isolate_timeout``
 # ini key by terminating the child if it overruns. The old SIGALRM-based
 # fixture (POSIX-only, didn't work on Windows) is gone.
-
-
-@pytest.fixture(autouse=True)
-def _ensure_current_event_loop(request):
-    """Provide a default event loop for sync tests that call get_event_loop().
-
-    Python 3.11+ no longer guarantees a current loop for plain synchronous tests.
-    A number of gateway tests still use asyncio.get_event_loop().run_until_complete(...).
-    Ensure they always have a usable loop without interfering with pytest-asyncio's
-    own loop management for @pytest.mark.asyncio tests.
-
-    On Python 3.12+, ``asyncio.get_event_loop_policy().get_event_loop()`` with no
-    *running* loop emits DeprecationWarning; skip that path and install a fresh
-    loop via ``new_event_loop()`` instead.
-    """
-    if request.node.get_closest_marker("asyncio") is not None:
-        yield
-        return
-
-    loop = None
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-
-    if loop is None and sys.version_info < (3, 12):
-        try:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-        except RuntimeError:
-            loop = None
-
-    created = loop is None or loop.is_closed()
-    if created:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    try:
-        yield
-    finally:
-        if created and loop is not None:
-            try:
-                loop.close()
-            finally:
-                asyncio.set_event_loop(None)
 
 
 # ── Live-system guard ──────────────────────────────────────────────────────

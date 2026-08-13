@@ -27,12 +27,19 @@ import logging
 import os
 import shutil
 import asyncio
+import contextvars
+import threading
+import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiofiles.os
 
 from agent.memory_provider import MemoryProvider
+from agent.secret_scope import get_secret
+from hermes_constants import get_hermes_home
+from tools.environments.local import build_subprocess_env, _terminate_process
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -46,26 +53,15 @@ _MIN_QUERY_LEN = 10
 _MIN_OUTPUT_LEN = 20
 
 
-async def _finish_process_communicate(
-    process: asyncio.subprocess.Process,
-    communicate_task: asyncio.Task[tuple[bytes, bytes]],
-) -> tuple[bytes, bytes]:
-    """Drain and reap one owned brv process through repeated cancellation."""
-    async def drain_or_wait() -> tuple[bytes, bytes]:
-        try:
-            return await communicate_task
-        except BaseException:
-            await process.wait()
-            raise
-
-    cleanup_task = asyncio.create_task(drain_or_wait())
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned task before propagating repeated cancellation."""
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            output = await asyncio.shield(cleanup_task)
+            output = await asyncio.shield(task)
             break
         except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
-            if cleanup_task.cancelled():
+            if task.cancelled():
                 raise
             if cancellation is None:
                 cancellation = exc
@@ -122,39 +118,185 @@ async def _load_plugin_config() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# brv binary resolution (cached)
+# brv binary resolution (cached per loop and canonical profile)
 # ---------------------------------------------------------------------------
 
+# Retained private test seam. Runtime resolution is stored in the scoped cache
+# below; a non-None value deliberately overrides it for focused subprocess
+# tests that historically monkeypatched this name.
 _cached_brv_path: Optional[str] = None
 _which = aiofiles.os.wrap(shutil.which)
 
 
+@dataclass
+class _BrvPathState:
+    signature: tuple[str, str] | None = None
+    resolved: str | None = None
+    lock_ref: weakref.ReferenceType[asyncio.Lock] | None = None
+
+
+_BrvScope = tuple[asyncio.AbstractEventLoop, str]
+_brv_path_states: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, _BrvPathState]
+] = weakref.WeakKeyDictionary()
+_brv_scope_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_brv_scope_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("byterover_profile_scope", default=None)
+)
+_brv_cache_guard = threading.RLock()
+
+
+def _lexical_brv_profile() -> str:
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _prune_closed_brv_loops() -> None:
+    with _brv_cache_guard:
+        for loop in set(_brv_path_states) | set(_brv_scope_aliases):
+            if loop.is_closed():
+                _brv_path_states.pop(loop, None)
+                _brv_scope_aliases.pop(loop, None)
+
+
+async def _activate_brv_scope() -> _BrvScope:
+    _prune_closed_brv_loops()
+    loop = asyncio.get_running_loop()
+    lexical = _lexical_brv_profile()
+    active = _brv_scope_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        with _brv_cache_guard:
+            aliases = _brv_scope_aliases.get(loop)
+            canonical = aliases.get(lexical) if aliases is not None else None
+        if canonical is None:
+            expanduser = aiofiles.os.wrap(os.path.expanduser)
+            expanded = str(await expanduser(lexical))
+            is_absolute = (
+                expanded.startswith(("/", "\\\\"))
+                or (
+                    len(expanded) >= 3
+                    and expanded[1] == ":"
+                    and expanded[2] in "/\\"
+                )
+            )
+            if not is_absolute:
+                expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+            realpath = aiofiles.os.wrap(os.path.realpath)
+            canonical = os.path.normcase(str(await realpath(expanded)))
+        with _brv_cache_guard:
+            _brv_scope_aliases.setdefault(loop, {})[lexical] = canonical
+    _brv_scope_context.set((lexical, canonical))
+    return loop, canonical
+
+
+def _brv_state(scope: _BrvScope) -> _BrvPathState:
+    loop, profile = scope
+    with _brv_cache_guard:
+        return _brv_path_states.setdefault(loop, {}).setdefault(
+            profile,
+            _BrvPathState(),
+        )
+
+
+def _brv_state_lock(state: _BrvPathState) -> asyncio.Lock:
+    with _brv_cache_guard:
+        lock = state.lock_ref() if state.lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            state.lock_ref = weakref.ref(lock)
+        return lock
+
+
 async def _resolve_brv_path() -> Optional[str]:
     """Find the brv binary on PATH or well-known install locations."""
-    global _cached_brv_path
     if _cached_brv_path is not None:
         return _cached_brv_path if _cached_brv_path != "" else None
+    scope = await _activate_brv_scope()
+    state = _brv_state(scope)
+    path_value = os.environ.get("PATH", "")
+    home_value = os.environ.get("HOME", "").strip()
+    if not home_value:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        home_value = str(await expanduser("~"))
+    signature = (path_value, home_value)
 
-    found = await _which("brv")
-    if not found:
-        home = Path.home()
-        candidates = [
-            home / ".brv-cli" / "bin" / "brv",
-            Path("/usr/local/bin/brv"),
-            home / ".npm-global" / "bin" / "brv",
-        ]
-        for c in candidates:
-            if await aiofiles.os.path.exists(c):
-                found = str(c)
-                break
+    async with _brv_state_lock(state):
+        if state.signature == signature and state.resolved is not None:
+            return state.resolved or None
 
-    _cached_brv_path = found or ""
-    return found
+        found = await _which("brv", path=path_value)
+        if not found:
+            home = Path(home_value)
+            candidates = [
+                home / ".brv-cli" / "bin" / "brv",
+                Path("/usr/local/bin/brv"),
+                home / ".npm-global" / "bin" / "brv",
+            ]
+            for candidate in candidates:
+                if await aiofiles.os.path.exists(candidate):
+                    found = str(candidate)
+                    break
+
+        state.signature = signature
+        state.resolved = found or ""
+        return found
+
+
+async def _invalidate_brv_path(path: str) -> None:
+    global _cached_brv_path
+    if _cached_brv_path == path:
+        _cached_brv_path = None
+        return
+    scope = await _activate_brv_scope()
+    state = _brv_state(scope)
+    async with _brv_state_lock(state):
+        if state.resolved == path:
+            state.signature = None
+            state.resolved = None
+
+
+async def _build_brv_env(brv_path: str) -> dict[str, str]:
+    """Build a profile-scoped child env containing only ByteRover's key."""
+    api_key = get_secret("BRV_API_KEY")
+    base_env = os.environ.copy()
+    base_env.pop("BRV_API_KEY", None)
+    extra = (
+        {"_HERMES_FORCE_BRV_API_KEY": str(api_key)}
+        if api_key is not None
+        else None
+    )
+    env = await build_subprocess_env(
+        base=base_env,
+        scrub_secrets=True,
+        extra=extra,
+    )
+    brv_bin_dir = str(Path(brv_path).parent)
+    env["PATH"] = brv_bin_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+async def _terminate_and_drain_brv(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    if hasattr(process, "pid"):
+        await _terminate_process(process)
+    else:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+    return await communicate_task
 
 
 async def _run_brv(
     args: List[str],
-    timeout: int = _QUERY_TIMEOUT,
+    timeout: int = _QUERY_TIMEOUT,  # noqa: ASYNC109 - upstream argument name
     cwd: Optional[str] = None,
 ) -> dict:
     """Run a brv CLI command. Returns {success, output, error}."""
@@ -166,11 +308,11 @@ async def _run_brv(
     effective_cwd = cwd or str(_get_brv_cwd())
     await aiofiles.os.makedirs(effective_cwd, exist_ok=True)
 
-    env = os.environ.copy()
-    brv_bin_dir = str(Path(brv_path).parent)
-    env["PATH"] = brv_bin_dir + os.pathsep + env.get("PATH", "")
-
     try:
+        env = await _build_brv_env(brv_path)
+        subprocess_kwargs: dict[str, Any] = {}
+        if os.name != "nt":
+            subprocess_kwargs["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -178,35 +320,47 @@ async def _run_brv(
             stdin=asyncio.subprocess.DEVNULL,
             cwd=effective_cwd,
             env=env,
+            **subprocess_kwargs,
         )
+        if os.name != "nt" and hasattr(process, "pid"):
+            process._hermes_pgid = process.pid
         communicate_task = asyncio.create_task(process.communicate())
         timeout_error: TimeoutError | None = None
+        communication_error: Exception | None = None
         try:
             async with asyncio.timeout(timeout):
                 stdout_bytes, stderr_bytes = await asyncio.shield(communicate_task)
         except TimeoutError as exc:
             timeout_error = exc
         except asyncio.CancelledError:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+            cleanup_task = asyncio.create_task(
+                _terminate_and_drain_brv(process, communicate_task),
+                name="byterover-cancelled-process-cleanup",
+            )
             try:
-                await _finish_process_communicate(process, communicate_task)
+                await _finish_owned_task(cleanup_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.debug("brv cleanup after cancellation failed", exc_info=True)
             raise
+        except Exception as exc:
+            communication_error = exc
+
+        if communication_error is not None:
+            cleanup_task = asyncio.create_task(
+                _terminate_and_drain_brv(process, communicate_task),
+                name="byterover-failed-process-cleanup",
+            )
+            await _finish_owned_task(cleanup_task)
+            raise communication_error
 
         if timeout_error is not None:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            await _finish_process_communicate(process, communicate_task)
+            cleanup_task = asyncio.create_task(
+                _terminate_and_drain_brv(process, communicate_task),
+                name="byterover-timed-out-process-cleanup",
+            )
+            await _finish_owned_task(cleanup_task)
             return {"success": False, "error": f"brv timed out after {timeout}s"}
 
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -220,8 +374,7 @@ async def _run_brv(
         }
 
     except FileNotFoundError:
-        global _cached_brv_path
-        _cached_brv_path = None
+        await _invalidate_brv_path(brv_path)
         return {"success": False, "error": "brv CLI not found"}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -229,7 +382,6 @@ async def _run_brv(
 
 def _get_brv_cwd() -> Path:
     """Profile-scoped working directory for the brv context tree."""
-    from hermes_constants import get_hermes_home
     return get_hermes_home() / "byterover"
 
 
@@ -292,6 +444,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         self._cwd = ""
         self._session_id = ""
         self._turn_count = 0
+        self._brv_available = False
 
     @property
     def name(self) -> str:
@@ -299,7 +452,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
 
     async def is_available(self) -> bool:
         """Check if brv CLI is installed. No network calls."""
-        return await _resolve_brv_path() is not None
+        self._brv_available = await _resolve_brv_path() is not None
+        return self._brv_available
 
     def get_config_schema(self):
         return [
@@ -330,7 +484,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         await aiofiles.os.makedirs(self._cwd, exist_ok=True)
 
     def system_prompt_block(self) -> str:
-        if not _cached_brv_path:
+        if not self._brv_available and not _cached_brv_path:
             return ""
         return (
             "# ByteRover Memory\n"

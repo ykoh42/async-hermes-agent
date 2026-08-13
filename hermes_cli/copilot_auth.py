@@ -19,11 +19,15 @@ Credential search order (matching Copilot CLI behaviour):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import shutil
+import threading
 import time
+import weakref
+from collections.abc import Hashable, Iterator, MutableMapping
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +35,10 @@ import aiofiles
 import aiofiles.os
 import httpx
 
+from agent.secret_scope import (
+    get_secret as _get_secret,
+    is_multiplex_active as _is_multiplex_active,
+)
 from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
@@ -139,7 +147,7 @@ async def resolve_copilot_token() -> tuple[str, str]:
     # 1. Check env vars in priority order
     any_env_var_set = False
     for env_var in COPILOT_ENV_VARS:
-        val = os.getenv(env_var, "").strip()
+        val = (_get_secret(env_var, "") or "").strip()
         if val:
             any_env_var_set = True
             valid, msg = validate_copilot_token(val)
@@ -155,6 +163,16 @@ async def resolve_copilot_token() -> tuple[str, str]:
             "Copilot env var(s) set but none held a supported token; "
             "skipping `gh auth token` fallback to honor explicit env-var "
             "intent (and avoid the subprocess cost on cold start, #60800)."
+        )
+        return "", ""
+
+    # ``gh auth token`` reads the process user's global credential store. It
+    # cannot identify the active Hermes profile, so falling through here in a
+    # multiplexed service could authenticate profile B as profile A. Scoped
+    # environment tokens above remain supported; the global CLI store does not.
+    if _is_multiplex_active():
+        logger.debug(
+            "Skipping `gh auth token` fallback while profile multiplexing is active"
         )
         return "", ""
 
@@ -202,7 +220,14 @@ async def _try_gh_cli_token() -> Optional[str]:
     subprocess environment so ``gh`` reads from its own credential store
     (hosts.yml) instead of just echoing the env var back.
     """
-    hostname = os.getenv("COPILOT_GH_HOST", "").strip()
+    if _is_multiplex_active():
+        logger.debug(
+            "Skipping process-global GitHub CLI credentials while profile "
+            "multiplexing is active"
+        )
+        return None
+
+    hostname = (_get_secret("COPILOT_GH_HOST", "") or "").strip()
 
     # Build a clean env so gh doesn't short-circuit on GITHUB_TOKEN / GH_TOKEN
     clean_env = {k: v for k, v in os.environ.items()
@@ -359,9 +384,167 @@ async def copilot_device_code_login(
 
 # ─── Copilot Token Exchange ────────────────────────────────────────────────
 
+_COPILOT_NO_LOOP = object()
+_CopilotScope = tuple[asyncio.AbstractEventLoop | object, str]
+_copilot_scope_context: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("copilot_auth_profile_scope", default=None)
+)
+_copilot_scope_aliases: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, str]
+] = weakref.WeakKeyDictionary()
+_copilot_scope_guard = threading.RLock()
+
+
+def _lexical_copilot_profile() -> str:
+    """Return the active profile marker without filesystem access."""
+    from hermes_constants import get_hermes_home
+
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_copilot_scope() -> _CopilotScope:
+    """Return the activated profile or a lexical staging scope."""
+    lexical = _lexical_copilot_profile()
+    try:
+        loop: asyncio.AbstractEventLoop | object = asyncio.get_running_loop()
+    except RuntimeError:
+        return _COPILOT_NO_LOOP, lexical
+    active = _copilot_scope_context.get()
+    if active is not None and active[0] == lexical:
+        return loop, active[1]
+    with _copilot_scope_guard:
+        aliases = _copilot_scope_aliases.get(loop)
+        canonical = aliases.get(lexical, lexical) if aliases is not None else lexical
+    return loop, canonical
+
+
+class _ScopedCopilotCache(MutableMapping):
+    """Dict-compatible active-loop/profile cache for retained private hooks."""
+
+    def __init__(self) -> None:
+        self._loop_values: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, dict]
+        ] = weakref.WeakKeyDictionary()
+        self._staged_values: dict[str, dict] = {}
+
+    def _scoped(self, scope: _CopilotScope) -> dict:
+        loop, profile = scope
+        with _copilot_scope_guard:
+            if loop is _COPILOT_NO_LOOP:
+                return self._staged_values.setdefault(profile, {})
+            assert isinstance(loop, asyncio.AbstractEventLoop)
+            return self._loop_values.setdefault(loop, {}).setdefault(profile, {})
+
+    def _active(self) -> dict:
+        return self._scoped(_current_copilot_scope())
+
+    def migrate(self, source: _CopilotScope, target: _CopilotScope) -> None:
+        if source == target:
+            return
+        with _copilot_scope_guard:
+            source_values = self._scoped(source)
+            target_values = self._scoped(target)
+            if source_values is target_values:
+                return
+            target_values.update(source_values)
+            source_values.clear()
+
+    def __getitem__(self, key):
+        return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        del self._active()[key]
+
+    def __iter__(self) -> Iterator:
+        return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def clear(self) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            with _copilot_scope_guard:
+                self._loop_values.clear()
+                self._staged_values.clear()
+            return
+        self._active().clear()
+
+
+class _CopilotAsyncLocks:
+    """Weak loop-local locks for exchange and disk critical sections."""
+
+    def __init__(self) -> None:
+        self._locks: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            dict[Hashable, weakref.ReferenceType[asyncio.Lock]],
+        ] = weakref.WeakKeyDictionary()
+
+    def for_key(self, key: Hashable) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        with _copilot_scope_guard:
+            locks = self._locks.setdefault(loop, {})
+            for stale_key, stale_ref in tuple(locks.items()):
+                if stale_ref() is None:
+                    locks.pop(stale_key, None)
+            lock_ref = locks.get(key)
+            lock = lock_ref() if lock_ref is not None else None
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[key] = weakref.ref(lock)
+            return lock
+
+
+async def _activate_copilot_scope() -> _CopilotScope:
+    """Resolve the active event loop and canonical Hermes profile."""
+    loop = asyncio.get_running_loop()
+    lexical = _lexical_copilot_profile()
+    active = _copilot_scope_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        with _copilot_scope_guard:
+            aliases = _copilot_scope_aliases.get(loop)
+            canonical = aliases.get(lexical) if aliases is not None else None
+        if canonical is None:
+            expanduser = aiofiles.os.wrap(os.path.expanduser)
+            expanded = str(await expanduser(lexical))
+            is_absolute = (
+                expanded.startswith(("/", "\\\\"))
+                or (
+                    len(expanded) >= 3
+                    and expanded[1] == ":"
+                    and expanded[2] in "/\\"
+                )
+            )
+            if not is_absolute:
+                expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+            realpath = aiofiles.os.wrap(os.path.realpath)
+            canonical = os.path.normcase(str(await realpath(expanded)))
+        with _copilot_scope_guard:
+            _copilot_scope_aliases.setdefault(loop, {})[lexical] = canonical
+    scope = (loop, canonical)
+    _copilot_scope_context.set((lexical, canonical))
+    for source in ((loop, lexical), (_COPILOT_NO_LOOP, lexical)):
+        for cache in (_jwt_cache, _exchange_failure_cache):
+            migrate = getattr(cache, "migrate", None)
+            if callable(migrate):
+                migrate(source, scope)
+    return scope
+
+
+_exchange_locks = _CopilotAsyncLocks()
+_jwt_disk_locks = _CopilotAsyncLocks()
+
 # Module-level cache for exchanged Copilot API tokens.
 # Maps raw_token_fingerprint -> (api_token, expires_at_epoch, base_url).
-_jwt_cache: dict[str, tuple[str, float, Optional[str]]] = {}
+_jwt_cache: MutableMapping[str, tuple[str, float, Optional[str]]] = (
+    _ScopedCopilotCache()
+)
 _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 
 # Token exchange endpoint and headers (matching VS Code / Copilot CLI)
@@ -385,7 +568,7 @@ _JWT_DISK_MAX_BYTES = 1_048_576
 # Negative cache for failed exchanges. Without it, every load_pool("copilot")
 # call re-runs the full exchange. Maps raw-token fingerprint to the epoch until
 # which exchange attempts are skipped.
-_exchange_failure_cache: dict[str, float] = {}
+_exchange_failure_cache: MutableMapping[str, float] = _ScopedCopilotCache()
 _EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS = 60.0
 _EXCHANGE_FAILURE_TTL_PERMANENT_SECONDS = 1800.0
 _EXCHANGE_PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404})
@@ -417,32 +600,85 @@ async def _read_jwt_store(path: Path) -> Optional[dict]:
         return None
 
 
+async def _jwt_disk_lock(path: Path) -> asyncio.Lock:
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    key = os.path.normcase(str(await realpath(path)))
+    return _jwt_disk_locks.for_key(key)
+
+
+async def _remove_jwt_temp(path: Path) -> None:
+    try:
+        await aiofiles.os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+async def _cleanup_jwt_temp_after_cancellation(
+    path: Path,
+    cancellation: asyncio.CancelledError,
+) -> None:
+    """Remove a secret-bearing temp file before propagating cancellation."""
+    cleanup_task = asyncio.create_task(_remove_jwt_temp(path))
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError:  # noqa: ASYNC103 - original re-raised below
+            if cleanup_task.cancelled():
+                break  # noqa: ASYNC104 - original re-raised below
+        except Exception as exc:
+            logger.debug("Failed to clean Copilot JWT temp file: %s", exc)
+            break
+    raise cancellation
+
+
+async def _write_jwt_store(path: Path, store: dict) -> None:
+    """Atomically replace one bounded JWT store with private permissions."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+            # Tighten a reused/crash-left temp file before writing secrets.
+            try:
+                await aiofiles.os.wrap(os.chmod)(temporary, 0o600)
+            except Exception:
+                pass
+            await handle.write(json.dumps(store))
+        await aiofiles.os.replace(temporary, path)
+        try:
+            await aiofiles.os.wrap(os.chmod)(path, 0o600)
+        except Exception:
+            pass
+    except asyncio.CancelledError as cancellation:  # noqa: ASYNC103
+        await _cleanup_jwt_temp_after_cancellation(temporary, cancellation)
+    except Exception:
+        await _remove_jwt_temp(temporary)  # noqa: ASYNC120 - then re-raise
+        raise
+
+
 async def evict_cached_exchanged_token(raw_token: str) -> None:
     """Drop any cached exchanged JWT for ``raw_token`` in both cache tiers."""
     if not raw_token:
         return
+    scope = await _activate_copilot_scope()
     fp = _token_fingerprint(raw_token)
-    _jwt_cache.pop(fp, None)
-    _exchange_failure_cache.pop(fp, None)
-    path = _jwt_disk_path()
-    if not path or not await aiofiles.os.path.exists(path):
-        return
-    try:
-        store = await _read_jwt_store(path)
-        if store is not None and fp in store:
-            del store[fp]
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            async with aiofiles.open(tmp, "w", encoding="utf-8") as handle:
-                await handle.write(json.dumps(store))
+    async with _exchange_locks.for_key((scope[1], fp)):
+        _jwt_cache.pop(fp, None)
+        _exchange_failure_cache.pop(fp, None)
+        path = _jwt_disk_path()
+        if not path:
+            return
+        async with await _jwt_disk_lock(path):
+            if not await aiofiles.os.path.exists(path):
+                return
             try:
-                await aiofiles.os.wrap(os.chmod)(tmp, 0o600)
-            except Exception:
-                pass
-            await aiofiles.os.replace(tmp, path)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.debug("Failed to evict cached Copilot JWT: %s", exc)
+                store = await _read_jwt_store(path)
+                if store is not None and fp in store:
+                    del store[fp]
+                    await _write_jwt_store(path, store)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Failed to evict cached Copilot JWT: %s", exc)
 
 
 def _jwt_disk_path() -> Optional[Path]:
@@ -486,41 +722,32 @@ async def _save_jwt_to_disk(
     base_url: Optional[str],
 ) -> None:
     """Persist an exchanged JWT (0o600), pruning expired entries."""
+    await _activate_copilot_scope()
     path = _jwt_disk_path()
     if not path:
         return
-    try:
-        store: dict = {}
-        if await aiofiles.os.path.exists(path):
-            store = await _read_jwt_store(path) or {}
-        now = time.time()
-        store = {
-            key: value
-            for key, value in store.items()
-            if isinstance(value, dict)
-            and float(value.get("expires_at", 0) or 0) > now
-        }
-        store[fp] = {
-            "api_token": api_token,
-            "expires_at": expires_at,
-            "base_url": base_url,
-        }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        async with aiofiles.open(tmp, "w", encoding="utf-8") as handle:
-            await handle.write(json.dumps(store))
+    async with await _jwt_disk_lock(path):
         try:
-            await aiofiles.os.wrap(os.chmod)(tmp, 0o600)
-        except Exception:
-            pass
-        await aiofiles.os.replace(tmp, path)
-        try:
-            await aiofiles.os.wrap(os.chmod)(path, 0o600)
-        except Exception:
-            pass
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.debug("Failed to persist Copilot JWT: %s", exc)
+            store: dict = {}
+            if await aiofiles.os.path.exists(path):
+                store = await _read_jwt_store(path) or {}
+            now = time.time()
+            store = {
+                key: value
+                for key, value in store.items()
+                if isinstance(value, dict)
+                and float(value.get("expires_at", 0) or 0) > now
+            }
+            store[fp] = {
+                "api_token": api_token,
+                "expires_at": expires_at,
+                "base_url": base_url,
+            }
+            await _write_jwt_store(path, store)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Failed to persist Copilot JWT: %s", exc)
 
 
 async def exchange_copilot_token(
@@ -543,7 +770,23 @@ async def exchange_copilot_token(
     Results are cached in-process and reused until close to expiry.
     Raises ``ValueError`` on failure.
     """
+    scope = await _activate_copilot_scope()
     fp = _token_fingerprint(raw_token)
+    async with _exchange_locks.for_key((scope[1], fp)):
+        return await _exchange_copilot_token_locked(
+            raw_token,
+            timeout=timeout,
+            fp=fp,
+        )
+
+
+async def _exchange_copilot_token_locked(
+    raw_token: str,
+    *,
+    timeout: float,
+    fp: str,
+) -> tuple[str, float, Optional[str]]:
+    """Exchange after the active profile's fingerprint lock is held."""
 
     # Check in-process cache first
     cached = _jwt_cache.get(fp)
@@ -645,8 +888,8 @@ async def exchange_copilot_token(
     if not base_url:
         base_url = _derive_base_url_from_proxy_ep(api_token)
 
-    _jwt_cache[fp] = (api_token, expires_at, base_url)
     await _save_jwt_to_disk(fp, api_token, expires_at, base_url)
+    _jwt_cache[fp] = (api_token, expires_at, base_url)
     logger.debug(
         "Copilot token exchanged, expires_at=%s, base_url=%s",
         expires_at,

@@ -1,12 +1,12 @@
 """
 SWE Runner with Hermes Trajectory Format
 
-A native-async library runner that uses Hermes-Agent's retained local execution
+A native-async library runner that uses Hermes-Agent's retained execution
 environment and outputs trajectories in the Hermes-Agent format
 compatible with batch_runner.py and trajectory_compressor.py.
 
 Features:
-- Uses Hermes-Agent's local environment for command execution
+- Uses Hermes-Agent's local, Docker, or Modal environment for command execution
 - Outputs trajectories in Hermes format (from/value pairs with <tool_call>/<tool_response> XML)
 - Compatible with the trajectory compression pipeline
 - Supports batch processing from JSONL prompt files
@@ -16,7 +16,6 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, cast
@@ -30,9 +29,10 @@ from agent.auxiliary_client import (
     resolve_provider_client,
 )
 from agent.process_bootstrap import OpenAI as AsyncOpenAI
+from agent.secret_scope import get_secret, is_multiplex_active
 from agent.tool_dispatch_helpers import make_tool_result_message
 from hermes_cli.env_loader import load_hermes_dotenv
-from tools.environments.local import LocalEnvironment
+from hermes_constants import get_hermes_home
 
 
 def _effective_temperature_for_model(
@@ -71,6 +71,15 @@ async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     return result
 
 
+def _fallback_provider_api_key() -> str:
+    """Preserve upstream's OPENROUTER -> ANTHROPIC -> OPENAI precedence."""
+    openrouter_key = get_secret("OPENROUTER_API_KEY")
+    if openrouter_key is not None:
+        return openrouter_key
+    anthropic_key = get_secret("ANTHROPIC_API_KEY")
+    if anthropic_key is not None:
+        return anthropic_key
+    return get_secret("OPENAI_API_KEY", "") or ""
 
 
 # ============================================================================
@@ -137,8 +146,8 @@ def create_environment(
     Create an execution environment using Hermes-Agent's retained backend.
 
     Args:
-        env_type: "local". The argument is retained from upstream.
-        image: Retained upstream argument (ignored for local)
+        env_type: One of "local", "docker", "modal"
+        image: Docker/Modal image name (ignored for local)
         cwd: Working directory
         timeout: Default command timeout
         **kwargs: Additional environment-specific options
@@ -147,13 +156,17 @@ def create_environment(
         Environment instance with execute() and cleanup() methods
     """
     if env_type == "local":
-        return LocalEnvironment(cwd=cwd, timeout=timeout)
+        from tools.environments.local import LocalEnvironment
 
-    if env_type in {"docker", "modal"}:
-        raise RuntimeError(
-            f"The {env_type} execution backend has no native-async implementation "
-            "in this library distribution"
-        )
+        return LocalEnvironment(cwd=cwd, timeout=timeout)
+    if env_type == "docker":
+        from tools.environments.docker import DockerEnvironment
+
+        return DockerEnvironment(image=image, cwd=cwd, timeout=timeout, **kwargs)
+    if env_type == "modal":
+        from tools.environments.modal import ModalEnvironment
+
+        return ModalEnvironment(image=image, cwd=cwd, timeout=timeout, **kwargs)
 
     raise ValueError(
         f"Unknown environment type: {env_type}. Use 'local', 'docker', or 'modal'"
@@ -231,20 +244,18 @@ class MiniSWERunner:
             return self.client
 
         if not self._configuration_loaded:
-            project_env = Path(await aiofiles.os.getcwd()) / ".env"
-            await load_hermes_dotenv(project_env=project_env)
+            if not is_multiplex_active():
+                project_env = Path(await aiofiles.os.getcwd()) / ".env"
+                await load_hermes_dotenv(
+                    hermes_home=get_hermes_home(),
+                    project_env=project_env,
+                )
             self._configuration_loaded = True
 
         if self._api_key or self._base_url:
             self.client = AsyncOpenAI(
                 base_url=self._base_url or "https://openrouter.ai/api/v1",
-                api_key=self._api_key or os.getenv(
-                    "OPENROUTER_API_KEY",
-                    os.getenv(
-                        "ANTHROPIC_API_KEY",
-                        os.getenv("OPENAI_API_KEY", ""),
-                    ),
-                ),
+                api_key=self._api_key or _fallback_provider_api_key(),
             )
             self._owns_client = True
             return self.client
@@ -255,7 +266,7 @@ class MiniSWERunner:
         if self.client is None:
             self.client = AsyncOpenAI(
                 base_url="https://openrouter.ai/api/v1",
-                api_key=os.getenv("OPENROUTER_API_KEY", ""),
+                api_key=get_secret("OPENROUTER_API_KEY", "") or "",
             )
         self._owns_client = True
         return self.client

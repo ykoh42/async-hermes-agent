@@ -124,7 +124,7 @@ def set_session_vars(
     return tokens
 
 
-def clear_session_vars(tokens: list[Token]) -> None:
+def clear_session_vars(tokens: list) -> None:
     """Mark session metadata explicitly cleared, matching upstream semantics.
 
     ``tokens`` is retained for API compatibility.  The upstream helper is

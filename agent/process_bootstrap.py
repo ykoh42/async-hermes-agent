@@ -45,6 +45,24 @@ from openai.resources.chat import AsyncChat as _AsyncChatBootstrap  # noqa: F401
 # other SDK bootstraps rather than letting importlib pause that first turn.
 import httpcore as _HttpcoreBootstrap  # noqa: F401
 
+# Provider/session teardown consults the profile-local secret ContextVar from
+# its first awaited lifecycle boundary.  Prime the in-repo module here so the
+# initial provider setup/close path does not run importlib on the event loop.
+from agent import secret_scope as _SecretScopeBootstrap  # noqa: F401
+
+# AIAgent's state-only constructor and deterministic close path reference
+# these retained runtime modules through intentionally lazy local imports.
+# Importing them at the process boundary keeps those local imports cheap when
+# an application constructs its first agent from an already-running loop.
+from tools import async_delegation as _AsyncDelegationBootstrap  # noqa: F401
+from tools import browser_tool as _BrowserToolBootstrap  # noqa: F401
+from tools import browser_supervisor as _BrowserSupervisorBootstrap  # noqa: F401
+from tools import computer_use as _ComputerUseBootstrap  # noqa: F401
+from tools import memory_tool as _MemoryToolBootstrap  # noqa: F401
+from hermes_cli import nous_subscription as _NousSubscriptionBootstrap  # noqa: F401
+import gateway.status as _GatewayStatusBootstrap  # noqa: F401
+import hermes_state as _HermesStateBootstrap  # noqa: F401
+
 # Anthropic's SDK also performs a sizeable lazy import graph.  The retained
 # runtime reaches ``build_anthropic_client`` from an awaited turn, so loading
 # the optional SDK here keeps that first-use import out of the event loop.
@@ -114,6 +132,11 @@ try:
     import parallel as _ParallelWebBootstrap  # noqa: F401
 except Exception:
     _ParallelWebBootstrap = None
+
+try:
+    import fal_client as _FalClientBootstrap  # noqa: F401
+except Exception:
+    _FalClientBootstrap = None
 
 # MCP OAuth is optional, but its SDK auth modules are imported lazily by the
 # OAuth storage/manager.  Resolve those imports beside the other provider SDK

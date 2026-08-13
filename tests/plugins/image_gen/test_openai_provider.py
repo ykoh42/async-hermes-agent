@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pyleak import no_task_leaks
+from pyleak.eventloop import LeakAction
 
 import plugins.image_gen.openai as openai_plugin
 
@@ -156,6 +159,48 @@ class TestSourceImageLoading:
         assert data == b"\x89PNG\r\n\x1a\nfake-image-bytes"
         assert name == "pic.png"
 
+    async def test_remote_load_repeated_cancellation_finishes_close_and_preserves_error(
+        self,
+        monkeypatch,
+    ):
+        request_started = asyncio.Event()
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        close_finished = asyncio.Event()
+
+        class _Client:
+            async def get(self, _url):
+                request_started.set()
+                await asyncio.Event().wait()
+
+            async def aclose(self):
+                close_started.set()
+                await allow_close.wait()
+                close_finished.set()
+
+        monkeypatch.setattr(
+            openai_plugin,
+            "_create_httpx_client",
+            AsyncMock(return_value=_Client()),
+        )
+
+        async with no_task_leaks(action=LeakAction.RAISE):
+            task = asyncio.create_task(
+                openai_plugin._load_image_bytes("https://example.com/image.png")
+            )
+            await asyncio.wait_for(request_started.wait(), timeout=1.0)
+            task.cancel("original-request-cancellation")
+            await asyncio.wait_for(close_started.wait(), timeout=1.0)
+            task.cancel("second-cleanup-cancellation")
+            await asyncio.sleep(0)
+            assert task.done() is False
+            allow_close.set()
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+
+        assert raised.value.args == ("original-request-cancellation",)
+        assert close_finished.is_set()
+
 
 class TestGenerate:
     async def test_empty_prompt_rejected(self, provider):
@@ -261,3 +306,125 @@ class TestGenerate:
         assert result["image"].startswith("/")
         assert "example.com" not in result["image"]
         mock_save_url.assert_called_once()
+
+    @pytest.mark.parametrize("edit", [False, True])
+    async def test_repeated_cancellation_closes_client_and_preserves_first_error(
+        self,
+        provider,
+        monkeypatch,
+        edit,
+    ):
+        request_started = asyncio.Event()
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        close_finished = asyncio.Event()
+
+        class _Images:
+            async def generate(self, **_kwargs):
+                request_started.set()
+                await asyncio.Event().wait()
+
+            async def edit(self, **_kwargs):
+                request_started.set()
+                await asyncio.Event().wait()
+
+        class _Client:
+            images = _Images()
+
+            async def close(self):
+                close_started.set()
+                await allow_close.wait()
+                close_finished.set()
+
+        async def _create_client(*_args, **_kwargs):
+            return _Client()
+
+        monkeypatch.setattr(
+            openai_plugin,
+            "_create_openai_sdk_client",
+            _create_client,
+        )
+        monkeypatch.setattr(
+            openai_plugin,
+            "_load_image_bytes",
+            AsyncMock(return_value=(b"image", "image.png")),
+        )
+        kwargs = {"image_url": "image.png"} if edit else {}
+
+        async with no_task_leaks(action=LeakAction.RAISE):
+            task = asyncio.create_task(provider.generate("a cat", **kwargs))
+            await asyncio.wait_for(request_started.wait(), timeout=1.0)
+            task.cancel("original-request-cancellation")
+            await asyncio.wait_for(close_started.wait(), timeout=1.0)
+            task.cancel("second-cleanup-cancellation")
+            await asyncio.sleep(0)
+            assert task.done() is False
+            allow_close.set()
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+
+        assert raised.value.args == ("original-request-cancellation",)
+        assert close_finished.is_set()
+
+    @pytest.mark.parametrize("edit", [False, True])
+    async def test_client_initialization_failure_propagates_without_leaking_tasks(
+        self,
+        provider,
+        monkeypatch,
+        edit,
+    ):
+        import openai
+
+        initialization_error = RuntimeError("client initialization failed")
+        close_finished = asyncio.Event()
+
+        class _HttpClient:
+            async def aclose(self):
+                close_finished.set()
+
+        class _FailingClient:
+            def __init__(self, **_kwargs):
+                raise initialization_error
+
+        create_http_client = AsyncMock(return_value=_HttpClient())
+        monkeypatch.setattr(openai, "AsyncOpenAI", _FailingClient)
+        monkeypatch.setattr(
+            "agent.ssl_verify._create_httpx_client",
+            create_http_client,
+        )
+        monkeypatch.setattr(
+            openai_plugin,
+            "_load_image_bytes",
+            AsyncMock(return_value=(b"image", "image.png")),
+        )
+        kwargs = {"image_url": "image.png"} if edit else {}
+
+        async with no_task_leaks(action=LeakAction.RAISE):
+            with pytest.raises(RuntimeError) as raised:
+                await provider.generate("a cat", **kwargs)
+
+        assert raised.value is initialization_error
+        create_http_client.assert_awaited_once()
+        assert close_finished.is_set()
+
+    async def test_api_error_keeps_upstream_response_shape_after_client_close(
+        self,
+        provider,
+    ):
+        fake_client = _fake_client(response=None)
+        fake_client.images.generate.side_effect = RuntimeError("provider failed")
+
+        with _patched_openai(fake_client):
+            result = await provider.generate("a cat")
+
+        assert result == {
+            "success": False,
+            "image": None,
+            "error": "OpenAI image generation failed: provider failed",
+            "error_type": "api_error",
+            "model": "gpt-image-2-medium",
+            "prompt": "a cat",
+            "aspect_ratio": "landscape",
+            "provider": "openai",
+        }
+        fake_client.close.assert_awaited_once()

@@ -483,7 +483,7 @@ async def run_compress_context_with_progress_timeout(
     total_ceiling_seconds: float,
     on_timeout: Callable[[float, float, float], Any] | None = None,
     on_commit_overrun: Callable[[float, float], Any] | None = None,
-    fence: CompressionCommitFence | None = None,
+    fence: Optional[CompressionCommitFence] = None,
     telemetry_agent: Any = None,
 ) -> Tuple[list, str]:
     """Run compression under native async progress and commit fencing.
@@ -1062,7 +1062,7 @@ async def check_compression_model_feasibility(agent: Any) -> None:
         )
         from agent.model_metadata import (
             MINIMUM_CONTEXT_LENGTH,
-            _get_static_context_length,
+            get_model_context_length,
         )
 
         # Best-effort aux provider label for the warning message. The
@@ -1116,14 +1116,21 @@ async def check_compression_model_feasibility(agent: Any) -> None:
             return
 
         aux_base_url = str(getattr(client, "base_url", ""))
-        # Startup feasibility must not make a provider metadata request. The
-        # static bound is refined by native response usage once compression
-        # actually runs.
-        aux_context = _get_static_context_length(
+        # ``client.api_key`` may be a callable (Azure Foundry Entra ID bearer
+        # provider). The metadata resolver only accepts a string for live
+        # catalogue probes; provider/static fallbacks do not need a minted JWT.
+        raw_aux_key = getattr(client, "api_key", "")
+        aux_api_key = (
+            ""
+            if callable(raw_aux_key) and not isinstance(raw_aux_key, str)
+            else str(raw_aux_key or "")
+        )
+        aux_context = await get_model_context_length(
             aux_model,
             base_url=aux_base_url,
+            api_key=aux_api_key,
             config_context_length=getattr(agent, "_aux_compression_context_length_config", None),
-            # Each model must be resolved with its own provider so static
+            # Each model must be resolved with its own provider so live and
             # provider-specific bounds apply to the correct client.
             provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
             custom_providers=agent._custom_providers,

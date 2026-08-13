@@ -26,7 +26,11 @@ import json
 import logging
 import time
 import asyncio
-from dataclasses import dataclass
+import concurrent.futures
+import contextvars
+import os
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,8 +44,189 @@ _MODELS_DEV_RETRY_DELAY = 300  # 5 minutes after a failed refresh
 _models_dev_cache: Dict[str, Any] = {}
 _models_dev_cache_time: float = 0
 _models_dev_retry_after: float = 0
+# Retained as a private compatibility seam for upstream-derived tests. The
+# native runtime uses the loop-neutral completion claim below instead of
+# binding an asyncio.Lock to the first event loop that reaches the cache.
 _models_dev_lock: Optional[asyncio.Lock] = None
 _models_dev_refresh_task: Optional[asyncio.Task[None]] = None
+_models_dev_update_guard = threading.RLock()
+_models_dev_update_claim: Optional[concurrent.futures.Future[bool]] = None
+_models_dev_profile_context: contextvars.ContextVar[
+    tuple[str, str] | None
+] = contextvars.ContextVar("models_dev_profile_scope", default=None)
+_models_dev_profile_aliases: Dict[str, str] = {}
+
+
+@dataclass
+class _ModelsDevProfileState:
+    cache: Dict[str, Any] = field(default_factory=dict)
+    cache_time: float = 0
+    retry_after: float = 0
+    refresh_task: Optional[asyncio.Task[None]] = None
+    refresh_claim: Optional[concurrent.futures.Future[bool]] = None
+    update_claim: Optional[concurrent.futures.Future[bool]] = None
+
+
+_models_dev_profile_states: Dict[str, _ModelsDevProfileState] = {}
+_models_dev_legacy_snapshot: tuple = (
+    id(_models_dev_cache),
+    _models_dev_cache_time,
+    _models_dev_retry_after,
+    _models_dev_refresh_task,
+    _models_dev_update_claim,
+)
+
+
+def _lexical_models_dev_profile() -> str:
+    """Return the active profile marker without filesystem access."""
+    from hermes_constants import get_hermes_home
+
+    return os.path.normcase(os.fspath(get_hermes_home()))
+
+
+def _current_models_dev_profile() -> str:
+    lexical = _lexical_models_dev_profile()
+    active = _models_dev_profile_context.get()
+    if active is not None and active[0] == lexical:
+        return active[1]
+    with _models_dev_update_guard:
+        return _models_dev_profile_aliases.get(lexical, lexical)
+
+
+def _models_dev_state() -> _ModelsDevProfileState:
+    profile = _current_models_dev_profile()
+    with _models_dev_update_guard:
+        return _models_dev_profile_states.setdefault(
+            profile,
+            _ModelsDevProfileState(),
+        )
+
+
+def _publish_models_dev_legacy_state(state: _ModelsDevProfileState) -> None:
+    """Expose the active profile through retained private scalar seams."""
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+    global _models_dev_refresh_task, _models_dev_update_claim
+    global _models_dev_legacy_snapshot
+    with _models_dev_update_guard:
+        _models_dev_cache = state.cache
+        _models_dev_cache_time = state.cache_time
+        _models_dev_retry_after = state.retry_after
+        _models_dev_refresh_task = state.refresh_task
+        _models_dev_update_claim = state.update_claim
+        _models_dev_legacy_snapshot = (
+            id(_models_dev_cache),
+            _models_dev_cache_time,
+            _models_dev_retry_after,
+            _models_dev_refresh_task,
+            _models_dev_update_claim,
+        )
+
+
+def _capture_models_dev_legacy_overrides(state: _ModelsDevProfileState) -> None:
+    """Apply direct assignments made through upstream-derived test seams."""
+    current = (
+        id(_models_dev_cache),
+        _models_dev_cache_time,
+        _models_dev_retry_after,
+        _models_dev_refresh_task,
+        _models_dev_update_claim,
+    )
+    previous = _models_dev_legacy_snapshot
+    if current != previous:
+        # Test fixtures reset these coupled cache fields through direct module
+        # assignments. Treat any observed change as one atomic legacy state so
+        # reusing the same registry object identity cannot miss the reset.
+        state.cache = _models_dev_cache
+        state.cache_time = _models_dev_cache_time
+        state.retry_after = _models_dev_retry_after
+        state.refresh_task = _models_dev_refresh_task
+        state.update_claim = _models_dev_update_claim
+    _publish_models_dev_legacy_state(state)
+
+
+async def _activate_models_dev_profile() -> _ModelsDevProfileState:
+    """Activate the canonical Hermes profile at an existing awaited edge."""
+    lexical = _lexical_models_dev_profile()
+    active = _models_dev_profile_context.get()
+    if active is not None and active[0] == lexical:
+        canonical = active[1]
+    else:
+        with _models_dev_update_guard:
+            canonical = _models_dev_profile_aliases.get(lexical)
+        if canonical is None:
+            import aiofiles.os
+
+            expanduser = aiofiles.os.wrap(os.path.expanduser)
+            expanded = str(await expanduser(lexical))
+            is_absolute = (
+                expanded.startswith(("/", "\\\\"))
+                or (
+                    len(expanded) >= 3
+                    and expanded[1] == ":"
+                    and expanded[2] in "/\\"
+                )
+            )
+            if not is_absolute:
+                expanded = str(await aiofiles.os.getcwd()) + os.sep + expanded
+            realpath = aiofiles.os.wrap(os.path.realpath)
+            canonical = os.path.normcase(str(await realpath(expanded)))
+    with _models_dev_update_guard:
+        _models_dev_profile_aliases[lexical] = canonical
+        target = _models_dev_profile_states.setdefault(
+            canonical,
+            _ModelsDevProfileState(),
+        )
+        if lexical != canonical:
+            staged = _models_dev_profile_states.pop(lexical, None)
+            if staged is not None and staged is not target:
+                if staged.cache:
+                    target.cache = staged.cache
+                    target.cache_time = staged.cache_time
+                target.retry_after = max(target.retry_after, staged.retry_after)
+                if target.refresh_task is None:
+                    target.refresh_task = staged.refresh_task
+                    target.refresh_claim = staged.refresh_claim
+                if target.update_claim is None:
+                    target.update_claim = staged.update_claim
+        _models_dev_profile_context.set((lexical, canonical))
+        _capture_models_dev_legacy_overrides(target)
+        return target
+
+
+def _claim_models_dev_update(
+) -> tuple[bool, concurrent.futures.Future[bool]]:
+    """Claim one profile-local models.dev update without loop affinity."""
+    state = _models_dev_state()
+    with _models_dev_update_guard:
+        claim = state.update_claim
+        if claim is None or claim.done():
+            claim = concurrent.futures.Future()
+            state.update_claim = claim
+            _publish_models_dev_legacy_state(state)
+            return True, claim
+        return False, claim
+
+
+def _finish_models_dev_update(
+    claim: concurrent.futures.Future[bool],
+    *,
+    completed: bool,
+) -> None:
+    """Publish update completion and release the profile-local claim."""
+    state = _models_dev_state()
+    with _models_dev_update_guard:
+        if state.update_claim is claim:
+            state.update_claim = None
+        if not claim.done():
+            claim.set_result(completed)
+        _publish_models_dev_legacy_state(state)
+
+
+async def _wait_for_models_dev_update(
+    claim: concurrent.futures.Future[bool],
+) -> bool:
+    """Await another loop's update without letting waiter cancellation own it."""
+    return await asyncio.shield(asyncio.wrap_future(claim))
 
 
 # ---------------------------------------------------------------------------
@@ -277,19 +462,21 @@ async def _fetch_models_dev_from_network() -> Dict[str, Any]:
 
 def _mark_stale_cache_grace() -> None:
     """Give stale cache data a short in-memory grace before retrying."""
-    global _models_dev_cache_time
+    state = _models_dev_state()
     grace_time = time.time() - _MODELS_DEV_CACHE_TTL + _MODELS_DEV_RETRY_DELAY
-    if grace_time > _models_dev_cache_time:
-        _models_dev_cache_time = grace_time
+    if grace_time > state.cache_time:
+        state.cache_time = grace_time
+        _publish_models_dev_legacy_state(state)
 
 
 async def _commit_registry(data: Dict[str, Any], *, where: str) -> None:
     """Persist a freshly fetched registry and clear failure backoff."""
-    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+    state = _models_dev_state()
     await _save_disk_cache(data)
-    _models_dev_cache = data
-    _models_dev_cache_time = time.time()
-    _models_dev_retry_after = 0
+    state.cache = data
+    state.cache_time = time.time()
+    state.retry_after = 0
+    _publish_models_dev_legacy_state(state)
     logger.debug(
         "Refreshed models.dev registry (%s): %d providers, %d total models",
         where,
@@ -303,9 +490,10 @@ async def _commit_registry(data: Dict[str, Any], *, where: str) -> None:
 
 
 def _note_refresh_failure(exc: Exception, *, where: str) -> None:
-    """Arm the process-wide retry backoff after a failed refresh."""
-    global _models_dev_retry_after
-    _models_dev_retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
+    """Arm the active profile's retry backoff after a failed refresh."""
+    state = _models_dev_state()
+    state.retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
+    _publish_models_dev_legacy_state(state)
     logger.debug(
         "models.dev refresh failed (%s); retry suppressed for %ds: %s",
         where,
@@ -316,27 +504,48 @@ def _note_refresh_failure(exc: Exception, *, where: str) -> None:
 
 async def _background_refresh_models_dev() -> None:
     """Best-effort native async refresh after serving stale cache data."""
-    global _models_dev_lock
+    owned_claim: Optional[concurrent.futures.Future[bool]] = None
+    completed = False
     try:
+        state = await _activate_models_dev_profile()
+        current_task = asyncio.current_task()
+        if state.refresh_task is current_task:
+            owned_claim = state.refresh_claim
+        if owned_claim is None:
+            owner, claim = _claim_models_dev_update()
+            if not owner:
+                await _wait_for_models_dev_update(claim)
+                return
+            owned_claim = claim
         data = await _fetch_models_dev_from_network()
-        if _models_dev_lock is None:
-            _models_dev_lock = asyncio.Lock()
-        async with _models_dev_lock:
-            await _commit_registry(data, where="background")
+        await _commit_registry(data, where="background")
+        completed = True
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        if _models_dev_lock is None:
-            _models_dev_lock = asyncio.Lock()
-        async with _models_dev_lock:
-            _note_refresh_failure(exc, where="background")
+        _note_refresh_failure(exc, where="background")
+        completed = True
+    finally:
+        if owned_claim is not None:
+            _finish_models_dev_update(owned_claim, completed=completed)
 
 
 def _consume_refresh_task(task: asyncio.Task[None]) -> None:
     """Clear the tracked refresh task and consume terminal exceptions."""
-    global _models_dev_refresh_task
-    if _models_dev_refresh_task is task:
-        _models_dev_refresh_task = None
+    state = _models_dev_state()
+    with _models_dev_update_guard:
+        if state.refresh_task is task:
+            state.refresh_task = None
+            claim = state.refresh_claim
+            state.refresh_claim = None
+            # A task cancelled before its coroutine starts cannot execute the
+            # coroutine's finally block. Release only its own claim here; a
+            # later foreground owner may already hold a different claim.
+            if claim is not None and state.update_claim is claim:
+                state.update_claim = None
+                if not claim.done():
+                    claim.set_result(False)
+        _publish_models_dev_legacy_state(state)
     if task.cancelled():
         return
     try:
@@ -347,16 +556,25 @@ def _consume_refresh_task(task: asyncio.Task[None]) -> None:
 
 def _start_background_refresh_models_dev() -> None:
     """Start at most one event-loop-owned refresh task outside backoff."""
-    global _models_dev_refresh_task
-    if time.time() < _models_dev_retry_after:
+    state = _models_dev_state()
+    if time.time() < state.retry_after:
         return
-    if _models_dev_refresh_task is not None and not _models_dev_refresh_task.done():
+    owner, claim = _claim_models_dev_update()
+    if not owner:
         return
-    _models_dev_refresh_task = asyncio.create_task(
-        _background_refresh_models_dev(),
-        name="models-dev-refresh",
-    )
-    _models_dev_refresh_task.add_done_callback(_consume_refresh_task)
+    try:
+        task = asyncio.create_task(
+            _background_refresh_models_dev(),
+            name="models-dev-refresh",
+        )
+    except BaseException:
+        _finish_models_dev_update(claim, completed=False)
+        raise
+    with _models_dev_update_guard:
+        state.refresh_task = task
+        state.refresh_claim = claim
+        _publish_models_dev_legacy_state(state)
+    task.add_done_callback(_consume_refresh_task)
 
 
 async def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
@@ -500,44 +718,45 @@ async def fetch_models_dev(
     foreground request. Failed automatic refreshes back off for five minutes;
     ``force_refresh`` bypasses both caches and the backoff.
     """
-    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
-    global _models_dev_lock
+    state = await _activate_models_dev_profile()
 
     if not allow_network:
-        if _models_dev_cache:
-            return _models_dev_cache
+        if state.cache:
+            return state.cache
         disk_data = await _load_disk_cache()
         if disk_data:
-            _models_dev_cache = disk_data
+            state.cache = disk_data
             disk_age = await _disk_cache_age_seconds()
-            _models_dev_cache_time = (
+            state.cache_time = (
                 time.time() - disk_age if disk_age is not None else 0
             )
-        return _models_dev_cache
+            _publish_models_dev_legacy_state(state)
+        return state.cache
 
     if (
         not force_refresh
-        and _models_dev_cache
-        and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL
+        and state.cache
+        and (time.time() - state.cache_time) < _MODELS_DEV_CACHE_TTL
     ):
-        return _models_dev_cache
+        return state.cache
 
-    if not force_refresh and _models_dev_cache:
+    if not force_refresh and state.cache:
         _mark_stale_cache_grace()
         _start_background_refresh_models_dev()
         logger.debug(
             "Using stale in-memory models.dev cache; refreshing in background"
         )
-        return _models_dev_cache
+        return state.cache
 
     if not force_refresh:
         disk_age = await _disk_cache_age_seconds()
         if disk_age is not None:
             disk_data = await _load_disk_cache()
             if disk_data:
-                _models_dev_cache = disk_data
+                state.cache = disk_data
                 if disk_age < _MODELS_DEV_CACHE_TTL:
-                    _models_dev_cache_time = time.time() - disk_age
+                    state.cache_time = time.time() - disk_age
+                    _publish_models_dev_legacy_state(state)
                     logger.debug(
                         "Loaded models.dev from fresh disk cache "
                         "(%d providers, age=%.0fs)",
@@ -552,39 +771,55 @@ async def fetch_models_dev(
                         "refreshing in background",
                         disk_age,
                     )
-                return _models_dev_cache
+                return state.cache
 
-    if not force_refresh and time.time() < _models_dev_retry_after:
-        return _models_dev_cache
+    if not force_refresh and time.time() < state.retry_after:
+        return state.cache
 
-    if _models_dev_lock is None:
-        _models_dev_lock = asyncio.Lock()
+    owner, claim = _claim_models_dev_update()
+    if not owner:
+        await _wait_for_models_dev_update(claim)
+        # A forced refresh retains upstream's serialized refresh semantics:
+        # every explicit caller performs its own fetch after the predecessor.
+        if force_refresh:
+            return await fetch_models_dev(force_refresh=True)
+        if state.cache or time.time() < state.retry_after:
+            return state.cache
+        return await fetch_models_dev()
 
-    async with _models_dev_lock:
+    completed = False
+    try:
         if not force_refresh:
-            if _models_dev_cache:
-                return _models_dev_cache
-            if time.time() < _models_dev_retry_after:
-                return _models_dev_cache
+            if state.cache:
+                completed = True
+                return state.cache
+            if time.time() < state.retry_after:
+                completed = True
+                return state.cache
 
         try:
             data = await _fetch_models_dev_from_network()
             await _commit_registry(data, where="foreground")
+            completed = True
             return data
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             _note_refresh_failure(exc, where="foreground")
 
-        if not _models_dev_cache:
-            _models_dev_cache = await _load_disk_cache()
-            _models_dev_cache_time = 0
-            if _models_dev_cache:
+        if not state.cache:
+            state.cache = await _load_disk_cache()
+            state.cache_time = 0
+            _publish_models_dev_legacy_state(state)
+            if state.cache:
                 logger.debug(
                     "Loaded stale models.dev disk cache (%d providers)",
-                    len(_models_dev_cache),
+                    len(state.cache),
                 )
-        return _models_dev_cache
+        completed = True
+        return state.cache
+    finally:
+        _finish_models_dev_update(claim, completed=completed)
 
 
 async def get_model_capabilities(

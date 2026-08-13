@@ -490,6 +490,11 @@ class TestAIAgentBedrockDispatch:
     @pytest.mark.asyncio
     async def test_nonstream_request_is_awaited_and_client_is_closed(self, monkeypatch):
         agent = self._agent()
+        retain = AsyncMock()
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._retain_bedrock_lifecycle",
+            retain,
+        )
         client = SimpleNamespace(
             converse=AsyncMock(
                 return_value={
@@ -525,6 +530,8 @@ class TestAIAgentBedrockDispatch:
             messages=[{"role": "user", "content": [{"text": "hi"}]}],
         )
         assert context.entered and context.exited
+        retain.assert_awaited_once_with(agent)
+        assert agent._bedrock_lifecycle_retained is True
 
     @pytest.mark.asyncio
     async def test_stream_request_preserves_callbacks_and_closes_client(self, monkeypatch):

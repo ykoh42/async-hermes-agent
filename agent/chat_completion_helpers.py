@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.secret_scope import UnscopedSecretError, get_secret
 from agent.turn_context import substitute_api_content
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
@@ -324,13 +325,13 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
-def should_use_direct_api_call(agent: Any) -> bool:
+def should_use_direct_api_call(agent) -> bool:
     """Return True because the native async runtime never spawns API workers."""
     del agent
     return True
 
 
-async def direct_api_call(agent: Any, api_kwargs: dict) -> Any:
+async def direct_api_call(agent, api_kwargs: dict):
     """Execute a non-streaming provider request directly on the event loop."""
     return await interruptible_api_call(agent, api_kwargs)
 
@@ -607,7 +608,7 @@ async def _interruptible_codex_api_call(agent: Any, api_kwargs: dict) -> Any:
     return response
 
 
-async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
+async def interruptible_api_call(agent, api_kwargs: dict):
     """Execute a bounded native-async non-streaming provider request."""
     _check_stale_giveup(agent)
     if getattr(agent, "api_mode", None) == "codex_responses":
@@ -923,11 +924,11 @@ def _stream_request_timeout(agent: Any, stale_timeout: float) -> Any:
 
 
 async def interruptible_streaming_api_call(
-    agent: Any,
+    agent,
     api_kwargs: dict,
     *,
     on_first_delta=None,
-) -> Any:
+):
     """Execute a native stream with upstream retry and stale-call policy."""
     _check_stale_giveup(agent)
     timeout = await _derive_stream_stale_timeout(agent, api_kwargs)
@@ -2048,12 +2049,12 @@ async def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -
             # _normalize_custom_provider_entry in hermes_cli/config.py).
             fb_key_env = (fb.get("key_env") or fb.get("api_key_env") or "").strip()
             if fb_key_env:
-                fb_api_key_hint = os.getenv(fb_key_env, "").strip() or None
+                fb_api_key_hint = (get_secret(fb_key_env) or "").strip() or None
         # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
         # when no explicit key is in the fallback config. Host match
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-            fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+            fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2281,6 +2282,8 @@ async def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -
         # single stream attempt.
         _reset_stale_streak(agent)
         return True
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         if fb_provider == "nous":
             unavailable.add(fb_key)

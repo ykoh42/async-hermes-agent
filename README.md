@@ -2,7 +2,7 @@
 
 Native-async, library-focused distribution of
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), based
-on the upstream `v2026.8.3` (`v0.20.0`) release.
+on upstream tag `v2026.8.3` (Python package version `0.20.0`).
 
 This repository keeps the Hermes agent loop, model providers, tool execution,
 MCP, skills, persistent memory and sessions, trajectory generation, runner, and
@@ -36,11 +36,12 @@ Inside an async function, the compact string-returning interface and explicit
 lifecycle are:
 
 ```python
-agent = AIAgent(provider="openrouter", model="openrouter/auto")
-try:
-    answer = await agent.chat("Summarize the result")
-finally:
-    await agent.close()
+async def chat_once():
+    agent = AIAgent(provider="openrouter", model="openrouter/auto")
+    try:
+        return await agent.chat("Summarize the result")
+    finally:
+        await agent.close()
 ```
 
 `AIAgent.__init__()` performs state-only construction. Configuration, provider
@@ -53,7 +54,24 @@ instances can run concurrently.
 Python 3.11 through 3.13 is supported.
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git"
+uv pip install "async-hermes-agent==0.20.0.5"
+```
+
+Versioned packages are published to PyPI through GitHub OIDC Trusted
+Publishing. The same verified wheel, source distribution, and checksums are
+attached to the corresponding GitHub Release.
+
+The package version has four numeric segments: `0.20.0.5` means upstream
+Python version `0.20.0` plus async-distribution revision `5`. Fork-only releases
+increment the fourth segment. When a new upstream version is ported, the first
+three segments change to match it and the async revision restarts at `1`.
+
+The earlier `0.20.4` GitHub release used the old independent version scheme and
+sorts after `0.20.0.5` under Python version ordering. If it was installed from
+that Git tag, migrate explicitly once:
+
+```bash
+uv pip install --reinstall "async-hermes-agent==0.20.0.5"
 ```
 
 For development:
@@ -75,6 +93,11 @@ uv sync --extra hindsight
 uv sync --extra honcho
 ```
 
+The [installation guide](https://ykoh42.github.io/async-hermes-agent/getting-started/installation)
+lists
+every current extra, including retained media, execution-backend, and memory
+providers.
+
 The Hindsight extra covers cloud and local-external modes. Its
 `local_embedded` mode additionally requires the upstream `hindsight-all`
 runtime.
@@ -82,12 +105,12 @@ runtime.
 The Honcho extra pins the native-async SDK version validated by this package.
 Select `memory.provider: honcho` in `config.yaml`; connection, identity,
 cadence, and session settings are documented in the
-[Honcho provider guide](plugins/memory/honcho/README.md).
+[Honcho provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/plugins/memory/honcho/README.md).
 
 OpenViking uses the core native-async HTTP transport and needs no Python
 extra. Server setup, provider configuration, async lifecycle, recall, and tool
 behavior are documented in the
-[OpenViking provider guide](plugins/memory/openviking/README.md).
+[OpenViking provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/plugins/memory/openviking/README.md).
 
 ## Sessions
 
@@ -96,16 +119,23 @@ behavior are documented in the
 resource cleanup are awaited directly:
 
 ```python
+import asyncio
+
 from hermes_state import SessionDB
 
-source = SessionDB("state.db")
-restored = SessionDB("restored-state.db")
-try:
-    exported = await source.export_all()
-    result = await restored.import_sessions(exported)
-finally:
-    await source.close()
-    await restored.close()
+
+async def copy_sessions():
+    source = SessionDB("state.db")
+    restored = SessionDB("restored-state.db")
+    try:
+        exported = await source.export_all()
+        return await restored.import_sessions(exported)
+    finally:
+        await source.close()
+        await restored.close()
+
+
+asyncio.run(copy_sessions())
 ```
 
 `export_all()`, `export_session()`, and `import_sessions()` preserve the
@@ -180,14 +210,21 @@ and JSONL batch methods are native coroutines; the trajectory conversion and
 return shapes remain unchanged:
 
 ```python
+import asyncio
+
 from mini_swe_runner import MiniSWERunner
 
-runner = MiniSWERunner(
-    model="openai/gpt-oss-20b:free",
-    env_type="local",
-    cwd="/workspace",
-)
-result = await runner.run_task("Inspect and repair the project")
+
+async def run_one_task():
+    runner = MiniSWERunner(
+        model="openai/gpt-oss-20b:free",
+        env_type="local",
+        cwd="/workspace",
+    )
+    return await runner.run_task("Inspect and repair the project")
+
+
+result = asyncio.run(run_one_task())
 ```
 
 For datasets, use `BatchRunner` from the unchanged `batch_runner.py` module and
@@ -230,28 +267,27 @@ No web framework is bundled. A service should own its HTTP lifecycle and await
 the library directly:
 
 ```python
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from run_agent import AIAgent
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with AIAgent(provider="openrouter", model="openrouter/auto") as agent:
-        app.state.agent = agent
-        yield
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 @app.post("/chat")
 async def chat(message: str):
-    return await app.state.agent.run_conversation(message)
+    # One AIAgent is one mutable conversation. A real host should keep one
+    # instance per conversation ID; this short-lived example isolates calls.
+    async with AIAgent(provider="openrouter", model="openrouter/auto") as agent:
+        return await agent.run_conversation(message)
 ```
 
-The package does not use `asyncio.to_thread()`, `run_in_executor()`,
-`run_until_complete()`, or blocking `.result()` in the retained active agent
-path. Optional providers without a native async transport fail fast instead of
-silently running synchronous work in a thread.
+Provider, network, MCP, and subprocess paths use coroutine transports, and
+optional providers without one fail explicitly. The filesystem layer uses
+`aiofiles`, whose regular-file operations delegate to an executor, while
+`aiosqlite` serializes SQLite calls on a connection worker thread. Eliminating
+those portable Python limitations is outside the package's native-async
+contract: public I/O remains directly awaitable and does not block the host
+event loop, but the project does not claim zero-thread, OS-native regular-file
+or embedded-SQLite I/O.
 
 ## Verification
 
@@ -267,8 +303,10 @@ uv build
 
 ## Contributing and security
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes and
-[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+Read [CONTRIBUTING.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/CONTRIBUTING.md)
+before submitting changes and
+[SECURITY.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/SECURITY.md)
+for private vulnerability reporting.
 
 ## Upstream relationship
 
@@ -277,4 +315,5 @@ upstream imports reviewable. It is a divergent async distribution, not a claim
 that these changes are drop-in mergeable to the synchronous upstream product.
 
 Hermes Agent is built by [Nous Research](https://nousresearch.com). This
-distribution retains the upstream MIT license; see [LICENSE](LICENSE).
+distribution retains the upstream MIT license; see
+[LICENSE](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/LICENSE).

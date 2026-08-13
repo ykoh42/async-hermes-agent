@@ -406,6 +406,40 @@ async def test_close_finishes_owned_connection_before_reraising_cancellation(
         await connection.execute("SELECT 1")
 
 
+async def test_provider_shutdown_finishes_state_cleanup_through_repeated_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    provider = HolographicMemoryProvider(
+        config={"db_path": str(tmp_path / "provider-close.db")}
+    )
+    await provider.initialize("shutdown-cancel")
+    connection = provider._store._conn
+    original_close = connection.close
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    async def paused_close():
+        close_started.set()
+        await allow_close.wait()
+        await original_close()
+
+    monkeypatch.setattr(connection, "close", paused_close)
+    shutdown = asyncio.create_task(provider.shutdown())
+    await close_started.wait()
+    shutdown.cancel()
+    await asyncio.sleep(0)
+    shutdown.cancel()
+    assert not shutdown.done()
+    allow_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+    assert provider._store is None
+    assert provider._retriever is None
+    assert MemoryStore._shared == {}
+
+
 async def test_native_lifecycle_does_not_block_or_leak_tasks(tmp_path):
     async with (
         no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),

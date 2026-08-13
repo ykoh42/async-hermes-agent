@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -235,8 +234,6 @@ async def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
     Resolution order: API (live, if token provided) > config.toml default >
     local cache > hardcoded defaults.
     """
-    codex_home_str = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
-    codex_home = Path(codex_home_str).expanduser()
     ordered: List[str] = []
 
     # Try live API if we have a token
@@ -246,6 +243,15 @@ async def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
             return _add_forward_compat_models(api_models)
 
     # Fall back to local sources
+    from agent.secret_scope import get_secret, is_multiplex_active
+
+    configured_home = str(get_secret("CODEX_HOME", "") or "").strip()
+    if not configured_home and is_multiplex_active():
+        raise RuntimeError(
+            "Codex model discovery requires a non-empty profile-scoped "
+            "CODEX_HOME while profile multiplexing is active."
+        )
+    codex_home = Path(configured_home or Path.home() / ".codex").expanduser()
     default_model = await _read_default_model(codex_home)
     if default_model:
         ordered.append(default_model)

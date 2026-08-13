@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import ssl
+import sys
 import warnings
 from pathlib import Path
 from typing import Any, Optional
 
+import aiofiles
 import aiofiles.os
 import certifi
+
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,126 @@ def _coerce_insecure(ssl_verify: Any) -> bool:
     if isinstance(ssl_verify, str) and ssl_verify.strip().lower() in {"false", "0", "no", "off"}:
         return True
     return False
+
+
+def _ca_data(raw: bytes) -> str | bytes:
+    """Return the in-memory form accepted by ``SSLContext``.
+
+    PEM bundles must be text while a single ASN.1 certificate must remain
+    bytes. Decoding after the awaited read keeps certificate parsing as the
+    only synchronous work at this boundary.
+    """
+    if b"-----BEGIN CERTIFICATE-----" in raw:
+        return raw.decode("ascii")
+    return raw
+
+
+async def _read_file_bytes(path: str | Path) -> bytes:
+    async with aiofiles.open(path, "rb") as handle:
+        return await handle.read()
+
+
+async def _context_from_ca_file(path: str | Path) -> ssl.SSLContext:
+    raw = await _read_file_bytes(path)
+    return ssl.create_default_context(cadata=_ca_data(raw))
+
+
+def _empty_verified_context() -> ssl.SSLContext:
+    """Match ``create_default_context(capath=<empty>)`` without disk I/O."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    if sys.version_info >= (3, 13):
+        context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+        context.verify_flags |= ssl.VERIFY_X509_STRICT
+    keylog_file = os.getenv("SSLKEYLOGFILE")
+    if (
+        keylog_file
+        and not sys.flags.ignore_environment
+        and hasattr(context, "keylog_filename")
+    ):
+        context.keylog_filename = keylog_file
+    return context
+
+
+async def _context_from_ca_directories(raw_paths: str) -> ssl.SSLContext:
+    """Load OpenSSL-style CA directories through awaited file operations."""
+    payloads: list[str | bytes] = []
+    for raw_path in raw_paths.split(os.pathsep):
+        if not raw_path:
+            continue
+        directory = Path(raw_path).expanduser()
+        if not await aiofiles.os.path.isdir(directory):
+            continue
+        try:
+            names = sorted(await aiofiles.os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            # OpenSSL's ``capath`` contract ignores entries that have not been
+            # prepared with ``openssl rehash``. Loading arbitrary PEM files
+            # here would silently broaden the caller's trust store.
+            if re.fullmatch(r"[0-9A-Fa-f]{8}\.[0-9]+", name) is None:
+                continue
+            candidate = directory / name
+            if not await aiofiles.os.path.isfile(candidate):
+                continue
+            try:
+                payloads.append(_ca_data(await _read_file_bytes(candidate)))
+            except (OSError, UnicodeDecodeError):
+                # OpenSSL capath semantics ignore unrelated/unreadable entries.
+                continue
+
+    context = _empty_verified_context()
+    for payload in payloads:
+        try:
+            context.load_verify_locations(cadata=payload)
+        except ssl.SSLError:
+            # Hashed certificate directories commonly contain auxiliary files;
+            # OpenSSL ignores entries that are not usable trust anchors.
+            continue
+    return context
+
+
+def _raw_default_verify_paths() -> tuple[str | None, str | None]:
+    """Resolve OpenSSL's configured paths without ``os.stat`` calls."""
+    cafile_env, openssl_cafile, capath_env, openssl_capath = (
+        ssl._ssl.get_default_verify_paths()  # type: ignore[attr-defined]
+    )
+    return (
+        os.getenv(cafile_env, openssl_cafile),
+        os.getenv(capath_env, openssl_capath),
+    )
+
+
+async def _default_proxy_context() -> ssl.SSLContext:
+    """Reproduce httpcore's system-plus-certifi proxy trust store."""
+    context = await _context_from_ca_file(certifi.where())
+    default_cafile, default_capath = _raw_default_verify_paths()
+    if default_cafile and await aiofiles.os.path.isfile(default_cafile):
+        try:
+            system_data = _ca_data(await _read_file_bytes(default_cafile))
+            context.load_verify_locations(cadata=system_data)
+        except (OSError, UnicodeDecodeError, ssl.SSLError):
+            pass
+    if default_capath:
+        system_context = await _context_from_ca_directories(default_capath)
+        # Python does not expose one context's certificate objects as cadata.
+        # Read the same directory into this context directly instead.
+        for der_cert in system_context.get_ca_certs(binary_form=True):
+            try:
+                context.load_verify_locations(cadata=der_cert)
+            except ssl.SSLError:
+                continue
+    return context
+
+
+async def _preload_client_cert_files(cert: Any) -> None:
+    """Await client-certificate reads before stdlib attaches the parsed chain."""
+    paths = (cert,) if isinstance(cert, str) else tuple(cert[:2])
+    for path in paths:
+        if path is not None:
+            await _read_file_bytes(path)
 
 
 async def resolve_httpx_verify(
@@ -60,11 +185,9 @@ async def resolve_httpx_verify(
     for effective_ca in candidates:
         if not effective_ca:
             continue
-        ca_path = await aiofiles.os.wrap(Path.expanduser)(Path(effective_ca))
+        ca_path = Path(effective_ca).expanduser()
         if await aiofiles.os.path.isfile(ca_path):
-            return await aiofiles.os.wrap(ssl.create_default_context)(
-                cafile=str(ca_path)
-            )
+            return await _context_from_ca_file(ca_path)
         logger.warning(
             "CA bundle path does not exist: %s — falling back to default certificates",
             effective_ca,
@@ -82,9 +205,9 @@ async def _resolve_httpx_client_verify(
     """Materialize the default TLS context before constructing an HTTP client.
 
     The public resolver retains upstream's exact ``True`` default.  httpx turns
-    that sentinel into an SSL context synchronously in its constructor, so the
-    retained async runtime uses this private boundary to perform that work away
-    from the event-loop thread without changing the public return shape.
+    that sentinel into an SSL context synchronously in its constructor, so this
+    boundary awaits the certificate file read before parsing the in-memory
+    certificate data without changing the public return shape.
     """
     verify = await resolve_httpx_verify(
         ca_bundle=ca_bundle,
@@ -96,16 +219,11 @@ async def _resolve_httpx_client_verify(
     if trust_env:
         ssl_cert_file = os.getenv("SSL_CERT_FILE")
         if ssl_cert_file:
-            return await aiofiles.os.wrap(ssl.create_default_context)(
-                cafile=ssl_cert_file
-            )
+            return await _context_from_ca_file(ssl_cert_file)
         ssl_cert_dir = os.getenv("SSL_CERT_DIR")
         if ssl_cert_dir:
-            return await aiofiles.os.wrap(ssl.create_default_context)(
-                capath=ssl_cert_dir
-            )
-    default_ca = await aiofiles.os.wrap(certifi.where)()
-    return await aiofiles.os.wrap(ssl.create_default_context)(cafile=default_ca)
+            return await _context_from_ca_directories(ssl_cert_dir)
+    return await _context_from_ca_file(certifi.where())
 
 
 async def _materialize_httpx_verify(
@@ -119,18 +237,11 @@ async def _materialize_httpx_verify(
         ssl_cert_file = os.getenv("SSL_CERT_FILE") if trust_env else None
         ssl_cert_dir = os.getenv("SSL_CERT_DIR") if trust_env else None
         if ssl_cert_file:
-            context = await aiofiles.os.wrap(ssl.create_default_context)(
-                cafile=ssl_cert_file
-            )
+            context = await _context_from_ca_file(ssl_cert_file)
         elif ssl_cert_dir:
-            context = await aiofiles.os.wrap(ssl.create_default_context)(
-                capath=ssl_cert_dir
-            )
+            context = await _context_from_ca_directories(ssl_cert_dir)
         else:
-            default_ca = await aiofiles.os.wrap(certifi.where)()
-            context = await aiofiles.os.wrap(ssl.create_default_context)(
-                cafile=default_ca
-            )
+            context = await _context_from_ca_file(certifi.where())
     elif verify is False:
         if cert is None:
             return False
@@ -145,13 +256,9 @@ async def _materialize_httpx_verify(
             DeprecationWarning,
         )
         if await aiofiles.os.path.isdir(verify):
-            context = await aiofiles.os.wrap(ssl.create_default_context)(
-                capath=verify
-            )
+            context = await _context_from_ca_directories(verify)
         else:
-            context = await aiofiles.os.wrap(ssl.create_default_context)(
-                cafile=verify
-            )
+            context = await _context_from_ca_file(verify)
     else:
         context = verify
 
@@ -161,15 +268,15 @@ async def _materialize_httpx_verify(
             "with `.load_cert_chain()` to configure the certificate chain.",
             DeprecationWarning,
         )
+        await _preload_client_cert_files(cert)
         if isinstance(cert, str):
-            await aiofiles.os.wrap(context.load_cert_chain)(cert)
+            context.load_cert_chain(cert)
         else:
-            await aiofiles.os.wrap(context.load_cert_chain)(*cert)
+            context.load_cert_chain(*cert)
     return context
 
 
 async def _materialize_httpx_proxy(proxy: Any) -> Any:
-    import httpcore
     import httpx
 
     resolved = (
@@ -179,7 +286,7 @@ async def _materialize_httpx_proxy(proxy: Any) -> Any:
     )
     if resolved.url.scheme != "https" or resolved.ssl_context is not None:
         return resolved
-    proxy_context = await aiofiles.os.wrap(httpcore.default_ssl_context)()
+    proxy_context = await _default_proxy_context()
     return httpx.Proxy(
         url=resolved.url,
         ssl_context=proxy_context,
@@ -252,7 +359,7 @@ async def _create_httpx_client(
             client_kwargs["mounts"] = proxy_mounts
             client_kwargs.pop("proxy")
         elif trust_env:
-            proxy_map = await aiofiles.os.wrap(get_environment_proxies)()
+            proxy_map = get_environment_proxies()
             env_mounts = {}
             for pattern, proxy_url in proxy_map.items():
                 if proxy_url is None:
@@ -328,7 +435,7 @@ async def _create_openai_sdk_client(
 
     base_url = kwargs.get("base_url")
     if base_url is None:
-        base_url = os.environ.get("OPENAI_BASE_URL")
+        base_url = get_secret("OPENAI_BASE_URL")
     if base_url is None:
         base_url = "https://api.openai.com/v1"
 

@@ -440,3 +440,57 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = await self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
+
+    @pytest.mark.asyncio
+    async def test_multiplex_provider_credentials_come_only_from_active_scope(
+        self, monkeypatch
+    ):
+        from agent import secret_scope
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        monkeypatch.setenv("OPENAI_API_KEY", "foreign-process-key")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "foreign-claude-token")
+        monkeypatch.setenv("CODEX_HOME", "/foreign/process/codex")
+        token = secret_scope.set_secret_scope(
+            {
+                "OPENAI_API_KEY": "profile-key",
+                "CLAUDE_CODE_OAUTH_TOKEN": "profile-claude-token",
+                "CODEX_HOME": "/profiles/a/codex",
+                "GH_TOKEN": "must-always-strip",
+            }
+        )
+        try:
+            env = await self._capture_spawn_env(monkeypatch)
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert env.get("OPENAI_API_KEY") == "profile-key"
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "profile-claude-token"
+        assert env.get("CODEX_HOME") == "/profiles/a/codex"
+        assert "GH_TOKEN" not in env
+
+    @pytest.mark.asyncio
+    async def test_multiplex_provider_env_fails_without_scope(self, monkeypatch):
+        from agent import secret_scope
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        monkeypatch.setenv("OPENAI_API_KEY", "foreign-process-key")
+
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            await self._capture_spawn_env(monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_direct_client_requires_scoped_codex_home_in_multiplex(
+        self, monkeypatch
+    ):
+        from agent import secret_scope
+        from agent.transports import codex_app_server as cas
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        monkeypatch.setenv("CODEX_HOME", "/foreign/process/codex")
+        token = secret_scope.set_secret_scope({"OPENAI_API_KEY": "profile-key"})
+        try:
+            with pytest.raises(RuntimeError, match="profile-scoped CODEX_HOME"):
+                await cas.CodexAppServerClient()._build_spawn_env()
+        finally:
+            secret_scope.reset_secret_scope(token)

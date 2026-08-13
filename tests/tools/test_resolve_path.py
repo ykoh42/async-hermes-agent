@@ -35,7 +35,7 @@ class TestResolvePath:
 
         task_id = "live-cwd"
         # The session's completed `cd` recorded the new directory.
-        await terminal_tool.record_session_cwd(task_id, str(live_dir))
+        terminal_tool.record_session_cwd(task_id, str(live_dir))
 
         try:
             result = await file_tools._resolve_path(

@@ -23,6 +23,7 @@ Selection precedence (first hit wins):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +33,7 @@ from agent.ssl_verify import _create_httpx_client, _create_openai_sdk_client
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
+    _close_owned_client,
     error_response,
     normalize_reference_images,
     resolve_aspect_ratio,
@@ -41,6 +43,57 @@ from agent.image_gen_provider import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_client_after_request(
+    client: Any,
+    cancellation: asyncio.CancelledError | None,
+) -> None:
+    """Finish client close without replacing the request's cancellation."""
+    try:
+        await _close_owned_client(client)
+    except asyncio.CancelledError:  # noqa: ASYNC103 - request cancellation wins below
+        if cancellation is None:
+            raise
+    except Exception as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _close_http_client_after_request(
+    client: Any,
+    cancellation: asyncio.CancelledError | None,
+) -> None:
+    """Finish an owned HTTP close and preserve the request cancellation."""
+    close_task = asyncio.create_task(
+        client.aclose(),
+        name="openai-image-source-http-close",
+    )
+    cleanup_cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(close_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if close_task.cancelled():
+                if cancellation is not None:
+                    raise cancellation from exc  # noqa: ASYNC104
+                raise
+            if cleanup_cancellation is None:
+                cleanup_cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    if cleanup_cancellation is not None:
+        raise cleanup_cancellation
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +151,7 @@ async def _load_openai_config() -> Dict[str, Any]:
 
 async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
-    env_override = os.environ.get("OPENAI_IMAGE_MODEL")
+    env_override = get_secret("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
         return env_override, _MODELS[env_override]
 
@@ -134,11 +187,15 @@ async def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
     ref = ref.strip()
     lower = ref.lower()
     if lower.startswith(("http://", "https://")):
-        import httpx
-
-        async with (await _create_httpx_client(timeout=60)) as client:
+        client = await _create_httpx_client(timeout=60)
+        cancellation: asyncio.CancelledError | None = None
+        try:
             resp = await client.get(ref)
             resp.raise_for_status()
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - closed below
+            cancellation = exc
+        finally:
+            await _close_http_client_after_request(client, cancellation)
         name = ref.split("?", 1)[0].rsplit("/", 1)[-1] or "image.png"
         return resp.content, name
     if lower.startswith("data:"):
@@ -302,6 +359,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 openai.AsyncOpenAI,
                 api_key=api_key,
             )
+            cancellation: asyncio.CancelledError | None = None
             try:
                 response = await client.images.edit(
                     model=API_MODEL,
@@ -311,6 +369,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     quality=meta["quality"],
                     n=1,
                 )
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103 - closed below
+                cancellation = exc
             except Exception as exc:
                 logger.debug("OpenAI image edit failed", exc_info=True)
                 return error_response(
@@ -322,7 +382,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
             finally:
-                await client.close()
+                await _close_client_after_request(client, cancellation)
         else:
             # gpt-image-2 returns b64_json unconditionally and REJECTS
             # ``response_format`` as an unknown parameter. Don't send it.
@@ -338,8 +398,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 openai.AsyncOpenAI,
                 api_key=api_key,
             )
+            cancellation = None
             try:
                 response = await client.images.generate(**payload)
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103 - closed below
+                cancellation = exc
             except Exception as exc:
                 logger.debug("OpenAI image generation failed", exc_info=True)
                 return error_response(
@@ -351,7 +414,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
             finally:
-                await client.close()
+                await _close_client_after_request(client, cancellation)
 
         data = getattr(response, "data", None) or []
         if not data:

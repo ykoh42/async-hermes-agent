@@ -22,6 +22,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
+from agent.secret_scope import get_secret as _get_secret
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -53,14 +54,14 @@ def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
 
 def _resolve_command() -> str:
     return (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        (_get_secret("HERMES_COPILOT_ACP_COMMAND", "") or "").strip()
+        or (_get_secret("COPILOT_CLI_PATH", "") or "").strip()
         or "copilot"
     )
 
 
 def _resolve_args() -> list[str]:
-    raw = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    raw = (_get_secret("HERMES_COPILOT_ACP_ARGS", "") or "").strip()
     if not raw:
         return ["--acp", "--stdio"]
     return shlex.split(raw)
@@ -88,6 +89,28 @@ async def _resolve_home_dir() -> str:
 
 async def _build_subprocess_env() -> dict[str, str]:
     env = await hermes_subprocess_env(inherit_credentials=True)
+    from agent.secret_scope import (
+        UnscopedSecretError,
+        current_secret_scope,
+        is_multiplex_active,
+    )
+
+    if is_multiplex_active():
+        scope = current_secret_scope()
+        if scope is None:
+            raise UnscopedSecretError(
+                "Copilot ACP subprocess environment requires an active "
+                "profile secret scope while multiplexing is enabled."
+            )
+        from tools.environments.local import (
+            _ALWAYS_STRIP_KEYS,
+            _HERMES_PROVIDER_ENV_BLOCKLIST,
+        )
+
+        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            env.pop(key, None)
+            if key not in _ALWAYS_STRIP_KEYS and key in scope:
+                env[key] = scope[key]
     env["HOME"] = await _resolve_home_dir()
     from hermes_constants import apply_subprocess_home_env
 

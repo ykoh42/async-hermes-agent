@@ -9,19 +9,34 @@ description: "Move between Async Hermes Agent releases while keeping application
 Async Hermes Agent does not include the upstream interactive updater. The host
 application controls dependency upgrades, rollout, and rollback.
 
-## Update a tagged Git installation
+## Update a pinned installation
 
-Replace `<release>` with the tag you have reviewed:
+Replace `<version>` with the release you have reviewed:
 
 ```bash
-uv pip install --upgrade \
-  "git+https://github.com/ykoh42/async-hermes-agent.git@<release>"
+uv pip install --upgrade "async-hermes-agent==<version>"
 ```
 
-Do not track `main` implicitly in production. Pin a tag or commit.
 Pinning the release keeps the agent harness reproducible alongside your model,
-prompt, and dataset versions. PyPI publication is not enabled for this
-distribution.
+prompt, and dataset versions. If you install from source, pin an immutable tag
+or commit rather than tracking `main` implicitly.
+
+### One-time migration from the legacy version scheme
+
+GitHub releases through `0.20.4` used a fork-only version sequence. Starting
+with `0.20.0.5`, the first three numeric segments match the upstream Python
+package and the fourth is this distribution's revision. Because Python version
+ordering considers `0.20.4` newer than `0.20.0.5`, replace an old exact pin and
+reinstall this transition release explicitly:
+
+```bash
+uv pip install --reinstall "async-hermes-agent==0.20.0.5"
+```
+
+Also update lockfiles, requirements manifests, and direct Git URLs from
+`v0.20.4` to `v0.20.0.5`. Releases after this one resume normal monotonic
+updates within the two-axis scheme, for example `0.20.0.6` for a fork-only
+change or `0.20.1.1` after porting upstream `0.20.1`.
 
 ## Update a source checkout
 

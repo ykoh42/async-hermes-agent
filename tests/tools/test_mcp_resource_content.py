@@ -11,6 +11,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 
 PDF_BYTES = b"%PDF-1.4 fake pdf payload for tests"
@@ -183,8 +184,8 @@ class TestToolResultLoopOrdering:
 class TestErrorPathResourceText:
     """isError payloads must surface EmbeddedResource text, not drop it."""
 
-    @pytest.fixture()
-    def _handler(self, monkeypatch):
+    @pytest_asyncio.fixture()
+    async def _handler(self, monkeypatch):
         from unittest.mock import AsyncMock, MagicMock, patch as mock_patch
 
         from tools import mcp_tool
@@ -192,6 +193,7 @@ class TestErrorPathResourceText:
         fake_session = MagicMock()
         fake_server = SimpleNamespace(session=fake_session, _rpc_lock=asyncio.Lock())
 
+        await mcp_tool._activate_mcp_scope()
         mcp_tool._reset_server_error("test-server")
         try:
             with mock_patch.dict(mcp_tool._servers, {"test-server": fake_server}):

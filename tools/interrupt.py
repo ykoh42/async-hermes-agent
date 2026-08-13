@@ -33,7 +33,7 @@ def _reset_interrupt_event(
 
 def set_interrupt(
     active: bool,
-    thread_id: asyncio.Event | None = None,
+    thread_id: int | None = None,
 ) -> None:
     """Set or clear an interrupt event without blocking the event loop.
 
@@ -43,7 +43,8 @@ def set_interrupt(
     :meth:`AIAgent.interrupt`. Tool code normally omits it and operates on the
     event bound to its inherited task context.
     """
-    target = thread_id or _current_interrupt_event.get()
+    target = thread_id if isinstance(thread_id, asyncio.Event) else None
+    target = target or _current_interrupt_event.get()
     if target is None:
         target = asyncio.Event()
         _current_interrupt_event.set(target)

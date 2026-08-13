@@ -7,9 +7,18 @@ import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 import plugins.memory.openviking as openviking_module
+from agent.secret_scope import (
+    UnscopedSecretError,
+    is_multiplex_active,
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from plugins.memory.openviking import (
     OpenVikingMemoryProvider,
     _DEFERRED_COMMIT_TIMEOUT,
@@ -223,6 +232,331 @@ memory:
     assert settings["api_key"] == ""
 
 
+async def test_concurrent_profile_scopes_isolate_connection_headers_and_recall_settings(
+    monkeypatch,
+):
+    process_values = {
+        "OPENVIKING_ENDPOINT": "http://127.0.0.1:29999",
+        "OPENVIKING_API_KEY": "process-key",
+        "OPENVIKING_ACCOUNT": "process-account",
+        "OPENVIKING_USER": "process-user",
+        "OPENVIKING_AGENT": "process-agent",
+        "OPENVIKING_RECALL_LIMIT": "99",
+        "OPENVIKING_PROFILE_TOKEN_BUDGET": "9999",
+    }
+    for name, value in process_values.items():
+        monkeypatch.setenv(name, value)
+
+    async def load_config():
+        return {
+            "recall_limit": 4,
+            "profile_token_budget": 800,
+        }
+
+    monkeypatch.setattr(
+        openviking_module,
+        "_load_hermes_openviking_config",
+        load_config,
+    )
+    requests = {}
+
+    async def exercise(name: str, port: int) -> tuple[dict, dict, int, int]:
+        scope = {
+            "OPENVIKING_ENDPOINT": f"http://127.0.0.1:{port}",
+            "OPENVIKING_API_KEY": f"key-{name}",
+            "OPENVIKING_ACCOUNT": f"account-{name}",
+            "OPENVIKING_USER": f"user-{name}",
+            "OPENVIKING_AGENT": f"agent-{name}",
+            "OPENVIKING_RECALL_LIMIT": "7" if name == "alpha" else "9",
+            "OPENVIKING_PROFILE_TOKEN_BUDGET": (
+                "700" if name == "alpha" else "900"
+            ),
+        }
+        token = set_secret_scope(scope)
+        try:
+            settings = await openviking_module._resolve_connection_settings({})
+            provider = OpenVikingMemoryProvider()
+            recall = await provider._recall_config()
+            profile_budget = await provider._profile_token_budget()
+
+            client = _VikingClient(
+                settings["endpoint"],
+                settings["api_key"],
+                account=settings["account"],
+                user=settings["user"],
+                agent=settings["agent"],
+            )
+            await client._http.aclose()
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                requests[name] = dict(request.headers)
+                return httpx.Response(200, json={"result": name}, request=request)
+
+            client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            assert await client.get("/profile-check") == {"result": name}
+            tenant_headers = {
+                key.lower(): value
+                for key, value in client._headers(include_tenant=True).items()
+            }
+            await client.close()
+            assert client._http.is_closed
+            return (
+                settings,
+                {**requests[name], **tenant_headers},
+                recall["limit"],
+                profile_budget,
+            )
+        finally:
+            reset_secret_scope(token)
+
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        alpha, beta = await asyncio.gather(
+            exercise("alpha", 21001),
+            exercise("beta", 21002),
+        )
+    finally:
+        set_multiplex_active(previous_multiplex)
+
+    alpha_settings, alpha_headers, alpha_limit, alpha_budget = alpha
+    beta_settings, beta_headers, beta_limit, beta_budget = beta
+    assert alpha_settings == {
+        "endpoint": "http://127.0.0.1:21001",
+        "api_key": "key-alpha",
+        "account": "account-alpha",
+        "user": "user-alpha",
+        "agent": "agent-alpha",
+    }
+    assert beta_settings == {
+        "endpoint": "http://127.0.0.1:21002",
+        "api_key": "key-beta",
+        "account": "account-beta",
+        "user": "user-beta",
+        "agent": "agent-beta",
+    }
+    assert alpha_headers["x-api-key"] == "key-alpha"
+    assert alpha_headers["x-openviking-account"] == "account-alpha"
+    assert alpha_headers["x-openviking-user"] == "user-alpha"
+    assert alpha_headers["x-openviking-actor-peer"] == "agent-alpha"
+    assert beta_headers["x-api-key"] == "key-beta"
+    assert beta_headers["x-openviking-account"] == "account-beta"
+    assert beta_headers["x-openviking-user"] == "user-beta"
+    assert beta_headers["x-openviking-actor-peer"] == "agent-beta"
+    assert (alpha_limit, beta_limit) == (7, 9)
+    assert (alpha_budget, beta_budget) == (700, 900)
+
+
+async def test_scoped_empty_values_preserve_ovcli_and_config_fallback_semantics(
+    tmp_path,
+    monkeypatch,
+):
+    ovcli_path = tmp_path / "profile-ovcli.conf"
+    ovcli_path.write_text(
+        json.dumps(
+            {
+                "url": "http://127.0.0.1:22001",
+                "api_key": "ovcli-key",
+                "root_api_key": "ovcli-key",
+                "account": "ovcli-account",
+                "user": "ovcli-user",
+                "agent_id": "ovcli-agent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in (
+        "OPENVIKING_ENDPOINT",
+        "OPENVIKING_API_KEY",
+        "OPENVIKING_ACCOUNT",
+        "OPENVIKING_USER",
+        "OPENVIKING_AGENT",
+        "OPENVIKING_CLI_CONFIG_FILE",
+        "OPENVIKING_RECALL_LIMIT",
+        "OPENVIKING_PROFILE_TOKEN_BUDGET",
+    ):
+        monkeypatch.setenv(name, f"process-{name.lower()}")
+
+    async def load_config():
+        return {
+            "recall_limit": 8,
+            "profile_token_budget": 750,
+        }
+
+    monkeypatch.setattr(
+        openviking_module,
+        "_load_hermes_openviking_config",
+        load_config,
+    )
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    token = set_secret_scope(
+        {
+            "OPENVIKING_CLI_CONFIG_FILE": str(ovcli_path),
+            "OPENVIKING_ENDPOINT": "",
+            "OPENVIKING_API_KEY": "",
+            "OPENVIKING_ACCOUNT": "",
+            "OPENVIKING_USER": "",
+            "OPENVIKING_AGENT": "",
+            "OPENVIKING_RECALL_LIMIT": "",
+            "OPENVIKING_PROFILE_TOKEN_BUDGET": "",
+        }
+    )
+    try:
+        settings = await openviking_module._resolve_connection_settings(
+            {"use_ovcli_config": True}
+        )
+        provider = OpenVikingMemoryProvider()
+        recall = await provider._recall_config()
+        profile_budget = await provider._profile_token_budget()
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(previous_multiplex)
+
+    assert settings == {
+        "endpoint": "http://127.0.0.1:22001",
+        # Upstream distinguishes an explicitly empty env value from absence
+        # for these three fields, so it deliberately masks ovcli values.
+        "api_key": "",
+        "account": "",
+        "user": "",
+        # Endpoint/agent use first-nonempty and therefore fall through.
+        "agent": "ovcli-agent",
+    }
+    assert recall["limit"] == 8
+    assert profile_budget == 750
+
+
+async def test_unscoped_profile_setting_reads_fail_closed_in_multiplex(
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://127.0.0.1:23001")
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(UnscopedSecretError):
+            await openviking_module._resolve_connection_settings({})
+        with pytest.raises(UnscopedSecretError):
+            await OpenVikingMemoryProvider().is_available()
+        with pytest.raises(UnscopedSecretError):
+            await OpenVikingMemoryProvider()._recall_config()
+        with pytest.raises(UnscopedSecretError):
+            openviking_module._resolve_ovcli_config_path()
+    finally:
+        set_multiplex_active(previous_multiplex)
+
+
+async def test_viking_client_repeated_close_cancellation_finishes_http_cleanup():
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+
+    class HTTPClient:
+        is_closed = False
+
+        async def aclose(self):
+            close_started.set()
+            await close_release.wait()
+            self.is_closed = True
+
+    client = _VikingClient(
+        "http://127.0.0.1:24001",
+        account="account",
+        user="user",
+        agent="agent",
+    )
+    await client._http.aclose()
+    http_client = HTTPClient()
+    client._http = http_client
+
+    close = asyncio.create_task(client.close())
+    await close_started.wait()
+    close.cancel()
+    close.cancel()
+    await asyncio.sleep(0)
+    assert not close.done()
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+    assert http_client.is_closed is True
+
+
+async def test_repeated_initialize_cancellation_closes_candidate_and_run_lock(
+    tmp_path,
+    monkeypatch,
+):
+    health_started = asyncio.Event()
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    clients = []
+
+    class HTTPClient:
+        is_closed = False
+
+        async def aclose(self):
+            close_started.set()
+            await close_release.wait()
+            self.is_closed = True
+
+    class Client:
+        close = _VikingClient.close
+
+        def __init__(self, *_args, **_kwargs):
+            self._http = HTTPClient()
+            clients.append(self)
+
+    async def classify(_client, _endpoint):
+        health_started.set()
+        await asyncio.Event().wait()
+
+    async def load_config():
+        return {}
+
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://127.0.0.1:25001")
+    monkeypatch.setattr(openviking_module, "_VikingClient", Client)
+    monkeypatch.setattr(
+        openviking_module,
+        "_classify_runtime_openviking_health",
+        classify,
+    )
+    monkeypatch.setattr(
+        openviking_module,
+        "_load_hermes_openviking_config",
+        load_config,
+    )
+
+    provider = OpenVikingMemoryProvider()
+    provider._conn_snapshot = (
+        "http://old-profile.invalid",
+        "old-key",
+        "old-account",
+        "old-user",
+        "old-agent",
+    )
+    initialize = asyncio.create_task(
+        provider.initialize("session", hermes_home=str(tmp_path))
+    )
+    await health_started.wait()
+    run_lock_path = provider._run_lock_path
+    assert run_lock_path is not None
+    assert run_lock_path.exists()
+
+    initialize.cancel()
+    await close_started.wait()
+    initialize.cancel()
+    await asyncio.sleep(0)
+    assert not initialize.done()
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await initialize
+
+    assert clients[0]._http.is_closed is True
+    assert provider._client is None
+    assert provider._conn_snapshot is None
+    assert provider._run_lock_file is None
+    assert provider._run_lock_path is None
+    assert not run_lock_path.exists()
+
+
 async def test_linked_ovcli_config_is_read_at_runtime(tmp_path, monkeypatch):
     _clear_openviking_env(monkeypatch)
     ovcli_path = tmp_path / "ovcli.conf"
@@ -268,6 +602,104 @@ async def test_linked_ovcli_config_is_read_at_runtime(tmp_path, monkeypatch):
     }
 
 
+async def test_multiplex_profiles_never_borrow_default_global_ovcli(
+    tmp_path,
+    monkeypatch,
+):
+    global_ovcli = (
+        openviking_module.Path.home()
+        / openviking_module._OVCLI_DEFAULT_RELATIVE_PATH
+    )
+    global_ovcli.parent.mkdir(parents=True)
+    global_ovcli.write_text(
+        json.dumps(
+            {
+                "url": "http://foreign-global.test",
+                "root_api_key": "foreign-global-key",
+                "account": "foreign-global-account",
+                "user": "foreign-global-user",
+                "agent_id": "foreign-global-agent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENVIKING_API_KEY", "foreign-process-key")
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+
+    async def resolve(label, port):
+        profile_home = tmp_path / f"profile-{label}"
+        home_token = set_hermes_home_override(profile_home)
+        scope_token = set_secret_scope(
+            {"OPENVIKING_ENDPOINT": f"http://127.0.0.1:{port}"}
+        )
+        try:
+            await asyncio.sleep(0)
+            resolved_path = openviking_module._resolve_ovcli_config_path()
+            settings = await openviking_module._resolve_connection_settings(
+                {"use_ovcli_config": True}
+            )
+            return profile_home, resolved_path, settings
+        finally:
+            reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+    try:
+        alpha, beta = await asyncio.gather(
+            resolve("alpha", 22101),
+            resolve("beta", 22102),
+        )
+    finally:
+        set_multiplex_active(previous_multiplex)
+
+    for profile_home, resolved_path, settings in (alpha, beta):
+        assert resolved_path == (
+            profile_home / openviking_module._OVCLI_DEFAULT_RELATIVE_PATH
+        )
+        assert settings["api_key"] == ""
+        assert settings["account"] == ""
+        assert settings["user"] == ""
+        assert settings["agent"] == openviking_module._DEFAULT_AGENT
+        assert "foreign-global" not in json.dumps(settings)
+        assert "foreign-process" not in json.dumps(settings)
+
+
+async def test_single_profile_keeps_default_global_ovcli_fallback(monkeypatch):
+    global_ovcli = (
+        openviking_module.Path.home()
+        / openviking_module._OVCLI_DEFAULT_RELATIVE_PATH
+    )
+    global_ovcli.parent.mkdir(parents=True)
+    global_ovcli.write_text(
+        json.dumps(
+            {
+                "url": "http://legacy-single.test",
+                "root_api_key": "legacy-single-key",
+                "account": "legacy-account",
+                "user": "legacy-user",
+                "agent_id": "legacy-agent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(False)
+    try:
+        settings = await openviking_module._resolve_connection_settings(
+            {"use_ovcli_config": True}
+        )
+    finally:
+        set_multiplex_active(previous_multiplex)
+
+    assert settings == {
+        "endpoint": "http://legacy-single.test",
+        "api_key": "legacy-single-key",
+        "account": "legacy-account",
+        "user": "legacy-user",
+        "agent": "legacy-agent",
+    }
+
+
 async def test_linked_ovcli_without_url_falls_through_to_profile_endpoint(tmp_path, monkeypatch):
     _clear_openviking_env(monkeypatch)
     ovcli_path = tmp_path / "ovcli.conf"
@@ -299,6 +731,7 @@ async def test_connection_values_omit_stale_identity_for_user_key_with_root_key(
 
 async def test_start_local_openviking_server_uses_endpoint_host_and_port(monkeypatch):
     subprocess_calls = []
+    build_env = AsyncMock(return_value={"PATH": "/profile/bin"})
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         subprocess_calls.append((args, kwargs))
@@ -314,15 +747,170 @@ async def test_start_local_openviking_server_uses_endpoint_host_and_port(monkeyp
         "_which",
         AsyncMock(return_value="/mock/bin/openviking-server"),
     )
+    monkeypatch.setattr(openviking_module, "build_subprocess_env", build_env)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
-    state, message = await openviking_module._start_local_openviking_server("http://127.0.0.1:1934")
+    state, message = await openviking_module._start_local_openviking_server(
+        "http://127.0.0.1:1934",
+        provider_env={
+            "OPENVIKING_ENDPOINT": "http://127.0.0.1:1934",
+            "OPENVIKING_API_KEY": "profile-key",
+        },
+    )
 
     assert state == openviking_module._LOCAL_SERVER_STARTED
     assert "127.0.0.1:1934" in message
     args, kwargs = subprocess_calls[0]
     assert args == ("/mock/bin/openviking-server", "--host", "127.0.0.1", "--port", "1934")
     assert kwargs["start_new_session"] is True
+    assert kwargs["env"] == {
+        "PATH": "/profile/bin",
+        "OPENVIKING_ENDPOINT": "http://127.0.0.1:1934",
+        "OPENVIKING_API_KEY": "profile-key",
+    }
+    build_kwargs = build_env.await_args.kwargs
+    assert build_kwargs["scrub_secrets"] is True
+    assert not any(
+        name.startswith("OPENVIKING_")
+        for name in build_kwargs["base"]
+    )
+
+
+async def test_openviking_child_env_strips_process_values_and_limits_overlay(
+    monkeypatch,
+):
+    for name, value in {
+        "OPENVIKING_ENDPOINT": "http://foreign-process.test",
+        "OPENVIKING_API_KEY": "foreign-process-key",
+        "OPENVIKING_ACCOUNT": "foreign-process-account",
+        "OPENVIKING_USER": "foreign-process-user",
+        "OPENVIKING_AGENT": "foreign-process-agent",
+        "OPENVIKING_CLI_CONFIG_FILE": "/foreign/ovcli.conf",
+        "OPENVIKING_UNDECLARED_SECRET": "foreign-undeclared",
+        "OPENAI_API_KEY": "foreign-openai",
+        "OPENVIKING_RUNTIME_MARKER": "foreign-marker",
+        "MEMORY_RUNTIME_MARKER": "preserved",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    child_env = await openviking_module._build_openviking_subprocess_env(
+        {
+            "OPENVIKING_ENDPOINT": "http://127.0.0.1:21930",
+            "OPENVIKING_API_KEY": "profile-key",
+            "OPENVIKING_ACCOUNT": "",
+            "OPENVIKING_UNDECLARED_SECRET": "must-not-pass",
+        }
+    )
+
+    assert child_env["OPENVIKING_ENDPOINT"] == "http://127.0.0.1:21930"
+    assert child_env["OPENVIKING_API_KEY"] == "profile-key"
+    assert child_env["OPENVIKING_ACCOUNT"] == ""
+    assert child_env["MEMORY_RUNTIME_MARKER"] == "preserved"
+    assert "OPENVIKING_USER" not in child_env
+    assert "OPENVIKING_AGENT" not in child_env
+    assert "OPENVIKING_CLI_CONFIG_FILE" not in child_env
+    assert "OPENVIKING_UNDECLARED_SECRET" not in child_env
+    assert "OPENVIKING_RUNTIME_MARKER" not in child_env
+    assert "OPENAI_API_KEY" not in child_env
+
+
+async def test_concurrent_profile_daemons_receive_only_resolved_provider_env(
+    monkeypatch,
+):
+    spawned = {}
+
+    async def probe(_host, _port):
+        return False
+
+    async def which(_name):
+        return "/mock/bin/openviking-server"
+
+    async def build_env(*, base, scrub_secrets):
+        assert scrub_secrets is True
+        assert not any(name.startswith("OPENVIKING_") for name in base)
+        await asyncio.sleep(0)
+        return {"PATH": "/safe/bin"}
+
+    async def spawn(*args, **kwargs):
+        spawned[int(args[-1])] = dict(kwargs["env"])
+        return object()
+
+    monkeypatch.setattr(openviking_module, "_local_openviking_port_is_open", probe)
+    monkeypatch.setattr(openviking_module, "_which", which)
+    monkeypatch.setattr(openviking_module, "build_subprocess_env", build_env)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setenv("OPENAI_API_KEY", "foreign-openai")
+    monkeypatch.setenv("OPENVIKING_API_KEY", "foreign-openviking")
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+
+    async def start(name, port):
+        token = set_secret_scope(
+            {
+                "OPENVIKING_ENDPOINT": f"http://127.0.0.1:{port}",
+                "OPENVIKING_API_KEY": f"key-{name}",
+                "OPENVIKING_ACCOUNT": f"account-{name}",
+                "OPENVIKING_USER": f"user-{name}",
+                "OPENVIKING_AGENT": f"agent-{name}",
+            }
+        )
+        try:
+            settings = await openviking_module._resolve_connection_settings({})
+            return await openviking_module._start_local_openviking_server(
+                settings["endpoint"],
+                provider_env={
+                    "OPENVIKING_ENDPOINT": settings["endpoint"],
+                    "OPENVIKING_API_KEY": settings["api_key"],
+                    "OPENVIKING_ACCOUNT": settings["account"],
+                    "OPENVIKING_USER": settings["user"],
+                    "OPENVIKING_AGENT": settings["agent"],
+                },
+            )
+        finally:
+            reset_secret_scope(token)
+
+    try:
+        alpha, beta = await asyncio.gather(
+            start("alpha", 21931),
+            start("beta", 21932),
+        )
+    finally:
+        set_multiplex_active(previous_multiplex)
+
+    assert alpha[0] == openviking_module._LOCAL_SERVER_STARTED
+    assert beta[0] == openviking_module._LOCAL_SERVER_STARTED
+    assert spawned[21931] == {
+        "PATH": "/safe/bin",
+        "OPENVIKING_ENDPOINT": "http://127.0.0.1:21931",
+        "OPENVIKING_API_KEY": "key-alpha",
+        "OPENVIKING_ACCOUNT": "account-alpha",
+        "OPENVIKING_USER": "user-alpha",
+        "OPENVIKING_AGENT": "agent-alpha",
+    }
+    assert spawned[21932] == {
+        "PATH": "/safe/bin",
+        "OPENVIKING_ENDPOINT": "http://127.0.0.1:21932",
+        "OPENVIKING_API_KEY": "key-beta",
+        "OPENVIKING_ACCOUNT": "account-beta",
+        "OPENVIKING_USER": "user-beta",
+        "OPENVIKING_AGENT": "agent-beta",
+    }
+
+
+async def test_unscoped_multiplex_daemon_resolution_fails_before_spawn(
+    monkeypatch,
+):
+    spawn = AsyncMock(side_effect=AssertionError("must fail before spawn"))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://127.0.0.1:21933")
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(UnscopedSecretError, match="OPENVIKING_ENDPOINT"):
+            await openviking_module._resolve_connection_settings({})
+    finally:
+        set_multiplex_active(previous_multiplex)
+    spawn.assert_not_awaited()
 
 
 async def test_start_local_openviking_server_does_not_spawn_when_port_already_open(monkeypatch):
@@ -423,6 +1011,7 @@ async def test_local_openviking_port_is_open_detects_listener_and_closed_port():
 
 async def test_describe_local_port_listener_reports_process(monkeypatch):
     calls = []
+    build_env = AsyncMock(return_value={"PATH": "/safe/bin"})
 
     class Process:
         def __init__(self, stdout):
@@ -438,22 +1027,32 @@ async def test_describe_local_port_listener_reports_process(monkeypatch):
         return Process(b"postgres\n")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(openviking_module, "build_subprocess_env", build_env)
 
     assert await openviking_module._describe_local_port_listener("127.0.0.1", 1934) == (
         "postgres (PID 4242)"
     )
     assert calls[0][0][:2] == ("lsof", "-nP")
     assert calls[1][0] == ("ps", "-p", "4242", "-o", "comm=")
+    assert calls[0][1]["env"] == {"PATH": "/safe/bin"}
+    assert calls[1][1]["env"] == {"PATH": "/safe/bin"}
+    build_kwargs = build_env.await_args.kwargs
+    assert build_kwargs["scrub_secrets"] is True
+    assert not any(
+        name.startswith("OPENVIKING_")
+        for name in build_kwargs["base"]
+    )
 
 
 async def test_runtime_reports_occupied_port_and_does_not_wait_or_spawn(monkeypatch):
+    start_server = AsyncMock(return_value=(
+            openviking_module._LOCAL_SERVER_OCCUPIED,
+            "Port 127.0.0.1:1934 is occupied by postgres (PID 99).",
+        ))
     monkeypatch.setattr(
         openviking_module,
         "_start_local_openviking_server",
-        AsyncMock(return_value=(
-            openviking_module._LOCAL_SERVER_OCCUPIED,
-            "Port 127.0.0.1:1934 is occupied by postgres (PID 99).",
-        )),
+        start_server,
     )
     provider = OpenVikingMemoryProvider()
     provider._endpoint = "http://127.0.0.1:1934"
@@ -467,6 +1066,16 @@ async def test_runtime_reports_occupied_port_and_does_not_wait_or_spawn(monkeypa
     assert len(warnings) == 1
     assert "postgres (PID 99)" in warnings[0]
     assert "temporarily unavailable" in warnings[0]
+    start_server.assert_awaited_once_with(
+        "http://127.0.0.1:1934",
+        provider_env={
+            "OPENVIKING_ENDPOINT": "http://127.0.0.1:1934",
+            "OPENVIKING_API_KEY": "",
+            "OPENVIKING_ACCOUNT": "",
+            "OPENVIKING_USER": "",
+            "OPENVIKING_AGENT": "",
+        },
+    )
 
 
 async def test_https_local_endpoint_is_not_runtime_autostart_eligible(monkeypatch):
@@ -501,6 +1110,7 @@ async def test_https_local_endpoint_is_not_runtime_autostart_eligible(monkeypatc
         "the config changes. "
         "Check the configured endpoint and network connectivity."
     ]
+    await provider.shutdown()
 
 
 async def test_runtime_does_not_autostart_when_local_server_reports_unhealthy(monkeypatch):
@@ -537,6 +1147,7 @@ async def test_runtime_does_not_autostart_when_local_server_reports_unhealthy(mo
         "OpenViking memory is temporarily unavailable; Hermes will retry on a later access "
         "or when the config changes."
     ]
+    await provider.shutdown()
 
 
 async def test_initialize_autostarts_local_openviking_in_background_when_runtime_health_fails(monkeypatch):
@@ -561,7 +1172,7 @@ async def test_initialize_autostarts_local_openviking_in_background_when_runtime
     monkeypatch.setattr(
         openviking_module,
         "_start_local_openviking_server",
-        AsyncMock(side_effect=lambda endpoint: start_calls.append(endpoint)
+        AsyncMock(side_effect=lambda endpoint, **_kwargs: start_calls.append(endpoint)
         or (openviking_module._LOCAL_SERVER_STARTED, "started")),
     )
     monkeypatch.setattr(
@@ -586,6 +1197,7 @@ async def test_initialize_autostarts_local_openviking_in_background_when_runtime
     assert len(waiter_calls) == 1
     assert waiter_calls[0]["status_callback"] == statuses.append
     assert any("starting in the background" in message for message in statuses)
+    await provider.shutdown()
 
 
 async def test_tool_search_sorts_by_raw_score_across_buckets():
@@ -1478,6 +2090,7 @@ async def test_blocked_endpoint_does_not_fall_back_or_construct_client(monkeypat
     assert "blocked metadata address" in warnings[0]
     assert "temporary-credential" not in warnings[0]
     assert openviking_module._DEFAULT_ENDPOINT not in warnings[0]
+    await provider.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -1533,6 +2146,7 @@ async def test_runtime_rejects_unrelated_json_health_response(
     assert len(warnings) == 1
     assert "/health response is not valid OpenViking" in warnings[0]
     assert "python-http-server (PID 4242)" in warnings[0]
+    await provider.shutdown()
 
 
 async def test_is_available_true_for_config_yaml_endpoint(monkeypatch):

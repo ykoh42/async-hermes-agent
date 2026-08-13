@@ -7,6 +7,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
+from agent import secret_scope
 from tools import env_probe
 
 pytestmark = pytest.mark.asyncio
@@ -14,9 +15,14 @@ pytestmark = pytest.mark.asyncio
 
 @pytest_asyncio.fixture(autouse=True)
 async def reset_probe_cache():
+    previous_multiplex = secret_scope.is_multiplex_active()
+    scope_token = secret_scope.set_secret_scope(None)
+    secret_scope.set_multiplex_active(False)
     await env_probe._reset_cache_for_tests()
     yield
     await env_probe._reset_cache_for_tests()
+    secret_scope.reset_secret_scope(scope_token)
+    secret_scope.set_multiplex_active(previous_multiplex)
 
 
 def _async_value(value):
@@ -69,6 +75,68 @@ async def test_remote_backend_is_silent(monkeypatch):
 
     monkeypatch.setattr(env_probe, "_python_version_of", should_not_run)
     assert await env_probe.get_environment_probe_line() == ""
+
+
+async def test_remote_profile_does_not_poison_shared_local_probe_cache(
+    monkeypatch,
+):
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    secret_scope.set_multiplex_active(True)
+    calls = 0
+
+    async def local_probe():
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return "Python toolchain: profile-local."
+
+    monkeypatch.setattr(env_probe, "_build_probe_line", local_probe)
+
+    async def resolve(backend: str) -> str:
+        token = secret_scope.set_secret_scope({"TERMINAL_ENV": backend})
+        try:
+            return await env_probe.get_environment_probe_line()
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    remote, local = await asyncio.gather(resolve("docker"), resolve("local"))
+    assert remote == ""
+    assert local == "Python toolchain: profile-local."
+    assert calls == 1
+    assert env_probe._CACHED_LINE == local
+
+    assert await resolve("ssh") == ""
+    assert await resolve("local") == local
+    assert calls == 1
+
+
+async def test_remote_warmup_does_not_start_or_clear_local_probe(monkeypatch):
+    secret_scope.set_multiplex_active(True)
+    called = False
+
+    async def local_probe():
+        nonlocal called
+        called = True
+        return "Python toolchain: local."
+
+    monkeypatch.setattr(env_probe, "_build_probe_line", local_probe)
+    token = secret_scope.set_secret_scope({"TERMINAL_ENV": "modal"})
+    try:
+        await env_probe.warm_environment_probe_async()
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert called is False
+    assert env_probe._CACHED_LINE is None
+    assert not env_probe._PROBE_TASKS
+
+
+async def test_unscoped_multiplex_probe_fails_closed(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    secret_scope.set_multiplex_active(True)
+
+    with pytest.raises(secret_scope.UnscopedSecretError):
+        await env_probe.get_environment_probe_line()
 
 
 async def test_result_is_cached(monkeypatch):

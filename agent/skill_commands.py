@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,47 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: dict[str, dict[str, Any]] = {}
 _skill_commands_platform: str | None = None
+_skill_commands_by_scope: dict[
+    tuple[str, str | None],
+    dict[str, dict[str, Any]],
+] = {}
+_skill_commands_projection_scope: tuple[str, str | None] | None = None
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+
+
+def _skill_command_scope_key(platform: str | None) -> tuple[str, str | None]:
+    """Return the active skill-root/platform cache key without filesystem I/O."""
+    module = sys.modules.get("tools.skills_tool")
+    skills_dir = getattr(module, "_skills_dir", None)
+    if callable(skills_dir):
+        root = skills_dir()
+    else:
+        from hermes_constants import get_hermes_home
+
+        root = get_hermes_home() / "skills"
+    return os.path.normcase(os.path.normpath(os.fspath(root))), platform
+
+
+def _active_skill_commands(
+    platform: str | None,
+) -> dict[str, dict[str, Any]] | None:
+    """Project the current profile cache onto the upstream private globals."""
+    global _skill_commands, _skill_commands_platform, _skill_commands_projection_scope
+    key = _skill_command_scope_key(platform)
+    if (
+        _skill_commands_projection_scope == key
+        and not _skill_commands
+        and _skill_commands_platform is None
+    ):
+        _skill_commands_by_scope.pop(key, None)
+    cached = _skill_commands_by_scope.get(key)
+    if cached is None:
+        return None
+    _skill_commands = cached
+    _skill_commands_platform = platform
+    _skill_commands_projection_scope = key
+    return cached
 
 # These literals are part of the persisted format emitted by the classic
 # runtime.  Keep them byte-stable so existing session previews and memory rows
@@ -302,7 +342,7 @@ async def _build_skill_message(
 
 async def scan_skill_commands() -> dict[str, dict[str, Any]]:
     """Scan local and external skill roots into slash-command metadata."""
-    global _skill_commands, _skill_commands_platform
+    global _skill_commands, _skill_commands_platform, _skill_commands_projection_scope
 
     from tools.skills_tool import (
         _external_skills_dirs,
@@ -377,17 +417,19 @@ async def scan_skill_commands() -> dict[str, dict[str, Any]]:
                 continue
     _skill_commands = commands
     _skill_commands_platform = scan_platform
+    scope = _skill_command_scope_key(scan_platform)
+    _skill_commands_by_scope[scope] = commands
+    _skill_commands_projection_scope = scope
     return _skill_commands
 
 
 async def get_skill_commands() -> dict[str, dict[str, Any]]:
     """Return cached skill commands, refreshing for platform-scope changes."""
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        await scan_skill_commands()
-    return _skill_commands
+    platform = _resolve_skill_commands_platform()
+    cached = _active_skill_commands(platform)
+    if not cached:
+        return await scan_skill_commands()
+    return cached
 
 
 async def reload_skills() -> dict[str, Any]:
@@ -398,7 +440,9 @@ async def reload_skills() -> dict[str, Any]:
             for key, info in commands.items()
         }
 
-    before = _snapshot(_skill_commands)
+    before = _snapshot(
+        _active_skill_commands(_resolve_skill_commands_platform()) or {}
+    )
     new_commands = await scan_skill_commands()
     after = _snapshot(new_commands)
     added_names = sorted(set(after) - set(before))

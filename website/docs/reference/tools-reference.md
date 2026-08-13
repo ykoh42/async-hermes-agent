@@ -23,8 +23,10 @@ contract.
 | `search_files` | `pattern` | Search file names or contents |
 | `web_search` | `query` | Search through the configured web provider |
 | `web_extract` | `urls` | Extract content from one or more URLs |
+| `x_search` | `query` | Search public X content through xAI; opt-in |
 | `vision_analyze` | `image_url`, `question` | Analyze an image |
 | `image_generate` | `prompt` | Generate an image through the selected provider plugin |
+| `execute_code` | `code` | Run bounded Python orchestration over enabled Hermes tools |
 | `skills_list` | none | Discover available skills |
 | `skill_view` | `name` | Load one skill document |
 | `skill_manage` | `action`, `name` | Create, edit, patch, or remove a skill |
@@ -33,9 +35,32 @@ contract.
 | `todo` | none | Maintain turn planning state |
 | `clarify` | `question` | Ask the host user for clarification through a callback |
 | `delegate_task` | none | Launch one or more child-agent tasks; each task requires a goal |
+| `text_to_speech` | `text` | Synthesize an audio file through the configured TTS provider |
+| `computer_use` | `action` | Drive a cua-driver desktop session, subject to approval |
 
-Optional retained media tools are `video_analyze` (`video_url`, `question`) and
-`video_generate` (`prompt`). They are not part of the default core list.
+## Media and service tools
+
+| Tool | Required input | Availability |
+| --- | --- | --- |
+| `video_analyze` | `video_url`, `question` | Opt-in `video` toolset |
+| `video_generate` | `prompt` | Selected video-generation provider |
+| `xai_video_edit` | `prompt`, `video_url` | xAI video-generation provider |
+| `xai_video_extend` | `prompt`, `video_url` | xAI video-generation provider |
+| `bfl_flux3_text_to_video` | `prompt` | BFL/Nous managed gateway |
+| `bfl_flux3_image_to_video` | `prompt`, `input_image` | BFL/Nous managed gateway |
+| `bfl_flux3_keyframes_to_video` | `prompt`, `input_images`, `keyframe_indices` | BFL/Nous managed gateway |
+| `bfl_flux3_video_continuation` | `prompt`, `input_video` | BFL/Nous managed gateway |
+| `bfl_flux3_get_result` | `id` | Existing BFL job |
+| `bfl_flux3_prompting_guide` | none | BFL toolset enabled |
+| `ha_list_entities` | none | `HASS_TOKEN` configured |
+| `ha_get_state` | `entity_id` | `HASS_TOKEN` configured |
+| `ha_list_services` | none | `HASS_TOKEN` configured |
+| `ha_call_service` | `domain`, `service` | `HASS_TOKEN` configured |
+
+`text_to_speech` returns synthesized media; speaker playback belongs to the
+removed CLI/gateway UI and is not a separate library API. `computer_use`
+requires the external `cua-driver` runtime even though its compatibility extra
+does not add another Python package.
 
 ## Browser tools
 
@@ -91,8 +116,10 @@ reduces prompt footprint and limits accidental capability exposure.
 
 Tool handlers on the retained active path are awaited directly. Parallel-safe
 calls may overlap, but result messages retain model-call order. Interactive,
-stateful, or safety-sensitive calls remain sequential. There is no thread-pool
-fallback for a synchronous-only tool.
+stateful, or safety-sensitive calls remain sequential. A synchronous-only tool
+transport fails explicitly. File-backed tools still inherit the documented
+`aiofiles` executor limitation; they are event-loop nonblocking but must not be
+described as zero-thread or OS-native regular-file I/O.
 
 See [Tools and Toolsets](/user-guide/features/tools) and
 [Toolsets Reference](./toolsets-reference.md).

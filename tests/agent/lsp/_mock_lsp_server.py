@@ -64,6 +64,21 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    capture_path = os.environ.get("MOCK_LSP_ENV_CAPTURE")
+    if capture_path:
+        with open(capture_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "home": os.environ.get("HERMES_HOME"),
+                    "path": os.environ.get("PATH"),
+                    "label": os.environ.get("LSP_PROFILE_LABEL"),
+                    "scoped": os.environ.get("PROFILE_SCOPED_TOKEN"),
+                    "openai": os.environ.get("OPENAI_API_KEY"),
+                    "anthropic": os.environ.get("ANTHROPIC_API_KEY"),
+                    "internal": os.environ.get("AUXILIARY_VISION_API_KEY"),
+                },
+                handle,
+            )
 
     while True:
         msg = read_message()

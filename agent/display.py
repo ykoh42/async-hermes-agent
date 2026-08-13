@@ -6,7 +6,7 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -63,6 +63,14 @@ def _diff_minus(): return _diff_ansi()["minus"]
 def _diff_plus():  return _diff_ansi()["plus"]
 _MAX_INLINE_DIFF_FILES = 6
 _MAX_INLINE_DIFF_LINES = 80
+
+
+@dataclass
+class LocalEditSnapshot:
+    """Pre-tool filesystem snapshot used by the retained display contract."""
+
+    paths: list[Path] = field(default_factory=list)
+    before: dict[str, str | None] = field(default_factory=dict)
 
 
 # =========================================================================
@@ -704,7 +712,7 @@ def extract_edit_diff(
     result: str | None,
     *,
     function_args: dict | None = None,
-    snapshot=None,
+    snapshot: LocalEditSnapshot | None = None,
 ) -> str | None:
     """Extract a unified diff from a file-edit tool result."""
     if tool_name == "patch" and result:
@@ -831,7 +839,7 @@ def render_edit_diff_with_delta(
     result: str | None,
     *,
     function_args: dict | None = None,
-    snapshot=None,
+    snapshot: LocalEditSnapshot | None = None,
     print_fn=None,
 ) -> bool:
     """Render an edit diff inline without taking over the terminal UI."""

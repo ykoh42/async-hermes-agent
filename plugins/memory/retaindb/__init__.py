@@ -587,7 +587,12 @@ class _Client:
             client = self._http_client
             self._http_client = None
         if client is not None:
-            await client.aclose()
+            await _finish_owned_task(
+                asyncio.create_task(
+                    client.aclose(),
+                    name="retaindb-http-client-close",
+                )
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -867,13 +872,13 @@ class RetainDBMemoryProvider(MemoryProvider):
         provider_config = await _load_retaindb_config()
         api_key = get_secret("RETAINDB_API_KEY", "") or ""
         base_url_raw = (
-            os.environ.get("RETAINDB_BASE_URL")
+            get_secret("RETAINDB_BASE_URL")
             or _config_str(provider_config.get("base_url"))
             or _DEFAULT_BASE_URL
         )
         base_url = re.sub(r"/+$", "", base_url_raw)
 
-        explicit = os.environ.get("RETAINDB_PROJECT") or _config_str(
+        explicit = get_secret("RETAINDB_PROJECT") or _config_str(
             provider_config.get("project")
         )
         if explicit:
@@ -909,7 +914,12 @@ class RetainDBMemoryProvider(MemoryProvider):
         try:
             await queue.initialize()
         except BaseException:
-            await client.close()
+            await _finish_owned_task(
+                asyncio.create_task(
+                    client.close(),
+                    name="retaindb-initialize-cleanup",
+                )
+            )
             raise
         self._client = client
         self._queue = queue

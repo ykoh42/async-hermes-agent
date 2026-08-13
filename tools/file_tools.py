@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import MutableMapping
 from pathlib import Path, PurePosixPath
 
 import aiofiles
@@ -54,9 +55,86 @@ logger = logging.getLogger(__name__)
 # backend.  It stays synchronous and tiny; all filesystem operations that feed
 # it are awaited by the native handlers below.
 _read_tracker_lock = threading.RLock()
-_read_tracker: dict[str, dict] = {}
 _patch_failure_lock = threading.RLock()
-_patch_failure_tracker: dict[str, dict[str, int]] = {}
+_read_tracker_states: dict[str, dict[str, dict]] = {}
+_patch_failure_tracker_states: dict[str, dict[str, dict[str, int]]] = {}
+
+
+class _ScopedTracker(MutableMapping):
+    """Dict-compatible view of one profile's private tracker state."""
+
+    def __init__(self, states: dict, lock: threading.RLock) -> None:
+        self._states = states
+        self._lock = lock
+
+    def _active(self) -> dict:
+        profile = file_state._current_profile_identity()
+        return self._states.setdefault(profile, {})
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._active()[key]
+
+    def __setitem__(self, key, value) -> None:
+        with self._lock:
+            self._active()[key] = value
+
+    def __delitem__(self, key) -> None:
+        with self._lock:
+            del self._active()[key]
+
+    def __iter__(self):
+        with self._lock:
+            return iter(tuple(self._active()))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._active())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._active().clear()
+
+
+_read_tracker: MutableMapping[str, dict] = _ScopedTracker(
+    _read_tracker_states,
+    _read_tracker_lock,
+)
+_patch_failure_tracker: MutableMapping[str, dict[str, int]] = _ScopedTracker(
+    _patch_failure_tracker_states,
+    _patch_failure_lock,
+)
+
+
+async def _activate_file_tracker_scope() -> str:
+    """Move lexical compatibility state into the canonical profile scope."""
+    lexical = file_state._lexical_profile_identity()
+    canonical = await file_state._activate_profile_scope()
+    if lexical == canonical:
+        return canonical
+    with _read_tracker_lock:
+        staged = _read_tracker_states.pop(lexical, None)
+        if staged:
+            active = _read_tracker_states.setdefault(canonical, {})
+            for task_id, task_state in staged.items():
+                current = active.get(task_id)
+                if current is None:
+                    active[task_id] = task_state
+                    continue
+                current.setdefault("read_history", set()).update(
+                    task_state.get("read_history", set())
+                )
+                for key in ("dedup", "dedup_hits", "read_timestamps", "not_found"):
+                    current.setdefault(key, {}).update(task_state.get(key, {}))
+    with _patch_failure_lock:
+        staged_failures = _patch_failure_tracker_states.pop(lexical, None)
+        if staged_failures:
+            active_failures = _patch_failure_tracker_states.setdefault(canonical, {})
+            for task_id, paths in staged_failures.items():
+                current_paths = active_failures.setdefault(task_id, {})
+                for path, count in paths.items():
+                    current_paths[path] = max(current_paths.get(path, 0), count)
+    return canonical
 _READ_HISTORY_CAP = 500
 _DEDUP_CAP = 1000
 _READ_TIMESTAMPS_CAP = 1000
@@ -106,6 +184,7 @@ async def _check_not_found_cache(
             return None
         timestamp, cached_json = entry
         if time.monotonic() - timestamp > _NOT_FOUND_TTL_SECONDS:
+            assert not_found is not None
             not_found.pop((op, resolved_str), None)
             return None
 
@@ -200,6 +279,7 @@ async def _expand_tilde(path: str) -> str:
 # ---------------------------------------------------------------------------
 _DEFAULT_MAX_READ_CHARS = 100_000
 _max_read_chars_cached: int | None = None
+_max_read_chars_by_profile: dict[str, int] = {}
 
 
 async def _get_max_read_chars() -> int:
@@ -210,7 +290,15 @@ async def _get_max_read_chars() -> int:
     built-in default if the config is missing or invalid.
     """
     global _max_read_chars_cached
-    if _max_read_chars_cached is not None:
+    from hermes_constants import get_hermes_home_override
+
+    profile = None
+    if get_hermes_home_override() is not None:
+        profile = await file_state._activate_profile_scope()
+        cached = _max_read_chars_by_profile.get(profile)
+        if cached is not None:
+            return cached
+    elif _max_read_chars_cached is not None:
         return _max_read_chars_cached
     try:
         from hermes_cli.config import load_config_readonly
@@ -218,12 +306,19 @@ async def _get_max_read_chars() -> int:
         cfg = await load_config_readonly()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
-            _max_read_chars_cached = int(val)
-            return _max_read_chars_cached
+            result = int(val)
+            if profile is None:
+                _max_read_chars_cached = result
+            else:
+                _max_read_chars_by_profile[profile] = result
+            return result
     except Exception:
         pass
-    _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
-    return _max_read_chars_cached
+    if profile is None:
+        _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
+    else:
+        _max_read_chars_by_profile[profile] = _DEFAULT_MAX_READ_CHARS
+    return _DEFAULT_MAX_READ_CHARS
 
 
 def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bool]:
@@ -373,7 +468,9 @@ async def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
-    return await _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+    from agent.secret_scope import get_secret
+
+    return await _sentinel_free_abs_cwd(get_secret("TERMINAL_CWD"))
 
 
 async def _registered_task_cwd_override(task_id: str = "default") -> str | None:
@@ -418,7 +515,7 @@ async def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     try:
         from tools.terminal_tool import get_session_cwd
 
-        recorded = await get_session_cwd(task_id)
+        recorded = get_session_cwd(task_id)
     except Exception:
         recorded = None
     if recorded:
@@ -798,7 +895,7 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
-def reset_file_dedup(task_id: str | None = None) -> None:
+def reset_file_dedup(task_id: str = None):
     """Clear cached unchanged-read results after context compression."""
     with _read_tracker_lock:
         states = [_read_tracker.get(task_id)] if task_id else list(_read_tracker.values())
@@ -808,7 +905,7 @@ def reset_file_dedup(task_id: str | None = None) -> None:
                 state.setdefault("dedup_hits", {}).clear()
 
 
-def clear_file_ops_cache(task_id: str | None = None) -> None:
+def clear_file_ops_cache(task_id: str = None):
     """Release per-task file-tool state when a terminal environment closes.
 
     The async fork no longer keeps the upstream shell-backed ``FileOperations``
@@ -924,10 +1021,10 @@ async def _filter_search_output_lines(
 from tools.registry import registry, tool_error
 
 
-def _check_file_reqs():
+async def _check_file_reqs():
     """Lazy wrapper to avoid circular import with tools/__init__.py."""
     from tools import check_file_requirements
-    return check_file_requirements()
+    return await check_file_requirements()
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
@@ -953,7 +1050,7 @@ WRITE_FILE_SCHEMA = {
             "content": {"type": "string", "description": "Complete content to write to the file"},
             "cross_profile": {
                 "type": "boolean",
-                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
+                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
         },
@@ -1004,7 +1101,7 @@ PATCH_SCHEMA = {
             },
             "cross_profile": {
                 "type": "boolean",
-                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/memories.",
+                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
                 "default": False,
             },
         },
@@ -1138,6 +1235,7 @@ async def _handle_read_file(args, **kw):
     """Read a local text file with native async I/O and stable line gutters."""
     from tools.tool_output_limits import _refresh_tool_output_limits
 
+    await _activate_file_tracker_scope()
     await _refresh_tool_output_limits()
     task_id = kw.get("task_id") or "default"
     path = args.get("path", "")
@@ -1780,15 +1878,30 @@ async def _write_native_result(path: Path, content: str) -> WriteResult:
     )
 
 
-async def _handle_write_file(args, **kw):
+async def _write_file_native(args, **kw):
     """Write a file atomically through ``aiofiles``."""
+    await _activate_file_tracker_scope()
     task_id = kw.get("task_id") or "default"
     path = args.get("path")
     content = args.get("content")
     if not isinstance(path, str) or not path:
-        return tool_error("write_file: missing required field 'path'.")
+        return tool_error(
+            "write_file: missing required field 'path'. Re-emit the tool call with "
+            "both 'path' and 'content' set."
+        )
+    if "content" not in args:
+        return tool_error(
+            "write_file: missing required field 'content'. The tool call included a "
+            "path but no content argument — this is almost always a dropped-arg bug "
+            "under context pressure. Re-emit the tool call with the full content "
+            "payload, or use execute_code with hermes_tools.write_file() for very "
+            "large files."
+        )
     if not isinstance(content, str):
-        return tool_error("write_file: missing required string field 'content'.")
+        return tool_error(
+            f"write_file: 'content' must be a string, got "
+            f"{type(content).__name__}."
+        )
     sensitive_error = await _check_sensitive_path(path, task_id)
     if sensitive_error:
         return tool_error(sensitive_error)
@@ -1798,7 +1911,9 @@ async def _handle_write_file(args, **kw):
             return tool_error(profile_warning)
     if _is_internal_file_tool_content(content):
         return tool_error(
-            "Refusing to write internal read_file display text as file content."
+            "Refusing to write internal read_file display text as file content. "
+            "Strip read_file line-number prefixes or reconstruct the intended "
+            "file contents before writing."
         )
 
     resolved = await _native_file_path(path, task_id)
@@ -1892,7 +2007,7 @@ async def _handle_v4a_patch(
 ) -> str:
     """Apply a V4A patch through the directly async-converted upstream applier."""
     patch_content = args.get("patch")
-    if not isinstance(patch_content, str) or not patch_content.strip():
+    if not patch_content:
         return tool_error("patch content required")
 
     from tools.patch_parser import OperationType, apply_v4a_operations, parse_v4a_patch
@@ -1990,8 +2105,9 @@ async def _handle_v4a_patch(
     return json.dumps(result, ensure_ascii=False)
 
 
-async def _handle_patch(args, **kw):
+async def _patch_native(args, **kw):
     """Apply a native async replace or V4A patch."""
+    await _activate_file_tracker_scope()
     task_id = kw.get("task_id") or "default"
     mode = args.get("mode", "replace")
     if mode == "patch":
@@ -1999,14 +2115,14 @@ async def _handle_patch(args, **kw):
             args, task_id, session_id=kw.get("session_id")
         )
     if mode != "replace":
-        return tool_error(f"patch: unknown mode {mode!r}.")
+        return tool_error(f"Unknown mode: {mode}")
     path = args.get("path")
     old_string = args.get("old_string")
     new_string = args.get("new_string")
     if not isinstance(path, str) or not path:
-        return tool_error("patch: mode='replace' requires 'path'.")
-    if not isinstance(old_string, str) or not isinstance(new_string, str):
-        return tool_error("patch: mode='replace' requires old_string and new_string.")
+        return tool_error("path required")
+    if old_string is None or new_string is None:
+        return tool_error("old_string and new_string required")
     sensitive_error = await _check_sensitive_path(path, task_id)
     if sensitive_error:
         return tool_error(sensitive_error)
@@ -2047,7 +2163,7 @@ async def _handle_patch(args, **kw):
                     content,
                     old_string,
                     new_string,
-                    bool(args.get("replace_all", False)),
+                    args.get("replace_all", False),
                 )
             )
             if match_error or replacement_count == 0:
@@ -2318,6 +2434,7 @@ async def _handle_search_files(args, **kw):
     """Search files using a native subprocess and preserve async cancellation."""
     from tools.tool_output_limits import _refresh_tool_output_limits
 
+    await _activate_file_tracker_scope()
     await _refresh_tool_output_limits()
     task_id = kw.get("task_id") or "default"
     pattern = args.get("pattern", "")
@@ -2583,8 +2700,15 @@ async def write_file_tool(
     cross_profile: bool = False,
     session_id: str | None = None,
 ) -> str:
-    """Write a file through the native async implementation."""
-    return await _handle_write_file(
+    """Write content to a file.
+
+    ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
+    guard fires only on writes that land in another profile's
+    skills/plugins/cron/memories directory; everything else is unaffected.
+    Pass ``True`` after explicit user direction — same shape as ``force``
+    on the terminal tool.
+    """
+    return await _write_file_native(
         {
             "path": path,
             "content": content,
@@ -2597,17 +2721,22 @@ async def write_file_tool(
 
 async def patch_tool(
     mode: str = "replace",
-    path: str | None = None,
-    old_string: str | None = None,
-    new_string: str | None = None,
+    path: str = None,
+    old_string: str = None,
+    new_string: str = None,
     replace_all: bool = False,
-    patch: str | None = None,
+    patch: str = None,
     task_id: str = "default",
     cross_profile: bool = False,
     session_id: str | None = None,
 ) -> str:
-    """Patch files through the native async implementation."""
-    return await _handle_patch(
+    """Patch a file using replace mode or V4A patch format.
+
+    ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
+    targets under another profile's skills/plugins/cron/memories
+    directory. Same shape as ``write_file``'s flag.
+    """
+    return await _patch_native(
         {
             "mode": mode,
             "path": path,
@@ -2626,7 +2755,7 @@ async def search_tool(
     pattern: str,
     target: str = "content",
     path: str = ".",
-    file_glob: str | None = None,
+    file_glob: str = None,
     limit: int = 50,
     offset: int = 0,
     output_mode: str = "content",
@@ -2646,6 +2775,50 @@ async def search_tool(
             "context": context,
         },
         task_id=task_id,
+    )
+
+
+async def _handle_write_file(args, **kw):
+    task_id = kw.get("task_id") or "default"
+    if not args.get("path") or not isinstance(args.get("path"), str):
+        return tool_error(
+            "write_file: missing required field 'path'. Re-emit the tool call with "
+            "both 'path' and 'content' set."
+        )
+    if "content" not in args:
+        return tool_error(
+            "write_file: missing required field 'content'. The tool call included a "
+            "path but no content argument — this is almost always a dropped-arg bug "
+            "under context pressure. Re-emit the tool call with the full content "
+            "payload, or use execute_code with hermes_tools.write_file() for very "
+            "large files."
+        )
+    if not isinstance(args["content"], str):
+        return tool_error(
+            f"write_file: 'content' must be a string, got "
+            f"{type(args['content']).__name__}."
+        )
+    return await write_file_tool(
+        path=args["path"],
+        content=args["content"],
+        task_id=task_id,
+        cross_profile=bool(args.get("cross_profile", False)),
+        session_id=kw.get("session_id"),
+    )
+
+
+async def _handle_patch(args, **kw):
+    task_id = kw.get("task_id") or "default"
+    return await patch_tool(
+        mode=args.get("mode", "replace"),
+        path=args.get("path"),
+        old_string=args.get("old_string"),
+        new_string=args.get("new_string"),
+        replace_all=args.get("replace_all", False),
+        patch=args.get("patch"),
+        task_id=task_id,
+        cross_profile=bool(args.get("cross_profile", False)),
+        session_id=kw.get("session_id"),
     )
 
 

@@ -151,7 +151,9 @@ async def _pip_python_version() -> Optional[str]:
 
 
 async def _build_probe_line() -> str:
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    from agent.secret_scope import get_secret
+
+    backend = (get_secret("TERMINAL_ENV") or "local").strip().lower()
     if backend in _REMOTE_BACKENDS:
         return ""
 
@@ -208,6 +210,13 @@ async def _build_probe_line() -> str:
     return "Python toolchain: " + ", ".join(parts) + "." if parts else ""
 
 
+def _active_backend_is_remote() -> bool:
+    from agent.secret_scope import get_secret
+
+    backend = (get_secret("TERMINAL_ENV") or "local").strip().lower()
+    return backend in _REMOTE_BACKENDS
+
+
 async def _probe_worker(generation: int) -> str:
     global _CACHED_LINE
     try:
@@ -237,6 +246,8 @@ def _ensure_probe_started() -> asyncio.Task[str]:
 async def get_environment_probe_line(*, force_refresh: bool = False) -> str:
     """Return the cached probe line, failing open after a bounded wait."""
     global _CACHED_LINE, _PROBE_GEN, _WAIT_ALREADY_TIMED_OUT
+    if _active_backend_is_remote():
+        return ""
     if force_refresh:
         await _reset_cache_for_tests()
     if _CACHED_LINE is not None:
@@ -259,6 +270,8 @@ async def get_environment_probe_line(*, force_refresh: bool = False) -> str:
 
 async def warm_environment_probe_async() -> None:
     """Populate the cached probe without leaving an unowned background task."""
+    if _active_backend_is_remote():
+        return
     await _ensure_probe_started()
 
 

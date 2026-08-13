@@ -94,7 +94,7 @@ async def test_nlp_constructor_is_state_only_and_protocol_is_ordered(monkeypatch
         spawn_calls.append((args, kwargs))
         return process
 
-    monkeypatch.setattr(_native_worker, "locate_source_module", locate)
+    monkeypatch.setattr(_native_worker, "_locate_source_module", locate)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     nlp = NativeNLP()
 
@@ -130,7 +130,7 @@ async def test_nlp_absence_preserves_upstream_fallback_without_process(monkeypat
     async def forbidden_spawn(*args, **kwargs):
         raise AssertionError("NLP subprocess must not start without spaCy")
 
-    monkeypatch.setattr(_native_worker, "locate_source_module", locate)
+    monkeypatch.setattr(_native_worker, "_locate_source_module", locate)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
     nlp = NativeNLP()
 
@@ -150,7 +150,7 @@ async def test_nlp_request_cancellation_terminates_owned_process(monkeypatch):
     async def spawn(*args, **kwargs):
         return process
 
-    monkeypatch.setattr(_native_worker, "locate_source_module", locate)
+    monkeypatch.setattr(_native_worker, "_locate_source_module", locate)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     nlp = NativeNLP()
     process.stdout.blocked = True

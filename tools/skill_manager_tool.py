@@ -11,12 +11,16 @@ module.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
+import errno
 import json
 import logging
 import os
 import re
+import threading
 import uuid
+import weakref
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional, Tuple
 
@@ -35,6 +39,7 @@ from agent.skill_utils import (
 )
 from hermes_constants import display_hermes_home, get_hermes_home
 from tools.registry import registry, tool_error
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +56,17 @@ VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 ALLOWED_SUBDIRS = frozenset({"references", "templates", "scripts", "assets"})
 
 _realpath = aiofiles.os.wrap(os.path.realpath)
+_os_fsync = aiofiles.os.wrap(os.fsync)
+_os_chmod = aiofiles.os.wrap(os.chmod)
+_os_utime = aiofiles.os.wrap(os.utime)
 _is_junction = aiofiles.os.wrap(
     lambda path: bool(getattr(path, "is_junction", lambda: False)())
 )
-_skill_write_lock = asyncio.Lock()
+_skill_write_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, weakref.ReferenceType[asyncio.Lock]],
+] = weakref.WeakKeyDictionary()
+_skill_write_locks_guard = threading.RLock()
 _background_review_read_paths: contextvars.ContextVar[frozenset[str]] = (
     contextvars.ContextVar("background_review_read_paths", default=frozenset())
 )
@@ -89,6 +101,54 @@ async def _background_review_has_read(path: Path) -> bool:
 def _reset_background_review_read_marks() -> None:
     """Clear read-before-write marks for the current review context."""
     _background_review_read_paths.set(frozenset())
+
+
+try:
+    from tools.skills_guard import format_scan_report, scan_skill, should_allow_install
+
+    _GUARD_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional import failure
+    _GUARD_AVAILABLE = False
+
+
+async def _guard_agent_created_enabled() -> bool:
+    """Read skills.guard_agent_created from config (default False)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = await load_config_readonly()
+        return is_truthy_value(
+            cfg_get(cfg, "skills", "guard_agent_created"),
+            default=False,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def _security_scan_skill(skill_dir: Path) -> Optional[str]:
+    """Scan an agent-created skill after write and return a block error."""
+    if not _GUARD_AVAILABLE or not await _guard_agent_created_enabled():
+        return None
+    try:
+        result = await scan_skill(skill_dir, source="agent-created")
+        allowed, reason = should_allow_install(result)
+        if allowed is False or allowed is None:
+            report = format_scan_report(result)
+            if allowed is None:
+                logger.warning(
+                    "Agent-created skill blocked (dangerous findings): %s",
+                    reason,
+                )
+            return f"Security scan blocked this skill ({reason}):\n{report}"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Security scan failed for %s: %s", skill_dir, exc, exc_info=True
+        )
+    return None
 
 
 async def _pinned_guard(name: str) -> Optional[str]:
@@ -289,6 +349,23 @@ def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
+async def _active_skill_write_lock() -> asyncio.Lock:
+    """Return a loop-local lock for the canonical writable skills root."""
+    loop = asyncio.get_running_loop()
+    root_key = os.path.normcase(str(await _realpath(_skills_dir())))
+    with _skill_write_locks_guard:
+        for candidate in tuple(_skill_write_locks):
+            if candidate.is_closed():
+                _skill_write_locks.pop(candidate, None)
+        locks = _skill_write_locks.setdefault(loop, {})
+        lock_ref = locks.get(root_key)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[root_key] = weakref.ref(lock)
+        return lock
+
+
 def _validate_name(name: str) -> Optional[str]:
     """Validate a skill name. Return an error message or ``None``."""
     if not name:
@@ -407,21 +484,65 @@ async def _atomic_write_text(path: Path, content: str) -> None:
     """Atomically replace a UTF-8 text file without blocking the event loop."""
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
     temporary = path.parent / f".{path.name}.hermes-{uuid.uuid4().hex}.tmp"
+    error: Exception | None = None
+
+    async def _cleanup() -> None:
+        with contextlib.suppress(FileNotFoundError):
+            await aiofiles.os.remove(temporary)
+
     try:
         async with aiofiles.open(
             temporary,
-            "w",
+            "x",
             encoding="utf-8",
             newline="",
+            opener=lambda raw_path, flags: os.open(raw_path, flags, 0o600),
         ) as handle:
             await handle.write(content)
             await handle.flush()
-        await aiofiles.os.replace(temporary, path)
-    finally:
+            await _os_fsync(handle.fileno())
+        write_path = (
+            Path(await _realpath(path))
+            if await aiofiles.os.path.islink(path)
+            else path
+        )
+        fallback_required = False
         try:
-            await aiofiles.os.remove(temporary)
-        except FileNotFoundError:
-            pass
+            await aiofiles.os.replace(temporary, write_path)
+        except OSError as exc:
+            if exc.errno not in {errno.EXDEV, errno.EBUSY}:
+                raise
+            fallback_required = True
+        if fallback_required:
+            async def _copy_fallback() -> None:
+                metadata = await aiofiles.os.stat(
+                    temporary,
+                    follow_symlinks=False,
+                )
+                async with (
+                    aiofiles.open(temporary, "rb") as source,
+                    aiofiles.open(write_path, "wb") as destination,
+                ):
+                    while chunk := await source.read(1024 * 1024):
+                        await destination.write(chunk)
+                    await destination.flush()
+                    await _os_fsync(destination.fileno())
+                await _os_chmod(write_path, metadata.st_mode & 0o7777)
+                await _os_utime(
+                    write_path,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+                )
+                await aiofiles.os.remove(temporary)
+
+            await _finish_owned_task(asyncio.create_task(_copy_fallback()))
+    except asyncio.CancelledError:
+        await _finish_owned_task(asyncio.create_task(_cleanup()))
+        raise
+    except Exception as exc:
+        error = exc
+    await _finish_owned_task(asyncio.create_task(_cleanup()))
+    if error is not None:
+        raise error
 
 
 async def _read_text(path: Path) -> str:
@@ -584,6 +705,15 @@ async def _create_skill(
     skill_md = skill_dir / "SKILL.md"
     await _atomic_write_text(skill_md, content)
 
+    try:
+        scan_error = await _security_scan_skill(skill_dir)
+    except asyncio.CancelledError:
+        await _remove_tree_fully(skill_dir)
+        raise
+    if scan_error:
+        await _remove_tree_fully(skill_dir)
+        return {"success": False, "error": scan_error}
+
     description = ""
     try:
         frontmatter_end = re.search(r"\n---\s*\n", content[3:])
@@ -634,7 +764,24 @@ async def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "SKILL.md",
     ):
         return guard
+    original_content = (
+        await _read_text(skill_md)
+        if await aiofiles.os.path.isfile(skill_md)
+        else None
+    )
     await _atomic_write_text(skill_md, content)
+    try:
+        scan_error = await _security_scan_skill(existing["path"])
+    except asyncio.CancelledError:
+        if original_content is not None:
+            await _finish_owned_task(
+                asyncio.create_task(_atomic_write_text(skill_md, original_content))
+            )
+        raise
+    if scan_error:
+        if original_content is not None:
+            await _atomic_write_text(skill_md, original_content)
+        return {"success": False, "error": scan_error}
 
     description = ""
     try:
@@ -715,6 +862,16 @@ async def _patch_skill(
             "error": f"Patch would break SKILL.md structure: {error}",
         }
     await _atomic_write_text(target, new_content)
+    try:
+        scan_error = await _security_scan_skill(skill_dir)
+    except asyncio.CancelledError:
+        await _finish_owned_task(
+            asyncio.create_task(_atomic_write_text(target, content))
+        )
+        raise
+    if scan_error:
+        await _atomic_write_text(target, content)
+        return {"success": False, "error": scan_error}
     return {
         "success": True,
         "message": (
@@ -837,7 +994,8 @@ async def _write_file(
     if error:
         return {"success": False, "error": error}
     assert target is not None
-    if await aiofiles.os.path.exists(target):
+    target_exists = await aiofiles.os.path.exists(target)
+    if target_exists:
         if guard := await _background_review_read_before_write_guard(
             name,
             target,
@@ -845,7 +1003,29 @@ async def _write_file(
             file_path,
         ):
             return guard
+    original_content = await _read_text(target) if target_exists else None
     await _atomic_write_text(target, file_content)
+    try:
+        scan_error = await _security_scan_skill(existing["path"])
+    except asyncio.CancelledError:
+        if original_content is not None:
+            await _finish_owned_task(
+                asyncio.create_task(_atomic_write_text(target, original_content))
+            )
+        else:
+            async def _remove_created_target() -> None:
+                with contextlib.suppress(FileNotFoundError):
+                    await aiofiles.os.remove(target)
+
+            await _finish_owned_task(asyncio.create_task(_remove_created_target()))
+        raise
+    if scan_error:
+        if original_content is not None:
+            await _atomic_write_text(target, original_content)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                await aiofiles.os.remove(target)
+        return {"success": False, "error": scan_error}
     return {
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
@@ -923,7 +1103,7 @@ async def skill_manage(
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
-    async with _skill_write_lock:
+    async with await _active_skill_write_lock():
         if action == "create":
             if not content:
                 return tool_error(
@@ -1031,9 +1211,10 @@ SKILL_MANAGE_SCHEMA = {
         "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
         "pruning it with no forwarding target. This lets the curator tell "
-        "consolidation from pruning without guessing so lifecycle consumers "
-        "retain the declared intent. The target you name in `absorbed_into` "
-        "must already exist — create/patch the umbrella first, then delete.\n\n"
+        "consolidation from pruning without guessing, so downstream consumers "
+        "(cron jobs that reference the old skill name, etc.) get updated "
+        "correctly. The target you name in `absorbed_into` must already "
+        "exist — create/patch the umbrella first, then delete.\n\n"
         "Create when: complex task succeeded (5+ calls), errors overcome, "
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
@@ -1050,10 +1231,10 @@ SKILL_MANAGE_SCHEMA = {
         "via skills_list/skill_view. Keep the trigger self-contained in that "
         "first 57-char window: 'Use when <trigger>. <one-line behavior>.'\n\n"
         "Pinned skills are protected from deletion only — "
-        "skill_manage(action='delete') will refuse until the skill is "
-        "explicitly unpinned. Patches and edits go through on pinned skills so "
-        "you can still improve them as pitfalls come up; pin only guards "
-        "against irrecoverable loss."
+        "skill_manage(action='delete') will refuse with a message pointing the "
+        "user to `hermes curator unpin <name>`. Patches and edits go through "
+        "on pinned skills so you can still improve them as pitfalls come up; "
+        "pin only guards against irrecoverable loss."
     ),
     "parameters": {
         "type": "object",
@@ -1139,8 +1320,9 @@ SKILL_MANAGE_SCHEMA = {
                     "merged into another (the target must already exist). Pass "
                     "an empty string when the skill is truly stale and being "
                     "pruned with no forwarding target. Omitting the arg on "
-                    "delete is supported for backward compatibility; lifecycle "
-                    "consumers then have to infer intent."
+                    "delete is supported for backward compatibility but "
+                    "downstream tooling (e.g. cron-job skill reference "
+                    "rewriting) will have to guess at intent."
                 ),
             },
         },
@@ -1149,7 +1331,7 @@ SKILL_MANAGE_SCHEMA = {
 }
 
 
-async def _handle_skill_manage(args: dict, **_kwargs) -> str:
+async def _handle_skill_manage(args, **kw):
     return await skill_manage(
         action=args.get("action", ""),
         name=args.get("name", ""),

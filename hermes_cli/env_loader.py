@@ -8,6 +8,8 @@ import io
 import logging
 import os
 import sys
+import threading
+import weakref
 from pathlib import Path
 
 import aiofiles
@@ -19,30 +21,133 @@ _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")
 _WARNED_KEYS: set[str] = set()
 _WARNED_UTF32_PATHS: set[Path] = set()
 _SECRET_SOURCES: dict[str, str] = {}
+_SECRET_SOURCES_BY_HOME: dict[str, dict[str, str]] = {}
 _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
+_SECRET_SOURCE_HOME_ALIASES: dict[str, str] = {}
 _APPLIED_HOMES: set[str] = set()
-_SECRET_SOURCE_CACHE_LOCK = asyncio.Lock()
+_SECRET_SOURCE_STATE_GUARD = threading.RLock()
+
+
+class _SecretSourceCacheLocks:
+    """Per-loop/profile locks without retaining closed event loops."""
+
+    def __init__(self) -> None:
+        self._locks: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            dict[str, weakref.ReferenceType[asyncio.Lock]],
+        ] = weakref.WeakKeyDictionary()
+
+    def for_home(self, home_key: str) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        with _SECRET_SOURCE_STATE_GUARD:
+            locks = self._locks.setdefault(loop, {})
+            lock_ref = locks.get(home_key)
+            lock = lock_ref() if lock_ref is not None else None
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[home_key] = weakref.ref(lock)
+            return lock
+
+    def clear(self) -> None:
+        with _SECRET_SOURCE_STATE_GUARD:
+            self._locks.clear()
+
+
+_SECRET_SOURCE_CACHE_LOCK = _SecretSourceCacheLocks()
 logger = logging.getLogger(__name__)
 
 
+def _lexical_home_key(home: str | os.PathLike) -> str:
+    return os.path.normcase(os.path.normpath(str(home)))
+
+
+def _active_secret_source_home_key() -> str | None:
+    """Resolve the active profile to a previously awaited canonical key."""
+    from hermes_constants import get_hermes_home_override
+
+    override = get_hermes_home_override()
+    if override is not None:
+        home = override
+    else:
+        home = os.environ.get("HERMES_HOME", "").strip()
+        if not home:
+            # This snapshot helper is deliberately synchronous and must remain
+            # environment-only.  Path.home()/expanduser may consult NSS and
+            # block; an environment without a resolvable launch home cannot
+            # safely inherit provenance from an arbitrary cached profile.
+            if sys.platform == "win32":
+                local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+                user_profile = os.environ.get("USERPROFILE", "").strip()
+                if local_appdata:
+                    home = os.path.join(local_appdata, "hermes")
+                elif user_profile:
+                    home = os.path.join(user_profile, "AppData", "Local", "hermes")
+                else:
+                    return None
+            else:
+                user_home = os.environ.get("HOME", "").strip()
+                if not user_home:
+                    return None
+                home = os.path.join(user_home, ".hermes")
+
+    lexical = _lexical_home_key(home)
+    with _SECRET_SOURCE_STATE_GUARD:
+        canonical = _SECRET_SOURCE_HOME_ALIASES.get(lexical)
+    if canonical is not None:
+        return canonical
+    # A context-local profile override is an isolation boundary. If that
+    # profile has not hydrated its source state, fail closed instead of
+    # falling back to provenance recorded for the process profile.
+    if override is not None:
+        return None
+    with _SECRET_SOURCE_STATE_GUARD:
+        return lexical if lexical in _SECRET_SOURCES_BY_HOME else None
+
+
+def _active_secret_source_snapshot() -> tuple[dict[str, str], dict[str, str]]:
+    """Return active-profile provenance and values without filesystem I/O."""
+    key = _active_secret_source_home_key()
+    if key is not None:
+        with _SECRET_SOURCE_STATE_GUARD:
+            return (
+                dict(_SECRET_SOURCES_BY_HOME.get(key, {})),
+                dict(_SECRET_SOURCE_VALUES_BY_HOME.get(key, {})),
+            )
+    # The process-wide map is retained only as a compatibility/debug snapshot.
+    # It cannot safely authorize subprocess pass-through because it may have
+    # been populated while an explicitly supplied, different profile home was
+    # loading. No awaited profile state means no provenance.
+    return {}, {}
+
+
 def get_secret_source(env_var: str) -> str | None:
-    """Return the external source that supplied an environment variable."""
-    return _SECRET_SOURCES.get(env_var)
+    """Return this profile's external source for an environment variable."""
+    sources, _values = _active_secret_source_snapshot()
+    return sources.get(env_var)
 
 
 async def get_secret_source_values(
     hermes_home: str | os.PathLike,
 ) -> dict[str, str]:
     """Return the immutable external-secret snapshot for one Hermes home."""
-    home_key = str(await aiofiles.os.wrap(os.path.realpath)(hermes_home))
-    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
+    lexical_key = _lexical_home_key(hermes_home)
+    home_key = os.path.normcase(
+        str(await aiofiles.os.wrap(os.path.realpath)(hermes_home))
+    )
+    with _SECRET_SOURCE_STATE_GUARD:
+        _SECRET_SOURCE_HOME_ALIASES[lexical_key] = home_key
+        return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
 
 
 def reset_secret_source_cache() -> None:
     """Forget external-source application state for all Hermes homes."""
-    _APPLIED_HOMES.clear()
-    _SECRET_SOURCES.clear()
-    _SECRET_SOURCE_VALUES_BY_HOME.clear()
+    with _SECRET_SOURCE_STATE_GUARD:
+        _APPLIED_HOMES.clear()
+        _SECRET_SOURCES.clear()
+        _SECRET_SOURCES_BY_HOME.clear()
+        _SECRET_SOURCE_VALUES_BY_HOME.clear()
+        _SECRET_SOURCE_HOME_ALIASES.clear()
+    _SECRET_SOURCE_CACHE_LOCK.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -173,9 +278,14 @@ def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:
 async def _apply_external_secret_sources(home_path: Path) -> None:
     """Fetch and apply every enabled source once per Hermes home."""
     home = Path(home_path)
-    home_key = str(await aiofiles.os.wrap(os.path.realpath)(home))
-    async with _SECRET_SOURCE_CACHE_LOCK:
-        if home_key in _APPLIED_HOMES:
+    lexical_key = _lexical_home_key(home)
+    home_key = os.path.normcase(str(await aiofiles.os.wrap(os.path.realpath)(home)))
+    with _SECRET_SOURCE_STATE_GUARD:
+        _SECRET_SOURCE_HOME_ALIASES[lexical_key] = home_key
+    async with _SECRET_SOURCE_CACHE_LOCK.for_home(home_key):
+        with _SECRET_SOURCE_STATE_GUARD:
+            already_applied = home_key in _APPLIED_HOMES
+        if already_applied:
             return
         secrets_config = await _load_secrets_config(home)
         if not secrets_config:
@@ -190,16 +300,24 @@ async def _apply_external_secret_sources(home_path: Path) -> None:
         if not report.sources:
             return
 
-        _APPLIED_HOMES.add(home_key)
+        sources = {
+            name: applied.source for name, applied in report.provenance.items()
+        }
+        values: dict[str, str] = {}
         if report.applied_any:
             _sanitize_loaded_credentials()
-            values: dict[str, str] = {}
             for name, applied in report.provenance.items():
-                _SECRET_SOURCES[name] = applied.source
                 value = os.environ.get(name)
                 if value is not None:
                     values[name] = value
-            _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        with _SECRET_SOURCE_STATE_GUARD:
+            _APPLIED_HOMES.add(home_key)
+            _SECRET_SOURCES_BY_HOME[home_key] = sources
+            _SECRET_SOURCES.update(
+                {name: sources[name] for name in values if name in sources}
+            )
+            if values:
+                _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
 
         for source_report in report.sources:
             if source_report.applied:
@@ -232,9 +350,14 @@ async def hydrate_profile_secret_sources(
 ) -> dict[str, str]:
     """Resolve a profile's sources into an isolated environment snapshot."""
     home = Path(hermes_home)
-    home_key = str(await aiofiles.os.wrap(os.path.realpath)(home))
-    async with _SECRET_SOURCE_CACHE_LOCK:
-        if home_key in _APPLIED_HOMES:
+    lexical_key = _lexical_home_key(home)
+    home_key = os.path.normcase(str(await aiofiles.os.wrap(os.path.realpath)(home)))
+    with _SECRET_SOURCE_STATE_GUARD:
+        _SECRET_SOURCE_HOME_ALIASES[lexical_key] = home_key
+    async with _SECRET_SOURCE_CACHE_LOCK.for_home(home_key):
+        with _SECRET_SOURCE_STATE_GUARD:
+            already_applied = home_key in _APPLIED_HOMES
+        if already_applied:
             return await get_secret_source_values(home)
 
         secrets_config = await _load_secrets_config(home)
@@ -262,15 +385,22 @@ async def hydrate_profile_secret_sources(
         if not report.sources:
             return {}
 
-        _APPLIED_HOMES.add(home_key)
+        sources = {
+            name: applied.source for name, applied in report.provenance.items()
+        }
         values: dict[str, str] = {}
         for name, applied in report.provenance.items():
             value = local_env.get(name)
             if value is not None:
-                _SECRET_SOURCES[name] = applied.source
                 values[name] = value
-        if values:
-            _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        with _SECRET_SOURCE_STATE_GUARD:
+            _APPLIED_HOMES.add(home_key)
+            _SECRET_SOURCES_BY_HOME[home_key] = sources
+            _SECRET_SOURCES.update(
+                {name: sources[name] for name in values if name in sources}
+            )
+            if values:
+                _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
         return dict(values)
 
 

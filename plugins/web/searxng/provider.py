@@ -23,7 +23,6 @@ Env var::
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
@@ -33,16 +32,10 @@ logger = logging.getLogger(__name__)
 
 
 async def _searxng_url() -> str:
-    """Return SEARXNG_URL from Hermes config-aware env, falling back to process env."""
-    try:
-        from agent.web_search_provider import get_provider_env
+    """Return the active profile's config-aware ``SEARXNG_URL``."""
+    from agent.web_search_provider import get_provider_env
 
-        val = await get_provider_env("SEARXNG_URL")
-    except Exception:
-        val = None
-    if val is None:
-        val = os.getenv("SEARXNG_URL", "")
-    return (val or "").strip()
+    return await get_provider_env("SEARXNG_URL")
 
 
 class SearXNGWebSearchProvider(WebSearchProvider):

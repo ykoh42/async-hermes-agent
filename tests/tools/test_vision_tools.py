@@ -659,12 +659,13 @@ class TestErrorClassification:
 
 
 class TestVisionRegistration:
-    def test_vision_tools_are_registered_with_native_async_handlers(self):
+    @pytest.mark.asyncio
+    async def test_vision_tools_are_registered_with_native_async_handlers(self):
         import inspect
 
         from tools.registry import discover_builtin_tools, registry
 
-        discover_builtin_tools()
+        await discover_builtin_tools()
 
         for name in ("vision_analyze", "video_analyze"):
             entry = registry.get_entry(name)

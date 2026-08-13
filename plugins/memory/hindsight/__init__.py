@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -49,11 +50,12 @@ import aiofiles.os
 import aiofiles.tempfile
 
 from agent.memory_provider import MemoryProvider
-from agent.secret_scope import get_secret
+from agent.secret_scope import get_secret, is_multiplex_active
 from agent.ssl_verify import _create_httpx_client
-from hermes_cli.async_source_loader import load_source_package, locate_source_module
+from hermes_cli.async_source_loader import _load_source_package, _locate_source_module
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
+from tools.environments.local import build_subprocess_env
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -121,31 +123,57 @@ def _parse_int_setting(value: Any, default: int) -> int:
 _PORT_HEALTH_GRACE_ENV = "HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT"
 
 
-def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
-    """Export the embedded-daemon health grace timeout to the process env.
-
-    Must run BEFORE ``hindsight_embed.daemon_embed_manager`` is imported,
-    because the package reads the env var into a module-level constant at
-    import time. We only set it when the user configured a value AND the
-    env var isn't already set, so an explicit env override always wins.
-    """
+def _configured_port_health_grace_timeout(
+    config: dict[str, Any],
+) -> str | None:
     raw = config.get("port_health_grace_timeout")
     if raw is None or raw == "":
-        return
+        return None
     try:
         seconds = float(raw)
     except (TypeError, ValueError):
         logger.warning(
             "Invalid Hindsight port_health_grace_timeout %r; ignoring.", raw
         )
-        return
+        return None
     if seconds < 0:
         logger.warning(
             "Negative Hindsight port_health_grace_timeout %r; ignoring.", raw
         )
-        return
-    # setdefault: an explicit env var the operator set wins over config.
-    os.environ.setdefault(_PORT_HEALTH_GRACE_ENV, repr(seconds))
+        return None
+    return repr(seconds)
+
+
+def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
+    """Preserve the upstream single-profile process environment contract."""
+    configured = _configured_port_health_grace_timeout(config)
+    if configured is not None:
+        os.environ.setdefault(_PORT_HEALTH_GRACE_ENV, configured)
+
+
+def _embedded_port_health_grace_timeout(
+    config: dict[str, Any],
+) -> str | None:
+    """Resolve the child-only embedded-daemon health grace timeout."""
+    configured_env = get_secret(_PORT_HEALTH_GRACE_ENV)
+    if configured_env is not None:
+        return str(configured_env)
+
+    return _configured_port_health_grace_timeout(config)
+
+
+async def _build_embedded_cli_env(config: dict[str, Any]) -> dict[str, str]:
+    """Build a sanitized child env without another profile's Hindsight data."""
+    base = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("HINDSIGHT_")
+    }
+    env = await build_subprocess_env(base=base, scrub_secrets=True)
+    grace_timeout = _embedded_port_health_grace_timeout(config)
+    if grace_timeout is not None:
+        env[_PORT_HEALTH_GRACE_ENV] = grace_timeout
+    return env
 
 
 async def _check_local_runtime() -> tuple[bool, str | None]:
@@ -167,11 +195,19 @@ async def _check_local_runtime() -> tuple[bool, str | None]:
     missing = [
         name
         for name in ("hindsight", "hindsight_embed", "sentence_transformers")
-        if await locate_source_module(name) is None
+        if await _locate_source_module(name) is None
     ]
     if missing:
         return False, f"missing local runtime package(s): {', '.join(missing)}"
 
+    # This is an import-only capability probe; it never authenticates. Do not
+    # expose another profile's process-global provider credentials to it.
+    base = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("HINDSIGHT_")
+    }
+    env = await build_subprocess_env(base=base, scrub_secrets=True)
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
@@ -183,6 +219,7 @@ async def _check_local_runtime() -> tuple[bool, str | None]:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     communicate = asyncio.create_task(
         process.communicate(),
@@ -242,8 +279,8 @@ async def _load_hindsight_client_class():
         if cached is not None and hasattr(cached, "Hindsight"):
             return cached.Hindsight
 
-        api_source = await locate_source_module("hindsight_client_api")
-        client_source = await locate_source_module("hindsight_client")
+        api_source = await _locate_source_module("hindsight_client_api")
+        client_source = await _locate_source_module("hindsight_client")
         if api_source is None or client_source is None:
             raise ImportError(
                 "Hindsight requires its native async client. Install "
@@ -256,8 +293,8 @@ async def _load_hindsight_client_class():
                 "The installed hindsight-client package is malformed."
             )
         if "hindsight_client_api" not in sys.modules:
-            await load_source_package("hindsight_client_api", api_path)
-        module = await load_source_package("hindsight_client", client_path)
+            await _load_source_package("hindsight_client_api", api_path)
+        module = await _load_source_package("hindsight_client", client_path)
         return module.Hindsight
 
 
@@ -498,8 +535,11 @@ async def _load_config() -> dict:
 
     Resolution order:
       1. $HERMES_HOME/hindsight/config.json  (profile-scoped)
-      2. ~/.hindsight/config.json             (legacy, shared)
+      2. ~/.hindsight/config.json             (single-profile legacy only)
       3. Environment variables
+
+    A multiplexer must never borrow the process user's shared legacy file
+    when one profile has no config of its own.
     """
     # Profile-scoped path (preferred)
     profile_path = get_hermes_home() / "hindsight" / "config.json"
@@ -510,29 +550,38 @@ async def _load_config() -> dict:
         except Exception:
             pass
 
-    # Legacy shared path (backward compat)
-    legacy_path = Path.home() / ".hindsight" / "config.json"
-    if await aiofiles.os.path.exists(legacy_path):
-        try:
-            async with aiofiles.open(legacy_path, encoding="utf-8") as handle:
-                return json.loads(await handle.read())
-        except Exception:
-            pass
+    # Legacy shared path (backward compat for single-profile deployments).
+    if not is_multiplex_active():
+        legacy_path = Path.home() / ".hindsight" / "config.json"
+        if await aiofiles.os.path.exists(legacy_path):
+            try:
+                async with aiofiles.open(legacy_path, encoding="utf-8") as handle:
+                    return json.loads(await handle.read())
+            except Exception:
+                pass
 
     return {
-        "mode": os.environ.get("HINDSIGHT_MODE", "cloud"),
+        "mode": get_secret("HINDSIGHT_MODE", "cloud"),
         "apiKey": get_secret("HINDSIGHT_API_KEY", ""),
-        "timeout": _parse_int_setting(os.environ.get("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT),
-        "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
-        "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
-        "observation_scopes": os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", ""),
-        "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", ""),
-        "retain_user_prefix": os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
-        "retain_assistant_prefix": os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"),
+        "timeout": _parse_int_setting(
+            get_secret("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT
+        ),
+        "idle_timeout": _parse_int_setting(
+            get_secret("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT
+        ),
+        "retain_tags": get_secret("HINDSIGHT_RETAIN_TAGS", ""),
+        "observation_scopes": get_secret(
+            "HINDSIGHT_RETAIN_OBSERVATION_SCOPES", ""
+        ),
+        "retain_source": get_secret("HINDSIGHT_RETAIN_SOURCE", ""),
+        "retain_user_prefix": get_secret("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
+        "retain_assistant_prefix": get_secret(
+            "HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"
+        ),
         "banks": {
             "hermes": {
-                "bankId": os.environ.get("HINDSIGHT_BANK_ID", "hermes"),
-                "budget": os.environ.get("HINDSIGHT_BUDGET", "mid"),
+                "bankId": get_secret("HINDSIGHT_BANK_ID", "hermes"),
+                "budget": get_secret("HINDSIGHT_BUDGET", "mid"),
                 "enabled": True,
             }
         },
@@ -637,6 +686,19 @@ def _embedded_profile_name(config: dict[str, Any]) -> str:
     return str(profile or "hermes")
 
 
+async def _scope_implicit_embedded_profile(config: dict[str, Any]) -> None:
+    """Give multiplexed implicit profiles a stable Hindsight daemon name."""
+    if not is_multiplex_active() or "profile" in config:
+        return
+
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded_home = str(await expanduser(os.fspath(get_hermes_home())))
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical_home = os.path.normcase(str(await realpath(expanded_home)))
+    digest = hashlib.sha256(os.fsencode(canonical_home)).hexdigest()[:16]
+    config["profile"] = f"hermes-{digest}"
+
+
 async def _load_simple_env(path) -> dict[str, str]:
     """Parse a simple KEY=VALUE env file, ignoring comments and blank lines."""
     if not await aiofiles.os.path.exists(path):
@@ -667,7 +729,9 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
 
     current_provider = config.get("llm_provider", "")
     current_model = config.get("llm_model", "")
-    current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
+    current_base_url = config.get("llm_base_url") or get_secret(
+        "HINDSIGHT_API_LLM_BASE_URL", ""
+    )
 
     # The embedded daemon expects OpenAI wire format for these providers.
     daemon_provider = "openai" if current_provider in {"openai_compatible", "openrouter"} else current_provider
@@ -684,7 +748,7 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     idle_timeout = (
         config.get("idle_timeout")
         if config.get("idle_timeout") is not None
-        else os.environ.get("HINDSIGHT_IDLE_TIMEOUT")
+        else get_secret("HINDSIGHT_IDLE_TIMEOUT")
     )
     if idle_timeout is not None and idle_timeout != "":
         env_values["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(
@@ -1038,7 +1102,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 or cfg.get("api_key")
                 or get_secret("HINDSIGHT_API_KEY", "")
             )
-            has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
+            has_url = bool(
+                cfg.get("api_url") or get_secret("HINDSIGHT_API_URL", "")
+            )
             return has_key or has_url
         except Exception:
             return False
@@ -1107,6 +1173,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     async def _run_embedded_cli(self, *args: str) -> int:
         """Run one hindsight-embed lifecycle command without a shell or thread."""
+        env = await _build_embedded_cli_env(self._config)
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -1117,6 +1184,7 @@ class HindsightMemoryProvider(MemoryProvider):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
         wait_task = asyncio.create_task(
             process.wait(),
@@ -1149,6 +1217,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     async def _start_embedded_daemon(self) -> None:
         """Materialize the profile and start its detached daemon natively."""
+        await _scope_implicit_embedded_profile(self._config)
         available, reason = await _check_local_runtime()
         if not available:
             raise RuntimeError(
@@ -1516,20 +1585,24 @@ class HindsightMemoryProvider(MemoryProvider):
         self._mode = self._config.get("mode", "cloud")
         # Read timeout from config or env var, fall back to default
         self._timeout = _parse_int_setting(
-            self._config.get("timeout") if self._config.get("timeout") is not None else os.environ.get("HINDSIGHT_TIMEOUT"),
+            self._config.get("timeout")
+            if self._config.get("timeout") is not None
+            else get_secret("HINDSIGHT_TIMEOUT"),
             _DEFAULT_TIMEOUT,
         )
         self._idle_timeout = _parse_int_setting(
-            self._config.get("idle_timeout") if self._config.get("idle_timeout") is not None else os.environ.get("HINDSIGHT_IDLE_TIMEOUT"),
+            self._config.get("idle_timeout")
+            if self._config.get("idle_timeout") is not None
+            else get_secret("HINDSIGHT_IDLE_TIMEOUT"),
             _DEFAULT_IDLE_TIMEOUT,
         )
         # "local" is a legacy alias for "local_embedded"
         if self._mode == "local":
             self._mode = "local_embedded"
         if self._mode == "local_embedded":
-            # Export the daemon health grace timeout BEFORE importing
-            # daemon_embed_manager (which reads it at import time).
-            _export_port_health_grace_timeout(self._config)
+            await _scope_implicit_embedded_profile(self._config)
+            if not is_multiplex_active():
+                _export_port_health_grace_timeout(self._config)
             available, reason = await _check_local_runtime()
             if not available:
                 logger.warning(
@@ -1540,7 +1613,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
-        self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
+        self._api_url = self._config.get("api_url") or get_secret(
+            "HINDSIGHT_API_URL", default_url
+        )
         self._llm_base_url = self._config.get("llm_base_url", "")
 
         banks = cfg_get(self._config, "banks", "hermes", default={})
@@ -1571,23 +1646,26 @@ class HindsightMemoryProvider(MemoryProvider):
         # Tags
         self._retain_tags = _normalize_retain_tags(
             self._config.get("retain_tags")
-            or os.environ.get("HINDSIGHT_RETAIN_TAGS", "")
+            or get_secret("HINDSIGHT_RETAIN_TAGS", "")
         )
         self._tags = self._retain_tags or None
         self._observation_scopes = _normalize_observation_scopes(
             self._config.get("observation_scopes")
-            or os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "")
+            or get_secret("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "")
         )
         self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
-            self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
+            self._config.get("retain_source")
+            or get_secret("HINDSIGHT_RETAIN_SOURCE", "")
         ).strip()
         self._retain_user_prefix = str(
-            self._config.get("retain_user_prefix") or os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User")
+            self._config.get("retain_user_prefix")
+            or get_secret("HINDSIGHT_RETAIN_USER_PREFIX", "User")
         ).strip() or "User"
         self._retain_assistant_prefix = str(
-            self._config.get("retain_assistant_prefix") or os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant")
+            self._config.get("retain_assistant_prefix")
+            or get_secret("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant")
         ).strip() or "Assistant"
 
         # Retain controls

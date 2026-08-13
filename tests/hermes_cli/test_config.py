@@ -70,7 +70,8 @@ class TestLoadConfigDefaults:
             assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
             assert "max_turns" not in config
             assert config["terminal"]["cwd"] == "."
-            assert config["terminal"]["local_persistent"] is False
+            assert config["terminal"]["backend"] == "local"
+            assert config["terminal"]["persistent_shell"] is True
             assert config["display"]["show_commentary"] is True
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
@@ -1255,7 +1256,7 @@ def test_default_config_has_no_duplicate_top_level_keys():
     import ast
     import hermes_cli.config_defaults as defaults_mod
 
-    src = open(defaults_mod.__file__, encoding="utf-8").read()
+    src = Path(defaults_mod.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     assignment = next(
         node

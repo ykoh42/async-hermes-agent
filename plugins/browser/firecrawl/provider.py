@@ -27,7 +27,6 @@ Auth env vars::
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any, Dict
 
@@ -65,7 +64,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
     # ------------------------------------------------------------------
 
     def _api_url(self) -> str:
-        return os.environ.get("FIRECRAWL_API_URL", _BASE_URL)
+        return str(get_secret("FIRECRAWL_API_URL", _BASE_URL))
 
     def _headers(self) -> Dict[str, str]:
         api_key = get_secret("FIRECRAWL_API_KEY")
@@ -81,7 +80,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
 
     async def create_session(self, task_id: str) -> Dict[str, object]:
         try:
-            ttl = int(os.environ.get("FIRECRAWL_BROWSER_TTL", "300"))
+            ttl = int(get_secret("FIRECRAWL_BROWSER_TTL", "300"))
         except (ValueError, TypeError):
             ttl = 300
 

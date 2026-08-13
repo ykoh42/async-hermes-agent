@@ -164,25 +164,19 @@ async def test_sync_sudo_callback_fails_fast(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_local_environment_pipes_sudo_password_before_stdin(tmp_path, monkeypatch):
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_sudo = fake_bin / "sudo"
-    fake_sudo.write_text(
-        "#!/bin/sh\n"
-        "IFS= read -r password\n"
-        "IFS= read -r payload\n"
-        "printf 'password=%s\\npayload=%s\\n' \"$password\" \"$payload\"\n"
-    )
-    fake_sudo.chmod(0o755)
     monkeypatch.setenv("SUDO_PASSWORD", "testpass")
 
     environment = terminal.LocalEnvironment(str(tmp_path))
-    environment.env["PATH"] = f"{fake_bin}{os.pathsep}{environment.env['PATH']}"
+    command = (
+        "function sudo { IFS= read -r password; IFS= read -r payload; "
+        "printf 'password=%s\\npayload=%s\\n' \"$password\" \"$payload\"; }; "
+        "sudo target"
+    )
     async with (
         no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
         no_task_leaks(action=LeakAction.RAISE),
     ):
-        result = await environment.execute("sudo target", stdin_data="payload-data\n")
+        result = await environment.execute(command, stdin_data="payload-data\n")
 
     assert result["returncode"] == 0
     assert result["output"].splitlines() == [
@@ -193,10 +187,19 @@ async def test_local_environment_pipes_sudo_password_before_stdin(tmp_path, monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", [None, "", "   "])
+@pytest.mark.parametrize("command", [None])
 async def test_rejects_invalid_commands(command):
     result = json.loads(await terminal.terminal_tool(command))
     assert result["status"] == "error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["", "   "])
+async def test_empty_string_commands_preserve_upstream_shell_behavior(command):
+    result = json.loads(await terminal.terminal_tool(command, force=True))
+    assert result["output"] == ""
+    assert result["exit_code"] == 0
+    assert result["error"] is None
 
 
 @pytest.mark.asyncio
@@ -224,7 +227,7 @@ async def test_async_approval_callback_can_allow_and_deny(tmp_path, monkeypatch)
         terminal.set_approval_callback(None)
 
     assert allowed["exit_code"] == 0
-    assert denied["status"] == "denied"
+    assert denied["status"] == "blocked"
     assert decisions == [
         'python -c "print(\'allowed\')"',
         'python -c "print(\'denied\')"',

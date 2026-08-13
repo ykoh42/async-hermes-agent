@@ -53,15 +53,22 @@ class TestCrossLoopCacheIsolation:
         def _get_client_on_new_loop(name):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            with patch("agent.auxiliary_client.resolve_provider_client",
-                        side_effect=_stub_resolve_provider_client):
-                client, _ = loop.run_until_complete(
-                    _get_cached_client(
-                        "custom", "m1", base_url="http://localhost:8081/v1"
+            try:
+                with patch("agent.auxiliary_client.resolve_provider_client",
+                            side_effect=_stub_resolve_provider_client):
+                    client, _ = loop.run_until_complete(
+                        _get_cached_client(
+                            "custom", "m1", base_url="http://localhost:8081/v1"
+                        )
                     )
+                results[name] = (id(client), id(loop))
+                from agent.auxiliary_client import shutdown_cached_clients
+
+                loop.run_until_complete(
+                    shutdown_cached_clients()
                 )
-            results[name] = (id(client), id(loop))
-            # Don't close loop — simulates real usage where loops persist
+            finally:
+                loop.close()
 
         t1 = threading.Thread(target=_get_client_on_new_loop, args=("a",))
         t2 = threading.Thread(target=_get_client_on_new_loop, args=("b",))
@@ -98,12 +105,17 @@ class TestCrossLoopCacheIsolation:
         worker_client_id = [None]
         def _worker():
             async def _inner():
-                with patch("agent.auxiliary_client.resolve_provider_client",
-                            side_effect=_stub_resolve_provider_client):
-                    client, _ = await _get_cached_client(
-                        "custom", "m1", base_url="http://localhost:8081/v1"
-                    )
-                worker_client_id[0] = id(client)
+                from agent.auxiliary_client import shutdown_cached_clients
+
+                try:
+                    with patch("agent.auxiliary_client.resolve_provider_client",
+                                side_effect=_stub_resolve_provider_client):
+                        client, _ = await _get_cached_client(
+                            "custom", "m1", base_url="http://localhost:8081/v1"
+                        )
+                    worker_client_id[0] = id(client)
+                finally:
+                    await shutdown_cached_clients()
             asyncio.run(_inner())
 
         t = threading.Thread(target=_worker)
@@ -115,4 +127,7 @@ class TestCrossLoopCacheIsolation:
             "this is the exact cross-loop scenario that causes httpx deadlocks. "
             "The cache key must include the event loop identity (#2681)"
         )
+        from agent.auxiliary_client import shutdown_cached_clients
+
+        gateway_loop.run_until_complete(shutdown_cached_clients())
         gateway_loop.close()

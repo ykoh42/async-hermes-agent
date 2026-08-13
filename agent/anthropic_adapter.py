@@ -32,7 +32,7 @@ from agent.errors import EmptyStreamError
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
-from agent.secret_scope import get_secret as _get_secret
+from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -824,7 +824,7 @@ async def _build_anthropic_default_http_client(
         )
     effective_base_url = base_url
     if effective_base_url is None:
-        effective_base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        effective_base_url = _get_secret("ANTHROPIC_BASE_URL")
     if effective_base_url is None:
         effective_base_url = "https://api.anthropic.com"
 
@@ -1109,8 +1109,10 @@ async def build_anthropic_bedrock_client(region: str):
     it, Bedrock caps these models at 200K even though the Anthropic API
     serves them with 1M natively.
 
-    Auth credentials are resolved through aiobotocore's async default chain
-    (IAM roles, SSO, environment variables) before client construction.
+    Auth credentials are resolved through the Bedrock adapter's profile-aware
+    boundary before client construction. Single-profile callers retain the
+    native async AWS default chain; multiplexed callers receive only their
+    explicit profile-scoped SigV4 credentials.
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
@@ -1126,16 +1128,9 @@ async def build_anthropic_bedrock_client(region: str):
             "The installed 'anthropic' package does not provide "
             "AsyncAnthropicBedrock; upgrade it before using Hermes's async runtime."
         )
-    try:
-        from aiobotocore.session import get_session
-    except ImportError as exc:
-        raise ImportError(
-            "The 'aiobotocore' package is required for native-async Bedrock "
-            "credentials. Install async-hermes-agent[bedrock]."
-        ) from exc
-    credentials = await get_session().get_credentials()
-    if credentials is None:
-        raise RuntimeError("could not resolve credentials from AWS session")
+    from agent.bedrock_adapter import _resolve_anthropic_bedrock_credentials
+
+    credentials = await _resolve_anthropic_bedrock_credentials()
     frozen = await credentials.get_frozen_credentials()
     timeout_obj = Timeout(timeout=900.0, connect=10.0)
     kwargs = {
@@ -1151,7 +1146,7 @@ async def build_anthropic_bedrock_client(region: str):
             "anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])
         },
     }
-    bedrock_base_url = os.environ.get("ANTHROPIC_BEDROCK_BASE_URL")
+    bedrock_base_url = _get_secret("ANTHROPIC_BEDROCK_BASE_URL")
     if bedrock_base_url is None:
         bedrock_base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
     http_client = await _build_anthropic_default_http_client(
@@ -1171,6 +1166,8 @@ async def build_anthropic_bedrock_client(region: str):
 
 async def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from macOS Keychain asynchronously."""
+    if is_multiplex_active():
+        return None
     if platform.system() != "Darwin":
         return None
     process = None
@@ -1217,6 +1214,8 @@ async def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, An
 
 async def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from its JSON file asynchronously."""
+    if is_multiplex_active():
+        return None
     cred_path = Path.home() / ".claude" / ".credentials.json"
     if not await aiofiles.os.path.exists(cred_path):
         return None
@@ -1239,6 +1238,12 @@ async def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
 
 async def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read and reconcile the keychain and file-based Claude Code credentials."""
+    # Claude Code owns these stores at the OS-user level. They have no Hermes
+    # profile discriminator, so reading them in a multiplexed service can bill
+    # profile B's request to profile A's Claude account. Profile-owned env and
+    # credential-pool sources remain available through resolve_anthropic_token().
+    if is_multiplex_active():
+        return None
     keychain, file = await asyncio.gather(
         _read_claude_code_credentials_from_keychain(),
         _read_claude_code_credentials_from_file(),
@@ -1337,6 +1342,11 @@ async def _write_claude_code_credentials(
     scopes: Optional[list] = None,
 ) -> None:
     """Atomically update Claude Code credentials through async filesystem APIs."""
+    if is_multiplex_active():
+        raise RuntimeError(
+            "Claude Code's global credential file cannot be written while "
+            "Hermes profile multiplexing is active"
+        )
     cred_path = Path.home() / ".claude" / ".credentials.json"
     existing: Dict[str, Any] = {}
     try:
@@ -1386,6 +1396,11 @@ async def _write_claude_code_credentials(
 
 async def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     """Refresh expired Claude Code credentials through the native async path."""
+    if is_multiplex_active():
+        raise RuntimeError(
+            "Claude Code's global OAuth credential cannot be refreshed while "
+            "Hermes profile multiplexing is active"
+        )
     current = await read_claude_code_credentials()
     if current and (
         current.get("accessToken") != creds.get("accessToken")
@@ -1411,7 +1426,11 @@ async def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
 
 async def resolve_anthropic_token() -> Optional[str]:
     """Resolve Anthropic credentials without blocking the agent event loop."""
-    creds = await read_claude_code_credentials()
+    creds = (
+        None
+        if is_multiplex_active()
+        else await read_claude_code_credentials()
+    )
     if creds:
         if is_claude_code_token_valid(creds):
             return creds["accessToken"]
@@ -1444,6 +1463,11 @@ async def run_oauth_setup_token() -> Optional[str]:
     Returns the token string, or None if no credentials were obtained.
     Raises FileNotFoundError if the 'claude' CLI is not installed.
     """
+    if is_multiplex_active():
+        raise RuntimeError(
+            "Claude Code's global interactive OAuth setup is unavailable while "
+            "Hermes profile multiplexing is active"
+        )
     import shutil
     claude_path = await aiofiles.os.wrap(shutil.which)("claude")
     if not claude_path:

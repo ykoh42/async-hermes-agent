@@ -12,13 +12,14 @@ from datetime import datetime, timezone
 import inspect
 import json
 import logging
-import os
 import re
 from typing import Any, Coroutine
 import uuid
 import warnings
 
 import aiosqlite
+
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -180,12 +181,12 @@ class OpenAIEmbedding:
             from openai import AsyncOpenAI
             from agent.ssl_verify import _create_openai_sdk_client
 
-            api_key = self.config.get("api_key") or os.getenv("OPENAI_API_KEY")
-            legacy_base_url = os.getenv("OPENAI_API_BASE")
+            api_key = self.config.get("api_key") or get_secret("OPENAI_API_KEY")
+            legacy_base_url = get_secret("OPENAI_API_BASE")
             base_url = (
                 self.config.get("openai_base_url")
                 or legacy_base_url
-                or os.getenv("OPENAI_BASE_URL")
+                or get_secret("OPENAI_BASE_URL")
                 or "https://api.openai.com/v1"
             )
             if legacy_base_url:
@@ -427,19 +428,21 @@ class OpenAILLM:
             from openai import AsyncOpenAI
             from agent.ssl_verify import _create_openai_sdk_client
 
-            openrouter_key = os.getenv("OPENROUTER_API_KEY")
+            openrouter_key = get_secret("OPENROUTER_API_KEY")
             if openrouter_key:
                 api_key = openrouter_key
                 base_url = (
                     self.config.get("openrouter_base_url")
-                    or os.getenv("OPENROUTER_API_BASE")
+                    or get_secret("OPENROUTER_API_BASE")
                     or "https://openrouter.ai/api/v1"
                 )
             else:
-                api_key = self.config.get("api_key") or os.getenv("OPENAI_API_KEY")
+                api_key = self.config.get("api_key") or get_secret(
+                    "OPENAI_API_KEY"
+                )
                 base_url = (
                     self.config.get("openai_base_url")
-                    or os.getenv("OPENAI_BASE_URL")
+                    or get_secret("OPENAI_BASE_URL")
                     or "https://api.openai.com/v1"
                 )
             self._client = await _create_openai_sdk_client(
@@ -483,7 +486,7 @@ class OpenAILLM:
 
         params = self._supported_params(messages, **kwargs)
         params.update({"model": self.model, "messages": messages})
-        if os.getenv("OPENROUTER_API_KEY"):
+        if get_secret("OPENROUTER_API_KEY"):
             models = self.config.get("models")
             if models:
                 params["models"] = models

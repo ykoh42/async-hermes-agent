@@ -1,6 +1,8 @@
 """Tests for native-async plugin singleton helpers."""
 
 import asyncio
+import queue
+import threading
 
 import pytest
 
@@ -166,3 +168,69 @@ async def test_slot_reset_waits_for_inflight_build():
     assert await build_task == "built"
     await reset_task
     assert slot.peek() is None
+
+
+@pytest.mark.asyncio
+async def test_slot_reset_finishes_after_repeated_cancellation():
+    slot: SingletonSlot[str] = SingletonSlot()
+    started = asyncio.Event()
+    release_build = asyncio.Event()
+
+    async def factory():
+        started.set()
+        await release_build.wait()
+        return "built"
+
+    build_task = asyncio.create_task(slot.get(factory))
+    await started.wait()
+    reset_task = asyncio.create_task(slot.reset())
+    await asyncio.sleep(0)
+    reset_task.cancel()
+    await asyncio.sleep(0)
+    reset_task.cancel()
+    assert not reset_task.done()
+
+    release_build.set()
+    assert await build_task == "built"
+    with pytest.raises(asyncio.CancelledError):
+        await reset_task
+    assert slot.peek() is None
+
+
+def test_slot_serializes_concurrent_first_call_across_event_loops():
+    slot: SingletonSlot[object] = SingletonSlot()
+    owner_started = threading.Event()
+    release_owner = threading.Event()
+    results: queue.Queue[tuple[object | None, BaseException | None]] = queue.Queue()
+    build_count = 0
+    count_guard = threading.Lock()
+
+    async def factory():
+        nonlocal build_count
+        with count_guard:
+            build_count += 1
+        owner_started.set()
+        while not release_owner.is_set():
+            await asyncio.sleep(0.001)
+        return object()
+
+    def run() -> None:
+        try:
+            results.put((asyncio.run(slot.get(factory)), None))
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            results.put((None, exc))
+
+    first = threading.Thread(target=run)
+    second = threading.Thread(target=run)
+    first.start()
+    assert owner_started.wait(timeout=2)
+    second.start()
+    release_owner.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    first_result, first_error = results.get_nowait()
+    second_result, second_error = results.get_nowait()
+    assert first_error is second_error is None
+    assert first_result is second_result
+    assert build_count == 1

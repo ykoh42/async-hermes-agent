@@ -947,6 +947,7 @@ class TestEnsureClientReloadsEnv:
         assert instances[1].posts[0][1]["uri"].startswith(
             "viking://user/peers/hermes/memories/"
         )
+        await provider.shutdown()
 
     async def test_concurrent_refresh_does_not_return_stale_client(self, monkeypatch):
         refresh_entered = asyncio.Event()
@@ -1004,7 +1005,7 @@ class TestEnsureClientReloadsEnv:
         release_start = asyncio.Event()
         waiter_release = asyncio.Event()
 
-        async def start_local(endpoint):
+        async def start_local(endpoint, **_kwargs):
             start_calls.append(endpoint)
             first_start_entered.set()
             await asyncio.wait_for(release_start.wait(), timeout=2.0)
@@ -1229,6 +1230,7 @@ class TestUnavailableWarningsPromiseRetry:
         assert provider._client is None
         assert len(warnings) == 1
         self._assert_promises_retry(warnings[0])
+        await provider.shutdown()
 
     async def test_ensure_client_responded_unhealthy_warning(self, monkeypatch, caplog):
         class _UnhealthyClient:
@@ -1284,3 +1286,4 @@ class TestUnavailableWarningsPromiseRetry:
         assert client is not None
         assert client.endpoint == "https://remote.example"
         assert len(probes) == 2
+        await provider.shutdown()
