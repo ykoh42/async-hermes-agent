@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import ast
+
 import pytest
 from qdrant_client import models
 
 from mem0.vector_stores.qdrant import Qdrant as UpstreamQdrant
 from plugins.memory.mem0._native_vector import Qdrant
+
+
+_SUPPORTED_OPERATORS_SEPARATOR = ". Supported operators: "
+
+
+def _error_signature(message: str) -> tuple[str, frozenset[str] | None]:
+    """Compare the stable error text and supported operators separately."""
+
+    prefix, separator, operator_repr = message.rpartition(
+        _SUPPORTED_OPERATORS_SEPARATOR
+    )
+    if not separator:
+        return message, None
+
+    operators = ast.literal_eval(operator_repr)
+    assert isinstance(operators, set)
+    assert all(isinstance(operator, str) for operator in operators)
+    return prefix, frozenset(operators)
 
 
 def _builders():
@@ -66,4 +86,16 @@ def test_native_qdrant_filter_errors_match_pinned_upstream(filters):
     with pytest.raises(type(expected.value)) as actual:
         native._create_filter(filters)
 
-    assert str(actual.value) == str(expected.value)
+    assert _error_signature(str(actual.value)) == _error_signature(
+        str(expected.value)
+    )
+
+
+def test_qdrant_supported_operator_error_ignores_set_display_order():
+    prefix = "Unsupported filter operator(s) for field 'priority': {'unknown'}"
+
+    assert _error_signature(
+        f"{prefix}{_SUPPORTED_OPERATORS_SEPARATOR}{{'eq', 'ne'}}"
+    ) == _error_signature(
+        f"{prefix}{_SUPPORTED_OPERATORS_SEPARATOR}{{'ne', 'eq'}}"
+    )

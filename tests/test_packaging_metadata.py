@@ -106,6 +106,19 @@ def test_python_compatibility_ci_scopes_tests_before_pytest_separator():
         assert compat_step.index(path) < separator
 
 
+def test_python_compatibility_ci_installs_ripgrep_before_testing_source():
+    """Compatibility runners must provide the binary required by search tests."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    compat_job = workflow.split("\n  python-compatibility:", 1)[1]
+    install_step = compat_job.index("- name: Install ripgrep")
+    test_step = compat_job.index("- name: Test retained compatibility surface")
+
+    assert install_step < test_step
+    assert "sudo apt-get install --yes ripgrep" in compat_job[install_step:test_step]
+
+
 def test_pages_workflow_validates_pull_requests_without_deploying_them():
     """Trusted PRs build in isolation, while only merged main may deploy."""
     workflow = (

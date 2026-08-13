@@ -61,7 +61,7 @@ class TestCrossLoopCacheIsolation:
                             "custom", "m1", base_url="http://localhost:8081/v1"
                         )
                     )
-                results[name] = (id(client), id(loop))
+                results[name] = (client, loop)
                 from agent.auxiliary_client import shutdown_cached_clients
 
                 loop.run_until_complete(
@@ -75,11 +75,11 @@ class TestCrossLoopCacheIsolation:
         t1.start(); t1.join()
         t2.start(); t2.join()
 
-        client_id_a, loop_id_a = results["a"]
-        client_id_b, loop_id_b = results["b"]
+        client_a, loop_a = results["a"]
+        client_b, loop_b = results["b"]
 
-        assert loop_id_a != loop_id_b, "Test setup error: same loop on both threads"
-        assert client_id_a != client_id_b, (
+        assert loop_a is not loop_b, "Test setup error: same loop on both threads"
+        assert client_a is not client_b, (
             "Different event loops got the SAME cached client — this causes "
             "httpx cross-loop deadlocks in gateway mode (#2681)"
         )

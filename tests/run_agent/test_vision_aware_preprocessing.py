@@ -18,6 +18,7 @@ import base64
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiofiles.tempfile
 import pytest
 from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
@@ -105,6 +106,12 @@ async def test_text_fallback_runs_native_vision_path_without_blocking(
     choice.message.content = "native async description"
     response.choices = [choice]
     jpeg = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 32).decode("ascii")
+
+    # Warm aiofiles' default executor before BlockBuster instruments threading
+    # internals; on loaded CI hosts, its stack inspection can make allowed worker
+    # startup look like an event-loop block.
+    async with aiofiles.tempfile.NamedTemporaryFile():
+        pass
 
     with (
         patch(

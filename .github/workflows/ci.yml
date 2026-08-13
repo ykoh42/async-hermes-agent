@@ -97,6 +97,11 @@ jobs:
       - name: Install Python
         run: uv python install ${{ matrix.python-version }}
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
       - name: Verify lockfile
         run: uv lock --check
 
