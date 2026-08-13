@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -55,23 +56,36 @@ def substitute_template_vars(
     return _SKILL_TEMPLATE_RE.sub(_replace, content)
 
 
-async def _finish_process_communicate(
+async def _terminate_inline_shell(
     process: asyncio.subprocess.Process,
     communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
-) -> tuple[bytes | None, bytes | None]:
-    """Drain and reap one owned inline-shell process through cancellation."""
-    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+) -> None:
+    """Terminate the owned process group and drain its pipe readers."""
+    async def cleanup() -> None:
         try:
-            return await communicate_task
-        except BaseException:
-            await process.wait()
-            raise
+            try:
+                pid = getattr(process, "pid", None)
+                if os.name == "posix" and isinstance(pid, int) and pid > 0:
+                    # The shell leader can exit while a descendant still
+                    # owns its stdout/stderr pipes. The process group remains
+                    # signalable in that state even though ``returncode`` is
+                    # already set, so always attempt group cleanup on POSIX.
+                    os.killpg(pid, signal.SIGKILL)
+                elif process.returncode is None:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+        finally:
+            try:
+                await communicate_task
+            except Exception:
+                await process.wait()
 
-    cleanup_task = asyncio.create_task(drain_or_wait())
+    cleanup_task = asyncio.create_task(cleanup())
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            output = await asyncio.shield(cleanup_task)
+            await asyncio.shield(cleanup_task)
             break
         except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
             if cleanup_task.cancelled():
@@ -84,7 +98,6 @@ async def _finish_process_communicate(
             raise
     if cancellation is not None:
         raise cancellation
-    return output
 
 
 async def _build_inline_shell_env() -> dict[str, str]:
@@ -142,6 +155,7 @@ async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=windows_hide_flags(),
+            start_new_session=os.name == "posix",
         )
     except FileNotFoundError:
         return "[inline-shell error: bash not found]"
@@ -154,21 +168,11 @@ async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
             asyncio.shield(communicate_task), timeout=timeout
         )
     except TimeoutError:
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        await _finish_process_communicate(process, communicate_task)
+        await _terminate_inline_shell(process, communicate_task)
         return f"[inline-shell timeout after {timeout}s: {command}]"
     except asyncio.CancelledError:
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
         try:
-            await _finish_process_communicate(process, communicate_task)
+            await _terminate_inline_shell(process, communicate_task)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -178,13 +182,8 @@ async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
             )
         raise
     except Exception as exc:
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
         try:
-            await _finish_process_communicate(process, communicate_task)
+            await _terminate_inline_shell(process, communicate_task)
         except asyncio.CancelledError:
             raise
         except Exception:

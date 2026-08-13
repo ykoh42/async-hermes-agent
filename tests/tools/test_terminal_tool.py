@@ -55,9 +55,12 @@ async def test_exported_environment_persists_between_calls(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_background_process_inherits_session_environment(tmp_path):
+async def test_background_process_inherits_session_environment(tmp_path, monkeypatch):
     from tools.process_registry import process_registry
 
+    # Background execution must use the same Bash grammar as the persistent
+    # session snapshot, regardless of an absent or incompatible login shell.
+    monkeypatch.setenv("SHELL", sys.executable)
     task_id = "background-environment"
     await terminal.terminal_tool(
         "export HERMES_BACKGROUND_ENV_PROBE=from-session",

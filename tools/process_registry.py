@@ -33,7 +33,7 @@ import aiofiles.os
 from hermes_constants import get_hermes_home
 # Preserve local imports below without first-use importlib I/O in the event loop.
 from tools import ansi_strip as _ansi_strip_bootstrap  # noqa: F401
-from tools.environments.local import build_subprocess_env
+from tools.environments.local import _find_bash, build_subprocess_env
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -388,7 +388,18 @@ class ProcessRegistry:
         raw_workdir = cwd or await aiofiles.os.getcwd()
         expanduser = aiofiles.os.wrap(os.path.expanduser)
         workdir = await aiofiles.os.path.abspath(await expanduser(raw_workdir))
-        shell = os.environ.get("SHELL") or "/bin/sh"
+        # Session snapshots are written by ``LocalEnvironment`` in Bash
+        # syntax (``declare -x``, aliases, and ``shopt``).  ``$SHELL`` is not
+        # guaranteed to be Bash and is commonly unset on Linux CI, where
+        # falling back to dash made ``source`` a no-op and silently dropped
+        # every exported session variable from background commands.  Preserve
+        # the historical shell choice for direct registry callers that do not
+        # consume a session snapshot.
+        shell = (
+            await _find_bash()
+            if snapshot_path
+            else os.environ.get("SHELL") or "/bin/sh"
+        )
         env = await build_subprocess_env(scrub_secrets=True, extra=child_env_vars)
         env["PYTHONUNBUFFERED"] = "1"
         session = ProcessSession(

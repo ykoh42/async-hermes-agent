@@ -7,8 +7,10 @@ import inspect
 import json
 import os
 import shlex
+import struct
 import subprocess
 import sys
+import wave
 
 import aiofiles
 import httpx
@@ -17,6 +19,7 @@ from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
 from tools import tts_tool
+from tools.neutts_synth import _write_wav
 from tools.registry import registry
 
 
@@ -229,6 +232,22 @@ async def test_neutts_parent_launch_uses_async_subprocess(tmp_path, monkeypatch)
 async def test_neutts_default_voice_assets_are_packaged():
     assert await aiofiles.os.path.exists(tts_tool._default_neutts_ref_audio())
     assert await aiofiles.os.path.exists(tts_tool._default_neutts_ref_text())
+
+
+def test_neutts_wav_fallback_serializes_iterables_without_numpy(tmp_path):
+    output = tmp_path / "stdlib-fallback.wav"
+    _write_wav(output, (sample for sample in (-2.0, -0.5, 0.0, 0.5, 2.0)))
+
+    with wave.open(str(output), "rb") as wav:
+        assert wav.getparams()[:4] == (1, 2, 24000, 5)
+        assert wav.readframes(5) == struct.pack(
+            "<hhhhh",
+            -32767,
+            -16383,
+            0,
+            16383,
+            32767,
+        )
 
 
 class _StreamingResponse:

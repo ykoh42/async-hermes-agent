@@ -19,22 +19,43 @@ from pathlib import Path
 
 
 def _write_wav(path: str, samples, sample_rate: int = 24000) -> None:
-    """Write a WAV file from float32 samples (no soundfile dependency)."""
-    import numpy as np
+    """Write mono float samples as PCM16 without optional audio packages."""
+    # NeuTTS normally returns a NumPy array or torch Tensor because its own
+    # ``[all]`` install includes those runtimes. Keep the fallback usable with
+    # plain Python iterables too: tests and minimal downstream integrations can
+    # exercise the subprocess boundary without installing either NumPy or
+    # soundfile solely to serialize two-byte PCM frames.
+    if hasattr(samples, "detach"):
+        samples = samples.detach()
+    if hasattr(samples, "cpu"):
+        samples = samples.cpu()
+    if hasattr(samples, "reshape") and hasattr(samples, "tolist"):
+        samples = samples.reshape(-1).tolist()
+    elif hasattr(samples, "tolist"):
+        samples = samples.tolist()
 
-    if not isinstance(samples, np.ndarray):
-        samples = np.array(samples, dtype=np.float32)
-    samples = samples.flatten()
+    def flatten(values):
+        if isinstance(values, (str, bytes)):
+            yield float(values)
+            return
+        try:
+            iterator = iter(values)
+        except TypeError:
+            yield float(values)
+            return
+        for value in iterator:
+            yield from flatten(value)
 
-    # Clamp and convert to int16
-    samples = np.clip(samples, -1.0, 1.0)
-    pcm = (samples * 32767).astype(np.int16)
+    pcm = bytearray()
+    for sample in flatten(samples):
+        clamped = max(-1.0, min(1.0, sample))
+        pcm.extend(struct.pack("<h", int(clamped * 32767)))
 
     num_channels = 1
     bits_per_sample = 16
     byte_rate = sample_rate * num_channels * (bits_per_sample // 8)
     block_align = num_channels * (bits_per_sample // 8)
-    data_size = len(pcm) * (bits_per_sample // 8)
+    data_size = len(pcm)
 
     with open(path, "wb") as f:
         f.write(b"RIFF")
@@ -45,7 +66,7 @@ def _write_wav(path: str, samples, sample_rate: int = 24000) -> None:
                             byte_rate, block_align, bits_per_sample))
         f.write(b"data")
         f.write(struct.pack("<I", data_size))
-        f.write(pcm.tobytes())
+        f.write(pcm)
 
 
 def main():

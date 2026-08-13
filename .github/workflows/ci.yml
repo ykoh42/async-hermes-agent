@@ -39,7 +39,7 @@ jobs:
         run: uv lock --check
 
       - name: Install project and test dependencies
-        run: uv sync --locked --python 3.11 --extra dev --extra bedrock --extra supermemory --extra hindsight
+        run: uv sync --locked --python 3.11 --extra dev --extra bedrock --extra supermemory --extra hindsight --extra honcho --extra mem0
 
       - name: Lint
         run: uv run ruff check .
@@ -105,8 +105,8 @@ jobs:
 
       - name: Test retained compatibility surface
         run: >-
-          scripts/run_tests.sh -j 2 -- -q
-          -W error::pytest.PytestUnhandledThreadExceptionWarning
+          scripts/run_tests.sh -j 2
           tests/runtime/test_core.py
           tests/test_hermes_state.py
           tests/tools/test_terminal_exit_semantics.py
+          -- -q -W error::pytest.PytestUnhandledThreadExceptionWarning

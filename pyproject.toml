@@ -68,6 +68,11 @@ dependencies = [
   # model. The bytes are loaded asynchronously and parsed in memory; encoding
   # is CPU-only and preserves their upstream special-token behavior.
   "sentencepiece==0.2.2",
+  # sentencepiece_model_pb2 is imported directly when those legacy models are
+  # parsed, but sentencepiece does not declare protobuf as its own dependency.
+  # Keep clean wheel installs functional instead of relying on an unrelated
+  # provider extra to pull the generated-code runtime transitively.
+  "protobuf==6.33.6",
   # Native CDP transport for browser_cdp and the persistent supervisor.
   "websockets==15.0.1",
   "rich==14.3.3",

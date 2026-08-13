@@ -35,6 +35,13 @@ class _Server:
 
 @pytest.mark.asyncio
 async def test_mcp_tool_dispatch_does_not_block_or_leak(monkeypatch):
+    # Activate the profile scope before measuring dispatch.  Its first
+    # aiofiles call may create asyncio's default executor; on a loaded CI host,
+    # pyleak's own stack inspection can make that allowed worker startup look
+    # like an event-loop block.  Activation itself is still native async, and
+    # pre-activating also installs the fixture in the canonical scoped cache.
+    await mcp_tool._activate_mcp_scope()
+
     server = _Server()
     monkeypatch.setitem(mcp_tool._servers, "srv", server)
     monkeypatch.setattr(mcp_tool, "_server_error_counts", {})

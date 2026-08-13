@@ -89,12 +89,20 @@ async def test_proxy_context_preserves_httpcore_default_trust_store(
 ):
     result = await _default_proxy_context()
 
+    # OpenSSL keeps ``capath`` certificates lazy until certificate-chain
+    # lookup, so httpcore's fresh context does not report them here.  The
+    # async materializer reads those same hashed entries up front; include
+    # them when comparing the effective trust stores.
+    _, default_capath = ssl_verify_module._raw_default_verify_paths()
+    capath_context = await _context_from_ca_directories(default_capath or "")
+    expected_certificates = set(
+        upstream_proxy_context.get_ca_certs(binary_form=True)
+    ) | set(capath_context.get_ca_certs(binary_form=True))
+
     assert result.options == upstream_proxy_context.options
     assert result.verify_flags == upstream_proxy_context.verify_flags
     assert result.minimum_version == upstream_proxy_context.minimum_version
-    assert set(result.get_ca_certs(binary_form=True)) == set(
-        upstream_proxy_context.get_ca_certs(binary_form=True)
-    )
+    assert set(result.get_ca_certs(binary_form=True)) == expected_certificates
 
 
 async def test_default_without_env_is_true(clean_ca_env):

@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
 from agent.secret_scope import UnscopedSecretError, get_secret
 from agent.turn_context import substitute_api_content
 from agent.message_content import flatten_message_text
@@ -1308,7 +1309,6 @@ async def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
         _timeout = max(_base, 240.0)
     else:
         _timeout = _base
-    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     # Resolve the model id from BOTH the OpenAI/Anthropic key (``model``) and
     # the Bedrock key (``modelId``). OpenAI/Anthropic wins first via the ``or``
     # chain, so those paths are unchanged. Bedrock carries the model as a
@@ -1356,8 +1356,6 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     digits), never other dashes in the slug, so ``claude-sonnet`` is left
     intact while ``4-5`` becomes ``4.5``.
     """
-    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-
     if not model_id or not isinstance(model_id, str):
         return None
     name = model_id.strip().lower()

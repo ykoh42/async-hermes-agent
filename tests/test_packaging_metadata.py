@@ -87,6 +87,25 @@ def test_release_workflow_smokes_every_supported_python_version():
     assert '"$compat_venv/bin/python" -I - <<\'PY\'' in workflow
 
 
+def test_python_compatibility_ci_scopes_tests_before_pytest_separator():
+    """Compatibility paths must select files, not repeat in every pytest run."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    compat_step = workflow.split(
+        "- name: Test retained compatibility surface", 1
+    )[1].split("\n      - name:", 1)[0]
+    separator = compat_step.index("\n          -- ")
+
+    for path in (
+        "tests/runtime/test_core.py",
+        "tests/test_hermes_state.py",
+        "tests/tools/test_terminal_exit_semantics.py",
+    ):
+        assert compat_step.count(path) == 1
+        assert compat_step.index(path) < separator
+
+
 def test_pages_workflow_validates_pull_requests_without_deploying_them():
     """Trusted PRs build in isolation, while only merged main may deploy."""
     workflow = (
@@ -374,7 +393,35 @@ def test_retained_runtime_dependencies_are_declared_and_exact_pinned():
 
     assert "certifi==2026.5.20" in core
     assert "cryptography==48.0.1" in core
+    assert "protobuf==6.33.6" in core
+    assert _locked_versions("protobuf") == {"6.33.6"}
     assert "packaging==26.0" in extras["hindsight"]
+
+
+def test_full_suite_workflows_install_the_backends_they_exercise():
+    """CI and release must resolve the same optional backend test surface."""
+    expected = {
+        "dev",
+        "bedrock",
+        "supermemory",
+        "hindsight",
+        "honcho",
+        "mem0",
+    }
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = (REPO_ROOT / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        install_step = re.search(
+            r"- name: Install project and test dependencies\n"
+            r"\s+run: (?P<command>[^\n]+)",
+            workflow,
+        )
+        assert install_step is not None, workflow_name
+        installed = set(
+            re.findall(r"--extra\s+([a-z0-9-]+)", install_step["command"])
+        )
+        assert installed == expected
 
 
 def test_retained_no_op_compatibility_extras_are_published():

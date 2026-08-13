@@ -17,12 +17,16 @@ the guard? Add a test here too.
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import shlex
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
+from blockbuster import BlockBuster
 
 # A guaranteed-foreign PID: PID 1 (init).  Owned by root, not us, and
 # always exists. A sane guard refuses to signal it.
@@ -249,6 +253,43 @@ def test_asyncio_create_subprocess_shell_systemctl_blocked():
 
     with pytest.raises(RuntimeError, match="live-system guard"):
         asyncio.run(_attempt())
+
+
+@pytest.mark.parametrize("spawn_kind", ["exec", "shell"])
+def test_asyncio_spawned_child_stays_signalable_under_blockbuster(spawn_kind):
+    """The guard remembers async children before blocking psutil inspection."""
+
+    async def _attempt():
+        # Keep the natural lifetime short so a guard regression cannot leave a
+        # long-running child behind after the expected signal is rejected.
+        source = "import time; time.sleep(1)"
+        if spawn_kind == "exec":
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                source,
+                start_new_session=True,
+            )
+        else:
+            process = await asyncio.create_subprocess_shell(
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}",
+                start_new_session=True,
+            )
+
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            if spawn_kind == "shell" and hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                os.kill(process.pid, signal.SIGTERM)
+        finally:
+            blocker.deactivate()
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+
+        assert process.returncode is not None
+
+    asyncio.run(_attempt())
 
 
 # ──────────────────── pkill / killall / taskkill ───────────────

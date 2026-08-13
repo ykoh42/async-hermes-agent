@@ -1,6 +1,8 @@
 """Cancellation contracts for native skill preprocessing subprocesses."""
 
 import asyncio
+import os
+import signal
 
 import pytest
 
@@ -87,6 +89,46 @@ async def test_inline_shell_timeout_drains_process(monkeypatch):
         == "[inline-shell timeout after 60s: command]"
     )
     assert communicate_completed.is_set()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+@pytest.mark.asyncio
+async def test_inline_shell_timeout_kills_group_after_shell_leader_exits(monkeypatch):
+    group_killed = asyncio.Event()
+
+    class CompletedLeaderProcess:
+        pid = 43210
+        returncode = 0
+
+        async def communicate(self):
+            await group_killed.wait()
+            return b"", b""
+
+        def kill(self):
+            raise AssertionError("POSIX cleanup must target the process group")
+
+        async def wait(self):
+            return self.returncode
+
+    async def create_process(*_args, **_kwargs):
+        return CompletedLeaderProcess()
+
+    async def timeout(*_args, **_kwargs):
+        raise TimeoutError
+
+    def killpg(pid, sig):
+        assert (pid, sig) == (43210, signal.SIGKILL)
+        group_killed.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(asyncio, "wait_for", timeout)
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    assert (
+        await run_inline_shell("command", None, timeout=60)
+        == "[inline-shell timeout after 60s: command]"
+    )
+    assert group_killed.is_set()
 
 
 @pytest.mark.asyncio

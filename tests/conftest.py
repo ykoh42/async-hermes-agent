@@ -893,9 +893,10 @@ def _live_system_guard(request, monkeypatch):
     import subprocess as _subprocess
 
     test_pid = _os.getpid()
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
+    # Capture the test process's existing children at fixture start. Async
+    # spawn wrappers below add their new child PIDs to this set; other new
+    # children fall back to the live psutil walk. The set keeps the fast path
+    # usable even while BlockBuster deliberately rejects psutil inspection.
     try:
         import psutil as _psutil
         _initial_children = {
@@ -1214,11 +1215,15 @@ def _live_system_guard(request, monkeypatch):
             _check_subprocess_cmd(
                 "asyncio.create_subprocess_exec", [program, *args]
             )
-            return await real_async_exec(program, *args, **kwargs)
+            process = await real_async_exec(program, *args, **kwargs)
+            _initial_children.add(process.pid)
+            return process
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
-            return await real_async_shell(cmd, *args, **kwargs)
+            process = await real_async_shell(cmd, *args, **kwargs)
+            _initial_children.add(process.pid)
+            return process
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(
