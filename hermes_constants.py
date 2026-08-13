@@ -870,7 +870,7 @@ async def is_container() -> bool:
         return True
     _CGROUP_MARKERS = ("docker", "podman", "/lxc/", "kubepods", "containerd", "crio")
     try:
-        async with aiofiles.open("/proc/1/cgroup", "r", encoding="utf-8") as f:
+        async with aiofiles.open("/proc/1/cgroup", encoding="utf-8") as f:
             cgroup = await f.read()
             if any(marker in cgroup for marker in _CGROUP_MARKERS):
                 _container_detected = True
@@ -881,7 +881,7 @@ async def is_container() -> bool:
     # runtime still shows up in the mount table (overlay rootfs, runtime mount
     # paths), so scan mountinfo as a last resort.
     try:
-        async with aiofiles.open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+        async with aiofiles.open("/proc/self/mountinfo", encoding="utf-8") as f:
             mountinfo = await f.read()
             if any(
                 marker in mountinfo for marker in ("kubepods", "containerd", "crio")

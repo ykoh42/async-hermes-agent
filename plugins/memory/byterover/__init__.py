@@ -32,7 +32,7 @@ import threading
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import aiofiles.os
 
@@ -90,7 +90,7 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-async def _load_plugin_config() -> Dict[str, Any]:
+async def _load_plugin_config() -> dict[str, Any]:
     """Read ByteRover's profile-scoped memory config.
 
     New memory-provider setup stores non-secret provider settings under
@@ -124,7 +124,7 @@ async def _load_plugin_config() -> Dict[str, Any]:
 # Retained private test seam. Runtime resolution is stored in the scoped cache
 # below; a non-None value deliberately overrides it for focused subprocess
 # tests that historically monkeypatched this name.
-_cached_brv_path: Optional[str] = None
+_cached_brv_path: str | None = None
 _which = aiofiles.os.wrap(shutil.which)
 
 
@@ -210,7 +210,7 @@ def _brv_state_lock(state: _BrvPathState) -> asyncio.Lock:
         return lock
 
 
-async def _resolve_brv_path() -> Optional[str]:
+async def _resolve_brv_path() -> str | None:
     """Find the brv binary on PATH or well-known install locations."""
     if _cached_brv_path is not None:
         return _cached_brv_path if _cached_brv_path != "" else None
@@ -295,9 +295,9 @@ async def _terminate_and_drain_brv(
 
 
 async def _run_brv(
-    args: List[str],
+    args: list[str],
     timeout: int = _QUERY_TIMEOUT,  # noqa: ASYNC109 - upstream argument name
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
 ) -> dict:
     """Run a brv CLI command. Returns {success, output, error}."""
     brv_path = await _resolve_brv_path()
@@ -437,7 +437,7 @@ STATUS_SCHEMA = {
 class ByteRoverMemoryProvider(MemoryProvider):
     """ByteRover persistent memory via the brv CLI."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         self._config = dict(config) if config is not None else None
         config_snapshot = self._config or {}
         self._auto_extract = _coerce_bool(config_snapshot.get("auto_extract"), True)
@@ -557,7 +557,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
             cwd=self._cwd,
         )
 
-    async def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    async def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Extract insights before context compression discards turns."""
         if not self._auto_extract:
             logger.debug("ByteRover pre-compression flush skipped (auto_extract disabled)")
@@ -586,7 +586,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         logger.info("ByteRover pre-compression flush: %d messages", len(parts))
         return ""
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [QUERY_SCHEMA, CURATE_SCHEMA, STATUS_SCHEMA]
 
     async def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:

@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger("agent.lsp.protocol")
 
@@ -63,7 +63,7 @@ def encode_message(obj: dict) -> bytes:
     return header + body
 
 
-async def read_message(reader: asyncio.StreamReader) -> Optional[dict]:
+async def read_message(reader: asyncio.StreamReader) -> dict | None:
     """Read one Content-Length framed JSON-RPC message from the stream.
 
     Returns ``None`` on clean EOF (server closed stdout cleanly between
@@ -158,7 +158,7 @@ def make_error_response(req_id: Any, code: int, message: str, data: Any = None) 
     return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
-def classify_message(msg: dict) -> Tuple[str, Any]:
+def classify_message(msg: dict) -> tuple[str, Any]:
     """Return ``(kind, key)`` where kind is one of ``request``,
     ``response``, ``notification``, ``invalid``.
 

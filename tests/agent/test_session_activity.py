@@ -45,6 +45,12 @@ def test_normalize_activity_provenance_defaults_to_unknown():
     )
 
 
+def test_activity_provenance_preserves_legacy_stringification():
+    provenance = ActivityProvenance.AGENT_COMPRESSION
+    assert str(provenance) == "ActivityProvenance.AGENT_COMPRESSION"
+    assert provenance.value == "agent.compression"
+
+
 def test_build_activity_snapshot_includes_compat_aliases():
     snapshot = build_activity_snapshot(
         last_activity_at=100.0,

@@ -26,7 +26,7 @@ import logging
 import asyncio
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
 
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.krea.ai"
 
 # Map our short model IDs to Krea's URL path segment.
-_MODELS: Dict[str, Dict[str, Any]] = {
+_MODELS: dict[str, dict[str, Any]] = {
     "krea-2-medium": {
         "display": "Krea 2 Medium",
         "speed": "~15-25s",
@@ -118,7 +118,7 @@ _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 # ---------------------------------------------------------------------------
 
 
-async def _load_krea_config() -> Dict[str, Any]:
+async def _load_krea_config() -> dict[str, Any]:
     """Read ``image_gen.krea`` (with fallthrough to ``image_gen``) from config.yaml."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -132,8 +132,8 @@ async def _load_krea_config() -> Dict[str, Any]:
 
 
 async def _resolve_model(
-    explicit: Optional[str] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    explicit: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Decide which model to use and return ``(model_id, meta)``.
 
     Precedence: explicit caller override → ``KREA_IMAGE_MODEL`` env →
@@ -149,7 +149,7 @@ async def _resolve_model(
 
     cfg = await _load_krea_config()
     krea_cfg = cfg.get("krea") if isinstance(cfg.get("krea"), dict) else {}
-    candidate: Optional[str] = None
+    candidate: str | None = None
     if isinstance(krea_cfg, dict):
         value = krea_cfg.get("model")
         if isinstance(value, str) and value in _MODELS:
@@ -203,7 +203,7 @@ async def _managed_krea_gateway_ready() -> bool:
         return False
 
 
-async def _resolve_creativity(value: Optional[str]) -> str:
+async def _resolve_creativity(value: str | None) -> str:
     """Coerce ``creativity`` kwarg to a valid Krea value (default ``medium``)."""
     if isinstance(value, str):
         v = value.strip().lower()
@@ -239,7 +239,7 @@ class KreaImageGenProvider(ImageGenProvider):
         # reach Krea 2 through the gateway.
         return bool(get_secret("KREA_API_KEY")) or await _managed_krea_gateway_ready()
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": model_id,
@@ -251,10 +251,10 @@ class KreaImageGenProvider(ImageGenProvider):
             for model_id, meta in _MODELS.items()
         ]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return DEFAULT_MODEL
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Krea",
             "badge": "paid",
@@ -268,7 +268,7 @@ class KreaImageGenProvider(ImageGenProvider):
             ],
         }
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         # Krea supports reference-guided generation (image-to-image style
         # transfer) via image_style_references — up to 10 refs.
         return {"modalities": ["text", "image"], "max_reference_images": 10}
@@ -282,10 +282,10 @@ class KreaImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
         krea_ar = _ASPECT_MAP.get(aspect, "1:1")
@@ -296,7 +296,7 @@ class KreaImageGenProvider(ImageGenProvider):
         #   2. legacy image_style_references kwarg — may be plain URL strings OR
         #      Krea's richer ref objects (e.g. {"url": ..., "strength": ...}),
         #      which are passed through verbatim for backward compatibility.
-        style_refs: List[Any] = []
+        style_refs: list[Any] = []
         if isinstance(image_url, str) and image_url.strip():
             style_refs.append(image_url.strip())
         for ref in (normalize_reference_images(reference_image_urls) or []):
@@ -313,7 +313,7 @@ class KreaImageGenProvider(ImageGenProvider):
         # Dedupe string entries while preserving order (dict refs aren't
         # hashable, so they're kept verbatim); Krea caps at 10.
         seen: set = set()
-        deduped: List[Any] = []
+        deduped: list[Any] = []
         for r in style_refs:
             if isinstance(r, str):
                 if r in seen:
@@ -392,7 +392,7 @@ class KreaImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "prompt": prompt,
             "aspect_ratio": krea_ar,
             "resolution": DEFAULT_RESOLUTION,
@@ -415,7 +415,7 @@ class KreaImageGenProvider(ImageGenProvider):
             # NOT a bare URL string — a string yields a 422 "Expected object,
             # received string". Convert URL strings to the object form and pass
             # already-object refs through verbatim (clamped to 10 above).
-            normalized_refs: List[Any] = []
+            normalized_refs: list[Any] = []
             for ref in style_refs:
                 if isinstance(ref, str):
                     normalized_refs.append(
@@ -551,7 +551,7 @@ class KreaImageGenProvider(ImageGenProvider):
         }
         interval = _POLL_INITIAL_INTERVAL
         deadline = time.monotonic() + _POLL_TIMEOUT_SECONDS
-        last_status: Optional[str] = None
+        last_status: str | None = None
 
         while True:
             await asyncio.sleep(interval)
@@ -682,7 +682,7 @@ class KreaImageGenProvider(ImageGenProvider):
         # Per Krea's job-lifecycle docs the completed payload exposes
         # ``result.urls`` (an array). Fall back to a single ``url`` field
         # for forward/backward compatibility.
-        result_image_url: Optional[str] = None
+        result_image_url: str | None = None
         urls = result.get("urls")
         if isinstance(urls, list) and urls:
             for candidate in urls:
@@ -721,7 +721,7 @@ class KreaImageGenProvider(ImageGenProvider):
         else:
             image_ref = str(saved_path)
 
-        extra: Dict[str, Any] = {
+        extra: dict[str, Any] = {
             "krea_aspect_ratio": krea_ar,
             "resolution": DEFAULT_RESOLUTION,
             "creativity": creativity,

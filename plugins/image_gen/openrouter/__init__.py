@@ -25,7 +25,7 @@ import base64
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
@@ -72,7 +72,7 @@ _MAX_REFERENCE_IMAGES = 3
 _REQUEST_TIMEOUT = 300.0
 
 
-async def _load_image_gen_config() -> Dict[str, Any]:
+async def _load_image_gen_config() -> dict[str, Any]:
     """Read the ``image_gen`` section from config.yaml (``{}`` on failure)."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -85,7 +85,7 @@ async def _load_image_gen_config() -> Dict[str, Any]:
         return {}
 
 
-async def _to_image_url_part(ref: str) -> Optional[str]:
+async def _to_image_url_part(ref: str) -> str | None:
     """Turn a reference (local path or http URL) into an ``image_url`` value.
 
     Remote URLs pass through unchanged; local files are inlined as base64 data
@@ -115,13 +115,13 @@ async def _to_image_url_part(ref: str) -> Optional[str]:
     return f"data:{mime};base64,{encoded}"
 
 
-def _extract_images(payload: Dict[str, Any]) -> List[str]:
+def _extract_images(payload: dict[str, Any]) -> list[str]:
     """Pull generated image URLs from a chat-completions response.
 
     OpenRouter returns generated images under
     ``choices[0].message.images[].image_url.url`` (typically a base64 data URI).
     """
-    out: List[str] = []
+    out: list[str] = []
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list):
         return out
@@ -142,7 +142,7 @@ def _extract_images(payload: Dict[str, Any]) -> List[str]:
 
 def _access_error_hint(
     display: str, model_id: str, env_var: str, status: int, err_msg: str
-) -> Optional[str]:
+) -> str | None:
     """A targeted hint when an access-gated OpenAI image model can't be reached.
 
     Some OpenAI image models on OpenRouter need account enablement / BYOK, so the
@@ -193,7 +193,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         runtime_name: str,
         config_key: str,
         model_env_var: str,
-        setup_schema: Dict[str, Any],
+        setup_schema: dict[str, Any],
     ) -> None:
         self._name = provider_name
         self._display = display_name
@@ -210,7 +210,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
     def display_name(self) -> str:
         return self._display
 
-    async def _resolve_runtime(self) -> Dict[str, Any]:
+    async def _resolve_runtime(self) -> dict[str, Any]:
         """Resolve ``(base_url, api_key)`` via the shared runtime resolver."""
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -224,7 +224,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             return False
         return bool(str(runtime.get("api_key") or "").strip())
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         # Both text-to-image and image-to-image (reference grounding) — the
         # latter is what makes this backend usable for pet sprite rows.
         return {
@@ -232,7 +232,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             "max_reference_images": _MAX_REFERENCE_IMAGES,
         }
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": DEFAULT_MODEL,
@@ -246,19 +246,19 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             },
         ]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return await self._resolve_model()
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return dict(self._setup_schema)
 
-    async def _resolve_model(self, explicit: Optional[str] = None) -> str:
+    async def _resolve_model(self, explicit: str | None = None) -> str:
         """Pick the image model (first of :meth:`_resolve_model_chain`)."""
         return (await self._resolve_model_chain(explicit))[0]
 
     async def _resolve_model_chain(
         self,
-        explicit: Optional[str] = None,
+        explicit: str | None = None,
     ) -> list[str]:
         """Ordered model attempts for this request.
 
@@ -291,10 +291,10 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         import httpx
 
         try:
@@ -326,7 +326,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         # Collect every reference: the pet generator passes local paths via the
         # ``reference_images`` kwarg; the generic tool surface uses ``image_url``
         # / ``reference_image_urls``. Accept all three.
-        references: List[str] = []
+        references: list[str] = []
         for ref in kwargs.get("reference_images") or []:
             references.append(str(ref))
         if image_url:
@@ -334,7 +334,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         for ref in reference_image_urls or []:
             references.append(str(ref))
 
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for ref in references[:_MAX_REFERENCE_IMAGES]:
             part = await _to_image_url_part(ref)
             if part:
@@ -347,9 +347,9 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
             "X-Title": "Hermes Agent",
         }
-        last_error: Optional[Dict[str, Any]] = None
+        last_error: dict[str, Any] | None = None
         for i, model_id in enumerate(model_chain):
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "model": model_id,
                 "modalities": ["image", "text"],
                 "messages": [{"role": "user", "content": content}],
@@ -497,7 +497,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         )
 
 
-def _build_providers() -> List[OpenRouterCompatImageProvider]:
+def _build_providers() -> list[OpenRouterCompatImageProvider]:
     return [
         OpenRouterCompatImageProvider(
             provider_name="openrouter",

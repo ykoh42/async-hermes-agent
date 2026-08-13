@@ -24,7 +24,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -318,17 +318,17 @@ class HolographicMemoryProvider(MemoryProvider):
         # The on_session_end hook handles auto-extraction if configured.
         pass
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
 
-    async def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+    async def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if tool_name == "fact_store":
             return await self._handle_fact_store(args)
         elif tool_name == "fact_feedback":
             return await self._handle_fact_feedback(args)
         return tool_error(f"Unknown tool: {tool_name}")
 
-    async def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         # is_truthy_value: the config schema declares auto_extract as a string
         # enum ("false"/"true"), and a plain truthiness check treats the string
         # "false" as enabled (#57682).

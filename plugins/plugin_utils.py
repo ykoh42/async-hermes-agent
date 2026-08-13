@@ -15,7 +15,7 @@ import functools
 import inspect
 import threading
 from collections.abc import Awaitable, Callable
-from typing import Generic, Optional, TypeVar
+from typing import Generic, TypeVar
 
 __all__ = ["lazy_singleton", "SingletonSlot"]
 
@@ -73,7 +73,7 @@ class SingletonSlot(Generic[T]):
     def __init__(self) -> None:
         self._guard = threading.RLock()
         self._claim: concurrent.futures.Future[None] | None = None
-        self._value: Optional[T] = None
+        self._value: T | None = None
         self._set = False
 
     async def get(self, factory: Callable[[], Awaitable[T]]) -> T:
@@ -109,7 +109,7 @@ class SingletonSlot(Generic[T]):
                     claim.set_result(None)
                     return value
 
-    def peek(self) -> Optional[T]:
+    def peek(self) -> T | None:
         """Return the cached instance without building it (None if unset)."""
         with self._guard:
             return self._value if self._set else None

@@ -28,7 +28,6 @@ Detection notes:
 
 from __future__ import annotations
 
-from typing import Optional
 
 # Container id -> canonical file extension.
 CONTAINER_TO_EXT = {
@@ -46,7 +45,7 @@ CONTAINER_TO_EXT = {
 _MP4_AUDIO_BRANDS = (b"m4a ", b"m4b ")
 
 
-def sniff_container(data: bytes) -> Optional[str]:
+def sniff_container(data: bytes) -> str | None:
     """Return a container id from magic bytes, or ``None`` when unknown.
 
     Possible ids: ``m4a``, ``mp4``, ``ogg``, ``flac``, ``wav``, ``mp3``,

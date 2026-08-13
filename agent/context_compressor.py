@@ -23,7 +23,7 @@ import re
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
 from agent.context_engine import ContextEngine, sanitize_memory_context
@@ -157,7 +157,7 @@ _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT = (
 )
 
 
-def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _fresh_compaction_message_copy(msg: dict[str, Any]) -> dict[str, Any]:
     """Copy a message for compaction assembly without persistence markers.
 
     Live cached-gateway transcripts stamp ``_db_persisted`` during incremental
@@ -176,7 +176,7 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     return fresh
 
 
-def _template_visible_role(message: Any) -> Optional[str]:
+def _template_visible_role(message: Any) -> str | None:
     """Role as counted by strict chat-template alternation checks.
 
     Mistral-family templates (Devstral, Mistral Small 3.x, Magistral)
@@ -205,7 +205,7 @@ def _template_visible_role(message: Any) -> Optional[str]:
     return role
 
 
-def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
+def _strip_persistence_markers(messages: list[dict[str, Any]]) -> None:
     """Enforce the compaction invariant: no assembled message carries a
     session-store persistence marker.
 
@@ -443,7 +443,7 @@ def _extract_pruned_skill_names(text: str) -> list[str]:
     return names
 
 
-def _collect_ghosted_skill_names(turns: List[Dict[str, Any]]) -> list[str]:
+def _collect_ghosted_skill_names(turns: list[dict[str, Any]]) -> list[str]:
     """Skill names whose instructions are about to be lost in compaction.
 
     Covers BOTH shapes a compacted middle window can carry:
@@ -538,7 +538,7 @@ _SKILL_PRUNE_RECENT_WINDOW = 10
 
 
 def _skill_view_call_sites(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
 ) -> list[tuple[int, str]]:
     """Yield ``(message_index, skill_name)`` for every skill_view tool call."""
     sites: list[tuple[int, str]] = []
@@ -568,7 +568,7 @@ def _skill_view_call_sites(
 
 
 def _collect_protected_skill_names(
-    messages: List[Dict[str, Any]], prune_boundary: int,
+    messages: list[dict[str, Any]], prune_boundary: int,
 ) -> set[str]:
     """Skill names whose skill_view bodies must survive Phase-1 demotion.
 
@@ -991,7 +991,7 @@ def _strip_images_from_content(content: Any) -> Any:
     if not any(_is_image_part(p) for p in content):
         return content
 
-    new_parts: List[Any] = []
+    new_parts: list[Any] = []
     for p in content:
         if _is_image_part(p):
             new_parts.append({
@@ -1003,7 +1003,7 @@ def _strip_images_from_content(content: Any) -> Any:
     return new_parts
 
 
-def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _strip_historical_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replace image parts in older messages with placeholder text.
 
     The anchor is the *last* user message that has any image content. Every
@@ -1043,7 +1043,7 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         return messages
 
     changed = False
-    result: List[Dict[str, Any]] = []
+    result: list[dict[str, Any]] = []
     for i, msg in enumerate(messages):
         if i >= anchor or not isinstance(msg, dict):
             result.append(msg)
@@ -1063,7 +1063,7 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     return result if changed else messages
 
 
-def _image_part_label(part: Dict[str, Any]) -> str:
+def _image_part_label(part: dict[str, Any]) -> str:
     """Render a multimodal image part as a short text label for the summarizer.
 
     Keeps a real, referenceable URL when the image lives at an http(s)
@@ -1348,14 +1348,14 @@ class ContextCompressor(ContextEngine):
         attempt_id: str | None = None,
         session_id: str | None = None,
         trigger_source: str | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Initialize content-free per-attempt compression telemetry."""
         seed = getattr(self, "_compression_telemetry_seed", None)
         if isinstance(seed, dict):
             attempt_id = attempt_id or seed.get("attempt_id")
             session_id = session_id or seed.get("session_id")
             trigger_source = trigger_source or seed.get("trigger_source")
-        telemetry: Dict[str, Any] = {
+        telemetry: dict[str, Any] = {
             "event": "compression_attempt",
             "attempt_id": attempt_id or uuid.uuid4().hex,
             "session_id": session_id or "",
@@ -1391,9 +1391,9 @@ class ContextCompressor(ContextEngine):
     def _record_compression_regions(
         self,
         *,
-        head_messages: List[Dict[str, Any]],
-        middle_messages: List[Dict[str, Any]],
-        tail_messages: List[Dict[str, Any]],
+        head_messages: list[dict[str, Any]],
+        middle_messages: list[dict[str, Any]],
+        tail_messages: list[dict[str, Any]],
     ) -> None:
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if not isinstance(telemetry, dict):
@@ -1405,7 +1405,7 @@ class ContextCompressor(ContextEngine):
     def _record_aux_compression_call(
         self,
         *,
-        prompt_messages: List[Dict[str, Any]],
+        prompt_messages: list[dict[str, Any]],
         max_tokens: int | None,
         duration_ms: int,
         aux_provider: str | None = None,
@@ -1554,7 +1554,7 @@ class ContextCompressor(ContextEngine):
     async def on_session_end(
         self,
         session_id: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> None:
         """Clear all per-session compaction state at a real session boundary.
 
@@ -1773,7 +1773,7 @@ class ContextCompressor(ContextEngine):
         self,
         *,
         refresh: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return the live compression-failure cooldown for the bound session."""
         if refresh:
             self._last_cooldown_refresh_was_authoritative = None
@@ -1836,7 +1836,7 @@ class ContextCompressor(ContextEngine):
     def _record_compression_failure_cooldown(
         self,
         cooldown_seconds: float,
-        error: Optional[str],
+        error: str | None,
     ) -> None:
         cooldown_until = time.time() + cooldown_seconds
         self._summary_failure_cooldown_until = time.monotonic() + cooldown_seconds
@@ -2086,7 +2086,7 @@ class ContextCompressor(ContextEngine):
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
-        summary_model_override: str = None,
+        summary_model_override: str | None = None,
         base_url: str = "",
         api_key: str = "",
         config_context_length: int | None = None,
@@ -2229,11 +2229,11 @@ class ContextCompressor(ContextEngine):
         self._session_id: str = ""
 
         # Stores the previous compaction summary for iterative updates
-        self._previous_summary: Optional[str] = None
+        self._previous_summary: str | None = None
         # Provenance for the rolling summary. A compaction handoff can carry
         # role="user" solely to satisfy provider alternation, so role alone
         # cannot prove that a human-authored turn ever existed.
-        self._summary_has_user_turn: Optional[bool] = None
+        self._summary_has_user_turn: bool | None = None
         # Anti-thrashing: track whether last compression was effective
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
@@ -2261,7 +2261,7 @@ class ContextCompressor(ContextEngine):
         # a refresh must then treat an empty durable row as unknown, not
         # cleared (see get_active_compression_failure_cooldown).
         self._cooldown_persist_failed: bool = False
-        self._last_summary_error: Optional[str] = None
+        self._last_summary_error: str | None = None
         # When summary generation fails and a static fallback is inserted,
         # record how many turns were unrecoverably dropped so callers
         # (gateway hygiene, /compress) can surface a visible warning.
@@ -2294,13 +2294,13 @@ class ContextCompressor(ContextEngine):
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
-        self._last_aux_model_failure_error: Optional[str] = None
-        self._last_aux_model_failure_model: Optional[str] = None
-        self._last_compression_telemetry: Optional[Dict[str, Any]] = None
-        self._active_compression_telemetry: Optional[Dict[str, Any]] = None
-        self._compression_telemetry_seed: Optional[Dict[str, Any]] = None
+        self._last_aux_model_failure_error: str | None = None
+        self._last_aux_model_failure_model: str | None = None
+        self._last_compression_telemetry: dict[str, Any] | None = None
+        self._active_compression_telemetry: dict[str, Any] | None = None
+        self._compression_telemetry_seed: dict[str, Any] | None = None
 
-    def update_from_response(self, usage: Dict[str, Any]):
+    def update_from_response(self, usage: dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
@@ -2410,7 +2410,7 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    async def should_compress(self, prompt_tokens: int = None) -> bool:
+    async def should_compress(self, prompt_tokens: int | None = None) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -2426,7 +2426,7 @@ class ContextCompressor(ContextEngine):
         return decision
 
     async def should_compress_info(
-        self, prompt_tokens: int = None
+        self, prompt_tokens: int | None = None
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
 
@@ -2613,10 +2613,10 @@ class ContextCompressor(ContextEngine):
     # ------------------------------------------------------------------
 
     def _prune_old_tool_results(
-        self, messages: List[Dict[str, Any]], protect_tail_count: int,
+        self, messages: list[dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
         min_prune_chars: int = 200,
-    ) -> tuple[List[Dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
         Instead of a generic placeholder, generates a summary like::
@@ -2650,7 +2650,7 @@ class ContextCompressor(ContextEngine):
         pruned = 0
 
         # Build index: tool_call_id -> (tool_name, arguments_json)
-        call_id_to_tool: Dict[str, tuple] = {}
+        call_id_to_tool: dict[str, tuple] = {}
         for msg in result:
             if msg.get("role") == "assistant":
                 for tc in msg.get("tool_calls") or []:
@@ -2899,8 +2899,8 @@ class ContextCompressor(ContextEngine):
         return result, pruned
 
     def prune_tool_results_only(
-        self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
-    ) -> tuple[List[Dict[str, Any]], int]:
+        self, messages: list[dict[str, Any]], current_tokens: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
         """Deterministic, no-LLM tool-result prune for the cost-oriented path.
 
         Runs the Phase-1 prune (``_prune_old_tool_results``) WITHOUT the
@@ -2971,7 +2971,7 @@ class ContextCompressor(ContextEngine):
     # Summarization
     # ------------------------------------------------------------------
 
-    def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
+    def _compute_summary_budget(self, turns_to_summarize: list[dict[str, Any]]) -> int:
         """Scale summary token budget with the amount of content being compressed.
 
         The maximum scales with the model's context window (5% of context,
@@ -2995,7 +2995,7 @@ class ContextCompressor(ContextEngine):
     # carries the full rationale) so subclasses/tests can override per-class.
     _SUMMARY_INPUT_MAX_CHARS = _SUMMARY_INPUT_MAX_CHARS
 
-    def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
+    def _serialize_for_summary(self, turns: list[dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
         Includes tool call arguments and result content (up to
@@ -3085,7 +3085,7 @@ class ContextCompressor(ContextEngine):
 
     def _build_static_fallback_summary(
         self,
-        turns_to_summarize: List[Dict[str, Any]],
+        turns_to_summarize: list[dict[str, Any]],
         reason: str | None = None,
     ) -> str:
         """Build a deterministic handoff when the LLM summarizer is unavailable.
@@ -3351,10 +3351,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     async def _generate_summary(
         self,
-        turns_to_summarize: List[Dict[str, Any]],
-        focus_topic: Optional[str] = None,
+        turns_to_summarize: list[dict[str, Any]],
+        focus_topic: str | None = None,
         memory_context: str = "",
-    ) -> Optional[str]:
+    ) -> str | None:
         """Generate a structured summary of conversation turns.
 
         Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
@@ -3985,7 +3985,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
 
     @classmethod
-    def classify_summary_content(cls, content: Any) -> Optional[str]:
+    def classify_summary_content(cls, content: Any) -> str | None:
         """Classify how *content* relates to a compaction summary.
 
         Returns:
@@ -4030,7 +4030,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         return bool(message.get(COMPRESSED_SUMMARY_METADATA_KEY))
 
     @classmethod
-    def _transcript_has_real_user_turn(cls, messages: List[Dict[str, Any]]) -> bool:
+    def _transcript_has_real_user_turn(cls, messages: list[dict[str, Any]]) -> bool:
         """Return whether *messages* contain a user-authored turn.
 
         Compaction summaries can deliberately carry ``role="user"`` to keep
@@ -4144,7 +4144,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     @classmethod
     def _blank_echo_indices_after(
-        cls, messages: List[Dict[str, Any]], user_idx: int
+        cls, messages: list[dict[str, Any]], user_idx: int
     ) -> set[int]:
         """Return contiguous blank echoes safe to remove after a user event.
 
@@ -4166,8 +4166,8 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _derive_auto_focus_topic(
         cls,
-        messages: List[Dict[str, Any]],
-    ) -> Optional[str]:
+        messages: list[dict[str, Any]],
+    ) -> str | None:
         """Infer a compact focus hint from the most recent real user turns."""
         candidates: list[str] = []
         for idx in range(len(messages) - 1, -1, -1):
@@ -4199,8 +4199,8 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _latest_user_task_snapshot(
         cls,
-        messages: List[Dict[str, Any]],
-    ) -> Optional[str]:
+        messages: list[dict[str, Any]],
+    ) -> str | None:
         """Return a deterministic task-snapshot line from the newest real user turn.
 
         The LLM summarizer is allowed to compress prose, but it must not invent
@@ -4237,7 +4237,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _ground_historical_task_snapshot(
         cls,
         summary: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> str:
         """Force the task snapshot section to match a real user turn when possible."""
         snapshot = cls._latest_user_task_snapshot(messages)
@@ -4262,7 +4262,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _find_context_summaries(
         cls,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         start: int,
         end: int,
     ) -> list[tuple[int, str]]:
@@ -4283,10 +4283,10 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _find_latest_context_summary(
         cls,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         start: int,
         end: int,
-    ) -> tuple[Optional[int], str]:
+    ) -> tuple[int | None, str]:
         """Find the newest handoff summary inside a compression window."""
         summaries = cls._find_context_summaries(messages, start, end)
         if summaries:
@@ -4296,8 +4296,8 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _strip_context_summary_handoff_message(
         cls,
-        message: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
+        message: dict[str, Any],
+    ) -> dict[str, Any] | None:
         """Drop stale handoff data while preserving merged prior-tail content."""
         if not isinstance(message, dict):
             return message
@@ -4423,7 +4423,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             return tc.get("call_id", "") or tc.get("id", "") or ""
         return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
 
-    def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_tool_pairs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs after compression.
 
         Two failure modes:
@@ -4501,7 +4501,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         return messages
 
-    def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
+    def _align_boundary_forward(self, messages: list[dict[str, Any]], idx: int) -> int:
         """Push a compress-start boundary forward past any orphan tool results.
 
         If ``messages[idx]`` is a tool result, slide forward until we hit a
@@ -4513,7 +4513,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _restart_handoff_probe_bounds(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> tuple[int, int]:
         """Return the bounded transcript region that can indicate restart decay."""
         if not messages or self.protect_first_n <= 0:
@@ -4528,7 +4528,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _effective_protect_first_n(
         self,
-        messages: Optional[List[Dict[str, Any]]] = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> int:
         """``protect_first_n`` decayed across compression cycles.
 
@@ -4561,7 +4561,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return 0
         return self.protect_first_n
 
-    def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
+    def _protect_head_size(self, messages: list[dict[str, Any]]) -> int:
         """Total count of head messages to protect.
 
         ``protect_first_n`` is defined as *additional* messages protected
@@ -4586,7 +4586,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             head = 1
         return head + self._effective_protect_first_n(messages)
 
-    def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
+    def _align_boundary_backward(self, messages: list[dict[str, Any]], idx: int) -> int:
         """Pull a compress-end boundary backward to avoid splitting a
         tool_call / result group.
 
@@ -4615,7 +4615,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     # ------------------------------------------------------------------
 
     def _find_last_user_message_idx(
-        self, messages: List[Dict[str, Any]], head_end: int
+        self, messages: list[dict[str, Any]], head_end: int
     ) -> int:
         """Return the latest actionable user turn at or after *head_end*, or -1.
 
@@ -4633,7 +4633,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         return -1
 
     def _find_last_assistant_message_idx(
-        self, messages: List[Dict[str, Any]], head_end: int
+        self, messages: list[dict[str, Any]], head_end: int
     ) -> int:
         """Return the index of the last user-visible assistant reply at or
         after *head_end*, or -1.
@@ -4685,7 +4685,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _ensure_last_assistant_message_in_tail(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         cut_idx: int,
         head_end: int,
     ) -> int:
@@ -4743,7 +4743,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _ensure_last_user_message_in_tail(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         cut_idx: int,
         head_end: int,
     ) -> int:
@@ -4817,7 +4817,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _ensure_last_n_user_messages_in_tail(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         cut_idx: int,
         head_end: int,
         n: int,
@@ -4880,7 +4880,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _find_turn_pair_end(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         user_idx: int,
     ) -> int:
         """Return the index *after* the complete turn-pair starting at *user_idx*.
@@ -4906,7 +4906,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         return idx
 
     def _find_tail_cut_by_tokens(
-        self, messages: List[Dict[str, Any]], head_end: int,
+        self, messages: list[dict[str, Any]], head_end: int,
         token_budget: int | None = None,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
@@ -5048,7 +5048,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     # ContextEngine: manual /compress preflight
     # ------------------------------------------------------------------
 
-    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+    def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
         """Return True if there is a non-empty middle region to compact.
 
         Overrides the ABC default so the gateway ``/compress`` guard can
@@ -5065,7 +5065,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _resolve_compact_cursor(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         head_end: int,
         tail_start: int,
     ) -> int:
@@ -5114,10 +5114,10 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _find_one_exchange(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         start: int,
         tail_start: int,
-    ) -> Optional[tuple[int, int]]:
+    ) -> tuple[int, int] | None:
         """Find the next complete exchange starting at *start*.
 
         An exchange is one full agent turn: the first assistant message after
@@ -5204,7 +5204,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _serialize_one_exchange(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         start: int,
         end: int,
     ) -> str:
@@ -5220,7 +5220,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self,
         existing_summary: str,
         exchange_text: str,
-    ) -> List[Dict[str, str]]:
+    ) -> list[dict[str, str]]:
         """Build the prompt messages for a single-exchange micro-summary."""
         if existing_summary.strip():
             summary_block = existing_summary
@@ -5252,7 +5252,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     async def _micro_summarize_one(
         self,
         exchange_text: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Micro-summarize one exchange into the rolling summary via aux LLM.
 
         Calls the same auxiliary compression model as the batch path, with
@@ -5313,7 +5313,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     async def _defrag_rolling_summary(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> bool:
         """Re-summarize the rolling summary TEXT and rewrite the marker in place.
 
@@ -5371,10 +5371,10 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     async def _micro_compact(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         *,
         session_db: Any = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Run one round of micro-compaction on the conversation.
 
         Absorbs the oldest uncompacted exchange into the rolling summary,
@@ -5547,7 +5547,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _cursor_after_splice(
         self,
-        result: List[Dict[str, Any]],
+        result: list[dict[str, Any]],
         fallback: int,
     ) -> int:
         """Cursor position just past the summary marker in *result*.
@@ -5639,7 +5639,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     async def _persist_micro_compaction(
         self,
         session_db: Any,
-        compacted_messages: List[Dict[str, Any]],
+        compacted_messages: list[dict[str, Any]],
     ) -> None:
         """Persist the micro-compacted message set to the session DB.
 
@@ -5672,11 +5672,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _splice_micro_compact_result(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         splice_start: int,
         splice_end: int,
         supersede: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Replace *messages[splice_start:splice_end]* with a summary marker.
 
         The summary marker carries the rolling summary text and the
@@ -5774,8 +5774,8 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     @staticmethod
     def _merge_adjacent_user_turns(
-        result: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        result: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Merge consecutive plain-text real user turns left by a supersede.
 
         Dropping a superseded marker removes the assistant turn that separated
@@ -5787,7 +5787,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         from agent.turn_context import drop_stale_api_content
 
-        merged: List[Dict[str, Any]] = []
+        merged: list[dict[str, Any]] = []
         for msg in result:
             prev = merged[-1] if merged else None
             if (
@@ -5816,12 +5816,12 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     async def compress(
         self,
-        messages: List[Dict[str, Any]],
-        current_tokens: Optional[int] = None,
-        focus_topic: Optional[str] = None,
+        messages: list[dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
         force: bool = False,
         memory_context: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -6038,7 +6038,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # carries genuine prior-tail user content before the delimiter —
             # unwrap it (via the strip helper) into the window instead of
             # dropping it (#47274 interplay with the multi-fossil scan).
-            def _window_row(idx: int, msg: Dict[str, Any]):
+            def _window_row(idx: int, msg: dict[str, Any]):
                 if idx not in summary_indices:
                     return msg
                 stripped = self._strip_context_summary_handoff_message(
@@ -6303,7 +6303,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 reason=None if feasibility_skip else self._last_summary_error,
             )
 
-        tail_messages: List[Dict[str, Any]] = []
+        tail_messages: list[dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may
         # have advanced it past a summary that sat beyond compress_end
         # (#57835). summary_indices rows are already rehydrated; the strip
@@ -6332,7 +6332,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # summary as role="user" behind a ``[user, assistant(tool_calls),
         # tool]`` head — which every Mistral-strict backend rejects with a
         # Jinja alternation 500, permanently poisoning the session.
-        last_head_role: Optional[str] = "user"
+        last_head_role: str | None = "user"
         if compressed:
             last_head_role = next(
                 (
@@ -6349,7 +6349,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 None,
             )
         first_tail_role = None
-        first_tail_visible_idx: Optional[int] = None
+        first_tail_visible_idx: int | None = None
         if tail_messages:
             first_tail_visible_idx, first_tail_role = next(
                 (
@@ -6388,7 +6388,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # preserved tail, the summary MUST carry role="user" so the request
         # always has at least one user turn.
         if not _force_user_leading:
-            def _is_nonempty_user_turn(message: Dict[str, Any]) -> bool:
+            def _is_nonempty_user_turn(message: dict[str, Any]) -> bool:
                 return message.get("role") == "user" and bool(
                     _content_text_for_contains(message.get("content")).strip()
                 )

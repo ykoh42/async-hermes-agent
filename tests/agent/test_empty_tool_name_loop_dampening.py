@@ -28,6 +28,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+import pytest_asyncio
 
 # Repo root = three levels up from tests/agent/<file>.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -119,8 +120,8 @@ def _text_resp(text: str) -> dict:
     }
 
 
-@pytest.fixture()
-def agent_env(tmp_path):
+@pytest_asyncio.fixture()
+async def agent_env(tmp_path):
     """Spin up the mock provider + an isolated HERMES_HOME, yield (agent, helpers)."""
     _MockHandler.captured_requests = []
     _MockHandler.response_queue = []
@@ -148,7 +149,10 @@ def agent_env(tmp_path):
     try:
         yield agent, _MockHandler
     finally:
+        await agent.close()
         srv.shutdown()
+        srv.server_close()
+        t.join(timeout=1)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:

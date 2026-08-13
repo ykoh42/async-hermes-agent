@@ -25,7 +25,8 @@ import shutil
 
 import aiofiles.os
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Awaitable, Callable, Sequence
 
 from agent.lsp.workspace import nearest_root
 
@@ -34,7 +35,7 @@ logger = logging.getLogger("agent.lsp.servers")
 # Language IDs per LSP spec.  Used for ``textDocument/didOpen.languageId``.
 # Most servers don't care exactly, but a few (typescript-language-server,
 # vue-language-server) refuse files with the wrong ID.
-LANGUAGE_BY_EXT: Dict[str, str] = {
+LANGUAGE_BY_EXT: dict[str, str] = {
     ".py": "python",
     ".pyi": "python",
     ".ts": "typescript",
@@ -120,11 +121,11 @@ class SpawnSpec:
     marker not found, exclude marker hit, etc.).
     """
 
-    command: List[str]
+    command: list[str]
     workspace_root: str
     cwd: str
-    env: Dict[str, str] = field(default_factory=dict)
-    initialization_options: Dict[str, Any] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+    initialization_options: dict[str, Any] = field(default_factory=dict)
     seed_diagnostics_on_first_push: bool = False
 
 
@@ -143,9 +144,9 @@ class ServerDef:
     """
 
     server_id: str
-    extensions: Tuple[str, ...]
-    resolve_root: Callable[[str, str], Awaitable[Optional[str]]]
-    build_spawn: Callable[[str, "ServerContext"], Awaitable[Optional[SpawnSpec]]]
+    extensions: tuple[str, ...]
+    resolve_root: Callable[[str, str], Awaitable[str | None]]
+    build_spawn: Callable[[str, ServerContext], Awaitable[SpawnSpec | None]]
     seed_first_push: bool = False
     description: str = ""
 
@@ -166,9 +167,9 @@ class ServerContext:
 
     workspace_root: str
     install_strategy: str = "auto"  # "auto" | "manual" | "off"
-    binary_overrides: Dict[str, List[str]] = field(default_factory=dict)
-    env_overrides: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    init_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    binary_overrides: dict[str, list[str]] = field(default_factory=dict)
+    env_overrides: dict[str, dict[str, str]] = field(default_factory=dict)
+    init_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +191,7 @@ def _file_ext_or_basename(path: str) -> str:
     return base
 
 
-async def _which(*names: str) -> Optional[str]:
+async def _which(*names: str) -> str | None:
     """Return the full path of the first command found on PATH."""
     for n in names:
         path = await aiofiles.os.wrap(shutil.which)(n)
@@ -199,7 +200,7 @@ async def _which(*names: str) -> Optional[str]:
     return None
 
 
-async def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], excludes: Sequence[str] = ()) -> Optional[str]:
+async def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], excludes: Sequence[str] = ()) -> str | None:
     """Common pattern: try ``nearest_root``, fall back to workspace root.
 
     Returns ``None`` if an exclude marker matches first (server gated off).
@@ -231,7 +232,7 @@ async def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[s
 # ---------------------------------------------------------------------------
 
 
-async def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_pyright(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "pyright") or await _which(
         "pyright-langserver", "pyright"
     )
@@ -246,7 +247,7 @@ async def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
         sibling = os.path.join(os.path.dirname(bin_path), "pyright-langserver")
         if await aiofiles.os.path.exists(sibling):
             bin_path = sibling
-    init: Dict[str, Any] = {}
+    init: dict[str, Any] = {}
     # Pick the project's venv interpreter if there is one — otherwise
     # pyright defaults to "python on PATH" which is rarely the venv.
     py = await _detect_python(root)
@@ -263,7 +264,7 @@ async def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _detect_python(root: str) -> Optional[str]:
+async def _detect_python(root: str) -> str | None:
     candidates = []
     if os.environ.get("VIRTUAL_ENV"):
         candidates.append(os.environ["VIRTUAL_ENV"])
@@ -276,7 +277,7 @@ async def _detect_python(root: str) -> Optional[str]:
     return None
 
 
-async def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_typescript(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "typescript") or await _which("typescript-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -293,7 +294,7 @@ async def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec
     )
 
 
-async def _spawn_gopls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_gopls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "gopls") or await _which("gopls")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -309,7 +310,7 @@ async def _spawn_gopls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_rust_analyzer(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_rust_analyzer(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "rust-analyzer") or await _which("rust-analyzer")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -325,7 +326,7 @@ async def _spawn_rust_analyzer(root: str, ctx: ServerContext) -> Optional[SpawnS
     )
 
 
-async def _spawn_clangd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_clangd(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "clangd") or await _which("clangd")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -344,7 +345,7 @@ async def _spawn_clangd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 _BASH_SHELLCHECK_WARNED = False
 
 
-async def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_bash_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "bash-language-server") or await _which("bash-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -372,7 +373,7 @@ async def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_yaml_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_yaml_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "yaml-language-server") or await _which("yaml-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -388,7 +389,7 @@ async def _spawn_yaml_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_lua_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_lua_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "lua-language-server") or await _which("lua-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -404,7 +405,7 @@ async def _spawn_lua_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_intelephense(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_intelephense(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "intelephense") or await _which("intelephense")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -422,7 +423,7 @@ async def _spawn_intelephense(root: str, ctx: ServerContext) -> Optional[SpawnSp
     )
 
 
-async def _spawn_ocamllsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_ocamllsp(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "ocaml-lsp") or await _which("ocamllsp")
     if bin_path is None:
         return None
@@ -435,7 +436,7 @@ async def _spawn_ocamllsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_dockerfile_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_dockerfile_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "dockerfile-ls") or await _which("docker-langserver")
     if bin_path is None:
         from agent.lsp.install import try_install
@@ -451,7 +452,7 @@ async def _spawn_dockerfile_ls(root: str, ctx: ServerContext) -> Optional[SpawnS
     )
 
 
-async def _spawn_terraform_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_terraform_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "terraform-ls") or await _which("terraform-ls")
     if bin_path is None:
         return None  # terraform-ls is heavy to auto-install; require user
@@ -471,7 +472,7 @@ async def _spawn_terraform_ls(root: str, ctx: ServerContext) -> Optional[SpawnSp
     )
 
 
-async def _spawn_dart(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_dart(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "dart") or await _which("dart")
     if bin_path is None:
         return None
@@ -484,7 +485,7 @@ async def _spawn_dart(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_haskell_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_haskell_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "haskell-language-server") or await _which(
         "haskell-language-server-wrapper", "haskell-language-server"
     )
@@ -499,7 +500,7 @@ async def _spawn_haskell_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec
     )
 
 
-async def _spawn_julia(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_julia(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "julia") or await _which("julia")
     if bin_path is None:
         return None
@@ -518,7 +519,7 @@ async def _spawn_julia(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_clojure_lsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_clojure_lsp(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "clojure-lsp") or await _which("clojure-lsp")
     if bin_path is None:
         return None
@@ -531,7 +532,7 @@ async def _spawn_clojure_lsp(root: str, ctx: ServerContext) -> Optional[SpawnSpe
     )
 
 
-async def _spawn_nixd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_nixd(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "nixd") or await _which("nixd")
     if bin_path is None:
         return None
@@ -544,7 +545,7 @@ async def _spawn_nixd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_zls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_zls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "zls") or await _which("zls")
     if bin_path is None:
         return None
@@ -557,7 +558,7 @@ async def _spawn_zls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_gleam(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_gleam(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "gleam") or await _which("gleam")
     if bin_path is None:
         return None
@@ -570,7 +571,7 @@ async def _spawn_gleam(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_elixir_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_elixir_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "elixir-ls") or await _which("elixir-ls", "language_server.sh")
     if bin_path is None:
         return None
@@ -583,7 +584,7 @@ async def _spawn_elixir_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]
     )
 
 
-async def _spawn_prisma(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_prisma(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "prisma") or await _which("prisma")
     if bin_path is None:
         return None
@@ -596,7 +597,7 @@ async def _spawn_prisma(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_kotlin_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_kotlin_ls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "kotlin-language-server") or await _which(
         "kotlin-language-server"
     )
@@ -611,7 +612,7 @@ async def _spawn_kotlin_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]
     )
 
 
-async def _spawn_jdtls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_jdtls(root: str, ctx: ServerContext) -> SpawnSpec | None:
     # jdtls has a complex install flow.  We require a manual install
     # for now and look for the wrapper script that the jdtls install
     # produces.
@@ -627,7 +628,7 @@ async def _spawn_jdtls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_vue(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "vue-language-server") or await _which(
         "vue-language-server"
     )
@@ -645,7 +646,7 @@ async def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_svelte(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_svelte(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "svelte-language-server") or await _which(
         "svelteserver", "svelte-language-server"
     )
@@ -663,7 +664,7 @@ async def _spawn_svelte(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-async def _spawn_astro(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_astro(root: str, ctx: ServerContext) -> SpawnSpec | None:
     bin_path = await _resolve_override(ctx, "astro-language-server") or await _which(
         "astro-ls", "astro-language-server"
     )
@@ -684,7 +685,7 @@ async def _spawn_astro(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 _PSES_BUNDLE_WARNED = False
 
 
-async def _find_pses_bundle(ctx: ServerContext) -> Optional[str]:
+async def _find_pses_bundle(ctx: ServerContext) -> str | None:
     """Locate the PowerShellEditorServices module bundle directory.
 
     PSES ships as a GitHub release zip (not an npm/go/pip package), so
@@ -702,7 +703,7 @@ async def _find_pses_bundle(ctx: ServerContext) -> Optional[str]:
     Returns the bundle directory containing ``PowerShellEditorServices/``,
     or ``None`` when it can't be found.
     """
-    candidates: List[str] = []
+    candidates: list[str] = []
     override = ctx.binary_overrides.get("powershell")
     if override and override[0]:
         candidates.append(override[0])
@@ -732,7 +733,7 @@ async def _find_pses_bundle(ctx: ServerContext) -> Optional[str]:
     return None
 
 
-async def _spawn_powershell_es(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+async def _spawn_powershell_es(root: str, ctx: ServerContext) -> SpawnSpec | None:
     """Spawn PowerShellEditorServices over stdio.
 
     Unlike the single-binary servers, PSES is a PowerShell module driven
@@ -806,7 +807,7 @@ async def hermes_lsp_session_dir() -> str:
     return d
 
 
-async def _resolve_override(ctx: ServerContext, server_id: str) -> Optional[str]:
+async def _resolve_override(ctx: ServerContext, server_id: str) -> str | None:
     """User can pin a binary path in config."""
     override = ctx.binary_overrides.get(server_id)
     if override and override[0] and await aiofiles.os.path.exists(override[0]):
@@ -819,7 +820,7 @@ async def _resolve_override(ctx: ServerContext, server_id: str) -> Optional[str]
 # ---------------------------------------------------------------------------
 
 
-async def _root_python(file_path: str, workspace: str) -> Optional[str]:
+async def _root_python(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -827,7 +828,7 @@ async def _root_python(file_path: str, workspace: str) -> Optional[str]:
     )
 
 
-async def _root_typescript(file_path: str, workspace: str) -> Optional[str]:
+async def _root_typescript(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -844,7 +845,7 @@ async def _root_typescript(file_path: str, workspace: str) -> Optional[str]:
     )
 
 
-async def _root_go(file_path: str, workspace: str) -> Optional[str]:
+async def _root_go(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -852,15 +853,15 @@ async def _root_go(file_path: str, workspace: str) -> Optional[str]:
     )
 
 
-async def _root_rust(file_path: str, workspace: str) -> Optional[str]:
+async def _root_rust(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["Cargo.toml", "Cargo.lock"])
 
 
-async def _root_ruby(file_path: str, workspace: str) -> Optional[str]:
+async def _root_ruby(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["Gemfile"])
 
 
-async def _root_clangd(file_path: str, workspace: str) -> Optional[str]:
+async def _root_clangd(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -876,7 +877,7 @@ async def _root_yaml(file_path: str, workspace: str) -> str:
     return workspace
 
 
-async def _root_lua(file_path: str, workspace: str) -> Optional[str]:
+async def _root_lua(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -884,11 +885,11 @@ async def _root_lua(file_path: str, workspace: str) -> Optional[str]:
     )
 
 
-async def _root_php(file_path: str, workspace: str) -> Optional[str]:
+async def _root_php(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["composer.json", "composer.lock", ".php-version"])
 
 
-async def _root_ocaml(file_path: str, workspace: str) -> Optional[str]:
+async def _root_ocaml(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["dune-project", "dune-workspace", ".merlin", "opam"])
 
 
@@ -896,23 +897,23 @@ async def _root_docker(file_path: str, workspace: str) -> str:
     return workspace
 
 
-async def _root_terraform(file_path: str, workspace: str) -> Optional[str]:
+async def _root_terraform(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, [".terraform.lock.hcl", "terraform.tfstate"])
 
 
-async def _root_dart(file_path: str, workspace: str) -> Optional[str]:
+async def _root_dart(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["pubspec.yaml", "analysis_options.yaml"])
 
 
-async def _root_haskell(file_path: str, workspace: str) -> Optional[str]:
+async def _root_haskell(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["stack.yaml", "cabal.project", "hie.yaml"])
 
 
-async def _root_julia(file_path: str, workspace: str) -> Optional[str]:
+async def _root_julia(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["Project.toml", "Manifest.toml"])
 
 
-async def _root_clojure(file_path: str, workspace: str) -> Optional[str]:
+async def _root_clojure(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path, workspace, ["deps.edn", "project.clj", "shadow-cljs.edn", "bb.edn", "build.boot"]
     )
@@ -923,21 +924,21 @@ async def _root_nix(file_path: str, workspace: str) -> str:
     return found or workspace
 
 
-async def _root_zig(file_path: str, workspace: str) -> Optional[str]:
+async def _root_zig(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["build.zig"])
 
 
-async def _root_elixir(file_path: str, workspace: str) -> Optional[str]:
+async def _root_elixir(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(file_path, workspace, ["mix.exs", "mix.lock"])
 
 
-async def _root_prisma(file_path: str, workspace: str) -> Optional[str]:
+async def _root_prisma(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path, workspace, ["schema.prisma", "prisma/schema.prisma"]
     )
 
 
-async def _root_kotlin(file_path: str, workspace: str) -> Optional[str]:
+async def _root_kotlin(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -945,7 +946,7 @@ async def _root_kotlin(file_path: str, workspace: str) -> Optional[str]:
     )
 
 
-async def _root_java(file_path: str, workspace: str) -> Optional[str]:
+async def _root_java(file_path: str, workspace: str) -> str | None:
     return await _root_or_workspace(
         file_path,
         workspace,
@@ -953,7 +954,7 @@ async def _root_java(file_path: str, workspace: str) -> Optional[str]:
     )
 
 
-async def _root_powershell(file_path: str, workspace: str) -> Optional[str]:
+async def _root_powershell(file_path: str, workspace: str) -> str | None:
     # PowerShell projects rarely have a universal root marker. Use the
     # PSScriptAnalyzer settings file when present, otherwise fall back to
     # the git workspace root (nearest_root does exact-name matching only,
@@ -970,7 +971,7 @@ async def _root_powershell(file_path: str, workspace: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-SERVERS: List[ServerDef] = [
+SERVERS: list[ServerDef] = [
     ServerDef(
         server_id="pyright",
         extensions=(".py", ".pyi"),
@@ -1164,7 +1165,7 @@ SERVERS: List[ServerDef] = [
 ]
 
 
-def find_server_for_file(file_path: str) -> Optional[ServerDef]:
+def find_server_for_file(file_path: str) -> ServerDef | None:
     """Return the registry entry that handles ``file_path``, or None."""
     for srv in SERVERS:
         if srv.matches(file_path):

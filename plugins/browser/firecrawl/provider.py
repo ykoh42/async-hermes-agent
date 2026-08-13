@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict
+from typing import Any
 
 import httpx
 
@@ -66,7 +66,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
     def _api_url(self) -> str:
         return str(get_secret("FIRECRAWL_API_URL", _BASE_URL))
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         api_key = get_secret("FIRECRAWL_API_KEY")
         if not api_key:
             raise ValueError(
@@ -78,13 +78,13 @@ class FirecrawlBrowserProvider(BrowserProvider):
             "Authorization": f"Bearer {api_key}",
         }
 
-    async def create_session(self, task_id: str) -> Dict[str, object]:
+    async def create_session(self, task_id: str) -> dict[str, object]:
         try:
             ttl = int(get_secret("FIRECRAWL_BROWSER_TTL", "300"))
         except (ValueError, TypeError):
             ttl = 300
 
-        body: Dict[str, object] = {"ttl": ttl}
+        body: dict[str, object] = {"ttl": ttl}
 
         try:
             async with (await _create_httpx_client(timeout=30)) as client:
@@ -156,7 +156,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
                 "Emergency cleanup failed for Firecrawl session %s: %s", session_id, e
             )
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Firecrawl",
             "badge": "paid",

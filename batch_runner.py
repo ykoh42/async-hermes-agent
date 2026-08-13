@@ -45,7 +45,7 @@ import stat
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any
 from datetime import datetime
 import traceback
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, MofNCompleteColumn
@@ -74,7 +74,7 @@ ALL_POSSIBLE_TOOLS = set(TOOL_TO_TOOLSET_MAP.keys())
 DEFAULT_TOOL_STATS = {'count': 0, 'success': 0, 'failure': 0}
 
 
-async def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
+async def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
     """Atomically publish a JSON checkpoint without blocking batch workers."""
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
     target = str(path)
@@ -156,7 +156,7 @@ async def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
         raise
 
 
-async def _append_jsonl_line(path: Path, payload: Dict[str, Any]) -> None:
+async def _append_jsonl_line(path: Path, payload: dict[str, Any]) -> None:
     """Append one complete trajectory row before propagating cancellation.
 
     A batch shard has exactly one owning coroutine, so rows cannot interleave.
@@ -236,7 +236,7 @@ async def _finish_batch_subprocess(
 
 
 async def _run_docker_image_command(
-    argv: List[Any],
+    argv: list[Any],
     *,
     timeout: int,
     text: bool = False,
@@ -293,7 +293,7 @@ async def _run_docker_image_command(
     )
 
 
-async def _list_batch_files(directory: Path) -> List[Path]:
+async def _list_batch_files(directory: Path) -> list[Path]:
     """List batch JSONL shards without a synchronous directory glob."""
     try:
         names = await aiofiles.os.listdir(directory)
@@ -311,7 +311,7 @@ async def _list_batch_files(directory: Path) -> List[Path]:
     return sorted(paths)
 
 
-def _normalize_tool_stats(tool_stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+def _normalize_tool_stats(tool_stats: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
     """
     Normalize tool_stats to include all possible tools with consistent schema.
     
@@ -341,7 +341,7 @@ def _normalize_tool_stats(tool_stats: Dict[str, Dict[str, int]]) -> Dict[str, Di
     return normalized
 
 
-def _normalize_tool_error_counts(tool_error_counts: Dict[str, int]) -> Dict[str, int]:
+def _normalize_tool_error_counts(tool_error_counts: dict[str, int]) -> dict[str, int]:
     """
     Normalize tool_error_counts to include all possible tools.
     
@@ -365,12 +365,12 @@ def _normalize_tool_error_counts(tool_error_counts: Dict[str, int]) -> Dict[str,
     return normalized
 
 
-def _extract_tool_stats(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+def _extract_tool_stats(messages: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
     """
     Extract tool usage statistics from message history.
     
     Args:
-        messages (List[Dict]): Message history
+        messages (list[dict]): Message history
         
     Returns:
         Dict: Tool statistics with counts and success/failure rates
@@ -448,7 +448,7 @@ def _extract_tool_stats(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, i
     return tool_stats
 
 
-def _extract_reasoning_stats(messages: List[Dict[str, Any]]) -> Dict[str, int]:
+def _extract_reasoning_stats(messages: list[dict[str, Any]]) -> dict[str, int]:
     """
     Count how many assistant turns have reasoning vs no reasoning.
     
@@ -486,10 +486,10 @@ def _extract_reasoning_stats(messages: List[Dict[str, Any]]) -> Dict[str, int]:
 
 async def _process_single_prompt(
     prompt_index: int,
-    prompt_data: Dict[str, Any],
+    prompt_data: dict[str, Any],
     batch_num: int,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
+    config: dict[str, Any]
+) -> dict[str, Any]:
     """
     Process a single prompt with the agent.
     
@@ -683,7 +683,7 @@ async def _process_single_prompt(
                 clear_task_env_overrides(task_id)
 
 
-async def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
+async def _process_batch_worker(args: tuple) -> dict[str, Any]:
     """
     Worker function to process a single batch of prompts.
     
@@ -823,22 +823,22 @@ class BatchRunner:
         run_name: str,
         distribution: str = "default",
         max_iterations: int = 10,
-        base_url: str = None,
-        api_key: str = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
         model: str = "claude-opus-4-20250514",
         num_workers: int = 4,
         verbose: bool = False,
-        ephemeral_system_prompt: str = None,
+        ephemeral_system_prompt: str | None = None,
         log_prefix_chars: int = 100,
-        providers_allowed: List[str] = None,
-        providers_ignored: List[str] = None,
-        providers_order: List[str] = None,
-        provider_sort: str = None,
-        openrouter_min_coding_score: Optional[float] = None,
-        max_tokens: int = None,
-        reasoning_config: Dict[str, Any] = None,
-        prefill_messages: List[Dict[str, Any]] = None,
-        max_samples: int = None,
+        providers_allowed: list[str] | None = None,
+        providers_ignored: list[str] | None = None,
+        providers_order: list[str] | None = None,
+        provider_sort: str | None = None,
+        openrouter_min_coding_score: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        prefill_messages: list[dict[str, Any]] | None = None,
+        max_samples: int | None = None,
     ):
         """
         Initialize the batch runner.
@@ -856,13 +856,13 @@ class BatchRunner:
             verbose (bool): Enable verbose logging
             ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
             log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 20)
-            providers_allowed (List[str]): OpenRouter providers to allow (optional)
-            providers_ignored (List[str]): OpenRouter providers to ignore (optional)
-            providers_order (List[str]): OpenRouter providers to try in order (optional)
+            providers_allowed (list[str]): OpenRouter providers to allow (optional)
+            providers_ignored (list[str]): OpenRouter providers to ignore (optional)
+            providers_order (list[str]): OpenRouter providers to try in order (optional)
             provider_sort (str): Sort providers by price/throughput/latency (optional)
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning config override (e.g. {"effort": "none"} to disable thinking)
-            prefill_messages (List[Dict]): Messages to prepend as prefilled conversation context (few-shot priming).
+            prefill_messages (list[dict]): Messages to prepend as prefilled conversation context (few-shot priming).
                 NOTE: Anthropic Sonnet 4.6+ and Opus 4.6+ reject a trailing assistant-role prefill
                 (400 error).  For those models use output_config.format or structured-output
                 schemas instead.  Safe here for user-role priming and for older Claude / non-Claude models.
@@ -905,20 +905,20 @@ class BatchRunner:
         # Statistics file
         self.stats_file = self.output_dir / "statistics.json"
         
-        self.dataset: List[Dict[str, Any]] = []
-        self.batches: List[List[Tuple[int, Dict[str, Any]]]] = []
+        self.dataset: list[dict[str, Any]] = []
+        self.batches: list[list[tuple[int, dict[str, Any]]]] = []
         self._initialized = False
     
-    async def _load_dataset(self) -> List[Dict[str, Any]]:
+    async def _load_dataset(self) -> list[dict[str, Any]]:
         """
         Load dataset from JSONL file.
         
         Returns:
-            List[Dict]: List of dataset entries
+            list[dict]: List of dataset entries
         """
         dataset = []
         try:
-            async with aiofiles.open(self.dataset_file, "r", encoding="utf-8") as source:
+            async with aiofiles.open(self.dataset_file, encoding="utf-8") as source:
                 line_num = 0
                 async for line in source:
                     line_num += 1
@@ -942,7 +942,7 @@ class BatchRunner:
         
         return dataset
     
-    def _create_batches(self) -> List[List[Tuple[int, Dict[str, Any]]]]:
+    def _create_batches(self) -> list[list[tuple[int, dict[str, Any]]]]:
         """
         Split dataset into batches with indices.
         
@@ -956,7 +956,7 @@ class BatchRunner:
         
         return batches
     
-    async def _load_checkpoint(self) -> Dict[str, Any]:
+    async def _load_checkpoint(self) -> dict[str, Any]:
         """
         Load checkpoint data if it exists.
         
@@ -964,7 +964,7 @@ class BatchRunner:
             Dict: Checkpoint data with completed prompt indices
         """
         try:
-            async with aiofiles.open(self.checkpoint_file, "r", encoding="utf-8") as source:
+            async with aiofiles.open(self.checkpoint_file, encoding="utf-8") as source:
                 return json.loads(await source.read())
         except FileNotFoundError:
             return {
@@ -984,8 +984,8 @@ class BatchRunner:
     
     async def _save_checkpoint(
         self,
-        checkpoint_data: Dict[str, Any],
-        lock: Optional[asyncio.Lock] = None,
+        checkpoint_data: dict[str, Any],
+        lock: asyncio.Lock | None = None,
     ):
         """
         Save checkpoint data.
@@ -1022,7 +1022,7 @@ class BatchRunner:
         
         for batch_file in batch_files:
             try:
-                async with aiofiles.open(batch_file, "r", encoding="utf-8") as source:
+                async with aiofiles.open(batch_file, encoding="utf-8") as source:
                     async for line in source:
                         try:
                             entry = json.loads(line.strip())
@@ -1046,7 +1046,7 @@ class BatchRunner:
         
         return completed_prompts
 
-    def _filter_dataset_by_completed(self, completed_prompts: set) -> Tuple[List[Dict], List[int]]:
+    def _filter_dataset_by_completed(self, completed_prompts: set) -> tuple[list[dict], list[int]]:
         """
         Filter the dataset to exclude prompts that have already been completed.
         
@@ -1227,7 +1227,7 @@ class BatchRunner:
 
         semaphore = asyncio.Semaphore(max(1, self.num_workers))
 
-        async def run_batch(task_args: Tuple) -> Dict[str, Any]:
+        async def run_batch(task_args: tuple) -> dict[str, Any]:
             async with semaphore:
                 return await _process_batch_worker(task_args)
 
@@ -1468,29 +1468,29 @@ class BatchRunner:
 
 
 async def main(
-    dataset_file: str = None,
-    batch_size: int = None,
-    run_name: str = None,
+    dataset_file: str | None = None,
+    batch_size: int | None = None,
+    run_name: str | None = None,
     distribution: str = "default",
     model: str = "anthropic/claude-sonnet-4.6",
-    api_key: str = None,
+    api_key: str | None = None,
     base_url: str = "https://openrouter.ai/api/v1",
     max_turns: int = 10,
     num_workers: int = 4,
     resume: bool = False,
     verbose: bool = False,
     list_distributions: bool = False,
-    ephemeral_system_prompt: str = None,
+    ephemeral_system_prompt: str | None = None,
     log_prefix_chars: int = 100,
-    providers_allowed: str = None,
-    providers_ignored: str = None,
-    providers_order: str = None,
-    provider_sort: str = None,
-    max_tokens: int = None,
-    reasoning_effort: str = None,
+    providers_allowed: str | None = None,
+    providers_ignored: str | None = None,
+    providers_order: str | None = None,
+    provider_sort: str | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     reasoning_disabled: bool = False,
-    prefill_messages_file: str = None,
-    max_samples: int = None,
+    prefill_messages_file: str | None = None,
+    max_samples: int | None = None,
 ):
     """
     Run batch processing of agent prompts from a dataset.
@@ -1590,7 +1590,7 @@ async def main(
     if prefill_messages_file:
         try:
             async with aiofiles.open(
-                prefill_messages_file, "r", encoding="utf-8"
+                prefill_messages_file, encoding="utf-8"
             ) as source:
                 prefill_messages = json.loads(await source.read())
             if not isinstance(prefill_messages, list):

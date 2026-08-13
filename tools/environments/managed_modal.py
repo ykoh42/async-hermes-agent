@@ -8,7 +8,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import httpx as _httpx
 
@@ -57,7 +57,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         image: str,
         cwd: str = "/root",
         timeout: int = 60,
-        modal_sandbox_kwargs: Optional[Dict[str, Any]] = None,
+        modal_sandbox_kwargs: dict[str, Any] | None = None,
         persistent_filesystem: bool = True,
         task_id: str = "default",
     ):
@@ -106,7 +106,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         self, prepared: PreparedModalExec
     ) -> ModalExecStart:
         exec_id = str(uuid.uuid4())
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "execId": exec_id,
             "command": prepared.command,
             "cwd": prepared.cwd,
@@ -301,9 +301,9 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         method: str,
         path: str,
         *,
-        json: Dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
         timeout: int = 30,
-        extra_headers: Dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> _httpx.Response:
         headers = {
             "Authorization": f"Bearer {self._nous_user_token}",

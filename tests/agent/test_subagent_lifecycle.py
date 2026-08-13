@@ -35,6 +35,11 @@ class FakeChild:
         self.interrupt_kind = "hard"
 
 
+def test_subagent_state_preserves_legacy_stringification():
+    assert str(SubagentState.RUNNING) == "SubagentState.RUNNING"
+    assert SubagentState.RUNNING.value == "RUNNING"
+
+
 @pytest.fixture
 def lifecycle(monkeypatch):
     parent = SimpleNamespace(session_id="parent-1", enabled_toolsets=["file"])

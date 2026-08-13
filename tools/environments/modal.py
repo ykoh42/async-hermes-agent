@@ -11,7 +11,7 @@ import shlex
 import weakref
 from collections import deque
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -226,7 +226,7 @@ class ModalEnvironment(BaseEnvironment):
         image: str,
         cwd: str = "/root",
         timeout: int = 60,
-        modal_sandbox_kwargs: Optional[dict[str, Any]] = None,
+        modal_sandbox_kwargs: dict[str, Any] | None = None,
         persistent_filesystem: bool = True,
         task_id: str = "default",
     ):

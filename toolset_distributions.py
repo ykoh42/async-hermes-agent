@@ -19,7 +19,6 @@ Usage:
     all_dists = list_distributions()
 """
 
-from typing import Dict, List, Optional
 import random
 from toolsets import validate_toolset
 
@@ -214,7 +213,7 @@ DISTRIBUTIONS = {
 }
 
 
-def get_distribution(name: str) -> Optional[Dict[str, any]]:
+def get_distribution(name: str) -> dict[str, any] | None:
     """
     Get a toolset distribution by name.
     
@@ -228,7 +227,7 @@ def get_distribution(name: str) -> Optional[Dict[str, any]]:
     return DISTRIBUTIONS.get(name)
 
 
-def list_distributions() -> Dict[str, Dict]:
+def list_distributions() -> dict[str, dict]:
     """
     List all available distributions.
     
@@ -238,7 +237,7 @@ def list_distributions() -> Dict[str, Dict]:
     return DISTRIBUTIONS.copy()
 
 
-def sample_toolsets_from_distribution(distribution_name: str) -> List[str]:
+def sample_toolsets_from_distribution(distribution_name: str) -> list[str]:
     """
     Sample toolsets based on a distribution's probabilities.
     
@@ -249,7 +248,7 @@ def sample_toolsets_from_distribution(distribution_name: str) -> List[str]:
         distribution_name (str): Name of the distribution to sample from
         
     Returns:
-        List[str]: List of sampled toolset names
+        list[str]: List of sampled toolset names
         
     Raises:
         ValueError: If distribution name is not found
@@ -355,4 +354,3 @@ if __name__ == "__main__":
     print("-" * 40)
     print_distribution_info("image_gen")
     print_distribution_info("research")
-

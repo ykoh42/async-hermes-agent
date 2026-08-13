@@ -23,7 +23,7 @@ ABC method-name change.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any
 
 from agent.web_search_provider import WebSearchProvider
 from agent.ssl_verify import _create_httpx_client
@@ -38,7 +38,7 @@ class ExaWebSearchProvider(WebSearchProvider):
     """
 
     @staticmethod
-    async def _request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _request(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         from agent.web_search_provider import get_provider_env
 
         api_key = await get_provider_env("EXA_API_KEY")
@@ -85,7 +85,7 @@ class ExaWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute an Exa search.
 
         Returns ``{"success": True, "data": {"web": [{...}, ...]}}`` on
@@ -127,7 +127,7 @@ class ExaWebSearchProvider(WebSearchProvider):
             logger.warning("Exa search error: %s", exc)
             return {"success": False, "error": f"Exa search failed: {exc}"}
 
-    async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+    async def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
         """Extract content from one or more URLs via Exa.
 
         Returns a list of result dicts shaped for the legacy LLM
@@ -148,7 +148,7 @@ class ExaWebSearchProvider(WebSearchProvider):
                 {"ids": urls, "text": True},
             )
 
-            results: List[Dict[str, Any]] = []
+            results: list[dict[str, Any]] = []
             for result in response.get("results") or []:
                 content = result.get("text") or ""
                 url = result.get("url") or ""
@@ -177,7 +177,7 @@ class ExaWebSearchProvider(WebSearchProvider):
                 for u in urls
             ]
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Exa",
             "badge": "paid",

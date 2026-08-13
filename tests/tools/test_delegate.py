@@ -1142,6 +1142,10 @@ class TestDelegationReasoningEffort(unittest.IsolatedAsyncioTestCase):
 class TestDelegateEventEnum(unittest.IsolatedAsyncioTestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
+    def test_event_preserves_legacy_stringification(self):
+        assert str(DelegateEvent.TASK_PROGRESS) == "DelegateEvent.TASK_PROGRESS"
+        assert DelegateEvent.TASK_PROGRESS.value == "delegate.task_progress"
+
     def test_progress_callback_normalises_tool_started(self):
         """_build_child_progress_callback handles tool.started via enum."""
         parent = _make_mock_parent()

@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -62,7 +62,7 @@ class FalImageGenProvider(ImageGenProvider):
         except Exception:  # noqa: BLE001 — defensive; never break the picker
             return False
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         import tools.image_generation_tool as _it
         return [
             {
@@ -75,11 +75,11 @@ class FalImageGenProvider(ImageGenProvider):
             for model_id, meta in _it.FAL_MODELS.items()
         ]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         import tools.image_generation_tool as _it
         return _it.DEFAULT_MODEL
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "FAL.ai",
             "badge": "paid",
@@ -93,7 +93,7 @@ class FalImageGenProvider(ImageGenProvider):
             ],
         }
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         # Whether image-to-image is available depends on the currently-
         # selected FAL model (each model entry declares an edit_endpoint or
         # not). Report the active model's actual surface so the dynamic tool
@@ -116,10 +116,10 @@ class FalImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Generate or edit an image via the canonical FAL pipeline.
 
         Forwards prompt + aspect_ratio + image_url/reference_image_urls (and

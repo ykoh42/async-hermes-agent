@@ -47,7 +47,8 @@ import types
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any
+from collections.abc import Callable
 
 import aiofiles
 import aiofiles.os
@@ -187,7 +188,7 @@ _install_plugin_debug_handler()
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_HOOKS: Set[str] = {
+VALID_HOOKS: set[str] = {
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
@@ -227,16 +228,16 @@ ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 _NS_PARENT = "hermes_plugins"
 
 
-_ACTIVE_PLUGIN_MANAGER: contextvars.ContextVar["PluginManager | None"] = (
+_ACTIVE_PLUGIN_MANAGER: contextvars.ContextVar[PluginManager | None] = (
     contextvars.ContextVar("active_plugin_manager", default=None)
 )
 _PLUGIN_REGISTRATION_TARGET: contextvars.ContextVar[
-    tuple["PluginManager", str] | None
+    tuple[PluginManager, str] | None
 ] = contextvars.ContextVar("plugin_registration_target", default=None)
 _PLUGIN_MANAGERS: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[str, "PluginManager"]
+    asyncio.AbstractEventLoop, dict[str, PluginManager]
 ] = weakref.WeakKeyDictionary()
-_PLUGIN_MANAGER_INSTANCES: weakref.WeakSet["PluginManager"] = weakref.WeakSet()
+_PLUGIN_MANAGER_INSTANCES: weakref.WeakSet[PluginManager] = weakref.WeakSet()
 _PLUGIN_MANAGER_GUARD = threading.RLock()
 
 
@@ -314,7 +315,7 @@ def _env_enabled(name: str) -> bool:
     return env_var_enabled(name)
 
 
-async def _get_disabled_plugins(config: Optional[dict] = None) -> set:
+async def _get_disabled_plugins(config: dict | None = None) -> set:
     """Read the disabled plugins list from config.yaml.
 
     Kept for backward compat and explicit deny-list semantics. A plugin
@@ -332,7 +333,7 @@ async def _get_disabled_plugins(config: Optional[dict] = None) -> set:
         return set()
 
 
-async def _get_enabled_plugins(config: Optional[dict] = None) -> Optional[set]:
+async def _get_enabled_plugins(config: dict | None = None) -> set | None:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
@@ -368,7 +369,7 @@ async def _get_enabled_plugins(config: Optional[dict] = None) -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_KINDS: set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
 
 
 @dataclass
@@ -379,11 +380,11 @@ class PluginManifest:
     version: str = ""
     description: str = ""
     author: str = ""
-    requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
-    provides_tools: List[str] = field(default_factory=list)
-    provides_hooks: List[str] = field(default_factory=list)
+    requires_env: list[str | dict[str, Any]] = field(default_factory=list)
+    provides_tools: list[str] = field(default_factory=list)
+    provides_hooks: list[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
-    path: Optional[str] = None
+    path: str | None = None
     # Plugin kind — see plugins.py module docstring for semantics.
     # ``standalone`` (default): hooks/tools of its own; opt-in via
     #                           ``plugins.enabled``.
@@ -408,13 +409,13 @@ class LoadedPlugin:
     """Runtime state for a single loaded plugin."""
 
     manifest: PluginManifest
-    module: Optional[types.ModuleType] = None
-    tools_registered: List[str] = field(default_factory=list)
-    hooks_registered: List[str] = field(default_factory=list)
-    middleware_registered: List[str] = field(default_factory=list)
-    commands_registered: List[str] = field(default_factory=list)
+    module: types.ModuleType | None = None
+    tools_registered: list[str] = field(default_factory=list)
+    hooks_registered: list[str] = field(default_factory=list)
+    middleware_registered: list[str] = field(default_factory=list)
+    commands_registered: list[str] = field(default_factory=list)
     enabled: bool = False
-    error: Optional[str] = None
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +425,7 @@ class LoadedPlugin:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(self, manifest: PluginManifest, manager: PluginManager):
         self.manifest = manifest
         self._manager = manager
         self._profile_context: tuple[Path | None, Path | None] | None = None
@@ -894,7 +895,7 @@ class PluginContext:
         *,
         display_name: str,
         description: str,
-        defaults: Optional[Dict[str, Any]] = None,
+        defaults: dict[str, Any] | None = None,
     ) -> None:
         """Register a plugin-defined auxiliary LLM task.
 
@@ -973,7 +974,7 @@ class PluginContext:
 
         # Normalize defaults — plugin owns the schema, but we ensure routing
         # fields exist with sensible types so consumers don't crash.
-        merged_defaults: Dict[str, Any] = {
+        merged_defaults: dict[str, Any] = {
             "provider": "auto",
             "model": "",
             "base_url": "",
@@ -1099,22 +1100,22 @@ class PluginManager:
         self._loop_finalizer: weakref.finalize | None = None
         _PLUGIN_MANAGER_INSTANCES.add(self)
         self._module_namespace = _NS_PARENT
-        self._owned_module_names: Set[str] = set()
-        self._bound_module_names: Set[str] = set()
-        self._plugins: Dict[str, LoadedPlugin] = {}
-        self._hooks: Dict[str, List[Callable]] = {}
-        self._middleware: Dict[str, List[Callable]] = {}
-        self._plugin_tool_names: Set[str] = set()
+        self._owned_module_names: set[str] = set()
+        self._bound_module_names: set[str] = set()
+        self._plugins: dict[str, LoadedPlugin] = {}
+        self._hooks: dict[str, list[Callable]] = {}
+        self._middleware: dict[str, list[Callable]] = {}
+        self._plugin_tool_names: set[str] = set()
         self._context_engine = None  # Set by a plugin via register_context_engine()
-        self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        self._plugin_commands: dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
-        self._plugin_skills: Dict[str, Dict[str, Any]] = {}
+        self._plugin_skills: dict[str, dict[str, Any]] = {}
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
-        self._aux_tasks: Dict[str, Dict[str, Any]] = {}
-        self._config: Dict[str, Any] = {}
+        self._aux_tasks: dict[str, dict[str, Any]] = {}
+        self._config: dict[str, Any] = {}
         self._profile_context: tuple[Path | None, Path | None] | None = None
         self._discovery_lock = asyncio.Lock()
 
@@ -1207,7 +1208,7 @@ class PluginManager:
             logger.debug("Plugin profile resolution failed", exc_info=True)
             self._profile_context = (None, None)
         self._config = await load_config_readonly()
-        manifests: List[PluginManifest] = []
+        manifests: list[PluginManifest] = []
 
         # 1. Bundled plugins (<repo>/plugins/<name>/)
         #
@@ -1267,7 +1268,7 @@ class PluginManager:
         enabled = await _get_enabled_plugins(
             self._config
         )  # None = opt-in default (nothing enabled)
-        winners: Dict[str, PluginManifest] = {}
+        winners: dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
         for manifest in winners.values():
@@ -1331,8 +1332,7 @@ class PluginManager:
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = (
-                    "not enabled in config (run `hermes plugins enable {}` to activate)"
-                    .format(lookup_key)
+                    f"not enabled in config (run `hermes plugins enable {lookup_key}` to activate)"
                 )
                 self._plugins[lookup_key] = loaded
                 logger.debug(
@@ -1356,8 +1356,8 @@ class PluginManager:
         self,
         path: Path,
         source: str,
-        skip_names: Optional[Set[str]] = None,
-    ) -> List[PluginManifest]:
+        skip_names: set[str] | None = None,
+    ) -> list[PluginManifest]:
         """Read ``plugin.yaml`` manifests from subdirectories of *path*.
 
         Supports two layouts, mixed freely:
@@ -1382,17 +1382,17 @@ class PluginManager:
         path: Path,
         source: str,
         *,
-        skip_names: Optional[Set[str]],
+        skip_names: set[str] | None,
         prefix: str,
         depth: int,
-    ) -> List[PluginManifest]:
+    ) -> list[PluginManifest]:
         """Recursive implementation of :meth:`_scan_directory`.
 
         ``prefix`` is the category path already accumulated ("" at root,
         "image_gen" one level in). ``depth`` is the recursion depth; we
         cap at 2 so ``<root>/a/b/c/`` is ignored.
         """
-        manifests: List[PluginManifest] = []
+        manifests: list[PluginManifest] = []
         if not await aiofiles.os.path.isdir(path):
             return manifests
 
@@ -1440,7 +1440,7 @@ class PluginManager:
         plugin_dir: Path,
         source: str,
         prefix: str,
-    ) -> Optional[PluginManifest]:
+    ) -> PluginManifest | None:
         """Parse a single ``plugin.yaml`` into a :class:`PluginManifest`.
 
         Returns ``None`` on parse failure (logs a warning).
@@ -1533,9 +1533,9 @@ class PluginManager:
     # Entry-point scanning
     # -----------------------------------------------------------------------
 
-    async def _scan_entry_points(self) -> List[PluginManifest]:
+    async def _scan_entry_points(self) -> list[PluginManifest]:
         """Check ``importlib.metadata`` for pip-installed plugins."""
-        manifests: List[PluginManifest] = []
+        manifests: list[PluginManifest] = []
         try:
             eps = await aiofiles.os.wrap(importlib.metadata.entry_points)()
             # Python 3.12+ returns a SelectableGroups; earlier returns dict
@@ -1847,7 +1847,7 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    async def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    async def invoke_hook(self, hook_name: str, **kwargs: Any) -> list[Any]:
         """Invoke lifecycle hooks through the native async plugin contract.
 
         An async agent cannot safely guess whether a third-party synchronous
@@ -1856,7 +1856,7 @@ class PluginManager:
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
-        results: List[Any] = []
+        results: list[Any] = []
         for callback in callbacks:
             try:
                 if not inspect.iscoroutinefunction(callback):
@@ -1886,10 +1886,10 @@ class PluginManager:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
 
-    async def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
+    async def invoke_middleware(self, kind: str, **kwargs: Any) -> list[Any]:
         """Invoke coroutine middleware callbacks registered for *kind*."""
         callbacks = self._middleware.get(kind, [])
-        results: List[Any] = []
+        results: list[Any] = []
         for callback in callbacks:
             try:
                 if not inspect.iscoroutinefunction(callback):
@@ -1915,9 +1915,9 @@ class PluginManager:
     # Introspection
     # -----------------------------------------------------------------------
 
-    def list_plugins(self) -> List[Dict[str, Any]]:
+    def list_plugins(self) -> list[dict[str, Any]]:
         """Return a list of info dicts for all discovered plugins."""
-        result: List[Dict[str, Any]] = []
+        result: list[dict[str, Any]] = []
         for key, loaded in sorted(self._plugins.items()):
             result.append(
                 {
@@ -1941,12 +1941,12 @@ class PluginManager:
     # Plugin skill lookups
     # -----------------------------------------------------------------------
 
-    def find_plugin_skill(self, qualified_name: str) -> Optional[Path]:
+    def find_plugin_skill(self, qualified_name: str) -> Path | None:
         """Return the ``Path`` to a plugin skill's SKILL.md, or ``None``."""
         entry = self._plugin_skills.get(qualified_name)
         return entry["path"] if entry else None
 
-    def list_plugin_skills(self, plugin_name: str) -> List[str]:
+    def list_plugin_skills(self, plugin_name: str) -> list[str]:
         """Return sorted bare names of all skills registered by *plugin_name*."""
         prefix = f"{plugin_name}:"
         return sorted(
@@ -1964,7 +1964,7 @@ class PluginManager:
 # Module-level singleton & convenience functions
 # ---------------------------------------------------------------------------
 
-_plugin_manager: Optional[PluginManager] = None
+_plugin_manager: PluginManager | None = None
 
 
 def get_plugin_manager() -> PluginManager:
@@ -2041,13 +2041,13 @@ class _PluginContractError(RuntimeError):
     """Raised when an unconverted plugin reaches the native async runtime."""
 
 
-async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+async def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Await native lifecycle hooks without a sync compatibility bridge."""
     await discover_plugins()
     return await get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
-async def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
+async def invoke_middleware(kind: str, **kwargs: Any) -> list[Any]:
     """Invoke registered middleware callbacks through the native async contract."""
     await discover_plugins()
     return await get_plugin_manager().invoke_middleware(kind, **kwargs)
@@ -2068,7 +2068,7 @@ def has_hook(hook_name: str) -> bool:
 
 
 _thread_tool_whitelist: contextvars.ContextVar[
-    tuple[Optional[Set[str]], str]
+    tuple[set[str] | None, str]
 ] = contextvars.ContextVar(
     "thread_tool_whitelist",
     default=(None, "Tool '{tool_name}' denied"),
@@ -2076,7 +2076,7 @@ _thread_tool_whitelist: contextvars.ContextVar[
 
 
 def set_thread_tool_whitelist(
-    allowed: Optional[Set[str]],
+    allowed: set[str] | None,
     deny_msg_fmt: str = (
         "Tool '{tool_name}' denied: not in this thread's tool whitelist"
     ),
@@ -2092,12 +2092,12 @@ def clear_thread_tool_whitelist() -> None:
 
 @dataclass(frozen=True)
 class _PreToolCallDirective:
-    action: Optional[str] = None
-    message: Optional[str] = None
-    rule_key: Optional[str] = None
+    action: str | None = None
+    message: str | None = None
+    rule_key: str | None = None
 
 
-def _first_pre_tool_call_directive(hook_results: List[Any]) -> _PreToolCallDirective:
+def _first_pre_tool_call_directive(hook_results: list[Any]) -> _PreToolCallDirective:
     """Return the first valid policy directive from hook results."""
     for result in hook_results:
         if not isinstance(result, dict):
@@ -2122,13 +2122,13 @@ def _first_pre_tool_call_directive(hook_results: List[Any]) -> _PreToolCallDirec
 
 async def _get_pre_tool_call_directive_details(
     tool_name: str,
-    args: Optional[Dict[str, Any]],
+    args: dict[str, Any] | None,
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    middleware_trace: list[dict[str, Any]] | None = None,
 ) -> _PreToolCallDirective:
     """Check async ``pre_tool_call`` hooks for a policy directive."""
     allowed, deny_msg_fmt = _thread_tool_whitelist.get()
@@ -2154,14 +2154,14 @@ async def _get_pre_tool_call_directive_details(
 
 async def get_pre_tool_call_directive(
     tool_name: str,
-    args: Optional[Dict[str, Any]],
+    args: dict[str, Any] | None,
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> tuple[Optional[str], Optional[str]]:
+    middleware_trace: list[dict[str, Any]] | None = None,
+) -> tuple[str | None, str | None]:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
     Backward-compatible public helper: returns ``(directive, message)`` where
@@ -2179,14 +2179,14 @@ async def get_pre_tool_call_directive(
 
 async def get_pre_tool_call_block_message(
     tool_name: str,
-    args: Optional[Dict[str, Any]],
+    args: dict[str, Any] | None,
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
+    middleware_trace: list[dict[str, Any]] | None = None,
+) -> str | None:
     """Return a plugin's async ``pre_tool_call`` block message, if any."""
     directive, message = await get_pre_tool_call_directive(
         tool_name,
@@ -2203,14 +2203,14 @@ async def get_pre_tool_call_block_message(
 
 async def resolve_pre_tool_block(
     tool_name: str,
-    args: Optional[Dict[str, Any]],
+    args: dict[str, Any] | None,
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
+    middleware_trace: list[dict[str, Any]] | None = None,
+) -> str | None:
     """Resolve a pre-tool policy directive to a final block message or ``None``."""
     details = await _get_pre_tool_call_directive_details(
         tool_name,
@@ -2252,8 +2252,8 @@ async def get_pre_verify_continue_message(
     coding: bool = False,
     attempt: int = 0,
     final_response: str = "",
-    changed_paths: Optional[List[str]] = None,
-) -> Optional[str]:
+    changed_paths: list[str] | None = None,
+) -> str | None:
     """Check user ``pre_verify`` hooks for a directive to keep the agent going.
 
     Fired once per turn when the agent edited code and is about to verify/finish.
@@ -2310,13 +2310,13 @@ async def get_plugin_context_engine():
     return (await _ensure_plugins_discovered())._context_engine
 
 
-async def get_plugin_command_handler(name: str) -> Optional[Callable]:
+async def get_plugin_command_handler(name: str) -> Callable | None:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = (await _ensure_plugins_discovered())._plugin_commands.get(name)
     return entry["handler"] if entry else None
 
 
-async def get_plugin_commands() -> Dict[str, dict]:
+async def get_plugin_commands() -> dict[str, dict]:
     """Return the full plugin commands dict (name → {handler, description, plugin}).
 
     Triggers idempotent plugin discovery so callers can use plugin commands
@@ -2325,7 +2325,7 @@ async def get_plugin_commands() -> Dict[str, dict]:
     return (await _ensure_plugins_discovered())._plugin_commands
 
 
-def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
+def get_plugin_auxiliary_tasks() -> list[dict[str, Any]]:
     """Return all plugin-registered auxiliary tasks as a stable-ordered list.
 
     Each entry is the registration dict from
@@ -2340,7 +2340,7 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
 
 
-def get_plugin_toolsets() -> List[tuple]:
+def get_plugin_toolsets() -> list[tuple]:
     """Return plugin toolsets as ``(key, label, description)`` tuples.
 
     Used by the ``hermes tools`` TUI so plugin-provided toolsets appear
@@ -2356,8 +2356,8 @@ def get_plugin_toolsets() -> List[tuple]:
         return []
 
     # Group plugin tool names by their toolset
-    toolset_tools: Dict[str, List[str]] = {}
-    toolset_plugin: Dict[str, LoadedPlugin] = {}
+    toolset_tools: dict[str, list[str]] = {}
+    toolset_plugin: dict[str, LoadedPlugin] = {}
     for tool_name in manager._plugin_tool_names:
         entry = registry.get_entry(tool_name)
         if not entry:

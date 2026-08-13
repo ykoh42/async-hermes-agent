@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from unittest.mock import patch
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -40,7 +40,7 @@ class FakeClient:
         self._closed = False
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
-        self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self._request_handler = None  # Callable[[str, dict], dict] | None
 
     # API matching CodexAppServerClient
     async def initialize(self, **kwargs):
@@ -48,7 +48,7 @@ class FakeClient:
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
 
-    async def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
+    async def request(self, method: str, params: dict | None = None, timeout: float = 30.0):
         self.requests.append((method, params or {}))
         if self._request_handler is not None:
             return self._request_handler(method, params or {})

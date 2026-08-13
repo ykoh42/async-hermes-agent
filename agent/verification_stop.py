@@ -10,7 +10,8 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import aiofiles.os
 

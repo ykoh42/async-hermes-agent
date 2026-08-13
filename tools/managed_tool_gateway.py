@@ -8,8 +8,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
+from datetime import UTC, datetime
+from typing import Any
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
 import aiofiles
@@ -24,7 +25,7 @@ _DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
 _DEFAULT_TOOL_GATEWAY_SCHEME = "https"
 _NOUS_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
-_TokenReader = Callable[[], Optional[str] | Awaitable[Optional[str]]]
+_TokenReader = Callable[[], str | None | Awaitable[str | None]]
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ def auth_json_path():
     return get_hermes_home() / "auth.json"
 
 
-async def _read_nous_provider_state() -> Optional[dict]:
+async def _read_nous_provider_state() -> dict | None:
     try:
         path = auth_json_path()
         if not await aiofiles.os.path.isfile(path):
@@ -58,7 +59,7 @@ async def _read_nous_provider_state() -> Optional[dict]:
     return None
 
 
-def _parse_timestamp(value: object) -> Optional[datetime]:
+def _parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     normalized = value.strip()
@@ -69,19 +70,19 @@ def _parse_timestamp(value: object) -> Optional[datetime]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _access_token_is_expiring(expires_at: object, skew_seconds: int) -> bool:
     expires = _parse_timestamp(expires_at)
     if expires is None:
         return True
-    remaining = (expires - datetime.now(timezone.utc)).total_seconds()
+    remaining = (expires - datetime.now(UTC)).total_seconds()
     return remaining <= max(0, int(skew_seconds))
 
 
-def _read_user_token_override() -> Optional[str]:
+def _read_user_token_override() -> str | None:
     """Read the gateway token from the active secret scope or process env."""
     try:
         from agent.secret_scope import get_secret
@@ -98,7 +99,7 @@ def _read_user_token_override() -> Optional[str]:
     return None
 
 
-async def peek_nous_access_token() -> Optional[str]:
+async def peek_nous_access_token() -> str | None:
     """Probe for a cached Nous token without triggering OAuth refresh."""
     explicit = _read_user_token_override()
     if explicit:
@@ -111,7 +112,7 @@ async def peek_nous_access_token() -> Optional[str]:
     return None
 
 
-async def read_nous_access_token() -> Optional[str]:
+async def read_nous_access_token() -> str | None:
     """Read or refresh a Nous Subscriber OAuth access token."""
     explicit = _read_user_token_override()
     if explicit:
@@ -163,7 +164,7 @@ def build_vendor_gateway_url(vendor: str) -> str:
     return f"{shared_scheme}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
 
 
-async def _read_token(token_reader: _TokenReader) -> Optional[str]:
+async def _read_token(token_reader: _TokenReader) -> str | None:
     token = token_reader()
     if inspect.isawaitable(token):
         token = await token
@@ -172,9 +173,9 @@ async def _read_token(token_reader: _TokenReader) -> Optional[str]:
 
 async def resolve_managed_tool_gateway(
     vendor: str,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[Callable[[], Optional[str]]] = None,
-) -> Optional[ManagedToolGatewayConfig]:
+    gateway_builder: Callable[[str], str] | None = None,
+    token_reader: Callable[[], str | None] | None = None,
+) -> ManagedToolGatewayConfig | None:
     """Resolve shared managed-tool gateway config for a vendor."""
     if not await managed_nous_tools_enabled():
         return None
@@ -196,8 +197,8 @@ async def resolve_managed_tool_gateway(
 
 async def is_managed_tool_gateway_ready(
     vendor: str,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[Callable[[], Optional[str]]] = None,
+    gateway_builder: Callable[[str], str] | None = None,
+    token_reader: Callable[[], str | None] | None = None,
 ) -> bool:
     """Return whether the gateway URL and a cached token are available."""
     return await resolve_managed_tool_gateway(
@@ -222,8 +223,8 @@ def managed_vendor_upload_path(vendor: str) -> str:
 
 def managed_vendor_endpoints(
     vendor: str,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-) -> Optional[dict]:
+    gateway_builder: Callable[[str], str] | None = None,
+) -> dict | None:
     """Return absolute managed-vendor URLs, or ``None`` when unresolved."""
     builder = gateway_builder or build_vendor_gateway_url
     try:
@@ -241,7 +242,7 @@ def managed_vendor_endpoints(
 
 def is_managed_nous_gateway_url(
     url: object,
-    gateway_builder: Optional[Callable[[str], str]] = None,
+    gateway_builder: Callable[[str], str] | None = None,
 ) -> bool:
     """Return whether a URL is on the configured Nous gateway origin."""
     if not isinstance(url, str) or not url.strip():
@@ -260,8 +261,8 @@ def is_managed_nous_gateway_url(
 
 async def managed_gateway_auth_headers(
     url: object,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[Callable[[], Optional[str]]] = None,
+    gateway_builder: Callable[[str], str] | None = None,
+    token_reader: Callable[[], str | None] | None = None,
 ) -> dict:
     """Return fresh auth headers for a managed gateway URL."""
     if not is_managed_nous_gateway_url(url, gateway_builder):
@@ -320,9 +321,9 @@ async def _close_httpx_client(client: Any, *, task_name: str) -> None:
 def build_managed_media_uploader(
     server_url: object,
     upload_path: object,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-    token_reader: Optional[Callable[[], Optional[str]]] = None,
-) -> Optional[Callable]:
+    gateway_builder: Callable[[str], str] | None = None,
+    token_reader: Callable[[], str | None] | None = None,
+) -> Callable | None:
     """Build the upstream managed-media presign/upload coroutine."""
     if not is_managed_nous_gateway_url(server_url, gateway_builder):
         return None

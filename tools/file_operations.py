@@ -32,7 +32,7 @@ import hashlib
 import tomllib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, ClassVar
+from typing import Any, ClassVar
 from pathlib import Path
 
 import aiofiles.os
@@ -54,7 +54,7 @@ def _strip_terminal_fence_leaks(text: str) -> str:
     if not text:
         return text
 
-    cleaned_lines: List[str] = []
+    cleaned_lines: list[str] = []
     for line in text.splitlines(keepends=True):
         had_terminal_wrapper = "__HERMES_FENCE_" in line or "\x1b]" in line
         cleaned = _OSC_SEQUENCE_RE.sub("", line)
@@ -66,7 +66,7 @@ def _strip_terminal_fence_leaks(text: str) -> str:
     return "".join(cleaned_lines)
 
 
-def _detect_line_ending(sample: str) -> Optional[str]:
+def _detect_line_ending(sample: str) -> str | None:
     """Return the dominant line ending in ``sample`` or None if undetermined.
 
     Looks at the first few line breaks and picks ``\\r\\n`` if any are
@@ -131,7 +131,7 @@ def _strip_bom(text: str) -> tuple[str, bool]:
     return text, False
 
 
-def _has_bom(text: Optional[str]) -> bool:
+def _has_bom(text: str | None) -> bool:
     """True if ``text`` begins with a UTF-8 BOM."""
     return bool(text) and text.startswith(_UTF8_BOM)
 
@@ -152,14 +152,14 @@ class ReadResult:
     total_lines: int = 0
     file_size: int = 0
     truncated: bool = False
-    hint: Optional[str] = None
+    hint: str | None = None
     is_binary: bool = False
     is_image: bool = False
-    base64_content: Optional[str] = None
-    mime_type: Optional[str] = None
-    dimensions: Optional[str] = None  # For images: "WIDTHxHEIGHT"
-    error: Optional[str] = None
-    similar_files: List[str] = field(default_factory=list)
+    base64_content: str | None = None
+    mime_type: str | None = None
+    dimensions: str | None = None  # For images: "WIDTHxHEIGHT"
+    error: str | None = None
+    similar_files: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
@@ -174,17 +174,17 @@ class WriteResult:
     # write (post-write verification). None when the backend couldn't
     # verify (no sha256sum). A mismatch never reaches the caller as a
     # flag — it becomes a hard error.
-    verified: Optional[bool] = None
-    lint: Optional[Dict[str, Any]] = None
+    verified: bool | None = None
+    lint: dict[str, Any] | None = None
     # Semantic diagnostics from the LSP layer, when applicable.  Kept in
     # its own field (not folded into ``lint``) so the model and any
     # downstream parsers can read syntax errors and semantic errors as
     # separate signals.  ``None`` when LSP is disabled, when the file
     # isn't in a git workspace, or when no diagnostics were introduced
     # by this edit.
-    lsp_diagnostics: Optional[str] = None
-    error: Optional[str] = None
-    warning: Optional[str] = None
+    lsp_diagnostics: str | None = None
+    error: str | None = None
+    warning: str | None = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -195,21 +195,21 @@ class PatchResult:
     """Result from patching a file."""
     success: bool = False
     diff: str = ""
-    files_modified: List[str] = field(default_factory=list)
-    files_created: List[str] = field(default_factory=list)
-    files_deleted: List[str] = field(default_factory=list)
-    lint: Optional[Dict[str, Any]] = None
+    files_modified: list[str] = field(default_factory=list)
+    files_created: list[str] = field(default_factory=list)
+    files_deleted: list[str] = field(default_factory=list)
+    lint: dict[str, Any] | None = None
     # See :class:`WriteResult.lsp_diagnostics`.
-    lsp_diagnostics: Optional[str] = None
-    error: Optional[str] = None
+    lsp_diagnostics: str | None = None
+    error: str | None = None
     # Set on success-shaped no-ops: the requested edit was already present
     # in the file, so nothing was written. Carries a short note for the
     # model explaining why no diff is included.
     no_change: bool = False
-    note: Optional[str] = None
+    note: str | None = None
 
     def to_dict(self) -> dict:
-        result: Dict[str, Any] = {"success": self.success}
+        result: dict[str, Any] = {"success": self.success}
         if self.no_change:
             result["no_change"] = True
         if self.note:
@@ -243,21 +243,21 @@ class SearchMatch:
 @dataclass
 class SearchResult:
     """Result from searching."""
-    matches: List[SearchMatch] = field(default_factory=list)
-    files: List[str] = field(default_factory=list)
-    counts: Dict[str, int] = field(default_factory=dict)
+    matches: list[SearchMatch] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    counts: dict[str, int] = field(default_factory=dict)
     total_count: int = 0
     truncated: bool = False
-    limit_reason: Optional[str] = None
-    warning: Optional[str] = None
-    error: Optional[str] = None
+    limit_reason: str | None = None
+    warning: str | None = None
+    error: str | None = None
 
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
     # the path-grouping header costs more than it saves.
     _DENSIFY_MIN_MATCHES: ClassVar[int] = 5
 
-    def _densify_matches(self) -> Optional[str]:
+    def _densify_matches(self) -> str | None:
         """Render content-mode matches as a compact, path-grouped text block.
 
         The verbose form repeats the ``{"path","line","content"}`` keys and the
@@ -275,7 +275,7 @@ class SearchResult:
         # consecutive), so grouping on path change collapses each file to a
         # single header without reordering results.
         lines: list[str] = []
-        current_path: Optional[str] = None
+        current_path: str | None = None
         for m in self.matches:
             if m.path != current_path:
                 lines.append(m.path)
@@ -344,7 +344,7 @@ class ExecuteResult:
 _SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
 
 
-def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]:
+def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, str | None]:
     """Return stdout cleaned for parsing and a limit reason for search timeouts."""
     if result.exit_code == 124:
         return _SEARCH_TIMEOUT_MARKER_RE.sub("", result.stdout), "search_timeout"
@@ -493,7 +493,7 @@ class FileOperations(ABC):
 
     @abstractmethod
     async def search(self, pattern: str, path: str = ".", target: str = "content",
-               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               file_glob: str | None = None, limit: int = 50, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """Search for content or files."""
         ...
@@ -765,7 +765,7 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
     return "\n" in pattern or bool(_REGEX_NEWLINE_ESCAPE_RE.search(pattern))
 
 
-def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
+def _is_line_oriented_newline_error(error: str | None) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     if not error:
         return False
@@ -796,7 +796,7 @@ class ShellFileOperations(FileOperations):
     This includes local, docker, singularity, ssh, modal, and daytona environments.
     """
 
-    def __init__(self, terminal_env, cwd: str = None):
+    def __init__(self, terminal_env, cwd: str | None = None):
         """
         Initialize file operations with a terminal environment.
 
@@ -829,10 +829,10 @@ class ShellFileOperations(FileOperations):
                    getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
 
         # Cache for command availability checks
-        self._command_cache: Dict[str, bool] = {}
+        self._command_cache: dict[str, bool] = {}
 
-    async def _exec(self, command: str, cwd: str = None, timeout: int = None,  # noqa: ASYNC109 - upstream API names timeout
-              stdin_data: str = None) -> ExecuteResult:
+    async def _exec(self, command: str, cwd: str | None = None, timeout: int | None = None,  # noqa: ASYNC109 - upstream API names timeout
+              stdin_data: str | None = None) -> ExecuteResult:
         """Execute command via terminal backend.
 
         Args:
@@ -870,7 +870,7 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
 
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _is_likely_binary(self, path: str, content_sample: str | None = None) -> bool:
         """
         Check if a file is likely binary.
 
@@ -1061,7 +1061,7 @@ class ShellFileOperations(FileOperations):
         )
         return await self._exec(script, stdin_data=content)
 
-    async def _detect_file_line_ending(self, path: str, pre_content: Optional[str] = None) -> Optional[str]:
+    async def _detect_file_line_ending(self, path: str, pre_content: str | None = None) -> str | None:
         """Detect the dominant line ending of a file on disk.
 
         If ``pre_content`` is already available (we just read the file
@@ -1082,7 +1082,7 @@ class ShellFileOperations(FileOperations):
             return None
         return _detect_line_ending(head_result.stdout)
 
-    async def _file_has_bom(self, path: str, pre_content: Optional[str] = None) -> bool:
+    async def _file_has_bom(self, path: str, pre_content: str | None = None) -> bool:
         """Whether the file on disk starts with a UTF-8 BOM.
 
         Uses ``pre_content`` if we already read the file (zero extra exec
@@ -1474,7 +1474,7 @@ class ShellFileOperations(FileOperations):
         # the UNION of in-process lint coverage and LSP coverage.  For
         # extensions outside both sets (binaries, opaque formats),
         # skipping the read keeps the hot path fast.
-        pre_content: Optional[str] = None
+        pre_content: str | None = None
         want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
         if want_pre:
             # Best-effort read; failure (file missing, permission) leaves
@@ -1562,7 +1562,7 @@ class ShellFileOperations(FileOperations):
         # an explicit verified flag makes that turn unnecessary, and a
         # mismatch is surfaced as a hard error instead of silent corruption
         # (mirrors patch_replace's post-write verification).
-        content_verified: Optional[bool] = None
+        content_verified: bool | None = None
         try:
             hash_cmd = f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null"
             hash_result = await self._exec(hash_cmd)
@@ -1591,7 +1591,7 @@ class ShellFileOperations(FileOperations):
         # content so the LSP layer can build a line-shift map and
         # remap baseline diagnostics into post-edit coordinates.
         # Best-effort: ``""`` is returned for any failure path.
-        lsp_diagnostics: Optional[str] = None
+        lsp_diagnostics: str | None = None
         if lint_result.success or lint_result.skipped:
             block = await self._maybe_lsp_diagnostics(
                 path, pre_content=pre_content, post_content=content
@@ -1782,7 +1782,7 @@ class ShellFileOperations(FileOperations):
         result = await apply_v4a_operations(operations, self)
         return result
 
-    async def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:
+    async def _check_lint(self, path: str, content: str | None = None) -> LintResult:
         """
         Run syntax check on a file after editing.
 
@@ -1870,8 +1870,8 @@ class ShellFileOperations(FileOperations):
             output=result.stdout.strip() if result.stdout.strip() else ""
         )
 
-    async def _check_lint_delta(self, path: str, pre_content: Optional[str],
-                          post_content: Optional[str] = None) -> LintResult:
+    async def _check_lint_delta(self, path: str, pre_content: str | None,
+                          post_content: str | None = None) -> LintResult:
         """
         Run post-write syntax lint with pre-write baseline comparison.
 
@@ -2060,8 +2060,8 @@ class ShellFileOperations(FileOperations):
         self,
         path: str,
         *,
-        pre_content: Optional[str] = None,
-        post_content: Optional[str] = None,
+        pre_content: str | None = None,
+        post_content: str | None = None,
     ) -> str:
         """Best-effort LSP semantic diagnostics for ``path``.
 
@@ -2129,7 +2129,7 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
 
     async def search(self, pattern: str, path: str = ".", target: str = "content",
-               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               file_glob: str | None = None, limit: int = 50, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """
         Search for content or files.
@@ -2201,8 +2201,8 @@ class ShellFileOperations(FileOperations):
                                         output_mode, context)
 
     async def _try_multi_path_search(self, pattern: str, path: str, target: str,
-                               file_glob: Optional[str], limit: int, offset: int,
-                               output_mode: str, context: int) -> Optional[SearchResult]:
+                               file_glob: str | None, limit: int, offset: int,
+                               output_mode: str, context: int) -> SearchResult | None:
         """Recover a not-found ``path`` that is really several paths in one string.
 
         Production trajectories show models passing "dir1 dir2 dir3" (or
@@ -2250,7 +2250,7 @@ class ShellFileOperations(FileOperations):
         return merged
 
     async def _zero_match_probe(self, pattern: str, path: str,
-                          file_glob: Optional[str]) -> Optional[str]:
+                          file_glob: str | None) -> str | None:
         """Return a hint for a 0-match content search, or None.
 
         13.9% of production content searches return zero matches and give
@@ -2456,7 +2456,7 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    async def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
+    async def _search_content(self, pattern: str, path: str, file_glob: str | None,
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search for content inside files (grep-like)."""
         # Try ripgrep first (fast), fallback to grep (slower but works)
@@ -2494,7 +2494,7 @@ class ShellFileOperations(FileOperations):
             return result
         return _maybe_warn_line_oriented_newline_pattern(result, pattern)
 
-    async def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
+    async def _search_with_rg(self, pattern: str, path: str, file_glob: str | None,
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search using ripgrep."""
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
@@ -2635,7 +2635,7 @@ class ShellFileOperations(FileOperations):
                 warning=_ml_note,
             )
 
-    async def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
+    async def _search_with_grep(self, pattern: str, path: str, file_glob: str | None,
                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
         cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches

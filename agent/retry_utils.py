@@ -8,9 +8,9 @@ rate-limited provider concurrently.
 import random
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Optional
+from typing import Any
 
 # Monotonic counter for jitter seed uniqueness within the same process.
 # Protected by a lock to avoid race conditions in concurrent retry paths
@@ -35,7 +35,7 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
 
-def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
+def parse_retry_after_seconds(value_or_headers: Any) -> float | None:
     """Parse a ``Retry-After`` value into non-negative seconds.
 
     Accepts either a raw header value (numeric string / HTTP-date / number)
@@ -83,8 +83,8 @@ def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     if when is None:
         return None
     if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
 def jittered_backoff(

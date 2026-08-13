@@ -91,6 +91,8 @@ def server_base():
         yield f"http://127.0.0.1:{port}"
     finally:
         httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=1)
 
 
 @pytest_asyncio.fixture()

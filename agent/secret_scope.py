@@ -27,7 +27,7 @@ import os
 import re
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from collections.abc import Mapping
 
 import aiofiles
 
@@ -56,7 +56,7 @@ def is_multiplex_active() -> bool:
 
 
 # ── the secret scope contextvar ──────────────────────────────────────────
-_SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
+_SECRET_SCOPE: ContextVar[Mapping[str, str] | None] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
 
@@ -72,7 +72,7 @@ class UnscopedSecretError(RuntimeError):
     """
 
 
-def set_secret_scope(secrets: Optional[Mapping[str, str]]) -> Token:
+def set_secret_scope(secrets: Mapping[str, str] | None) -> Token:
     """Install the active profile's secret mapping for the current context.
 
     Returns a token for ``reset_secret_scope``. Pass ``None`` to clear.
@@ -85,7 +85,7 @@ def reset_secret_scope(token: Token) -> None:
     _SECRET_SCOPE.reset(token)
 
 
-def current_secret_scope() -> Optional[Mapping[str, str]]:
+def current_secret_scope() -> Mapping[str, str] | None:
     """Return the active secret mapping, or None when no scope is installed."""
     return _SECRET_SCOPE.get()
 
@@ -120,7 +120,7 @@ def _is_global_env(name: str) -> bool:
     return any(name.startswith(p) for p in _GLOBAL_ENV_PREFIXES)
 
 
-def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+def get_secret(name: str, default: str | None = None) -> str | None:
     """Resolve a credential by env-var name, honoring the active profile scope.
 
     Resolution order:
@@ -200,9 +200,9 @@ def _strip_inline_comment(value: str) -> str:
     return re.split(r"\s+#", value, maxsplit=1)[0].strip()
 
 
-async def load_env_file(env_path: Path) -> Dict[str, str]:
+async def load_env_file(env_path: Path) -> dict[str, str]:
     """Parse a dotenv file without mutating the process environment."""
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
     try:
         async with aiofiles.open(env_path, encoding="utf-8-sig") as file:
             text = await file.read()
@@ -226,7 +226,7 @@ async def load_env_file(env_path: Path) -> Dict[str, str]:
     return secrets
 
 
-async def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+async def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
     """Build a fresh profile secret mapping from dotenv and source snapshots."""
     home = Path(hermes_home)
     secrets = await load_env_file(home / ".env")

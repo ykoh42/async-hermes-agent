@@ -10,7 +10,8 @@ import os
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 import aiofiles
 import aiofiles.os

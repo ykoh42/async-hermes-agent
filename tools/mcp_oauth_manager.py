@@ -42,7 +42,7 @@ import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from agent.ssl_verify import _create_httpx_client
 
@@ -97,11 +97,11 @@ class _ProviderEntry:
     """
 
     server_url: str
-    oauth_config: Optional[dict]
-    provider: Optional[Any] = None
+    oauth_config: dict | None
+    provider: Any | None = None
     last_mtime_ns: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
+    pending_401: dict[str, asyncio.Future[bool]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ class _ProviderEntry:
 # ---------------------------------------------------------------------------
 
 
-def _make_hermes_provider_class() -> Optional[type]:
+def _make_hermes_provider_class() -> type | None:
     """Lazy-import the SDK base class and return our subclass.
 
     Wrapped in a function so this module imports cleanly even when the
@@ -441,7 +441,7 @@ def _make_hermes_provider_class() -> Optional[type]:
 
 
 # Cached at import time. Tested and used by :class:`MCPOAuthManager`.
-_HERMES_PROVIDER_CLS: Optional[type] = _make_hermes_provider_class()
+_HERMES_PROVIDER_CLS: type | None = _make_hermes_provider_class()
 
 
 # ---------------------------------------------------------------------------
@@ -518,8 +518,8 @@ class MCPOAuthManager:
         self,
         server_name: str,
         server_url: str,
-        oauth_config: Optional[dict],
-    ) -> Optional[Any]:
+        oauth_config: dict | None,
+    ) -> Any | None:
         """Return/build a provider using only native async persistence.
 
         MCP transport startup runs on the agent event loop.  The historical
@@ -587,7 +587,7 @@ class MCPOAuthManager:
         self,
         server_name: str,
         entry: _ProviderEntry,
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Build an OAuth provider without blocking filesystem operations."""
         if _HERMES_PROVIDER_CLS is None:
             logger.warning(
@@ -752,7 +752,7 @@ class MCPOAuthManager:
     async def handle_401(
         self,
         server_name: str,
-        failed_access_token: Optional[str] = None,
+        failed_access_token: str | None = None,
     ) -> bool:
         """Handle a 401 from a tool call, deduplicated across concurrent callers.
 
@@ -835,7 +835,7 @@ class MCPOAuthManager:
 # ---------------------------------------------------------------------------
 
 
-_MANAGER: Optional[MCPOAuthManager] = None
+_MANAGER: MCPOAuthManager | None = None
 
 
 def get_manager() -> MCPOAuthManager:

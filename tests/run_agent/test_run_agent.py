@@ -3954,7 +3954,7 @@ class TestRunConversation:
         protect_first = agent.context_compressor.protect_first_n
         protect_last = agent.context_compressor.protect_last_n
         prefill = []
-        for _i in range((protect_first + protect_last + 4)):
+        for _i in range(protect_first + protect_last + 4):
             prefill.append({"role": "user", "content": f"q{_i}"})
             prefill.append({"role": "assistant", "content": f"a{_i}"})
 

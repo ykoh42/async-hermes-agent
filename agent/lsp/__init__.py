@@ -9,7 +9,6 @@ import os
 import threading
 import weakref
 from dataclasses import dataclass, field
-from typing import Optional
 
 import aiofiles.os
 
@@ -31,7 +30,7 @@ _lsp_scope_aliases: weakref.WeakKeyDictionary[
 class _LSPProfileState:
     """Resources shared by consumers on one loop and Hermes profile."""
 
-    service: Optional[LSPService] = None
+    service: LSPService | None = None
     service_lock_ref: weakref.ReferenceType[asyncio.Lock] | None = None
     shutdown_task: asyncio.Task[None] | None = None
     lifecycle_consumers: weakref.WeakSet[object] = field(
@@ -160,7 +159,7 @@ def _discard_scope_if_idle(
             _lsp_loop_states.pop(loop, None)
 
 
-async def get_service() -> Optional[LSPService]:
+async def get_service() -> LSPService | None:
     """Return the lazily created service for the active loop and profile."""
     scope = await _activate_lsp_scope()
     while True:

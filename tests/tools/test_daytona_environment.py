@@ -14,7 +14,7 @@ import aiofiles
 import pytest
 
 
-class _SandboxState(str, enum.Enum):
+class _SandboxState(str, enum.Enum):  # noqa: UP042 - preserve legacy str() output
     STARTED = "started"
     STOPPED = "stopped"
     ARCHIVED = "archived"
@@ -90,8 +90,8 @@ class _Snapshot:
 
 
 class _Client:
-    instances: list["_Client"] = []
-    next_instance: "_Client | None" = None
+    instances: list[_Client] = []
+    next_instance: _Client | None = None
 
     def __init__(self, config):
         self.config = config

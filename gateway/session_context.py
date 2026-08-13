@@ -7,7 +7,8 @@ concurrently without leaking routing or session identity.
 
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 _UNSET: Any = object()
 

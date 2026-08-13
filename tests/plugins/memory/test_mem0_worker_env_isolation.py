@@ -49,7 +49,7 @@ _CREDENTIAL_ENV = (
 
 
 class _FakeStdin:
-    def __init__(self, process: "_FakeProcess") -> None:
+    def __init__(self, process: _FakeProcess) -> None:
         self._process = process
 
     def write(self, data: bytes) -> None:

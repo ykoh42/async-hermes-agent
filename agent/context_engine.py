@@ -26,7 +26,7 @@ Lifecycle:
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.redact import redact_sensitive_text
 
@@ -131,7 +131,7 @@ class ContextEngine(ABC):
     # -- Core interface ----------------------------------------------------
 
     @abstractmethod
-    def update_from_response(self, usage: Dict[str, Any]) -> None:
+    def update_from_response(self, usage: dict[str, Any]) -> None:
         """Update tracked token usage from an API response.
 
         Called after every LLM call with a normalized usage dict. The legacy
@@ -143,10 +143,10 @@ class ContextEngine(ABC):
         """
 
     @abstractmethod
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int | None = None) -> bool:
         """Return True if compaction should fire this turn."""
 
-    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+    def should_compress_info(self, prompt_tokens: int | None = None) -> "tuple[bool, str | None]":
         """Return ``(should_compress, reason)``.
 
         The base implementation is backward-compatible: engines that only
@@ -162,12 +162,12 @@ class ContextEngine(ABC):
     @abstractmethod
     async def compress(
         self,
-        messages: List[Dict[str, Any]],
-        current_tokens: Optional[int] = None,
-        focus_topic: Optional[str] = None,
+        messages: list[dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
         force: bool = False,
         memory_context: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Compact the message list and return the new message list.
 
         This is the main entry point. The engine receives the full message
@@ -193,9 +193,9 @@ class ContextEngine(ABC):
 
     def prune_tool_results_only(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         current_tokens: int | None = None,
-    ) -> tuple[List[Dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """Deterministically trim old tool-result payloads without an LLM call.
 
         Runs on a low, cost-oriented trigger independent of ``should_compress``
@@ -214,12 +214,12 @@ class ContextEngine(ABC):
 
     async def select_context(
         self,
-        request_messages: List[Dict[str, Any]],
+        request_messages: list[dict[str, Any]],
         *,
-        conversation_messages: List[Dict[str, Any]] = None,
-        incoming_message: Dict[str, Any] = None,
+        conversation_messages: list[dict[str, Any]] | None = None,
+        incoming_message: dict[str, Any] | None = None,
         budget_tokens: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Optionally choose/replace the context for THIS request, pre-generation.
 
         Called every turn after the request message list is assembled and
@@ -280,8 +280,8 @@ class ContextEngine(ABC):
 
     async def on_turn_complete(
         self,
-        messages: List[Dict[str, Any]],
-        usage: Dict[str, Any] = None,
+        messages: list[dict[str, Any]],
+        usage: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         """Observe a finished user turn (post-turn ingestion / observation).
@@ -329,7 +329,7 @@ class ContextEngine(ABC):
 
     # -- Optional: pre-flight check ----------------------------------------
 
-    def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
+    def should_compress_preflight(self, messages: list[dict[str, Any]]) -> bool:
         """Quick rough check before the API call (no real token count yet).
 
         Default returns False (skip pre-flight). Override if your engine
@@ -369,7 +369,7 @@ class ContextEngine(ABC):
 
     # -- Optional: manual /compress preflight ------------------------------
 
-    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+    def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
         """Quick check: is there anything in ``messages`` that can be compacted?
 
         Used by the gateway ``/compress`` command as a preflight guard —
@@ -394,7 +394,7 @@ class ContextEngine(ABC):
     async def on_session_end(
         self,
         session_id: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> None:
         """Called at real session boundaries (CLI exit, /reset, gateway expiry).
 
@@ -414,7 +414,7 @@ class ContextEngine(ABC):
 
     # -- Optional: tools ---------------------------------------------------
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Return tool schemas this engine provides to the agent.
 
         Default returns empty list (no tools). LCM would return schemas
@@ -425,7 +425,7 @@ class ContextEngine(ABC):
     async def handle_tool_call(
         self,
         name: str,
-        args: Dict[str, Any],
+        args: dict[str, Any],
         **kwargs,
     ) -> str:
         """Handle a tool call from the agent.
@@ -441,7 +441,7 @@ class ContextEngine(ABC):
 
     # -- Optional: status / display ----------------------------------------
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict[str, Any]:
         """Return status dict for display/logging.
 
         Default returns the standard fields run_agent.py expects.

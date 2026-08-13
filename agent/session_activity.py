@@ -14,7 +14,8 @@ values are for special writers.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 ACTIVITY_DESCRIPTION_MAX = 120
 
@@ -26,7 +27,7 @@ ACTIVITY_DESCRIPTION_MAX = 120
 SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 
 
-class ActivityProvenance(str, Enum):
+class ActivityProvenance(str, Enum):  # noqa: UP042 - preserve legacy str() output
     """Where a durable/in-memory activity stamp came from."""
 
     UNKNOWN = "unknown"
@@ -35,7 +36,7 @@ class ActivityProvenance(str, Enum):
     AGENT_COMPRESSION_COOLDOWN = "agent.compression_cooldown"
 
 
-def bound_activity_description(description: Optional[str]) -> str:
+def bound_activity_description(description: str | None) -> str:
     """Clamp free-form activity text to the shared description budget."""
     text = (description or "").strip()
     if len(text) <= ACTIVITY_DESCRIPTION_MAX:
@@ -44,7 +45,7 @@ def bound_activity_description(description: Optional[str]) -> str:
 
 
 def normalize_activity_provenance(
-    provenance: Optional[ActivityProvenance | str],
+    provenance: ActivityProvenance | str | None,
 ) -> ActivityProvenance:
     """Return a known provenance, or ``UNKNOWN`` when unset/unrecognized."""
     if isinstance(provenance, ActivityProvenance):
@@ -66,11 +67,11 @@ def reset_session_activity_persist_window(agent: Any) -> None:
 
 def build_activity_snapshot(
     *,
-    last_activity_at: Optional[float],
-    last_activity_description: Optional[str],
-    last_activity_provenance: Optional[ActivityProvenance | str] = None,
-    now: Optional[float] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    last_activity_at: float | None,
+    last_activity_description: str | None,
+    last_activity_provenance: ActivityProvenance | str | None = None,
+    now: float | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the shared activity snapshot plus compatibility aliases."""
     import time as _time

@@ -24,7 +24,7 @@ import logging
 import mimetypes
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import aiofiles
 import aiofiles.os
@@ -77,7 +77,7 @@ VALID_RESOLUTIONS = {"480p", "720p"}
 MAX_REFERENCE_IMAGES = 7
 
 
-_MODELS: Dict[str, Dict[str, Any]] = {
+_MODELS: dict[str, dict[str, Any]] = {
     "grok-imagine-video": {
         "display": "Grok Imagine Video",
         "speed": "~60-240s",
@@ -105,7 +105,7 @@ _IMAGE_TO_VIDEO_COMPAT_MODEL_IDS = {
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_xai_credentials() -> Tuple[str, str]:
+async def _resolve_xai_credentials() -> tuple[str, str]:
     """Return ``(api_key, base_url)`` from the shared xAI credential resolver.
 
     Order: runtime provider (xai-oauth pool entry) → singleton ``auth.json``
@@ -140,7 +140,7 @@ def _xai_user_agent() -> str:
         return "hermes-agent/video_gen"
 
 
-def _xai_headers(api_key: str) -> Dict[str, str]:
+def _xai_headers(api_key: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -188,7 +188,7 @@ async def _image_ref_to_xai_url(value: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-async def _image_ref_to_xai_input(value: str) -> Optional[Dict[str, str]]:
+async def _image_ref_to_xai_input(value: str) -> dict[str, str] | None:
     ref = await _image_ref_to_xai_url(value)
     if not ref:
         return None
@@ -199,8 +199,8 @@ async def _image_ref_to_xai_input(value: str) -> Optional[Dict[str, str]]:
 
 
 def _xai_video_output_urls(
-    video: Dict[str, Any],
-) -> Tuple[str, Optional[str], Optional[str]]:
+    video: dict[str, Any],
+) -> tuple[str, str | None, str | None]:
     """Return ``(public_video_url, temporary_url, stored_public_url)``.
 
     ``public_video_url`` is the stored files-cdn HTTPS MP4 (``public_url``) when
@@ -251,7 +251,7 @@ async def _video_input_from_public_url(
     *,
     api_key: str,
     base_url: str,
-) -> Optional[Dict[str, str]]:
+) -> dict[str, str] | None:
     """Build xAI ``video`` input using a public HTTPS URL (``url`` field only)."""
     ref = (value or "").strip()
     if not ref:
@@ -270,9 +270,9 @@ async def _video_input_from_public_url(
 
 
 async def _normalize_reference_images(
-    reference_image_urls: Optional[List[str]],
-) -> Tuple[Optional[List[Dict[str, str]]], Optional[str]]:
-    refs: List[Dict[str, str]] = []
+    reference_image_urls: list[str] | None,
+) -> tuple[list[dict[str, str]] | None, str | None]:
+    refs: list[dict[str, str]] = []
     for url in reference_image_urls or []:
         cleaned = (url or "").strip()
         if not cleaned:
@@ -288,7 +288,7 @@ async def _normalize_reference_images(
 
 
 def _clamp_duration(
-    duration: Optional[int],
+    duration: int | None,
     *,
     has_reference_images: bool = False,
     max_seconds: int = 15,
@@ -305,7 +305,7 @@ def _clamp_duration(
 
 
 def _resolve_model_for_modality(
-    model: Optional[str],
+    model: str | None,
     *,
     modality: str,
     explicit_model: bool,
@@ -328,7 +328,7 @@ def _resolve_model_for_modality(
 
 async def _submit(
     client: httpx.AsyncClient,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     *,
     api_key: str,
     base_url: str,
@@ -357,7 +357,7 @@ async def _poll(
     base_url: str,
     timeout_seconds: int,
     poll_interval: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     elapsed = 0.0
     last_status = "queued"
     while elapsed < timeout_seconds:
@@ -401,13 +401,13 @@ class XAIVideoGenProvider(VideoGenProvider):
         api_key, _ = await _resolve_xai_credentials()
         return bool(api_key)
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [{"id": mid, **meta} for mid, meta in _MODELS.items()]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return DEFAULT_MODEL
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         # Auth resolution lives entirely in the shared ``xai_grok`` post_setup
         # hook (``hermes_cli/tools_config.py``) so the picker doesn't blindly
         # prompt for an API key when the user is already signed in via xAI
@@ -437,7 +437,7 @@ class XAIVideoGenProvider(VideoGenProvider):
             "post_setup": "xai_grok",
         }
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         return {
             "modalities": ["text", "image"],
             "aspect_ratios": sorted(VALID_ASPECT_RATIOS),
@@ -453,17 +453,17 @@ class XAIVideoGenProvider(VideoGenProvider):
         self,
         prompt: str,
         *,
-        model: Optional[str] = None,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
-        duration: Optional[int] = None,
+        model: str | None = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
+        duration: int | None = None,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         resolution: str = DEFAULT_RESOLUTION,
-        negative_prompt: Optional[str] = None,
-        audio: Optional[bool] = None,
-        seed: Optional[int] = None,
+        negative_prompt: str | None = None,
+        audio: bool | None = None,
+        seed: int | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return await run_xai_video_generation(
             prompt=prompt,
             model=model,
@@ -484,14 +484,14 @@ async def has_xai_video_credentials() -> bool:
 async def run_xai_video_generation(
     *,
     prompt: str,
-    model: Optional[str],
+    model: str | None,
     explicit_model: bool,
-    image_url: Optional[str],
-    reference_image_urls: Optional[List[str]],
-    duration: Optional[int],
+    image_url: str | None,
+    reference_image_urls: list[str] | None,
+    duration: int | None,
     aspect_ratio: str,
     resolution: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     try:
         return await _generate_xai_video(
             prompt=prompt,
@@ -517,8 +517,8 @@ async def run_xai_video_edit(
     *,
     prompt: str,
     video_url: str,
-    model: Optional[str] = None,
-) -> Dict[str, Any]:
+    model: str | None = None,
+) -> dict[str, Any]:
     try:
         return await _edit_xai_video(
             prompt=prompt, video_url=video_url, model=model
@@ -537,9 +537,9 @@ async def run_xai_video_extend(
     *,
     prompt: str,
     video_url: str,
-    duration: Optional[int] = None,
-    model: Optional[str] = None,
-) -> Dict[str, Any]:
+    duration: int | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
     try:
         return await _extend_xai_video(
             prompt=prompt,
@@ -561,10 +561,10 @@ def _unexpected_failure_response(
     exc: Exception,
     *,
     operation_label: str,
-    model: Optional[str],
+    model: str | None,
     prompt: str,
     aspect_ratio: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     logger.warning("xAI video %s unexpected failure: %s", operation_label, exc, exc_info=True)
     return error_response(
         error=f"xAI video {operation_label} failed: {exc}",
@@ -579,14 +579,14 @@ def _unexpected_failure_response(
 async def _generate_xai_video(
     *,
     prompt: str,
-    model: Optional[str],
+    model: str | None,
     explicit_model: bool,
-    image_url: Optional[str],
-    reference_image_urls: Optional[List[str]],
-    duration: Optional[int],
+    image_url: str | None,
+    reference_image_urls: list[str] | None,
+    duration: int | None,
     aspect_ratio: str,
     resolution: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     api_key, base_url = await _resolve_xai_credentials()
     if not api_key:
         return _auth_required_response(prompt)
@@ -662,7 +662,7 @@ async def _generate_xai_video(
         resolved_model = DEFAULT_TEXT_TO_VIDEO_MODEL
 
     clamped_duration = _clamp_duration(duration, has_reference_images=bool(refs))
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "model": resolved_model,
         "prompt": prompt,
         "duration": clamped_duration,
@@ -693,11 +693,11 @@ async def _run_xai_video_mutation(
     *,
     prompt: str,
     video_url: str,
-    model: Optional[str],
+    model: str | None,
     endpoint: str,
     operation: str,
     duration: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Edit or extend using a public HTTPS ``video_url`` input (``url`` on the wire)."""
     api_key, base_url = await _resolve_xai_credentials()
     if not api_key:
@@ -732,7 +732,7 @@ async def _run_xai_video_mutation(
         modality="text",
         explicit_model=bool(model),
     )
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "model": resolved_model,
         "prompt": prompt,
         "video": video_input,
@@ -758,8 +758,8 @@ async def _edit_xai_video(
     *,
     prompt: str,
     video_url: str,
-    model: Optional[str],
-) -> Dict[str, Any]:
+    model: str | None,
+) -> dict[str, Any]:
     return await _run_xai_video_mutation(
         prompt=prompt,
         video_url=video_url,
@@ -774,9 +774,9 @@ async def _extend_xai_video(
     *,
     prompt: str,
     video_url: str,
-    duration: Optional[int],
-    model: Optional[str],
-) -> Dict[str, Any]:
+    duration: int | None,
+    model: str | None,
+) -> dict[str, Any]:
     clamped_duration = _clamp_duration(
         duration,
         max_seconds=10,
@@ -792,7 +792,7 @@ async def _extend_xai_video(
     )
 
 
-def _auth_required_response(prompt: str) -> Dict[str, Any]:
+def _auth_required_response(prompt: str) -> dict[str, Any]:
     return error_response(
         error=(
             "No xAI credentials found. Sign in via `hermes auth add xai-oauth` "
@@ -809,15 +809,15 @@ async def _submit_xai_video_payload(
     api_key: str,
     base_url: str,
     endpoint: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     prompt: str,
     resolved_model: str,
     modality: str,
     aspect_ratio: str,
     duration: int,
     operation: str,
-    resolution: Optional[str] = None,
-) -> Dict[str, Any]:
+    resolution: str | None = None,
+) -> dict[str, Any]:
     httpx = _get_httpx_module()
     try:
         from tools.xai_http import (
@@ -885,7 +885,7 @@ async def _submit_xai_video_payload(
                 model=body.get("model") or resolved_model,
                 prompt=prompt,
             )
-        extra: Dict[str, Any] = {
+        extra: dict[str, Any] = {
             "request_id": request_id,
             "operation": operation,
             "storage_enabled": bool(storage_cfg.get("enabled")),

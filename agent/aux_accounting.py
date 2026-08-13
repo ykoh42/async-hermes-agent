@@ -26,12 +26,12 @@ from __future__ import annotations
 
 import logging
 from contextvars import ContextVar
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # (session_db, session_id) for the active agent turn, or None outside one.
-_accounting: ContextVar[Optional[tuple]] = ContextVar(
+_accounting: ContextVar[tuple | None] = ContextVar(
     "aux_accounting_context", default=None
 )
 
@@ -41,7 +41,7 @@ _accounting: ContextVar[Optional[tuple]] = ContextVar(
 _EXCLUDED_TASKS = frozenset({"moa_reference", "moa_aggregator"})
 
 
-def set_accounting_context(session_db: Any, session_id: Optional[str]):
+def set_accounting_context(session_db: Any, session_id: str | None):
     """Publish the active session's accounting handles for aux usage recording.
 
     Called by the agent loop at turn entry. Returns the ContextVar token so
@@ -61,17 +61,17 @@ def reset_accounting_context(token) -> None:
         _accounting.set(None)
 
 
-def get_accounting_context() -> Optional[tuple]:
+def get_accounting_context() -> tuple | None:
     """Return ``(session_db, session_id)`` for the active turn, or ``None``."""
     return _accounting.get()
 
 
 async def record_aux_usage(
     response: Any,
-    task: Optional[str],
+    task: str | None,
     *,
-    provider: Optional[str] = None,
-    base_url: Optional[str] = None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> None:
     """Record an auxiliary response's token usage against the ambient session.
 

@@ -37,21 +37,11 @@ import weakref
 import webbrowser
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import (
-    Any,
-    Awaitable,
-    Callable,
-    Dict,
-    FrozenSet,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    TYPE_CHECKING,
-)
+from typing import Any, TYPE_CHECKING
+from collections.abc import Awaitable, Callable, Iterable
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import aiofiles
@@ -183,14 +173,14 @@ class ProviderConfig:
     inference_base_url: str = ""
     client_id: str = ""
     scope: str = ""
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
     # For API-key providers: env vars to check (in priority order)
     api_key_env_vars: tuple = ()
     # Optional env var for base URL override
     base_url_env_var: str = ""
 
 
-PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
+PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "nous": ProviderConfig(
         id="nous",
         name="Nous Portal",
@@ -654,7 +644,7 @@ async def _resolve_api_key_provider_secret(
 
 async def resolve_api_key_provider_credentials(
     provider_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Async counterpart used by native provider/client resolution."""
     from providers import _ensure_provider_profiles_loaded
 
@@ -713,7 +703,7 @@ async def resolve_api_key_provider_credentials(
 
 async def resolve_external_process_provider_credentials(
     provider_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Resolve runtime details for a native-async subprocess provider."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
@@ -790,7 +780,7 @@ ZAI_ENDPOINTS = [
 async def detect_zai_endpoint(
     api_key: str,
     timeout: float = 8.0,
-) -> Optional[Dict[str, str]]:
+) -> dict[str, str] | None:
     """Probe z.ai endpoints to find one that accepts this API key.
 
     Returns {"id": ..., "base_url": ..., "model": ..., "label": ...} for the
@@ -957,7 +947,7 @@ class AuthError(RuntimeError):
         message: str,
         *,
         provider: str = "",
-        code: Optional[str] = None,
+        code: str | None = None,
         relogin_required: bool = False,
     ) -> None:
         super().__init__(message)
@@ -985,7 +975,7 @@ def is_rate_limited_auth_error(error: Exception) -> bool:
     )
 
 
-def _parse_retry_after_seconds(headers: Any) -> Optional[int]:
+def _parse_retry_after_seconds(headers: Any) -> int | None:
     """Best-effort parse of a ``Retry-After`` header into whole seconds.
 
     Thin wrapper around :func:`agent.retry_utils.parse_retry_after_seconds`
@@ -1035,7 +1025,7 @@ def _format_nous_entitlement_auth_error(error: AuthError) -> str:
     return f"{error} Check credits or billing in Nous Portal, then retry."
 
 
-def _token_fingerprint(token: Any) -> Optional[str]:
+def _token_fingerprint(token: Any) -> str | None:
     """Return a short hash fingerprint for telemetry without leaking token bytes."""
     if not isinstance(token, str):
         return None
@@ -1051,11 +1041,11 @@ def _oauth_trace_enabled() -> bool:
 
 
 def _oauth_trace(
-    event: str, *, sequence_id: Optional[str] = None, **fields: Any
+    event: str, *, sequence_id: str | None = None, **fields: Any
 ) -> None:
     if not _oauth_trace_enabled():
         return
-    payload: Dict[str, Any] = {"event": event}
+    payload: dict[str, Any] = {"event": event}
     if sequence_id:
         payload["sequence_id"] = sequence_id
     payload.update(fields)
@@ -1092,7 +1082,7 @@ async def _auth_file_path() -> Path:
     return path
 
 
-async def _global_auth_file_path() -> Optional[Path]:
+async def _global_auth_file_path() -> Path | None:
     """Return the global-root auth.json when the process is in profile mode.
 
     Returns ``None`` when the profile and global root resolve to the same
@@ -1127,7 +1117,7 @@ async def _global_auth_file_path() -> Optional[Path]:
 
 _auth_store_locks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
-    Dict[str, weakref.ReferenceType[asyncio.Lock]],
+    dict[str, weakref.ReferenceType[asyncio.Lock]],
 ] = weakref.WeakKeyDictionary()
 _auth_store_locks_guard = threading.RLock()
 
@@ -1160,7 +1150,7 @@ async def _auth_store_lock_for(target_path: Path) -> asyncio.Lock:
 
 @asynccontextmanager
 async def _auth_store_transaction(
-    target_path: Optional[Path] = None,
+    target_path: Path | None = None,
     *,
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
 ):
@@ -1204,8 +1194,8 @@ async def _auth_store_transaction(
 
 
 def _load_provider_state(
-    auth_store: Dict[str, Any], provider_id: str
-) -> Optional[Dict[str, Any]]:
+    auth_store: dict[str, Any], provider_id: str
+) -> dict[str, Any] | None:
     """Return a provider state from an already-loaded auth snapshot."""
     providers = auth_store.get("providers")
     if not isinstance(providers, dict):
@@ -1215,7 +1205,7 @@ def _load_provider_state(
 
 
 def _save_provider_state(
-    auth_store: Dict[str, Any], provider_id: str, state: Dict[str, Any]
+    auth_store: dict[str, Any], provider_id: str, state: dict[str, Any]
 ) -> None:
     providers = auth_store.setdefault("providers", {})
     if not isinstance(providers, dict):
@@ -1226,9 +1216,9 @@ def _save_provider_state(
 
 
 def _store_provider_state(
-    auth_store: Dict[str, Any],
+    auth_store: dict[str, Any],
     provider_id: str,
-    state: Dict[str, Any],
+    state: dict[str, Any],
     *,
     set_active: bool = True,
 ) -> None:
@@ -1274,7 +1264,7 @@ async def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-async def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+async def _load_auth_store(auth_file: Path | None = None) -> dict[str, Any]:
     """Load the auth store without masking transient filesystem failures."""
     auth_file = auth_file or await _auth_file_path()
     if not await aiofiles.os.path.exists(auth_file):
@@ -1345,7 +1335,7 @@ async def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-async def _load_global_auth_store() -> Dict[str, Any]:
+async def _load_global_auth_store() -> dict[str, Any]:
     """Read the profile fallback store without blocking an async turn."""
     global_path = await _global_auth_file_path()
     if global_path is None or not await aiofiles.os.path.exists(global_path):
@@ -1368,7 +1358,7 @@ async def _load_global_auth_store() -> Dict[str, Any]:
         return {}
 
 
-async def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
+async def get_provider_auth_state(provider_id: str) -> dict[str, Any] | None:
     """Return profile-local provider state, falling back to the global root."""
     auth_store = await _load_auth_store()
     state = _load_provider_state(auth_store, provider_id)
@@ -1468,7 +1458,7 @@ async def is_provider_explicitly_configured(provider_id: str) -> bool:
     return False
 
 
-async def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+async def read_credential_pool(provider_id: str | None = None) -> dict[str, Any]:
     """Awaitably read one credential-pool slice with profile shadowing."""
     auth_store, global_store = await asyncio.gather(
         _load_auth_store(),
@@ -1509,10 +1499,10 @@ _POOL_STATUS_FIELDS = (
 
 
 def _merge_disk_cooldown_state(
-    entry: Dict[str, Any],
-    disk_entry: Optional[Dict[str, Any]],
+    entry: dict[str, Any],
+    disk_entry: dict[str, Any] | None,
     provider_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
     ``write_credential_pool`` callers persist an in-memory snapshot that may
@@ -1566,15 +1556,15 @@ def _merge_disk_cooldown_state(
 
 
 async def _save_auth_store(
-    auth_store: Dict[str, Any],
-    target_path: Optional[Path] = None,
+    auth_store: dict[str, Any],
+    target_path: Path | None = None,
 ) -> Path:
     """Atomically persist ``auth.json`` through awaitable file operations."""
     auth_file = target_path or await _auth_file_path()
     await aiofiles.os.makedirs(auth_file.parent, exist_ok=True)
     await secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
-    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    auth_store["updated_at"] = datetime.now(UTC).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(
         f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
@@ -1607,9 +1597,9 @@ async def _save_auth_store(
 
 async def write_credential_pool(
     provider_id: str,
-    entries: List[Dict[str, Any]],
+    entries: list[dict[str, Any]],
     *,
-    removed_ids: Optional[Iterable[str]] = None,
+    removed_ids: Iterable[str] | None = None,
 ) -> Path:
     """Awaitably merge and persist one provider's pool slice.
 
@@ -1674,11 +1664,11 @@ async def unsuppress_credential_source(provider_id: str, source: str) -> bool:
 
 
 def _merge_credential_pool_entries(
-    auth_store: Dict[str, Any],
+    auth_store: dict[str, Any],
     provider_id: str,
-    entries: List[Dict[str, Any]],
+    entries: list[dict[str, Any]],
     *,
-    removed_ids: Optional[Iterable[str]] = None,
+    removed_ids: Iterable[str] | None = None,
 ) -> None:
     """Apply the credential-pool merge to an already locked auth snapshot."""
     removed = {rid for rid in (removed_ids or ()) if rid}
@@ -1704,7 +1694,7 @@ def _merge_credential_pool_entries(
         for entry in sanitized_entries
         if isinstance(entry, dict) and entry.get("id")
     }
-    merged: List[Dict[str, Any]] = [
+    merged: list[dict[str, Any]] = [
         _merge_disk_cooldown_state(
             entry, existing_by_id.get(entry.get("id")), provider_id
         )
@@ -1728,10 +1718,10 @@ def _merge_credential_pool_entries(
 
 
 async def resolve_provider(
-    requested: Optional[str] = None,
+    requested: str | None = None,
     *,
-    explicit_api_key: Optional[str] = None,
-    explicit_base_url: Optional[str] = None,
+    explicit_api_key: str | None = None,
+    explicit_base_url: str | None = None,
 ) -> str:
     """
     Determine which inference provider to use.
@@ -1898,7 +1888,7 @@ async def resolve_provider(
     # Determine the logged-in OAuth provider up front so the env-key loop below
     # can WARN when an exported API key preempts it (#29285 transparency). The
     # actual OAuth fallback (tier 6) still happens later if nothing else matches.
-    _oauth_active: Optional[str] = None
+    _oauth_active: str | None = None
     try:
         _store = await _load_auth_store()
         _maybe = _store.get("active_provider")
@@ -1990,7 +1980,7 @@ async def resolve_provider(
 # =============================================================================
 
 
-def _parse_iso_timestamp(value: Any) -> Optional[float]:
+def _parse_iso_timestamp(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
     text = value.strip()
@@ -2003,7 +1993,7 @@ def _parse_iso_timestamp(value: Any) -> Optional[float]:
     except Exception:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
 
 
@@ -2022,28 +2012,28 @@ def _coerce_ttl_seconds(expires_in: Any) -> int:
     return max(0, ttl)
 
 
-def _optional_base_url(value: Any) -> Optional[str]:
+def _optional_base_url(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     cleaned = value.strip().rstrip("/")
     return cleaned if cleaned else None
 
 
-_NOUS_STALE_PORTAL_HOSTS: FrozenSet[str] = frozenset({
+_NOUS_STALE_PORTAL_HOSTS: frozenset[str] = frozenset({
     "api.nousresearch.com",
 })
 
 # Allowlist of valid Nous Portal hosts. A portal_base_url outside this
 # set is treated as a misconfiguration and falls back to the default.
 # "localhost" / "127.0.0.1" are valid for local development and testing.
-_NOUS_PORTAL_ALLOWED_HOSTS: FrozenSet[str] = frozenset({
+_NOUS_PORTAL_ALLOWED_HOSTS: frozenset[str] = frozenset({
     "portal.nousresearch.com",
     "localhost",
     "127.0.0.1",
 })
 
 
-def _migrate_stale_nous_portal_url(providers: Dict[str, Any]) -> None:
+def _migrate_stale_nous_portal_url(providers: dict[str, Any]) -> None:
     nous = providers.get("nous")
     if not isinstance(nous, dict):
         return
@@ -2067,12 +2057,12 @@ def _migrate_stale_nous_portal_url(providers: Dict[str, Any]) -> None:
 # (NOUS_INFERENCE_BASE_URL) bypass validation — that's the documented
 # dev/staging escape hatch and the env source is already trusted (the
 # user set it themselves).
-_ALLOWED_NOUS_INFERENCE_HOSTS: FrozenSet[str] = frozenset({
+_ALLOWED_NOUS_INFERENCE_HOSTS: frozenset[str] = frozenset({
     "inference-api.nousresearch.com",
 })
 
 
-def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[str]:
+def _validate_nous_inference_url_from_network(url: str | None) -> str | None:
     """Validate a Portal-returned inference URL before persisting it."""
     if not isinstance(url, str):
         return None
@@ -2099,7 +2089,7 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
     return cleaned.rstrip("/")
 
 
-def _nous_inference_env_override() -> Optional[str]:
+def _nous_inference_env_override() -> str | None:
     """Return the user-set ``NOUS_INFERENCE_BASE_URL`` override, if any.
 
     This is the documented dev/staging escape hatch. The env source is
@@ -2112,7 +2102,7 @@ def _nous_inference_env_override() -> Optional[str]:
     return _optional_base_url(_get_secret("NOUS_INFERENCE_BASE_URL"))
 
 
-def _nous_portal_env_override() -> Optional[str]:
+def _nous_portal_env_override() -> str | None:
     """Return the trusted operator Portal URL override, if configured."""
     return _optional_base_url(
         _get_secret("HERMES_PORTAL_BASE_URL")
@@ -2120,7 +2110,7 @@ def _nous_portal_env_override() -> Optional[str]:
     )
 
 
-def _decode_jwt_claims(token: Any) -> Dict[str, Any]:
+def _decode_jwt_claims(token: Any) -> dict[str, Any]:
     if not isinstance(token, str) or token.count(".") != 2:
         return {}
     payload = token.split(".")[1]
@@ -2155,7 +2145,7 @@ def _nous_invoke_jwt_status(
     scope: Any = None,
     expires_at: Any = None,
     min_ttl_seconds: int = NOUS_INVOKE_JWT_MIN_TTL_SECONDS,
-) -> Optional[str]:
+) -> str | None:
     """Return None when the token can be used for inference, else a reason."""
     claims = _decode_jwt_claims(token)
     if not claims:
@@ -2197,7 +2187,7 @@ def _nous_invoke_jwt_is_usable(
 
 
 def _assert_nous_inference_jwt_usable(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     *,
     access_token: Any = None,
 ) -> None:
@@ -2221,7 +2211,7 @@ def _assert_nous_inference_jwt_usable(
 def _log_nous_invoke_jwt_selected(
     *,
     access_token: Any,
-    sequence_id: Optional[str] = None,
+    sequence_id: str | None = None,
 ) -> None:
     logger.debug("Nous inference auth: using NAS invoke JWT")
     _oauth_trace(
@@ -2231,26 +2221,26 @@ def _log_nous_invoke_jwt_selected(
     )
 
 
-def _nous_jwt_expires_at(token: Any, fallback_expires_at: Any = None) -> Optional[str]:
+def _nous_jwt_expires_at(token: Any, fallback_expires_at: Any = None) -> str | None:
     claims = _decode_jwt_claims(token)
     exp = claims.get("exp")
     if isinstance(exp, (int, float)):
         try:
-            return datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat()
+            return datetime.fromtimestamp(float(exp), tz=UTC).isoformat()
         except Exception:
             pass
     return fallback_expires_at if isinstance(fallback_expires_at, str) else None
 
 
 def _set_nous_agent_key_from_invoke_jwt(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     *,
-    obtained_at: Optional[str] = None,
+    obtained_at: str | None = None,
 ) -> None:
     access_token = state.get("access_token")
     if not isinstance(access_token, str) or not access_token.strip():
         return
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     existing_obtained_at = state.get("agent_key_obtained_at")
     if obtained_at:
         effective_obtained_at = obtained_at
@@ -2281,10 +2271,10 @@ def _set_nous_agent_key_from_invoke_jwt(
 
 
 def _select_nous_invoke_jwt(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     *,
     access_token: Any = None,
-    sequence_id: Optional[str] = None,
+    sequence_id: str | None = None,
 ) -> None:
     if isinstance(access_token, str) and access_token.strip():
         state["access_token"] = access_token
@@ -2304,7 +2294,7 @@ _NOUS_EFFECTIVE_STATE_IGNORED_KEYS = frozenset({
 })
 
 
-def _nous_effective_provider_state(state: Dict[str, Any]) -> Dict[str, Any]:
+def _nous_effective_provider_state(state: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in state.items()
@@ -2336,7 +2326,7 @@ def _reject_global_qwen_cli_store_in_multiplex() -> None:
         )
 
 
-async def _read_qwen_cli_tokens() -> Dict[str, Any]:
+async def _read_qwen_cli_tokens() -> dict[str, Any]:
     _reject_global_qwen_cli_store_in_multiplex()
     auth_path = _qwen_cli_auth_path()
     if not await aiofiles.os.path.exists(auth_path):
@@ -2389,7 +2379,7 @@ async def _finish_qwen_temp_cleanup(tmp_path: Path) -> None:
         raise cancellation
 
 
-async def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
+async def _save_qwen_cli_tokens(tokens: dict[str, Any]) -> Path:
     _reject_global_qwen_cli_store_in_multiplex()
     auth_path = _qwen_cli_auth_path()
     await aiofiles.os.makedirs(auth_path.parent, exist_ok=True)
@@ -2433,9 +2423,9 @@ def _qwen_access_token_is_expiring(
 
 
 async def _refresh_qwen_cli_tokens(
-    tokens: Dict[str, Any],
+    tokens: dict[str, Any],
     timeout_seconds: float = 20.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     _reject_global_qwen_cli_store_in_multiplex()
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     if not refresh_token:
@@ -2529,7 +2519,7 @@ async def resolve_qwen_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if is_multiplex_active():
         # The Qwen CLI has only one OS-user store and therefore cannot identify
         # which Hermes profile owns ~/.qwen/oauth_creds.json. The provider
@@ -2594,7 +2584,7 @@ async def refresh_codex_oauth_pure(
     refresh_token: str,
     *,
     timeout_seconds: float = 20.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Refresh Codex OAuth tokens without mutating Hermes auth state."""
     del access_token
     if not isinstance(refresh_token, str) or not refresh_token.strip():
@@ -2710,7 +2700,7 @@ async def refresh_codex_oauth_pure(
     updated = {
         "access_token": refreshed_access.strip(),
         "refresh_token": refresh_token.strip(),
-        "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "last_refresh": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
     next_refresh = refresh_payload.get("refresh_token")
     if isinstance(next_refresh, str) and next_refresh.strip():
@@ -2765,10 +2755,10 @@ def _is_codex_rate_limit_shaped(
 
 
 CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300
-_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_probe_cache: dict[str, tuple[float, bool | None]] = {}
 
 
-def _codex_usage_probe_url(base_url: Optional[str]) -> str:
+def _codex_usage_probe_url(base_url: str | None) -> str:
     """Resolve the Codex usage endpoint using the upstream path-style rule."""
     normalized = str(base_url or "").strip().rstrip("/")
     if not normalized:
@@ -2785,9 +2775,9 @@ def _codex_usage_probe_url(base_url: Optional[str]) -> str:
 async def _probe_codex_quota_restored(
     access_token: Any,
     *,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
-) -> Optional[bool]:
+) -> bool | None:
     """Return whether every reported Codex quota window is usable again."""
     token = str(access_token or "").strip()
     claims = _decode_jwt_claims(token) if token else {}
@@ -2803,7 +2793,7 @@ async def _probe_codex_quota_restored(
     # event loop cannot stampede the endpoint.
     _codex_quota_probe_cache[cache_key] = (now, None)
 
-    result: Optional[bool] = None
+    result: bool | None = None
     try:
         headers = {
             "Authorization": f"Bearer {token}",
@@ -2854,7 +2844,7 @@ async def _probe_codex_quota_restored(
 
 
 async def clear_codex_pool_quota_cooldowns(
-    access_token: Optional[str] = None,
+    access_token: str | None = None,
 ) -> int:
     """Clear persisted Codex 429 cooldowns after quota recovery is confirmed."""
     cleared = 0
@@ -2915,7 +2905,7 @@ async def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Resolve runtime credentials from Hermes's Codex credential pool."""
     from agent.credential_pool import STATUS_EXHAUSTED, load_pool
 
@@ -3059,7 +3049,7 @@ async def resolve_codex_runtime_credentials(
 # letting them copy the URL to a real browser.  When the resolved browser is
 # one of these we refuse to auto-open and fall back to the print-the-URL
 # path, same as a remote session.
-_CONSOLE_BROWSER_NAMES: FrozenSet[str] = frozenset({
+_CONSOLE_BROWSER_NAMES: frozenset[str] = frozenset({
     "w3m",
     "lynx",
     "links",
@@ -3242,7 +3232,7 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     return candidate
 
 
-async def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
+async def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> dict[str, str]:
     try:
         async with (await _create_httpx_client(
             timeout=timeout_seconds,
@@ -3303,7 +3293,7 @@ async def refresh_xai_oauth_pure(
     *,
     token_endpoint: str = "",
     timeout_seconds: float = 20.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     del access_token
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
@@ -3383,7 +3373,7 @@ async def refresh_xai_oauth_pure(
         "id_token": str(payload.get("id_token") or "").strip(),
         "expires_in": payload.get("expires_in"),
         "token_type": str(payload.get("token_type") or "Bearer").strip() or "Bearer",
-        "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "last_refresh": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
 
 
@@ -3391,8 +3381,8 @@ async def resolve_xai_oauth_runtime_credentials(
     *,
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
-    refresh_skew_seconds: Optional[int] = None,
-) -> Dict[str, Any]:
+    refresh_skew_seconds: int | None = None,
+) -> dict[str, Any]:
     """Resolve a usable xAI OAuth credential through the native async pool."""
     from agent.credential_pool import load_pool
 
@@ -3493,9 +3483,9 @@ async def _default_verify() -> bool | ssl.SSLContext:
 
 async def _resolve_verify(
     *,
-    insecure: Optional[bool] = None,
-    ca_bundle: Optional[str] = None,
-    auth_state: Optional[Dict[str, Any]] = None,
+    insecure: bool | None = None,
+    ca_bundle: str | None = None,
+    auth_state: dict[str, Any] | None = None,
 ) -> bool | ssl.SSLContext:
     tls_state = auth_state.get("tls") if isinstance(auth_state, dict) else {}
     tls_state = tls_state if isinstance(tls_state, dict) else {}
@@ -3519,9 +3509,9 @@ async def _resolve_verify(
 
 async def _resolve_client_verify(
     *,
-    insecure: Optional[bool] = None,
-    ca_bundle: Optional[str] = None,
-    auth_state: Optional[Dict[str, Any]] = None,
+    insecure: bool | None = None,
+    ca_bundle: str | None = None,
+    auth_state: dict[str, Any] | None = None,
 ) -> bool | ssl.SSLContext:
     """Resolve auth TLS settings and prebuild httpx's default context."""
     verify = await _resolve_verify(
@@ -3598,7 +3588,7 @@ async def _nous_shared_store_path() -> Path:
     return path
 
 
-async def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
+async def _read_shared_nous_state() -> dict[str, Any] | None:
     try:
         path = await _nous_shared_store_path()
     except RuntimeError:
@@ -3622,7 +3612,7 @@ async def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     return payload
 
 
-async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
+async def _save_shared_nous_state(state: dict[str, Any]) -> None:
     """Write shared state while the caller holds its transaction lock."""
     path = await _nous_shared_store_path()
     refresh_token = state.get("refresh_token")
@@ -3643,7 +3633,7 @@ async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
         or DEFAULT_NOUS_INFERENCE_URL,
         "obtained_at": state.get("obtained_at"),
         "expires_at": state.get("expires_at"),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
     await secure_parent_dir(path)
@@ -3674,7 +3664,7 @@ async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
     )
 
 
-async def _write_shared_nous_state(state: Dict[str, Any]) -> None:
+async def _write_shared_nous_state(state: dict[str, Any]) -> None:
     """Best-effort cross-profile mirror of the Nous OAuth token chain."""
     try:
         path = await _nous_shared_store_path()
@@ -3684,7 +3674,7 @@ async def _write_shared_nous_state(state: Dict[str, Any]) -> None:
         logger.debug("Failed to write shared Nous auth store: %s", exc)
 
 
-async def _merge_shared_nous_oauth_state(state: Dict[str, Any]) -> bool:
+async def _merge_shared_nous_oauth_state(state: dict[str, Any]) -> bool:
     shared = await _read_shared_nous_state()
     if not shared:
         return False
@@ -3737,7 +3727,7 @@ def _is_terminal_nous_refresh_error(exc: Exception) -> bool:
 
 
 def _quarantine_nous_oauth_state(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     error: AuthError,
     *,
     reason: str,
@@ -3776,12 +3766,12 @@ def _quarantine_nous_oauth_state(
         "message": str(error),
         "reason": reason,
         "relogin_required": True,
-        "at": datetime.now(timezone.utc).isoformat(),
+        "at": datetime.now(UTC).isoformat(),
     }
 
 
 def _quarantine_nous_pool_entries(
-    auth_store: Dict[str, Any],
+    auth_store: dict[str, Any],
     error: AuthError,
     *,
     reason: str,
@@ -3809,7 +3799,7 @@ def _quarantine_nous_pool_entries(
     return True
 
 
-def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
+def _agent_key_is_usable(state: dict[str, Any], min_ttl_seconds: int) -> bool:
     key = state.get("agent_key")
     if not isinstance(key, str) or not key.strip():
         return False
@@ -3827,7 +3817,7 @@ async def _refresh_access_token(
     portal_base_url: str,
     client_id: str,
     refresh_token: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     response = await client.post(
         f"{portal_base_url}/api/oauth/token",
         headers={"x-nous-refresh-token": refresh_token},
@@ -3885,18 +3875,18 @@ async def refresh_nous_oauth_pure(
     *,
     token_type: str = "Bearer",
     scope: str = DEFAULT_NOUS_SCOPE,
-    obtained_at: Optional[str] = None,
-    expires_at: Optional[str] = None,
-    agent_key: Optional[str] = None,
-    agent_key_expires_at: Optional[str] = None,
+    obtained_at: str | None = None,
+    expires_at: str | None = None,
+    agent_key: str | None = None,
+    agent_key_expires_at: str | None = None,
     timeout_seconds: float = 15.0,
-    insecure: Optional[bool] = None,
-    ca_bundle: Optional[str] = None,
+    insecure: bool | None = None,
+    ca_bundle: str | None = None,
     force_refresh: bool = False,
-    on_state_update: Optional[Callable[[Dict[str, Any], str], None]] = None,
-) -> Dict[str, Any]:
+    on_state_update: Callable[[dict[str, Any], str], None] | None = None,
+) -> dict[str, Any]:
     """Refresh Nous OAuth without owning a particular credential store."""
-    state: Dict[str, Any] = {
+    state: dict[str, Any] = {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "client_id": client_id or DEFAULT_NOUS_CLIENT_ID,
@@ -3946,7 +3936,7 @@ async def refresh_nous_oauth_pure(
                 client_id=state["client_id"],
                 refresh_token=refresh_value,
             )
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
             state["access_token"] = refreshed["access_token"]
             state["refresh_token"] = refreshed.get("refresh_token") or refresh_value
@@ -3962,7 +3952,7 @@ async def refresh_nous_oauth_pure(
             state["expires_in"] = access_ttl
             state["expires_at"] = datetime.fromtimestamp(
                 now.timestamp() + access_ttl,
-                tz=timezone.utc,
+                tz=UTC,
             ).isoformat()
             if on_state_update is not None:
                 update_result = on_state_update(
@@ -3977,12 +3967,12 @@ async def refresh_nous_oauth_pure(
 
 
 async def refresh_nous_oauth_from_state(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     *,
     timeout_seconds: float = 15.0,
     force_refresh: bool = False,
-    on_state_update: Optional[Callable[[Dict[str, Any], str], None]] = None,
-) -> Dict[str, Any]:
+    on_state_update: Callable[[dict[str, Any], str], None] | None = None,
+) -> dict[str, Any]:
     tls = state.get("tls") or {}
     return await refresh_nous_oauth_pure(
         state.get("access_token", ""),
@@ -4007,14 +3997,14 @@ async def refresh_nous_oauth_from_state(
 async def resolve_nous_runtime_credentials(
     *,
     timeout_seconds: float = 15.0,
-    insecure: Optional[bool] = None,
-    ca_bundle: Optional[str] = None,
+    insecure: bool | None = None,
+    ca_bundle: str | None = None,
     force_refresh: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Resolve and persist a usable Nous inference JWT with native async I/O."""
     local_path = await _auth_file_path()
     local_store = await _load_auth_store(local_path)
-    target_path: Optional[Path] = local_path
+    target_path: Path | None = local_path
     if _load_provider_state(local_store, "nous") is None:
         global_path = await _global_auth_file_path()
         global_store = await _load_global_auth_store()
@@ -4081,7 +4071,7 @@ async def resolve_nous_runtime_credentials(
             )
 
         try:
-            shared_path: Optional[Path] = await _nous_shared_store_path()
+            shared_path: Path | None = await _nous_shared_store_path()
         except RuntimeError:
             shared_path = None
 
@@ -4110,7 +4100,7 @@ async def resolve_nous_runtime_credentials(
             }
 
             async def persist_refresh(
-                updated: Dict[str, Any],
+                updated: dict[str, Any],
                 _reason: str,
             ) -> None:
                 merged = dict(state)
@@ -4229,8 +4219,8 @@ _RESOLVE_TOKEN_CACHE_TTL_S = 5.0
 async def resolve_nous_access_token(
     *,
     timeout_seconds: float = 15.0,
-    insecure: Optional[bool] = None,
-    ca_bundle: Optional[str] = None,
+    insecure: bool | None = None,
+    ca_bundle: str | None = None,
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for account lookup."""
@@ -4246,7 +4236,7 @@ async def resolve_nous_access_token(
             return cached_token
 
     local_store = await _load_auth_store(local_path)
-    target_path: Optional[Path] = local_path
+    target_path: Path | None = local_path
     if _load_provider_state(local_store, "nous") is None:
         global_path = await _global_auth_file_path()
         global_store = await _load_global_auth_store()
@@ -4280,7 +4270,7 @@ async def resolve_nous_access_token(
         persisted_state = dict(state)
 
         try:
-            shared_path: Optional[Path] = await _nous_shared_store_path()
+            shared_path: Path | None = await _nous_shared_store_path()
         except RuntimeError:
             shared_path = None
 
@@ -4390,7 +4380,7 @@ async def resolve_nous_access_token(
                                     )
                         raise refresh_error
 
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
                 access_token = refreshed["access_token"]
                 state["access_token"] = access_token
@@ -4403,7 +4393,7 @@ async def resolve_nous_access_token(
                 state["expires_in"] = access_ttl
                 state["expires_at"] = datetime.fromtimestamp(
                     now.timestamp() + access_ttl,
-                    tz=timezone.utc,
+                    tz=UTC,
                 ).isoformat()
 
             state["portal_base_url"] = portal_base_url
@@ -4443,9 +4433,7 @@ async def resolve_nous_access_token(
 # path + mtime so that profile switches do not share a process memo and
 # `hermes auth login/logout/add/remove` invalidate naturally on the next call.
 _NOUS_AUTH_STATUS_CACHE_TTL = 15.0  # seconds
-_nous_auth_status_cache: Optional[
-    Tuple[float, str, Optional[float], Dict[str, Any]]
-] = None
+_nous_auth_status_cache: tuple[float, str, float | None, dict[str, Any]] | None = None
 
 
 # Enum values reported on the dashboard /api/status as ``nous_session_valid``.
@@ -4457,7 +4445,7 @@ NOUS_SESSION_TERMINAL = "terminal"
 NOUS_SESSION_UNKNOWN = "unknown"
 
 
-async def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
+async def get_api_key_provider_status(provider_id: str) -> dict[str, Any]:
     """Status snapshot for API-key providers (z.ai, Kimi, MiniMax)."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
@@ -4541,8 +4529,8 @@ async def _minimax_post_form(
     client: httpx.AsyncClient,
     url: str,
     *,
-    data: Dict[str, Any],
-    headers: Dict[str, str],
+    data: dict[str, Any],
+    headers: dict[str, str],
 ) -> httpx.Response:
     """POST a MiniMax OAuth form without eagerly reading error bodies."""
     request = client.build_request("POST", url, data=data, headers=headers)
@@ -4574,11 +4562,11 @@ def _minimax_resolve_token_expiry_unix(
 
 
 async def _refresh_minimax_oauth_state(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     *,
     timeout_seconds: float = 15.0,
     force: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Refresh MiniMax OAuth state through native async file and HTTP I/O."""
     lock_timeout = max(
         float(AUTH_LOCK_TIMEOUT_SECONDS),
@@ -4658,7 +4646,7 @@ async def _refresh_minimax_oauth_state(
                 code="refresh_failed",
                 relogin_required=True,
             )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expires_at_unix = _minimax_resolve_token_expiry_unix(
             int(payload["expired_in"]),
             now=now,
@@ -4670,7 +4658,7 @@ async def _refresh_minimax_oauth_state(
             "obtained_at": now.isoformat(),
             "expires_at": datetime.fromtimestamp(
                 expires_at_unix,
-                tz=timezone.utc,
+                tz=UTC,
             ).isoformat(),
             "expires_in": max(0, int(expires_at_unix - now.timestamp())),
         })
@@ -4680,7 +4668,7 @@ async def _refresh_minimax_oauth_state(
 
 
 async def _minimax_oauth_quarantine_on_terminal_refresh(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     exc: AuthError,
 ) -> None:
     if not (exc.relogin_required and state.get("refresh_token")):
@@ -4708,7 +4696,7 @@ async def _minimax_oauth_quarantine_on_terminal_refresh(
             "message": str(exc),
             "reason": "runtime_refresh_failure",
             "relogin_required": True,
-            "at": datetime.now(timezone.utc).isoformat(),
+            "at": datetime.now(UTC).isoformat(),
         }
         _save_provider_state(auth_store, "minimax-oauth", current)
         await _save_auth_store(auth_store)
@@ -4729,7 +4717,7 @@ async def _resolve_minimax_oauth_runtime_credentials(
     min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
     as_token_provider: bool = False,
     force_refresh: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Resolve MiniMax OAuth credentials with internal refresh control."""
     auth_store = await _load_auth_store()
     state = _load_provider_state(auth_store, "minimax-oauth")
@@ -4770,7 +4758,7 @@ async def resolve_minimax_oauth_runtime_credentials(
     *,
     min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
     as_token_provider: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Resolve a current MiniMax OAuth credential without blocking the loop."""
     return await _resolve_minimax_oauth_runtime_credentials(
         min_token_ttl_seconds=min_token_ttl_seconds,

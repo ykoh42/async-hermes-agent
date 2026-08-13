@@ -8,12 +8,13 @@ contract while moving database lifecycle and queries behind ``aiosqlite``.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import inspect
 import json
 import logging
 import re
-from typing import Any, Coroutine
+from typing import Any
+from collections.abc import Coroutine
 import uuid
 import warnings
 
@@ -832,7 +833,7 @@ class SQLiteManager:
     ) -> None:
         if not messages:
             return
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         values = [
             (
                 str(uuid.uuid4()),

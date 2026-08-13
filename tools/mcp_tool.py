@@ -102,9 +102,10 @@ import weakref
 from collections.abc import MutableMapping, MutableSet
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Callable
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional
+from typing import Any
+from collections.abc import Coroutine
 from urllib.parse import urlparse
 
 import aiofiles
@@ -665,7 +666,7 @@ def _env_ref_name(ref: str) -> str:
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+def _build_safe_env(user_env: dict | None) -> dict:
     """Build a filtered environment dict for stdio subprocesses.
 
     Only passes through safe baseline variables (PATH, HOME, etc.) and XDG_*
@@ -801,7 +802,7 @@ _MCP_INJECTION_PATTERNS = [
 ]
 
 
-def _scan_mcp_description(server_name: str, tool_name: str, description: str) -> List[str]:
+def _scan_mcp_description(server_name: str, tool_name: str, description: str) -> list[str]:
     """Scan an MCP tool description for prompt injection patterns.
 
     Returns a list of finding strings (empty = clean).
@@ -1419,7 +1420,7 @@ async def _resolve_client_cert(server_name: str, config: dict):
 def _format_connect_error(exc: BaseException) -> str:
     """Render nested MCP connection errors into an actionable short message."""
 
-    def _find_missing(current: BaseException) -> Optional[str]:
+    def _find_missing(current: BaseException) -> str | None:
         nested = getattr(current, "exceptions", None)
         if nested:
             for child in nested:
@@ -1441,10 +1442,10 @@ def _format_connect_error(exc: BaseException) -> str:
                     return missing
         return None
 
-    def _flatten_messages(current: BaseException) -> List[str]:
+    def _flatten_messages(current: BaseException) -> list[str]:
         nested = getattr(current, "exceptions", None)
         if nested:
-            flattened: List[str] = []
+            flattened: list[str] = []
             for child in nested:
                 flattened.extend(_flatten_messages(child))
             return flattened
@@ -1469,7 +1470,7 @@ def _format_connect_error(exc: BaseException) -> str:
             )
         return _sanitize_error(message)
 
-    deduped: List[str] = []
+    deduped: list[str] = []
     for item in _flatten_messages(exc):
         if item not in deduped:
             deduped.append(item)
@@ -1527,7 +1528,7 @@ class SamplingHandler:
         )
 
         # Per-instance state
-        self._rate_timestamps: List[float] = []
+        self._rate_timestamps: list[float] = []
         self._tool_loop_count = 0
         self.metrics = {"requests": 0, "errors": 0, "tokens_used": 0, "tool_use_count": 0}
 
@@ -1545,7 +1546,7 @@ class SamplingHandler:
 
     # -- Model resolution ----------------------------------------------------
 
-    def _resolve_model(self, preferences) -> Optional[str]:
+    def _resolve_model(self, preferences) -> str | None:
         """Config override > server hint > None (use default)."""
         if self.model_override:
             return self.model_override
@@ -1565,7 +1566,7 @@ class SamplingHandler:
         items = block.content if isinstance(block.content, list) else [block.content]
         return "\n".join(item.text for item in items if hasattr(item, "text"))
 
-    def _convert_messages(self, params) -> List[dict]:
+    def _convert_messages(self, params) -> list[dict]:
         """Convert MCP SamplingMessages to OpenAI format.
 
         Uses ``msg.content_as_list`` (SDK helper) so single-block and
@@ -1573,7 +1574,7 @@ class SamplingHandler:
         with ``isinstance`` on real SDK types when available, falling back
         to duck-typing via ``hasattr`` for compatibility.
         """
-        messages: List[dict] = []
+        messages: list[dict] = []
         for msg in params.messages:
             blocks = msg.content_as_list if hasattr(msg, "content_as_list") else (
                 msg.content if isinstance(msg.content, list) else [msg.content]
@@ -1822,7 +1823,7 @@ class SamplingHandler:
                 ),
                 timeout=self.timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.metrics["errors"] += 1
             return self._error(
                 f"Sampling LLM call timed out after {self.timeout}s "
@@ -1908,7 +1909,7 @@ class ElicitationHandler:
     The server treats this as the user not approving.
     """
 
-    def __init__(self, server_name: str, config: dict, owner: Optional["MCPServerTask"] = None):
+    def __init__(self, server_name: str, config: dict, owner: "MCPServerTask | None" = None):
         self.server_name = server_name
         # Per-elicitation timeout. Default 5 min mirrors the gateway approval
         # default so users on async surfaces (Telegram, Slack) have time to
@@ -2089,9 +2090,9 @@ class MCPServerTask:
 
     def __init__(self, name: str):
         self.name = name
-        self.session: Optional[Any] = None
+        self.session: Any | None = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
         self._shutdown_event = asyncio.Event()
         # Set by tool handlers on auth failure after manager.handle_401()
@@ -2101,10 +2102,10 @@ class MCPServerTask:
         # rebuilt with fresh credentials.
         self._reconnect_event = asyncio.Event()
         self._tools: list = []
-        self._error: Optional[Exception] = None
+        self._error: Exception | None = None
         self._config: dict = {}
-        self._sampling: Optional[SamplingHandler] = None
-        self._elicitation: Optional[ElicitationHandler] = None
+        self._sampling: SamplingHandler | None = None
+        self._elicitation: ElicitationHandler | None = None
         self._registered_tool_names: list[str] = []
         self._reconnect_retries: int = 0
         # Rapid-drop budget (#62212): a freshly (re)established session is
@@ -2138,19 +2139,19 @@ class MCPServerTask:
         # and replaying it inside the elicitation callback restores
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
-        self._pending_call_context: Optional[contextvars.Context] = None
+        self._pending_call_context: contextvars.Context | None = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
-        self._idle_timeout_seconds: Optional[float] = None
-        self._max_lifetime_seconds: Optional[float] = None
-        self._recycled_reason: Optional[str] = None
+        self._idle_timeout_seconds: float | None = None
+        self._max_lifetime_seconds: float | None = None
+        self._recycled_reason: str | None = None
         # Captures the ``InitializeResult`` returned by
         # ``await session.initialize()`` so downstream code can inspect the
         # server's real advertised capabilities (``.capabilities.resources``,
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
-        self.initialize_result: Optional[Any] = None
+        self.initialize_result: Any | None = None
         # Set True the first time a keepalive ``ping`` returns JSON-RPC
         # -32601 (method not found): the server is tool-capable but doesn't
         # implement the optional ``ping`` utility. Subsequent keepalives fall
@@ -2196,7 +2197,7 @@ class MCPServerTask:
         self._last_tool_call_at = now
         self._recycled_reason = None
 
-    def _stdio_recycle_reason(self, now: Optional[float] = None) -> Optional[str]:
+    def _stdio_recycle_reason(self, now: float | None = None) -> str | None:
         """Return the stdio recycle reason if idle/age limits have elapsed."""
         if self._is_http() or self._rpc_lock.locked():
             return None
@@ -2213,7 +2214,7 @@ class MCPServerTask:
             return "idle_timeout_seconds"
         return None
 
-    def _next_stdio_recycle_deadline(self) -> Optional[float]:
+    def _next_stdio_recycle_deadline(self) -> float | None:
         """Return the next monotonic recycle deadline for stdio, if any."""
         if self._is_http() or self._rpc_lock.locked():
             return None
@@ -2577,7 +2578,7 @@ class MCPServerTask:
         return "reconnect"
 
     async def _wait_for_reconnect_or_shutdown(
-        self, timeout: Optional[float] = None
+        self, timeout: float | None = None
     ) -> str:
         """Block until a reconnect or shutdown is requested while parked.
 
@@ -2653,7 +2654,7 @@ class MCPServerTask:
                 check_package_for_malware(command, args),
                 timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "MCP server '%s': OSV malware preflight timed out after %.0fs "
                 "(network slow/unreachable) — proceeding without the check.",
@@ -2736,7 +2737,7 @@ class MCPServerTask:
                     # can no longer call ``os.getpgid`` on it, and the cleanup
                     # sweep needs the pgid to reach any reparented descendants
                     # (e.g. ``claude mcp serve`` spawned by a stdio wrapper).
-                    new_pgids: Dict[int, int] = {}
+                    new_pgids: dict[int, int] = {}
                     for _pid in new_pids:
                         try:
                             new_pgids[_pid] = os.getpgid(_pid)
@@ -2802,7 +2803,7 @@ class MCPServerTask:
                         pid: _stdio_pgids.get(pid) for pid in new_pids
                     }
 
-                liveness: Dict[int, tuple[bool, bool, Optional[int]]] = {}
+                liveness: dict[int, tuple[bool, bool, int | None]] = {}
                 for pid in new_pids:
                     # ``os.kill(pid, 0)`` is NOT a no-op on Windows
                     # (bpo-14484). Use the cross-platform check.
@@ -2849,7 +2850,7 @@ class MCPServerTask:
         self,
         url: str,
         *,
-        headers: Optional[dict] = None,
+        headers: dict | None = None,
         ssl_verify: bool = True,
         client_cert=None,
         timeout: float = 5.0,
@@ -3846,7 +3847,7 @@ _server_connecting: MutableSet[str] = _ScopedSet()
 _server_connect_errors: MutableMapping[str, str] = _ScopedDict()
 _lazy_server_configs: MutableMapping[str, dict] = _ScopedDict()
 _lazy_server_fingerprints: MutableMapping[str, str] = _ScopedDict()
-_lazy_server_tool_names: MutableMapping[str, List[str]] = _ScopedDict()
+_lazy_server_tool_names: MutableMapping[str, list[str]] = _ScopedDict()
 _lazy_server_connect_locks: MutableMapping[str, asyncio.Lock] = _ScopedDict()
 _mcp_lifecycle_consumers = _ScopedWeakSet()
 _mcp_lifecycle_locks: dict[_MCPScopeKey, asyncio.Lock] = {}
@@ -3854,7 +3855,7 @@ _mcp_lifecycle_locks: dict[_MCPScopeKey, asyncio.Lock] = {}
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
 _connect_server_claim: contextvars.ContextVar[
-    Optional[Callable[[MCPServerTask], None]]
+    Callable[[MCPServerTask], None] | None
 ] = contextvars.ContextVar("mcp_connect_server_claim", default=None)
 
 # Connection-retry cooldown (per-server isolation against restart storms).
@@ -4113,7 +4114,7 @@ async def _handle_auth_error_and_retry(
     exc: BaseException,
     retry_call,
     operation_description: str,
-) -> Optional[str]:
+) -> str | None:
     """Native async equivalent of the MCP OAuth recovery and single retry."""
     if not _is_auth_error(exc):
         return None
@@ -4241,7 +4242,7 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     # failures: SDK wrappers often raise a generic RuntimeError *from* the
     # message-less ClosedResourceError, leaving the transport signal only
     # reachable via ``__cause__``.
-    stack: "list[BaseException | None]" = [exc]
+    stack: list[BaseException | None] = [exc]
     seen: set[int] = set()
     transport_error_found = False
     budget = _EXC_TRAVERSAL_MAX_NODES
@@ -4282,7 +4283,7 @@ async def _handle_session_expired_and_retry(
     exc: BaseException,
     retry_call,
     operation_description: str,
-) -> Optional[str]:
+) -> str | None:
     """Reconnect a stale MCP transport and retry once without blocking."""
     if not _is_session_expired_error(exc):
         return None
@@ -4336,7 +4337,7 @@ _lock = threading.Lock()
 # gateway + CLI + TUI) from all running MCP discovery simultaneously.
 # See issue #62771.
 _LOCK_UNAVAILABLE: Any = object()  # sentinel: locking broken/unavailable
-_MCP_DISCOVERY_LOCK_PATH: Optional[str] = None  # resolved lazily
+_MCP_DISCOVERY_LOCK_PATH: str | None = None  # resolved lazily
 
 # Retry constants for the bounded wait when another process holds the lock.
 _MCP_DISCOVERY_LOCK_MAX_RETRIES: int = 240
@@ -4567,7 +4568,7 @@ async def _snapshot_child_pids() -> set:
             children.update(descendants)
             frontier.extend(descendants)
         return children
-    except (asyncio.TimeoutError, FileNotFoundError, OSError, ValueError):
+    except (TimeoutError, FileNotFoundError, OSError, ValueError):
         return set()
 
     return set()
@@ -4642,7 +4643,7 @@ async def _await_mcp_operation(coro_or_factory, timeout: float = 30):
         if timeout is None:
             return await coro
         return await asyncio.wait_for(coro, timeout=float(timeout))
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise TimeoutError(
             f"MCP call timed out after {float(timeout):.1f}s "
             f"(configured timeout: {float(timeout):.1f}s)"
@@ -4718,7 +4719,7 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> list[str]:
     return flagged
 
 
-def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+def _filter_suspicious_mcp_servers(servers: dict[str, dict]) -> dict[str, dict]:
     """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
     try:
         from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
@@ -4745,7 +4746,7 @@ def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     return safe_servers
 
 
-async def _load_mcp_config() -> Dict[str, dict]:
+async def _load_mcp_config() -> dict[str, dict]:
     """Read ``mcp_servers`` from the Hermes config file.
 
     Returns a dict of ``{server_name: server_config}`` or empty dict.
@@ -4776,7 +4777,7 @@ async def _load_mcp_config() -> Dict[str, dict]:
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
             return {}
-        safe_servers: Dict[str, dict] = {}
+        safe_servers: dict[str, dict] = {}
         for name, cfg in _filter_suspicious_mcp_servers(servers).items():
             interpolated = _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
@@ -4913,7 +4914,7 @@ async def _connect_lazy_server(server_name: str) -> bool:
 
 async def _get_connected_server_for_call(
     server_name: str,
-) -> Optional[MCPServerTask]:
+) -> MCPServerTask | None:
     """Return a connected server, starting cached lazy servers on first use."""
     await _activate_mcp_scope()
     with _lock:
@@ -4948,7 +4949,7 @@ async def _call_mcp_tool(
     tool_name: str,
     server: Any,
     args: dict,
-    elicitation_callback: Optional[Callable[..., Coroutine]] = None,
+    elicitation_callback: Callable[..., Coroutine] | None = None,
 ) -> str:
     """Perform and render one MCP ``tools/call`` RPC on the caller's loop."""
     _mark_server_call_started(server)
@@ -4980,7 +4981,7 @@ async def _call_mcp_tool(
                 error_text += str(res_text)
         return tool_error(_sanitize_error(error_text or "MCP tool returned an error"))
 
-    parts: List[str] = []
+    parts: list[str] = []
     for block in (result.content or []):
         if hasattr(block, "text") and block.text:
             parts.append(block.text)
@@ -5217,7 +5218,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             async with active_server._rpc_lock:
                 result = await active_server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
-            parts: List[str] = []
+            parts: list[str] = []
             contents = result.contents if hasattr(result, "contents") else []
             for block in contents:
                 if getattr(block, "text", None) is not None:
@@ -5626,7 +5627,7 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     }
 
 
-def _build_utility_schemas(server_name: str) -> List[dict]:
+def _build_utility_schemas(server_name: str) -> list[dict]:
     """Build schemas for the MCP utility tools (resources & prompts).
 
     Returns a list of (schema, handler_factory_name) tuples encoded as dicts
@@ -5750,7 +5751,7 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
     return default
 
 
-def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
+def _get_lifecycle_seconds(config: dict, key: str) -> float | None:
     """Return an optional positive lifecycle timeout from top-level/nested config."""
     raw = config.get(key)
     lifecycle = config.get("lifecycle")
@@ -5808,7 +5809,7 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
         _mcp_tool_server_names.pop(tool_name, None)
 
 
-def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
+def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> list[dict]:
     """Select utility schemas based on config and server capabilities."""
     tools_filter = config.get("tools") or {}
     resources_enabled = _parse_boolish(tools_filter.get("resources"), default=True)
@@ -5824,7 +5825,7 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
     if init_result is not None:
         advertised_caps = getattr(init_result, "capabilities", None)
 
-    selected: List[dict] = []
+    selected: list[dict] = []
     for entry in _build_utility_schemas(server_name):
         handler_key = entry["handler_key"]
         if handler_key in {"list_resources", "read_resource"} and not resources_enabled:
@@ -5865,9 +5866,9 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
     return selected
 
 
-def _existing_tool_names() -> List[str]:
+def _existing_tool_names() -> list[str]:
     """Return tool names for all currently connected servers."""
-    names: List[str] = []
+    names: list[str] = []
     for _sname, server in _servers.items():
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
@@ -5885,7 +5886,7 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
-def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> list[str]:
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering and utility tools. Toolset resolution
@@ -5904,7 +5905,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     """
     from tools.registry import registry
 
-    registered_names: List[str] = []
+    registered_names: list[str] = []
     toolset_name = f"mcp-{name}"
 
     # Selective tool loading: honour include/exclude lists from config.
@@ -5930,7 +5931,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         return True
 
     check_fn = _make_check_fn(name)
-    candidates: List[dict] = []
+    candidates: list[dict] = []
 
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
@@ -5980,9 +5981,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     # Exact duplicate rows from a server are harmless but should not inflate
     # counts. Distinct origins that collapse to one normalized name are unsafe.
-    unique_candidates: List[dict] = []
+    unique_candidates: list[dict] = []
     seen_candidates: set[tuple[str, str]] = set()
-    origins_by_name: Dict[str, set[str]] = {}
+    origins_by_name: dict[str, set[str]] = {}
     for candidate in candidates:
         key = (candidate["registry_name"], candidate["origin"])
         if key in seen_candidates:
@@ -6083,7 +6084,7 @@ class _CachedMCPTool:
         self.inputSchema = input_schema or {}
 
 
-def _register_from_cache(name: str, config: dict, entry: dict) -> List[str]:
+def _register_from_cache(name: str, config: dict, entry: dict) -> list[str]:
     """Register cached schemas without starting the MCP transport."""
     from tools.mcp_schema_cache import (
         config_fingerprint,
@@ -6092,7 +6093,7 @@ def _register_from_cache(name: str, config: dict, entry: dict) -> List[str]:
     )
     from tools.registry import registry
 
-    registered_names: List[str] = []
+    registered_names: list[str] = []
     toolset_name = f"mcp-{name}"
     timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
     tools_filter = config.get("tools") or {}
@@ -6217,7 +6218,7 @@ async def _write_server_schema_cache(
     except Exception as exc:
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(name: str, config: dict) -> list[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
@@ -6227,7 +6228,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     # List-based claim (not a ``nonlocal`` rebind): the claim callback runs
     # inside ``_connect_server`` while this frame is suspended, and appending
     # keeps type narrowing intact for the module's other ``server`` locals.
-    claimed: List[MCPServerTask] = []
+    claimed: list[MCPServerTask] = []
 
     def _claim_server(created: MCPServerTask) -> None:
         claimed.append(created)
@@ -6287,7 +6288,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
 
 
-async def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+async def register_mcp_servers(servers: dict[str, dict]) -> list[str]:
     """Connect explicit MCP servers and register their tools without blocking."""
     await _activate_mcp_scope()
     if not _MCP_AVAILABLE:
@@ -6374,7 +6375,7 @@ async def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             ),
             timeout=120,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         results = [TimeoutError("MCP discovery timed out after 120.0s")] * len(names)
 
     for name, result in zip(names, results):
@@ -6435,7 +6436,7 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return bool(server_name and server_name in _parallel_safe_servers)
 
 
-async def get_mcp_status() -> List[dict]:
+async def get_mcp_status() -> list[dict]:
     """Return status of all configured MCP servers for banner display.
 
     Returns a list of dicts with keys: name, transport, tools, connected,
@@ -6444,7 +6445,7 @@ async def get_mcp_status() -> List[dict]:
     configured but have not been started in this process yet.
     """
     await _activate_mcp_scope()
-    result: List[dict] = []
+    result: list[dict] = []
 
     # Get configured servers from config
     configured = await _load_mcp_config()
@@ -6516,7 +6517,7 @@ async def get_mcp_status() -> List[dict]:
     return result
 
 
-async def discover_mcp_tools() -> List[str]:
+async def discover_mcp_tools() -> list[str]:
     """Discover configured MCP tools without blocking the agent event loop.
 
     The cross-process discovery lease remains part of the public operation.
@@ -6589,7 +6590,7 @@ async def discover_mcp_tools() -> List[str]:
             await cookie.release()
 
 
-async def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
+async def probe_mcp_server_tools() -> dict[str, list[tuple]]:
     """Temporarily connect to configured MCP servers and list their tools.
 
     Designed for ``hermes tools`` interactive configuration — connects to each
@@ -6615,8 +6616,8 @@ async def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
     if not enabled:
         return {}
 
-    result: Dict[str, List[tuple]] = {}
-    probed_servers: List[MCPServerTask] = []
+    result: dict[str, list[tuple]] = {}
+    probed_servers: list[MCPServerTask] = []
 
     async def _probe_all():
         names = list(enabled.keys())
@@ -6987,7 +6988,7 @@ async def _release_mcp_lifecycle(owner: object) -> None:
 
 async def _kill_orphaned_mcp_children(
     include_active: bool = False,
-    server_name: Optional[str] = None,
+    server_name: str | None = None,
 ) -> None:
     """Terminate and reap tracked MCP child processes asynchronously.
 
@@ -6998,7 +6999,7 @@ async def _kill_orphaned_mcp_children(
     import signal as _signal
 
     with _lock:
-        pids: Dict[int, str] = {}
+        pids: dict[int, str] = {}
         for orphan_pid in _orphan_stdio_pids:
             owner = _orphan_stdio_pid_servers.get(orphan_pid, "orphan")
             if server_name is not None and owner != server_name:

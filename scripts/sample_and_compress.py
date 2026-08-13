@@ -19,7 +19,7 @@ import json
 import random
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Any
 import fire
 
 # Load environment variables
@@ -37,7 +37,7 @@ DEFAULT_DATASETS = [
 ]
 
 
-def load_dataset_from_hf(dataset_name: str) -> List[Dict[str, Any]]:
+def load_dataset_from_hf(dataset_name: str) -> list[dict[str, Any]]:
     """
     Load a dataset from HuggingFace.
     
@@ -86,7 +86,7 @@ def _init_tokenizer_worker(tokenizer_name: str):
     _TOKENIZER = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
 
 
-def _count_tokens_for_entry(entry: Dict) -> Tuple[Dict, int]:
+def _count_tokens_for_entry(entry: dict) -> tuple[dict, int]:
     """
     Count tokens for a single entry (used in parallel processing).
     
@@ -116,13 +116,13 @@ def _count_tokens_for_entry(entry: Dict) -> Tuple[Dict, int]:
 
 
 def sample_from_datasets(
-    datasets: List[str],
+    datasets: list[str],
     total_samples: int,
     min_tokens: int = 16000,
     tokenizer_name: str = "moonshotai/Kimi-K2-Thinking",
     seed: int = 42,
     num_proc: int = 8
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Load all datasets, filter by token count, then randomly sample from combined pool.
     
@@ -223,7 +223,7 @@ def sample_from_datasets(
 
 
 def save_samples_for_compression(
-    samples: List[Dict[str, Any]],
+    samples: list[dict[str, Any]],
     output_dir: Path,
     batch_size: int = 100
 ):
@@ -299,7 +299,7 @@ def merge_output_to_single_jsonl(input_dir: Path, output_file: Path):
     for jsonl_file in sorted(input_dir.glob("*.jsonl")):
         if jsonl_file.name == output_file.name:
             continue
-        with open(jsonl_file, 'r', encoding='utf-8') as f:
+        with open(jsonl_file, encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -317,7 +317,7 @@ def merge_output_to_single_jsonl(input_dir: Path, output_file: Path):
 def main(
     total_samples: int = 2500,
     output_name: str = "compressed_agentic",
-    datasets: str = None,
+    datasets: str | None = None,
     config: str = "configs/trajectory_compression.yaml",
     seed: int = 42,
     batch_size: int = 100,

@@ -540,7 +540,7 @@ async def test_bounded_run_bash_timeout_preserves_partial_spill(
 async def _wait_for_pid(path: Path) -> int:
     for _ in range(200):
         try:
-            async with aiofiles.open(path, "r", encoding="utf-8") as handle:
+            async with aiofiles.open(path, encoding="utf-8") as handle:
                 return int((await handle.read()).strip())
         except (FileNotFoundError, ValueError):
             await asyncio.sleep(0.005)

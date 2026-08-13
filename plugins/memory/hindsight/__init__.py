@@ -41,9 +41,9 @@ import stat
 import sys
 import weakref
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -84,13 +84,13 @@ _PROVIDER_DEFAULT_MODELS = {
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
-_client_load_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]]" = (
+_client_load_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]] = (
     weakref.WeakKeyDictionary()
 )
 
 
 def _loop_local_lock(
-    registry: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]]",
+    registry: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]],
 ) -> asyncio.Lock:
     """Return one live lock per loop without retaining finished loops or locks."""
     loop = asyncio.get_running_loop()
@@ -351,8 +351,8 @@ async def _prepare_hindsight_client_transport(client) -> None:
 # Cache of API_URL -> bool (whether that API supports update_mode='append').
 # Probed once per URL per process — every provider talking to the same API
 # gets the same answer without re-hitting /version on each initialize().
-_append_capability_cache: Dict[str, bool] = {}
-_append_capability_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]]" = (
+_append_capability_cache: dict[str, bool] = {}
+_append_capability_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -588,7 +588,7 @@ async def _load_config() -> dict:
     }
 
 
-def _normalize_retain_tags(value: Any) -> List[str]:
+def _normalize_retain_tags(value: Any) -> list[str]:
     """Normalize tag config/tool values to a deduplicated list of strings."""
     if value is None:
         return []
@@ -677,7 +677,7 @@ def _normalize_observation_scopes(value: Any) -> Any:
 
 def _utc_timestamp() -> str:
     """Return current UTC timestamp in ISO-8601 with milliseconds and Z suffix."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _embedded_profile_name(config: dict[str, Any]) -> str:
@@ -968,7 +968,7 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
-    def backup_paths(self) -> List[str]:
+    def backup_paths(self) -> list[str]:
         """Hindsight's legacy shared config and embedded-mode profile env
         files live under ~/.hindsight (see _load_config / line ~509)."""
         try:
@@ -988,7 +988,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._llm_base_url = ""
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
         self._prefetch_method = "recall"  # "recall" or "reflect"
-        self._retain_tags: List[str] = []
+        self._retain_tags: list[str] = []
         self._retain_source = ""
         self._retain_user_prefix = "User"
         self._retain_assistant_prefix = "Assistant"
@@ -1869,8 +1869,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_tasks.add(task)
         task.add_done_callback(self._prefetch_tasks.discard)
 
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        now = datetime.now(timezone.utc).isoformat()
+    def _build_turn_messages(self, user_content: str, assistant_content: str) -> list[dict[str, str]]:
+        now = datetime.now(UTC).isoformat()
         return [
             {
                 "role": "user",
@@ -1884,8 +1884,8 @@ class HindsightMemoryProvider(MemoryProvider):
             },
         ]
 
-    def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
-        metadata: Dict[str, str] = {
+    def _build_metadata(self, *, message_count: int, turn_index: int) -> dict[str, str]:
+        metadata: dict[str, str] = {
             "retained_at": _utc_timestamp(),
             "message_count": str(message_count),
             "turn_index": str(turn_index),
@@ -1918,11 +1918,11 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         context: str | None = None,
         document_id: str | None = None,
-        metadata: Dict[str, str] | None = None,
-        tags: List[str] | None = None,
+        metadata: dict[str, str] | None = None,
+        tags: list[str] | None = None,
         retain_async: bool | None = None,
-    ) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
             "bank_id": self._bank_id,
             "content": content,
             "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
@@ -2044,7 +2044,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if update_mode == "append":
             self._last_retained_turn_count = len(self._session_turns)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         if self._memory_mode == "context":
             return []
         return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]

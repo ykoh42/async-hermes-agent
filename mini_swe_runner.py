@@ -18,7 +18,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, cast
+from typing import Any, cast
 
 import aiofiles
 import aiofiles.os
@@ -37,8 +37,8 @@ from hermes_constants import get_hermes_home
 
 def _effective_temperature_for_model(
     model: str,
-    base_url: Optional[str] = None,
-) -> Optional[float]:
+    base_url: str | None = None,
+) -> float | None:
     """Return a fixed temperature for models with strict sampling contracts.
 
     Returns ``None`` when the model manages temperature server-side (Kimi);
@@ -47,7 +47,7 @@ def _effective_temperature_for_model(
     result = _fixed_temperature_for_model(model, base_url)
     if result is OMIT_TEMPERATURE:
         return None  # caller must omit temperature
-    return cast(Optional[float], result)
+    return cast(float | None, result)
 
 
 async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
@@ -186,8 +186,8 @@ class MiniSWERunner:
     def __init__(
         self,
         model: str = "anthropic/claude-sonnet-4.6",
-        base_url: str = None,  # type: ignore[invalid-parameter-default]
-        api_key: str = None,  # type: ignore[invalid-parameter-default]
+        base_url: str | None = None,  # type: ignore[invalid-parameter-default]
+        api_key: str | None = None,  # type: ignore[invalid-parameter-default]
         env_type: str = "local",
         image: str = "python:3.11-slim",
         cwd: str = "/tmp",
@@ -229,7 +229,7 @@ class MiniSWERunner:
         self.env: Any | None = None
 
         # Tool definition
-        self.tools: List[Dict[str, Any]] = [TERMINAL_TOOL_DEFINITION]
+        self.tools: list[dict[str, Any]] = [TERMINAL_TOOL_DEFINITION]
 
         print("🤖 Mini-SWE Runner initialized")
         print(f"   Model: {self.model}")
@@ -332,8 +332,8 @@ class MiniSWERunner:
     async def _execute_command(
         self,
         command: str,
-        timeout: int = None,  # type: ignore[invalid-parameter-default]
-    ) -> Dict[str, Any]:
+        timeout: int | None = None,  # type: ignore[invalid-parameter-default]
+    ) -> dict[str, Any]:
         """
         Execute a command in the environment.
 
@@ -389,10 +389,10 @@ class MiniSWERunner:
 
     def _convert_to_hermes_format(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         user_query: str,
         completed: bool
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Convert internal message format to Hermes trajectory format.
 
@@ -497,7 +497,7 @@ class MiniSWERunner:
 
         return trajectory
 
-    async def run_task(self, task: str) -> Dict[str, Any]:
+    async def run_task(self, task: str) -> dict[str, Any]:
         """
         Run a single task and return the result with trajectory.
 
@@ -510,13 +510,13 @@ class MiniSWERunner:
         async with self._run_lock:
             return await self._run_task(task)
 
-    async def _run_task(self, task: str) -> Dict[str, Any]:
+    async def _run_task(self, task: str) -> dict[str, Any]:
         print(f"\n{'='*60}")
         print(f"📝 Task: {task[:80]}{'...' if len(task) > 80 else ''}")
         print(f"{'='*60}")
 
         # Message history
-        messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
+        messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
 
         # System prompt for the LLM (ephemeral - not saved to trajectory)
         system_prompt = """You are an AI agent that can execute bash commands to complete tasks.
@@ -590,7 +590,7 @@ Complete the user's task step by step."""
                         "reasoning_content",
                         None,
                     ) or getattr(assistant_message, "reasoning", None)
-                    assistant_entry: Dict[str, Any] = {
+                    assistant_entry: dict[str, Any] = {
                         "role": "assistant",
                         "content": assistant_message.content,
                         "tool_calls": [
@@ -706,9 +706,9 @@ Complete the user's task step by step."""
 
     async def run_batch(
         self,
-        prompts: List[str],
+        prompts: list[str],
         output_file: str
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Run multiple tasks and save trajectories to a JSONL file.
 
@@ -725,7 +725,7 @@ Complete the user's task step by step."""
         print(f"📁 Output: {output_file}")
 
         async with aiofiles.open(output_file, "w", encoding="utf-8") as f:
-            async def _write_result(value: Dict[str, Any]) -> None:
+            async def _write_result(value: dict[str, Any]) -> None:
                 await f.write(json.dumps(value, ensure_ascii=False) + "\n")
                 await f.flush()
 

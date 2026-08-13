@@ -43,7 +43,8 @@ import weakref
 import zipfile
 from collections.abc import Awaitable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any
+from collections.abc import Callable
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 
@@ -172,7 +173,7 @@ _PENDING_SESSIONS_RELATIVE_DIR = Path("openviking") / "pending_sessions"
 _RUN_LOCKS_RELATIVE_DIR = Path("openviking") / "runs"
 _LEGACY_RECOVERY_LOCK_FILENAME = "legacy-recovery.lock"
 _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
-_INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
+_INVALID_SETTING_WARNINGS: set[tuple[str, str]] = set()
 _ENDPOINT_SAFETY_CACHE: dict[str, bool] = {}
 _ENDPOINT_SAFETY_CACHE_GUARD = threading.RLock()
 _ENDPOINT_SAFETY_LOCKS_GUARD = threading.RLock()
@@ -197,7 +198,7 @@ def _endpoint_safety_lock() -> asyncio.Lock:
 
 
 class _OpenVikingHTTPError(RuntimeError):
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
 
@@ -206,7 +207,7 @@ class _OpenVikingEndpointError(ValueError):
     """Raised when a configured endpoint cannot be used safely."""
 
 
-def _sanitize_openviking_error_message(message: str, status_code: Optional[int] = None) -> str:
+def _sanitize_openviking_error_message(message: str, status_code: int | None = None) -> str:
     text = (message or "").strip()
     status = f"HTTP {status_code}" if status_code else "HTTP error"
     looks_like_html = bool(re.search(r"^\s*<(!doctype|html|head|body)\b", text, flags=re.IGNORECASE))
@@ -332,8 +333,8 @@ class _VikingClient:
     """Thin HTTP client for the OpenViking REST API."""
 
     def __init__(self, endpoint: str, api_key: str = "",
-                 account: Optional[str] = None, user: Optional[str] = None,
-                 agent: Optional[str] = None):
+                 account: str | None = None, user: str | None = None,
+                 agent: str | None = None):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         # Account/user are local/trusted-mode tenant identity. API-key requests
@@ -455,7 +456,7 @@ class _VikingClient:
             )
         )
 
-    async def post(self, path: str, payload: Optional[dict] = None, **kwargs) -> dict:
+    async def post(self, path: str, payload: dict | None = None, **kwargs) -> dict:
         timeout = kwargs.pop("timeout", _TIMEOUT)
         return await self._send_with_trusted_identity_retry(
             lambda headers: self._http.post(
@@ -774,7 +775,7 @@ def _is_remote_resource_source(value: str) -> bool:
     return value.startswith(_REMOTE_RESOURCE_PREFIXES)
 
 
-def _memory_segment_index(parts: List[str]) -> Optional[int]:
+def _memory_segment_index(parts: list[str]) -> int | None:
     if len(parts) >= 2 and parts[0] == "user" and parts[1] == "memories":
         return 1
     if len(parts) >= 3 and parts[0] == "user" and parts[2] == "memories":
@@ -786,7 +787,7 @@ def _memory_segment_index(parts: List[str]) -> Optional[int]:
     return None
 
 
-def _validate_forget_memory_uri(raw_uri: Any) -> tuple[Optional[str], Optional[str]]:
+def _validate_forget_memory_uri(raw_uri: Any) -> tuple[str | None, str | None]:
     if not isinstance(raw_uri, str):
         return None, "uri is required"
 
@@ -885,7 +886,7 @@ def _ovcli_config_dir() -> Path:
     return _default_ovcli_config_path().parent
 
 
-async def _load_ovcli_config(path: Optional[Path] = None) -> dict:
+async def _load_ovcli_config(path: Path | None = None) -> dict:
     config_path = path or _resolve_ovcli_config_path()
     if not await aiofiles.os.path.exists(config_path):
         return {}
@@ -1108,19 +1109,19 @@ async def _load_hermes_openviking_config() -> dict:
         return {}
 
 
-def _env_value(name: str) -> Optional[str]:
+def _env_value(name: str) -> str | None:
     value = get_secret(name)
     return value.strip() if value is not None else None
 
 
-def _first_nonempty(*values: Optional[str], default: str = "") -> str:
+def _first_nonempty(*values: str | None, default: str = "") -> str:
     for value in values:
         if value:
             return value
     return default
 
 
-async def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict:
+async def _resolve_connection_settings(provider_config: dict | None = None) -> dict:
     provider_config = dict(provider_config or {})
     ovcli_values: dict = {}
     if provider_config.get("use_ovcli_config"):
@@ -1191,7 +1192,7 @@ async def _validate_openviking_reachability(endpoint: str) -> tuple[bool, str]:
     return False, f"OpenViking server is not reachable at {endpoint}."
 
 
-def _status_code_from_error(error: Exception) -> Optional[int]:
+def _status_code_from_error(error: Exception) -> int | None:
     if isinstance(error, _OpenVikingHTTPError):
         return error.status_code
     response = getattr(error, "response", None)
@@ -1207,7 +1208,7 @@ async def _local_openviking_bind(endpoint: str) -> tuple[str, int]:
 
 
 async def _build_openviking_subprocess_env(
-    provider_env: Optional[dict[str, str]] = None,
+    provider_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a scrubbed child env with only this profile's OpenViking data."""
     base = {
@@ -1304,7 +1305,7 @@ async def _local_listener_suffix(endpoint: str) -> str:
 async def _start_local_openviking_server(
     endpoint: str,
     *,
-    provider_env: Optional[dict[str, str]] = None,
+    provider_env: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     try:
         host, port = await _local_openviking_bind(endpoint)
@@ -1453,7 +1454,7 @@ async def _classify_runtime_openviking_health(
 class OpenVikingMemoryProvider(MemoryProvider):
     """Full bidirectional memory via OpenViking context database."""
 
-    def backup_paths(self) -> List[str]:
+    def backup_paths(self) -> list[str]:
         """OpenViking's ovcli config lives at ~/.openviking/ovcli.conf by
         default (or OPENVIKING_CLI_CONFIG_FILE). Capture the resolved file so
         endpoint/api-key survive a backup/import cycle."""
@@ -1469,7 +1470,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return []
 
     def __init__(self):
-        self._client: Optional[_VikingClient] = None
+        self._client: _VikingClient | None = None
         self._endpoint = ""
         self._api_key = ""
         self._account = ""
@@ -1479,24 +1480,24 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._hermes_home = ""
         self._run_id = uuid.uuid4().hex
-        self._run_lock_file: Optional[Any] = None
-        self._run_lock_path: Optional[Path] = None
+        self._run_lock_file: Any | None = None
+        self._run_lock_path: Path | None = None
         # Set once initialize() has resolved the connection baseline. Until then
         # _ensure_client() must not re-resolve from the environment — callers
         # that wire up a client directly (e.g. tests) would otherwise have it
         # discarded. See _ensure_client() / #21130.
         self._env_refresh_enabled = False
         self._session_state_lock = asyncio.Lock()
-        self._inflight_writers: Dict[str, Set[asyncio.Task[None]]] = {}
+        self._inflight_writers: dict[str, set[asyncio.Task[None]]] = {}
         self._inflight_lock = asyncio.Lock()
-        self._memory_write_tasks: Set[asyncio.Task[None]] = set()
+        self._memory_write_tasks: set[asyncio.Task[None]] = set()
         self._memory_write_lock = asyncio.Lock()
-        self._deferred_commit_sids: Set[str] = set()
-        self._deferred_commit_tasks: Set[asyncio.Task[None]] = set()
+        self._deferred_commit_sids: set[str] = set()
+        self._deferred_commit_tasks: set[asyncio.Task[None]] = set()
         self._deferred_commit_lock = asyncio.Lock()
-        self._committed_session_ids: Set[str] = set()
+        self._committed_session_ids: set[str] = set()
         self._committed_session_lock = asyncio.Lock()
-        self._pending_marked_sids: Set[str] = set()
+        self._pending_marked_sids: set[str] = set()
         # Connection settings and _client are one published state. Serialize
         # refreshes so callers never observe a new config with the old client.
         self._client_refresh_lock = asyncio.Lock()
@@ -1504,17 +1505,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # single tuple assignment (atomic in CPython) so lock-free background
         # writers (_new_client, on_memory_write) never see a torn mix of old
         # and new fields, and never target an endpoint that failed health.
-        self._conn_snapshot: Optional[tuple] = None
+        self._conn_snapshot: tuple | None = None
         # (settings tuple, monotonic timestamp) of the last refresh attempt
         # that failed. While the resolved config still matches and the retry
         # cooldown hasn't elapsed, _ensure_client_locked() returns None without
         # re-probing — keeping provider accesses cheap while a server is down.
-        self._failed_refresh: Optional[tuple] = None
+        self._failed_refresh: tuple | None = None
         self._runtime_start_lock = asyncio.Lock()
-        self._runtime_start_task: Optional[asyncio.Task[None]] = None
+        self._runtime_start_task: asyncio.Task[None] | None = None
         self._runtime_start_pending = False
-        self._owned_tasks: Set[asyncio.Task[None]] = set()
-        self._profile_prefetched_sessions: Set[str] = set()
+        self._owned_tasks: set[asyncio.Task[None]] = set()
+        self._profile_prefetched_sessions: set[str] = set()
         self._system_prompt_cache = ""
         # Set on shutdown so deferred-commit / writer finalizers stop issuing
         # network writes against a torn-down provider.
@@ -1665,7 +1666,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             },
         ]
 
-    async def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+    async def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         """Validate and persist provider configuration for the active profile."""
         normalized = dict(values or {})
         normalized.pop("api_key", None)
@@ -1771,7 +1772,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _finish_runtime_openviking_start(
         self,
         *,
-        endpoint: Optional[str] = None,
+        endpoint: str | None = None,
         status_callback=None,
         warning_callback=None,
     ) -> None:
@@ -1991,7 +1992,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 )
                 self._client = None
             else:
-                candidate: Optional[_VikingClient] = None
+                candidate: _VikingClient | None = None
                 try:
                     candidate = _VikingClient(
                         self._endpoint, self._api_key,
@@ -2054,7 +2055,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 )
             raise
 
-    async def _ensure_client(self) -> Optional["_VikingClient"]:
+    async def _ensure_client(self) -> _VikingClient | None:
         """Return the active client, rebuilding it if the resolved config changed.
 
         ``/reload`` only refreshes ``os.environ`` — the existing provider
@@ -2075,7 +2076,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         async with self._client_refresh_lock:
             return await self._ensure_client_locked()
 
-    async def _ensure_client_locked(self) -> Optional["_VikingClient"]:
+    async def _ensure_client_locked(self) -> _VikingClient | None:
         """Resolve and publish one client/config state under the refresh lock."""
         if self._shutting_down:
             await self._discard_client()
@@ -2254,7 +2255,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return ""
 
         effective_session_id = str(session_id or self._session_id or "").strip()
-        parts: List[str] = []
+        parts: list[str] = []
         session_memory = await self._session_start_memory_context(effective_session_id)
         if session_memory:
             parts.append(session_memory)
@@ -2283,7 +2284,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         session_id: str,
         *,
         limit: int,
-        context_type: str | List[str],
+        context_type: str | list[str],
         deadline: float,
         request_timeout: float,
     ) -> dict:
@@ -2410,11 +2411,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         )
 
     @staticmethod
-    def _text_part(content: str) -> Dict[str, str]:
+    def _text_part(content: str) -> dict[str, str]:
         return {"type": "text", "text": content}
 
-    def _turn_batch_payload(self, user_content: str, assistant_content: str) -> Dict[str, Any]:
-        assistant_message: Dict[str, Any] = {
+    def _turn_batch_payload(self, user_content: str, assistant_content: str) -> dict[str, Any]:
+        assistant_message: dict[str, Any] = {
             "role": "assistant",
             "parts": [self._text_part(assistant_content)],
         }
@@ -2475,31 +2476,31 @@ class OpenVikingMemoryProvider(MemoryProvider):
         async with self._committed_session_lock:
             self._committed_session_ids.discard(sid)
 
-    def _pending_session_dir(self) -> Optional[Path]:
+    def _pending_session_dir(self) -> Path | None:
         if not self._hermes_home:
             return None
         return Path(self._hermes_home) / _PENDING_SESSIONS_RELATIVE_DIR
 
-    def _pending_session_marker_path(self, sid: str) -> Optional[Path]:
+    def _pending_session_marker_path(self, sid: str) -> Path | None:
         sid = str(sid or "").strip()
         directory = self._pending_session_dir()
         if not sid or directory is None:
             return None
         return directory / f"{quote(sid, safe='')}.json"
 
-    def _run_lock_dir(self) -> Optional[Path]:
+    def _run_lock_dir(self) -> Path | None:
         if not self._hermes_home:
             return None
         return Path(self._hermes_home) / _RUN_LOCKS_RELATIVE_DIR
 
-    def _run_lock_path_for(self, run_id: str) -> Optional[Path]:
+    def _run_lock_path_for(self, run_id: str) -> Path | None:
         run_id = str(run_id or "").strip()
         directory = self._run_lock_dir()
         if not run_id or directory is None:
             return None
         return directory / f"{quote(run_id, safe='')}.lock"
 
-    def _recovery_lock_path_for(self, owner_run_id: str) -> Optional[Path]:
+    def _recovery_lock_path_for(self, owner_run_id: str) -> Path | None:
         owner_run_id = str(owner_run_id or "").strip()
         if owner_run_id:
             return self._run_lock_path_for(owner_run_id)
@@ -2563,7 +2564,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _claim_owner_run_for_recovery(
         self,
         owner_run_id: str,
-    ) -> tuple[bool, Optional[Any]]:
+    ) -> tuple[bool, Any | None]:
         owner_run_id = str(owner_run_id or "").strip()
         if owner_run_id == self._run_id:
             return False, None
@@ -2617,7 +2618,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _release_owner_run_claim(
         self,
         owner_run_id: str,
-        lock_file: Optional[Any],
+        lock_file: Any | None,
     ) -> None:
         if lock_file is not None:
             try:
@@ -2678,11 +2679,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Could not clear OpenViking pending session %s: %s", sid, e)
 
-    async def _pending_sessions(self) -> List[tuple[str, str]]:
+    async def _pending_sessions(self) -> list[tuple[str, str]]:
         directory = self._pending_session_dir()
         if directory is None or not await aiofiles.os.path.isdir(directory):
             return []
-        sessions: List[tuple[str, str]] = []
+        sessions: list[tuple[str, str]] = []
         entries = await aiofiles.os.scandir(directory)
         for entry in sorted(entries, key=lambda item: item.name):
             if not entry.name.endswith(".json"):
@@ -2706,7 +2707,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _recover_pending_sessions(self) -> None:
         if not self._client:
             return
-        pending_by_owner: Dict[str, List[str]] = {}
+        pending_by_owner: dict[str, list[str]] = {}
         for sid, owner_run_id in await self._pending_sessions():
             pending_by_owner.setdefault(owner_run_id, []).append(sid)
 
@@ -2720,7 +2721,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             async def _recover_owner(
                 pending_sids: tuple = tuple(sids),
                 pending_owner_run_id: str = owner_run_id,
-                pending_owner_lock_file: Optional[Any] = owner_lock_file,
+                pending_owner_lock_file: Any | None = owner_lock_file,
             ) -> None:
                 try:
                     for pending_sid in pending_sids:
@@ -2845,7 +2846,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         query: str,
         *,
         session_id: str = "",
-        client: Optional[_VikingClient] = None,
+        client: _VikingClient | None = None,
     ) -> str:
         query_text = (query or "").strip()
         if len(query_text) < _RECALL_QUERY_MIN_CHARS:
@@ -2872,8 +2873,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             cfg = await self._recall_config()
             candidate_limit = max(cfg["limit"] * 4, 20)
             deadline = time.monotonic() + cfg["timeout_seconds"]
-            candidates: List[Dict[str, Any]] = []
-            context_type: str | List[str] = (
+            candidates: list[dict[str, Any]] = []
+            context_type: str | list[str] = (
                 ["memory", "resource"] if cfg["resources"] else "memory"
             )
 
@@ -3000,7 +3001,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             parsed = default
         return max(minimum, min(maximum, parsed))
 
-    async def _recall_config(self) -> Dict[str, Any]:
+    async def _recall_config(self) -> dict[str, Any]:
         # Read from config.yaml → memory.openviking as primary source, env vars
         # as override. Behavioural settings belong in config.yaml (AGENTS.md).
         provider_config = await _load_hermes_openviking_config()
@@ -3075,12 +3076,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return ""
 
     @staticmethod
-    def _extract_memory_listing(resp: Any) -> List[Dict[str, str]]:
+    def _extract_memory_listing(resp: Any) -> list[dict[str, str]]:
         result = OpenVikingMemoryProvider._unwrap_result(resp)
         if not isinstance(result, list):
             return []
 
-        entries: List[Dict[str, str]] = []
+        entries: list[dict[str, str]] = []
         for raw in result:
             if not isinstance(raw, dict) or raw.get("isDir"):
                 continue
@@ -3167,7 +3168,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         *,
         deadline: float,
         request_timeout: float,
-    ) -> Optional[str]:
+    ) -> str | None:
         try:
             timeout = self._remaining_recall_timeout(deadline, request_timeout)
             resp = await client.get(
@@ -3188,7 +3189,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         *,
         deadline: float,
         request_timeout: float,
-    ) -> List[Dict[str, str]]:
+    ) -> list[dict[str, str]]:
         try:
             timeout = self._remaining_recall_timeout(deadline, request_timeout)
             resp = await client.get(
@@ -3203,10 +3204,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _read_session_start_memory_parts(
         self,
         *,
-        client: Optional[_VikingClient] = None,
+        client: _VikingClient | None = None,
         deadline: float,
         request_timeout: float,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         active_client = client or self._client
         if not active_client:
             return {}
@@ -3237,10 +3238,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
     @staticmethod
     def _assemble_session_start_memory_block(
         profile: str,
-        preference_lines: List[str],
-        entity_lines: List[str],
+        preference_lines: list[str],
+        entity_lines: list[str],
     ) -> str:
-        lines: List[str] = []
+        lines: list[str] = []
         if profile:
             lines.extend([
                 f'<user-profile uri="{_PROFILE_URI}">',
@@ -3258,9 +3259,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def _format_memory_listing(
         cls,
         uri: str,
-        entries: List[Dict[str, str]],
+        entries: list[dict[str, str]],
         max_units: int,
-    ) -> tuple[List[str], int]:
+    ) -> tuple[list[str], int]:
         if not entries or max_units <= 0:
             return [], 0
 
@@ -3296,8 +3297,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         cls,
         *,
         profile: str,
-        preferences: List[Dict[str, str]],
-        entities: List[Dict[str, str]],
+        preferences: list[dict[str, str]],
+        entities: list[dict[str, str]],
         token_budget: int,
     ) -> str:
         profile = profile.strip()
@@ -3320,8 +3321,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             profile_text = cls._truncate_profile_content(profile, profile_units)
             available_units -= cls._token_units(profile_text)
 
-        preference_lines: List[str] = []
-        entity_lines: List[str] = []
+        preference_lines: list[str] = []
+        entity_lines: list[str] = []
         if preferences and entities:
             preference_budget = available_units // 2
         else:
@@ -3378,12 +3379,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return max(0.0, min(1.0, score))
 
     @staticmethod
-    def _recall_category(item: Dict[str, Any]) -> str:
+    def _recall_category(item: dict[str, Any]) -> str:
         category = str(item.get("category") or "").strip()
         return category or "memory"
 
     @staticmethod
-    def _recall_abstract(item: Dict[str, Any]) -> str:
+    def _recall_abstract(item: dict[str, Any]) -> str:
         for key in ("abstract", "overview", "text", "content"):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
@@ -3392,7 +3393,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return str(uri or "").strip()
 
     @staticmethod
-    def _dedupe_key(item: Dict[str, Any]) -> str:
+    def _dedupe_key(item: dict[str, Any]) -> str:
         uri = str(item.get("uri") or "").strip()
         category = str(item.get("category") or "").strip().lower() or "unknown"
         abstract = OpenVikingMemoryProvider._recall_abstract(item).lower()
@@ -3403,7 +3404,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return f"uri:{uri}"
 
     @staticmethod
-    def _query_tokens(query: str) -> List[str]:
+    def _query_tokens(query: str) -> list[str]:
         tokens = []
         for raw in query.lower().replace("_", " ").split():
             token = "".join(ch for ch in raw if ch.isalnum())
@@ -3412,7 +3413,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return tokens[:8]
 
     @classmethod
-    def _recall_rank(cls, item: Dict[str, Any], query_tokens: List[str]) -> float:
+    def _recall_rank(cls, item: dict[str, Any], query_tokens: list[str]) -> float:
         text = f"{item.get('uri', '')} {cls._recall_abstract(item)}".lower()
         overlap = sum(1 for token in query_tokens if token in text)
         overlap_boost = min(0.2, overlap * 0.05)
@@ -3422,15 +3423,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
     @classmethod
     def _select_recall_candidates(
         cls,
-        items: List[Dict[str, Any]],
+        items: list[dict[str, Any]],
         query: str,
         *,
         limit: int,
         score_threshold: float,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         seen_uri = set()
         seen_key = set()
-        filtered: List[Dict[str, Any]] = []
+        filtered: list[dict[str, Any]] = []
         for item in items:
             uri = str(item.get("uri") or "").strip()
             if not uri or uri in seen_uri:
@@ -3463,12 +3464,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _resolve_recall_content(
         self,
         client: _VikingClient,
-        item: Dict[str, Any],
+        item: dict[str, Any],
         *,
         prefer_abstract: bool,
         deadline: float,
         request_timeout: float,
-        read_state: Dict[str, int],
+        read_state: dict[str, int],
         full_read_limit: int,
     ) -> str:
         abstract = self._recall_abstract(item)
@@ -3504,15 +3505,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
     async def _build_prefetch_entries(
         self,
         client: _VikingClient,
-        items: List[Dict[str, Any]],
+        items: list[dict[str, Any]],
         *,
         prefer_abstract: bool,
         max_injected_chars: int,
         deadline: float,
         request_timeout: float,
         full_read_limit: int,
-    ) -> List[str]:
-        entries: List[str] = []
+    ) -> list[str]:
+        entries: list[str] = []
         total_chars = 0
         read_state = {"full_reads": 0}
         for item in items:
@@ -3546,7 +3547,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return flatten_message_text(content)
 
     @classmethod
-    def _message_matches_text(cls, message: Dict[str, Any], expected: Any) -> bool:
+    def _message_matches_text(cls, message: dict[str, Any], expected: Any) -> bool:
         expected_text = cls._message_text(expected).strip()
         if not expected_text:
             return False
@@ -3556,15 +3557,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
     @classmethod
     def _extract_current_turn_messages(
         cls,
-        messages: Optional[List[Dict[str, Any]]],
+        messages: list[dict[str, Any]] | None,
         user_content: str,
         assistant_content: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Slice the completed turn out of Hermes' full canonical transcript."""
         if not messages:
             return []
 
-        end_idx: Optional[int] = None
+        end_idx: int | None = None
         if cls._message_text(assistant_content).strip():
             for idx in range(len(messages) - 1, -1, -1):
                 message = messages[idx]
@@ -3584,7 +3585,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if end_idx is None:
             end_idx = len(messages) - 1
 
-        start_idx: Optional[int] = None
+        start_idx: int | None = None
         if cls._message_text(user_content).strip():
             for idx in range(end_idx, -1, -1):
                 message = messages[idx]
@@ -3607,11 +3608,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return [message for message in messages[start_idx : end_idx + 1] if isinstance(message, dict)]
 
     @staticmethod
-    def _tool_call_id(tool_call: Dict[str, Any]) -> str:
+    def _tool_call_id(tool_call: dict[str, Any]) -> str:
         return str(tool_call.get("id") or tool_call.get("tool_call_id") or "")
 
     @staticmethod
-    def _tool_call_name(tool_call: Dict[str, Any]) -> str:
+    def _tool_call_name(tool_call: dict[str, Any]) -> str:
         function = tool_call.get("function")
         if isinstance(function, dict):
             return str(function.get("name") or "")
@@ -3622,7 +3623,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return str(tool_name or "").strip().lower() in _OPENVIKING_RECALL_TOOL_NAMES
 
     @staticmethod
-    def _tool_call_input(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    def _tool_call_input(tool_call: dict[str, Any]) -> dict[str, Any]:
         function = tool_call.get("function")
         raw_args: Any = None
         if isinstance(function, dict):
@@ -3646,7 +3647,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return {"value": raw_args}
 
     @classmethod
-    def _tool_result_status(cls, message: Dict[str, Any]) -> str:
+    def _tool_result_status(cls, message: dict[str, Any]) -> str:
         raw_status = str(message.get("status") or message.get("tool_status") or "").lower()
         if raw_status in _TOOL_STATUS_ERROR_ALIASES:
             return _TOOL_STATUS_ERROR
@@ -3675,13 +3676,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
     @classmethod
     def _messages_to_openviking_batch(
         cls,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         *,
         assistant_peer_id: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Convert Hermes canonical messages into OpenViking batch payloads."""
         assistant_peer_id = str(assistant_peer_id or "").strip()
-        tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
+        tool_calls_by_id: dict[str, dict[str, Any]] = {}
         completed_tool_ids: set[str] = set()
         skipped_tool_ids: set[str] = set()
         for message in messages:
@@ -3709,11 +3710,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     if cls._is_openviking_recall_tool_name(tool_name):
                         skipped_tool_ids.add(tool_id)
 
-        payload_messages: List[Dict[str, Any]] = []
-        pending_tool_parts: List[Dict[str, Any]] = []
+        payload_messages: list[dict[str, Any]] = []
+        pending_tool_parts: list[dict[str, Any]] = []
 
-        def payload_message(role: str, parts: List[Dict[str, Any]]) -> Dict[str, Any]:
-            payload: Dict[str, Any] = {"role": role, "parts": parts}
+        def payload_message(role: str, parts: list[dict[str, Any]]) -> dict[str, Any]:
+            payload: dict[str, Any] = {"role": role, "parts": parts}
             if role == "assistant" and assistant_peer_id:
                 payload["peer_id"] = assistant_peer_id
             return payload
@@ -3753,7 +3754,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 continue
 
             flush_tool_parts()
-            parts: List[Dict[str, Any]] = []
+            parts: list[dict[str, Any]] = []
             text = cls._message_text(message.get("content"))
             if text:
                 parts.append({"type": "text", "text": text})
@@ -3797,7 +3798,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Record the conversation turn through native async OpenViking I/O."""
         if not await self._ensure_client():
@@ -3970,7 +3971,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         if not workers:
                             self._inflight_writers.pop(sid, None)
 
-    async def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Commit the session to trigger memory extraction.
 
         OpenViking automatically extracts 6 categories of memories:
@@ -4106,7 +4107,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Mirror successful built-in memory additions to OpenViking."""
         if action != "add" or not content or not await self._ensure_client():
@@ -4141,7 +4142,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 async with self._memory_write_lock:
                     self._memory_write_tasks.discard(current)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [
             SEARCH_SCHEMA,
             READ_SCHEMA,
@@ -4267,7 +4268,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not query:
             return tool_error("query is required")
 
-        payload: Dict[str, Any] = {"query": query}
+        payload: dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
         if args.get("scope"):
             payload["target_uri"] = args["scope"]
@@ -4314,8 +4315,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         uri: str,
         level: str,
         *,
-        limit: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         summary_level = level in {"abstract", "overview"}
         # OpenViking expects directory URIs for pseudo summary files
         # (e.g. viking://user/hermes/.overview.md).
@@ -4392,7 +4393,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         uri_arg = args.get("uri", "")
         uris_arg = args.get("uris", [])
 
-        raw_uris: List[Any]
+        raw_uris: list[Any]
         batch_requested = bool(uris_arg) or isinstance(uri_arg, list)
         if isinstance(uris_arg, list) and uris_arg:
             raw_uris = uris_arg
@@ -4403,8 +4404,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         else:
             return tool_error("uri or uris is required")
 
-        uris: List[str] = []
-        seen: Set[str] = set()
+        uris: list[str] = []
+        seen: set[str] = set()
         for raw_uri in raw_uris:
             if not isinstance(raw_uri, str):
                 continue
@@ -4429,7 +4430,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 ensure_ascii=False,
             )
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for uri in selected:
             try:
                 results.append(
@@ -4527,7 +4528,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             params={"uri": uri, "recursive": False},
         )
         result = self._unwrap_result(resp)
-        payload: Dict[str, Any] = {"status": "deleted", "uri": uri}
+        payload: dict[str, Any] = {"status": "deleted", "uri": uri}
         if isinstance(result, dict):
             payload["uri"] = result.get("uri") or uri
             for key in (
@@ -4552,7 +4553,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if args.get("to") and args.get("parent"):
             return tool_error("Cannot specify both 'to' and 'parent'")
 
-        payload: Dict[str, Any] = {}
+        payload: dict[str, Any] = {}
         for key in ("reason", "to", "parent", "instruction", "wait", "timeout"):
             if key in args and args[key] not in {None, ""}:
                 payload[key] = args[key]
@@ -4569,7 +4570,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         else:
             source_path = Path(url).expanduser()
 
-        cleanup_path: Optional[Path] = None
+        cleanup_path: Path | None = None
         try:
             if source_path is not None:
                 if await aiofiles.os.path.exists(source_path):

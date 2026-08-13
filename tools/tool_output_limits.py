@@ -34,7 +34,7 @@ from __future__ import annotations
 import contextvars
 import os
 import threading
-from typing import Any, Dict
+from typing import Any
 
 import aiofiles.os
 
@@ -132,7 +132,7 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return iv
 
 
-def get_tool_output_limits() -> Dict[str, int]:
+def get_tool_output_limits() -> dict[str, int]:
     """Return deterministic limits without synchronous configuration I/O."""
     profile = _current_limits_profile()
     with _limits_cache_guard:
@@ -142,7 +142,7 @@ def get_tool_output_limits() -> Dict[str, int]:
     return _publish_limits(profile, _default_limits())
 
 
-async def _refresh_tool_output_limits() -> Dict[str, int]:
+async def _refresh_tool_output_limits() -> dict[str, int]:
     """Refresh the active profile through the native async config loader."""
     profile = await _activate_limits_profile()
     try:

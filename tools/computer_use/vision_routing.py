@@ -48,12 +48,12 @@ one extra LLM call and yields a usable description.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
+def _explicit_aux_vision_override(cfg: dict[str, Any] | None) -> bool:
     """True when ``auxiliary.vision`` carries a non-default user override.
 
     Mirrors ``agent.image_routing._explicit_aux_vision_override`` so the
@@ -83,8 +83,8 @@ def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
 def _lookup_user_declared_supports_vision(
     provider: str,
     model: str,
-    cfg: Optional[Dict[str, Any]],
-) -> Optional[bool]:
+    cfg: dict[str, Any] | None,
+) -> bool | None:
     """Return config-declared ``supports_vision`` for the active route."""
     try:
         from agent.image_routing import _supports_vision_override
@@ -107,8 +107,8 @@ def _lookup_user_declared_supports_vision(
 def _lookup_supports_vision(
     provider: str,
     model: str,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> Optional[bool]:
+    cfg: dict[str, Any] | None = None,
+) -> bool | None:
     """Return config/models.dev ``supports_vision`` for *(provider, model)*."""
     if not provider or not model:
         return None
@@ -140,7 +140,7 @@ def _lookup_supports_vision(
     return bool(getattr(caps, "supports_vision", False))
 
 
-def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> Optional[bool]:
+def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> bool | None:
     """Return whether *provider*+*model* carries images inside tool-result messages.
 
     Reuses ``tools.vision_tools._supports_media_in_tool_results`` so the
@@ -164,7 +164,7 @@ def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> Optio
 def should_route_capture_to_aux_vision(
     provider: str,
     model: str,
-    cfg: Optional[Dict[str, Any]],
+    cfg: dict[str, Any] | None,
 ) -> bool:
     """Return True iff the captured screenshot should be pre-analysed via aux vision.
 

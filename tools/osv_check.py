@@ -13,7 +13,6 @@ Inspired by Block/goose's extension malware check.
 import logging
 import os
 import re
-from typing import Optional, Tuple
 
 import httpx
 
@@ -28,7 +27,7 @@ _TIMEOUT = 10  # seconds
 async def check_package_for_malware(
     command: str,
     args: list,
-) -> Optional[str]:
+) -> str | None:
     """Async OSV malware preflight for native-async MCP startup.
 
     The package parsing and response policy intentionally match the legacy
@@ -58,7 +57,7 @@ async def check_package_for_malware(
     return None
 
 
-def _infer_ecosystem(command: str) -> Optional[str]:
+def _infer_ecosystem(command: str) -> str | None:
     """Infer package ecosystem from the command name."""
     base = os.path.basename(command).lower()
     if base in {"npx", "npx.cmd"}:
@@ -70,7 +69,7 @@ def _infer_ecosystem(command: str) -> Optional[str]:
 
 def _parse_package_from_args(
     args: list, ecosystem: str
-) -> Tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """Extract package name and optional version from command args.
 
     Returns (package_name, version) or (None, None) if not parseable.
@@ -112,7 +111,7 @@ def _parse_package_from_args(
     return package_token, None
 
 
-def _parse_npm_package(token: str) -> Tuple[Optional[str], Optional[str]]:
+def _parse_npm_package(token: str) -> tuple[str | None, str | None]:
     """Parse npm package: @scope/name@version or name@version."""
     if token.startswith("@"):
         # Scoped: @scope/name@version
@@ -129,7 +128,7 @@ def _parse_npm_package(token: str) -> Tuple[Optional[str], Optional[str]]:
     return token, None
 
 
-def _parse_pypi_package(token: str) -> Tuple[Optional[str], Optional[str]]:
+def _parse_pypi_package(token: str) -> tuple[str | None, str | None]:
     """Parse PyPI package: name==version or name[extras]==version."""
     # Strip extras: name[extra1,extra2]==version
     match = re.match(r"^([a-zA-Z0-9._-]+)(?:\[[^\]]*\])?(?:==(.+))?$", token)
@@ -141,7 +140,7 @@ def _parse_pypi_package(token: str) -> Tuple[Optional[str], Optional[str]]:
 async def _query_osv(
     package: str,
     ecosystem: str,
-    version: Optional[str] = None,
+    version: str | None = None,
 ) -> list:
     """Query OSV without blocking the event loop."""
     payload = {"package": {"name": package, "ecosystem": ecosystem}}

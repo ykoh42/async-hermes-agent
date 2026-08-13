@@ -7,7 +7,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -36,9 +36,9 @@ def _coerce_non_negative_int(value: Any, default: int) -> int:
     return converted if converted >= 0 else default
 
 
-async def get_spill_config() -> Dict[str, Any]:
+async def get_spill_config() -> dict[str, Any]:
     """Resolve output-spill configuration without blocking or raising."""
-    section: Dict[str, Any] = {}
+    section: dict[str, Any] = {}
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -74,8 +74,8 @@ async def get_spill_config() -> Dict[str, Any]:
 
 
 def _resolve_spill_dir(
-    directory_override: Optional[str],
-    session_id: Optional[str],
+    directory_override: str | None,
+    session_id: str | None,
 ) -> Path:
     if directory_override:
         base = Path(os.path.expanduser(directory_override))
@@ -92,7 +92,7 @@ def _build_preview(
     text: str,
     head: int,
     tail: int,
-    saved_path: Optional[str],
+    saved_path: str | None,
     *,
     source: str,
 ) -> str:
@@ -115,9 +115,9 @@ def _build_preview(
 async def spill_if_oversized(
     text: str,
     *,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     source: str = "hook",
-    config: Optional[Dict[str, Any]] = None,
+    config: dict[str, Any] | None = None,
 ) -> str:
     """Return text unchanged under the cap, otherwise persist and preview it."""
     if text is None:
@@ -135,7 +135,7 @@ async def spill_if_oversized(
     if len(text) <= max_chars:
         return text
 
-    saved_path: Optional[str] = None
+    saved_path: str | None = None
     try:
         spill_dir = _resolve_spill_dir(resolved.get("directory"), session_id)
         await aiofiles.os.makedirs(spill_dir, exist_ok=True)

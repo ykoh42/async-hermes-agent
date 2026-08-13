@@ -51,7 +51,8 @@ import warnings
 import weakref
 import aiofiles.os
 import aiofiles.tempfile
-from typing import List, Dict, Any, Optional, Callable
+from typing import Any
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,7 +81,7 @@ async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     return result
 
 
-async def _launch_cwd_for_session(source: str) -> Optional[str]:
+async def _launch_cwd_for_session(source: str) -> str | None:
     """Working directory to stamp on a new session row, or None.
 
     Only local CLI sessions get a recorded cwd: the directory the process was
@@ -104,7 +105,7 @@ async def _launch_cwd_for_session(source: str) -> Optional[str]:
         return None
 
 
-def _session_source_for_agent(platform: Optional[str]) -> str:
+def _session_source_for_agent(platform: str | None) -> str:
     try:
         from gateway.session_context import get_session_env
 
@@ -412,9 +413,9 @@ class _StreamErrorEvent(Exception):
         self,
         message: str,
         *,
-        code: Optional[str] = None,
-        param: Optional[str] = None,
-        status_code: Optional[int] = None,
+        code: str | None = None,
+        param: str | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -423,7 +424,7 @@ class _StreamErrorEvent(Exception):
         self.status_code = status_code
         # OpenAI SDK-shaped body so _extract_api_error_context /
         # _summarize_api_error / classify_api_error all pick it up.
-        self.body: Dict[str, Any] = {
+        self.body: dict[str, Any] = {
             "error": {
                 "message": message,
                 "code": code,
@@ -458,78 +459,78 @@ class AIAgent:
 
     def __init__(
         self,
-        base_url: str = None,
-        api_key: str = None,
-        provider: str = None,
-        api_mode: str = None,
-        acp_command: str = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        provider: str | None = None,
+        api_mode: str | None = None,
+        acp_command: str | None = None,
         acp_args: list[str] | None = None,
-        command: str = None,
+        command: str | None = None,
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
-        tool_delay: float = None,  # Deprecated: accepted for compatibility, ignored
-        enabled_toolsets: List[str] = None,
-        disabled_toolsets: List[str] = None,
+        tool_delay: float | None = None,  # Deprecated: accepted for compatibility, ignored
+        enabled_toolsets: list[str] | None = None,
+        disabled_toolsets: list[str] | None = None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
         tool_progress_mode: str = "all",
-        ephemeral_system_prompt: str = None,
+        ephemeral_system_prompt: str | None = None,
         log_prefix_chars: int = 100,
         log_prefix: str = "",
-        providers_allowed: List[str] = None,
-        providers_ignored: List[str] = None,
-        providers_order: List[str] = None,
-        provider_sort: str = None,
+        providers_allowed: list[str] | None = None,
+        providers_ignored: list[str] | None = None,
+        providers_order: list[str] | None = None,
+        provider_sort: str | None = None,
         provider_require_parameters: bool = False,
-        provider_data_collection: str = None,
-        openrouter_min_coding_score: Optional[float] = None,
-        session_id: str = None,
-        tool_progress_callback: callable = None,
-        tool_start_callback: callable = None,
-        tool_complete_callback: callable = None,
-        thinking_callback: callable = None,
-        reasoning_callback: callable = None,
-        clarify_callback: callable = None,
-        read_terminal_callback: callable = None,
-        step_callback: callable = None,
-        stream_delta_callback: callable = None,
-        interim_assistant_callback: callable = None,
-        tool_gen_callback: callable = None,
-        status_callback: callable = None,
-        notice_callback: callable = None,
-        notice_clear_callback: callable = None,
-        event_callback: Optional[Callable[[str, dict], None]] = None,
-        reaction_callback: Optional[Callable[[str], None]] = None,
-        max_tokens: int = None,
-        reasoning_config: Dict[str, Any] = None,
-        service_tier: str = None,
-        request_overrides: Dict[str, Any] = None,
-        prefill_messages: List[Dict[str, Any]] = None,
-        platform: str = None,
-        user_id: str = None,
-        user_id_alt: str = None,
-        user_name: str = None,
-        chat_id: str = None,
-        chat_name: str = None,
-        chat_type: str = None,
-        thread_id: str = None,
-        gateway_session_key: str = None,
+        provider_data_collection: str | None = None,
+        openrouter_min_coding_score: float | None = None,
+        session_id: str | None = None,
+        tool_progress_callback: Callable[..., Any] | None = None,
+        tool_start_callback: Callable[..., Any] | None = None,
+        tool_complete_callback: Callable[..., Any] | None = None,
+        thinking_callback: Callable[..., Any] | None = None,
+        reasoning_callback: Callable[..., Any] | None = None,
+        clarify_callback: Callable[..., Any] | None = None,
+        read_terminal_callback: Callable[..., Any] | None = None,
+        step_callback: Callable[..., Any] | None = None,
+        stream_delta_callback: Callable[..., Any] | None = None,
+        interim_assistant_callback: Callable[..., Any] | None = None,
+        tool_gen_callback: Callable[..., Any] | None = None,
+        status_callback: Callable[..., Any] | None = None,
+        notice_callback: Callable[..., Any] | None = None,
+        notice_clear_callback: Callable[..., Any] | None = None,
+        event_callback: Callable[[str, dict], None] | None = None,
+        reaction_callback: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        service_tier: str | None = None,
+        request_overrides: dict[str, Any] | None = None,
+        prefill_messages: list[dict[str, Any]] | None = None,
+        platform: str | None = None,
+        user_id: str | None = None,
+        user_id_alt: str | None = None,
+        user_name: str | None = None,
+        chat_id: str | None = None,
+        chat_name: str | None = None,
+        chat_type: str | None = None,
+        thread_id: str | None = None,
+        gateway_session_key: str | None = None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
         session_db=None,
-        parent_session_id: str = None,
+        parent_session_id: str | None = None,
         iteration_budget: "IterationBudget" = None,
-        fallback_model: Dict[str, Any] = None,
+        fallback_model: dict[str, Any] | None = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
-        requested_provider: str = None,
+        requested_provider: str | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -825,9 +826,9 @@ class AIAgent:
     async def _transition_context_engine_session(
         self,
         *,
-        old_session_id: Optional[str] = None,
-        new_session_id: Optional[str] = None,
-        previous_messages: Optional[list] = None,
+        old_session_id: str | None = None,
+        new_session_id: str | None = None,
+        previous_messages: list | None = None,
         carry_over_context: bool = False,
         reset_engine: bool = True,
         **extra_context,
@@ -896,8 +897,8 @@ class AIAgent:
 
     async def reset_session_state(
         self,
-        previous_messages: Optional[list] = None,
-        old_session_id: Optional[str] = None,
+        previous_messages: list | None = None,
+        old_session_id: str | None = None,
         carry_over_context: bool = False,
     ):
         """Reset all session-scoped token counters to 0 for a fresh session.
@@ -981,9 +982,9 @@ class AIAgent:
 
     @staticmethod
     def _effective_lmstudio_context_length(
-        config_context_length: Optional[int],
+        config_context_length: int | None,
         runtime_context_length: Any,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Return a safe context budget from explicit intent and verified runtime."""
         explicit = (
             config_context_length
@@ -1019,7 +1020,7 @@ class AIAgent:
 
     async def _ensure_lmstudio_runtime_loaded(
         self,
-        config_context_length: Optional[int] = None,
+        config_context_length: int | None = None,
     ) -> Any:
         """Preload LM Studio unless configured to rely on JIT loading."""
         if (self.provider or "").strip().lower() != "lmstudio":
@@ -1372,8 +1373,8 @@ class AIAgent:
 
     def _disable_codex_reasoning_replay(
         self,
-        messages: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, int]:
+        messages: list[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
         """Disable Responses encrypted reasoning replay and strip cached state.
 
         Called from the conversation_loop retry path when the provider
@@ -1408,13 +1409,13 @@ class AIAgent:
     from agent.stream_diag import STREAM_DIAG_HEADERS as _STREAM_DIAG_HEADERS  # noqa: E402
 
     @staticmethod
-    def _stream_diag_init() -> Dict[str, Any]:
+    def _stream_diag_init() -> dict[str, Any]:
         """Forwarder — see ``agent.stream_diag.stream_diag_init``."""
         from agent.stream_diag import stream_diag_init
         return stream_diag_init()
 
     def _stream_diag_capture_response(
-        self, diag: Dict[str, Any], http_response: Any
+        self, diag: dict[str, Any], http_response: Any
     ) -> None:
         """Forwarder — see ``agent.stream_diag.stream_diag_capture_response``."""
         from agent.stream_diag import stream_diag_capture_response
@@ -1452,7 +1453,7 @@ class AIAgent:
         attempt: int,
         max_attempts: int,
         mid_tool_call: bool,
-        diag: Optional[Dict[str, Any]] = None,
+        diag: dict[str, Any] | None = None,
     ) -> None:
         """Forwarder — see ``agent.stream_diag.log_stream_retry``."""
         from agent.stream_diag import log_stream_retry
@@ -1468,7 +1469,7 @@ class AIAgent:
         attempt: int,
         max_attempts: int,
         mid_tool_call: bool,
-        diag: Optional[Dict[str, Any]] = None,
+        diag: dict[str, Any] | None = None,
     ) -> None:
         """Forwarder — see ``agent.stream_diag.emit_stream_drop``."""
         from agent.stream_diag import emit_stream_drop
@@ -1488,7 +1489,7 @@ class AIAgent:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, str]:
+    def _current_main_runtime(self) -> dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             "model": getattr(self, "model", "") or "",
@@ -1509,7 +1510,7 @@ class AIAgent:
         from agent.conversation_compression import replay_compression_warning
         replay_compression_warning(self)
 
-    def _is_direct_openai_url(self, base_url: str = None) -> bool:
+    def _is_direct_openai_url(self, base_url: str | None = None) -> bool:
         """Return True when a base URL targets OpenAI's native API."""
         if base_url is not None:
             hostname = base_url_hostname(base_url)
@@ -1519,7 +1520,7 @@ class AIAgent:
             )
         return hostname == "api.openai.com"
 
-    def _is_azure_openai_url(self, base_url: str = None) -> bool:
+    def _is_azure_openai_url(self, base_url: str | None = None) -> bool:
         """Return True when a base URL targets Azure OpenAI.
 
         Azure OpenAI exposes an OpenAI-compatible endpoint at
@@ -1535,7 +1536,7 @@ class AIAgent:
             url = getattr(self, "_base_url_lower", "") or ""
         return "openai.azure.com" in url
 
-    def _is_github_copilot_url(self, base_url: str = None) -> bool:
+    def _is_github_copilot_url(self, base_url: str | None = None) -> bool:
         """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
         if base_url is not None:
             hostname = base_url_hostname(base_url)
@@ -1632,7 +1633,7 @@ class AIAgent:
             return max(stale_base, 150.0)
         return stale_base
 
-    def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
+    def _codex_silent_hang_hint(self, model: str | None = None) -> str | None:
         """Return an actionable hint when this request matches a known
         Codex silent-reject configuration, else ``None``.
 
@@ -1717,10 +1718,10 @@ class AIAgent:
     def _anthropic_prompt_cache_policy(
         self,
         *,
-        provider: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_mode: Optional[str] = None,
-        model: Optional[str] = None,
+        provider: str | None = None,
+        base_url: str | None = None,
+        api_mode: str | None = None,
+        model: str | None = None,
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.anthropic_prompt_cache_policy``."""
         from agent.agent_runtime_helpers import anthropic_prompt_cache_policy
@@ -1745,7 +1746,7 @@ class AIAgent:
     def _provider_model_requires_responses_api(
         model: str,
         *,
-        provider: Optional[str] = None,
+        provider: str | None = None,
     ) -> bool:
         """Return True when this provider/model pair should use Responses API."""
         normalized_provider = (provider or "").strip().lower()
@@ -1793,7 +1794,7 @@ class AIAgent:
         return {"max_tokens": value}
 
     @staticmethod
-    def _requested_output_cap_from_api_kwargs(api_kwargs: Any) -> Optional[int]:
+    def _requested_output_cap_from_api_kwargs(api_kwargs: Any) -> int | None:
         """Extract the outgoing response token cap from a prepared request."""
         if not isinstance(api_kwargs, dict):
             return None
@@ -1881,7 +1882,7 @@ class AIAgent:
         self,
         finish_reason: str,
         assistant_message,
-        messages: Optional[list] = None,
+        messages: list | None = None,
     ) -> bool:
         """Detect conservative stop->length misreports for Ollama-hosted GLM models."""
         if finish_reason != "stop" or self.api_mode != "chat_completions":
@@ -1912,7 +1913,7 @@ class AIAgent:
         self,
         user_message: str,
         assistant_content: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         require_workspace: bool = True,
     ) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.looks_like_codex_intermediate_ack``."""
@@ -1921,7 +1922,7 @@ class AIAgent:
             self, user_message, assistant_content, messages, require_workspace
         )
 
-    def _extract_reasoning(self, assistant_message) -> Optional[str]:
+    def _extract_reasoning(self, assistant_message) -> str | None:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_reasoning``."""
         from agent.agent_runtime_helpers import extract_reasoning
         return extract_reasoning(self, assistant_message)
@@ -1941,10 +1942,10 @@ class AIAgent:
 
     @staticmethod
     def _summarize_background_review_actions(
-        review_messages: List[Dict],
-        prior_snapshot: List[Dict],
+        review_messages: list[dict],
+        prior_snapshot: list[dict],
         notification_mode: str = "on",
-    ) -> List[str]:
+    ) -> list[str]:
         from agent.background_review import summarize_background_review_actions
 
         return summarize_background_review_actions(
@@ -1955,7 +1956,7 @@ class AIAgent:
 
     def _spawn_background_review(
         self,
-        messages_snapshot: List[Dict],
+        messages_snapshot: list[dict],
         review_memory: bool = False,
         review_skills: bool = False,
     ) -> None:
@@ -1982,11 +1983,11 @@ class AIAgent:
     def _build_memory_write_metadata(
         self,
         *,
-        write_origin: Optional[str] = None,
-        execution_context: Optional[str] = None,
-        task_id: Optional[str] = None,
-        tool_call_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        write_origin: str | None = None,
+        execution_context: str | None = None,
+        task_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
         """Forwarder — see ``agent.background_review.build_memory_write_metadata``."""
         from agent.background_review import build_memory_write_metadata
 
@@ -1998,7 +1999,7 @@ class AIAgent:
             tool_call_id=tool_call_id,
         )
 
-    def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
+    def _apply_persist_user_message_override(self, messages: list[dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
 
         Some call paths need an API-only user-message variant without letting
@@ -2044,7 +2045,7 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    async def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    async def _persist_session(self, messages: list[dict], conversation_history: list[dict] | None = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -2090,7 +2091,7 @@ class AIAgent:
                     await flush_token_counts()
             note_turn_persisted(self)
 
-    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
+    def _drop_trailing_empty_response_scaffolding(self, messages: list[dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
 
         Also rewinds past any trailing tool-result / assistant(tool_calls) pair
@@ -2143,15 +2144,15 @@ class AIAgent:
         ):
             messages.pop()
 
-    def _repair_message_sequence(self, messages: List[Dict]) -> int:
+    def _repair_message_sequence(self, messages: list[dict]) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_message_sequence``."""
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
     async def _flush_messages_to_session_db(
         self,
-        messages: List[Dict],
-        conversation_history: Optional[List[Dict]] = None,
+        messages: list[dict],
+        conversation_history: list[dict] | None = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         async with self._get_session_persist_lock():
@@ -2161,8 +2162,8 @@ class AIAgent:
 
     async def _flush_messages_to_session_db_unlocked(
         self,
-        messages: List[Dict],
-        conversation_history: Optional[List[Dict]] = None,
+        messages: list[dict],
+        conversation_history: list[dict] | None = None,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2427,7 +2428,7 @@ class AIAgent:
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
-    def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
+    def _get_messages_up_to_last_assistant(self, messages: list[dict]) -> list[dict]:
         """
         Get messages up to (but not including) the last assistant turn.
         
@@ -2463,17 +2464,17 @@ class AIAgent:
         from agent.system_prompt import format_tools_for_system_message
         return format_tools_for_system_message(self)
 
-    def _convert_to_trajectory_format(self, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
+    def _convert_to_trajectory_format(self, messages: list[dict[str, Any]], user_query: str, completed: bool) -> list[dict[str, Any]]:
         """Forwarder — see ``agent.agent_runtime_helpers.convert_to_trajectory_format``."""
         from agent.agent_runtime_helpers import convert_to_trajectory_format
         return convert_to_trajectory_format(self, messages, user_query, completed)
 
-    async def _save_trajectory(self, messages: List[Dict[str, Any]], user_query: str, completed: bool):
+    async def _save_trajectory(self, messages: list[dict[str, Any]], user_query: str, completed: bool):
         """
         Save conversation trajectory to JSONL file.
         
         Args:
-            messages (List[Dict]): Complete message history
+            messages (list[dict]): Complete message history
             user_query (str): Original user query
             completed (bool): Whether the conversation completed successfully
         """
@@ -2485,8 +2486,8 @@ class AIAgent:
 
     @staticmethod
     def _is_entitlement_failure(
-        error_context: Optional[Dict[str, Any]],
-        status_code: Optional[int],
+        error_context: dict[str, Any] | None,
+        status_code: int | None,
     ) -> bool:
         """Detect subscription/entitlement 403s that masquerade as auth failures.
 
@@ -2717,7 +2718,7 @@ class AIAgent:
         prefix = f"HTTP {status_code}: " if status_code else ""
         return AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
 
-    def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
+    def _mask_api_key_for_logs(self, key: Any) -> str | None:
         # Azure Foundry Entra ID bearer providers are callables — never
         # invoke them in log paths; identify the auth surface instead.
         if callable(key) and not isinstance(key, str):
@@ -2755,12 +2756,12 @@ class AIAgent:
         return cleaned
 
     @staticmethod
-    def _extract_api_error_context(error: Exception) -> Dict[str, Any]:
+    def _extract_api_error_context(error: Exception) -> dict[str, Any]:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_api_error_context``."""
         from agent.agent_runtime_helpers import extract_api_error_context
         return extract_api_error_context(error)
 
-    def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _usage_summary_for_api_request_hook(self, response: Any) -> dict[str, Any] | None:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
         if response is None:
             return None
@@ -2819,7 +2820,7 @@ class AIAgent:
         if isinstance(value, (bytes, bytearray)):
             return f"<{len(value)} bytes>"
         if isinstance(value, dict):
-            out: Dict[str, Any] = {}
+            out: dict[str, Any] = {}
             for idx, (key, item) in enumerate(value.items()):
                 if idx >= max_sequence:
                     out["_truncated_items"] = len(value) - max_sequence
@@ -2927,7 +2928,7 @@ class AIAgent:
             "preview": encoded[:limit],
         }
 
-    def _api_request_payload_for_hook(self, api_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _api_request_payload_for_hook(self, api_kwargs: dict[str, Any] | None) -> dict[str, Any]:
         body = {
             key: value
             for key, value in (api_kwargs or {}).items()
@@ -2945,8 +2946,8 @@ class AIAgent:
         response: Any,
         assistant_message: Any,
         *,
-        finish_reason: Optional[str],
-    ) -> Dict[str, Any]:
+        finish_reason: str | None,
+    ) -> dict[str, Any]:
         # ``tool_calls`` is the raw list of provider SDK objects (e.g.
         # OpenAI ``ChatCompletionMessageToolCall``).  We deliberately hand
         # the raw objects to ``_sanitize_hook_payload`` and rely on
@@ -2976,14 +2977,14 @@ class AIAgent:
         api_request_id: str,
         api_call_count: int,
         api_start_time: float,
-        api_kwargs: Optional[Dict[str, Any]],
+        api_kwargs: dict[str, Any] | None,
         error_type: str,
         error_message: str,
-        status_code: Optional[int] = None,
-        retry_count: Optional[int] = None,
-        max_retries: Optional[int] = None,
-        retryable: Optional[bool] = None,
-        reason: Optional[str] = None,
+        status_code: int | None = None,
+        retry_count: int | None = None,
+        max_retries: int | None = None,
+        retryable: bool | None = None,
+        reason: str | None = None,
     ) -> None:
         # Lazy module import (not from-import) so tests can replace lifecycle
         # dispatch at this call site. After first call the import is a
@@ -3025,11 +3026,11 @@ class AIAgent:
 
     async def _dump_api_request_debug(
         self,
-        api_kwargs: Dict[str, Any],
+        api_kwargs: dict[str, Any],
         *,
         reason: str,
-        error: Optional[Exception] = None,
-    ) -> Optional[Path]:
+        error: Exception | None = None,
+    ) -> Path | None:
         """Forwarder — see ``agent.agent_runtime_helpers.dump_api_request_debug``."""
         from agent.agent_runtime_helpers import dump_api_request_debug
         return await dump_api_request_debug(
@@ -3076,7 +3077,7 @@ class AIAgent:
             return redacted
         return content
 
-    async def _save_session_log(self, messages: List[Dict[str, Any]] = None):
+    async def _save_session_log(self, messages: list[dict[str, Any]] | None = None):
         """Optional per-session JSON snapshot writer.
 
         Gated by ``sessions.write_json_snapshots`` (default False).  state.db
@@ -3176,7 +3177,7 @@ class AIAgent:
 
     def interrupt(
         self,
-        message: Optional[str] = None,
+        message: str | None = None,
         *,
         hard_cancel: bool = False,
     ) -> None:
@@ -3245,7 +3246,7 @@ class AIAgent:
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
-    def hard_interrupt(self, message: Optional[str] = None) -> None:
+    def hard_interrupt(self, message: str | None = None) -> None:
         """Request an explicit stop while preserving the interrupt ABI."""
         AIAgent.interrupt(self, message, hard_cancel=True)
 
@@ -3359,13 +3360,13 @@ class AIAgent:
         """Return whether an active-turn redirect is waiting to be applied."""
         return bool(getattr(self, "_pending_redirect", None))
 
-    def _drain_pending_redirect(self) -> Optional[str]:
+    def _drain_pending_redirect(self) -> str | None:
         """Return and clear pending active-turn correction text."""
         text = getattr(self, "_pending_redirect", None)
         self._pending_redirect = None
         return text
 
-    def _drain_pending_steer(self) -> Optional[str]:
+    def _drain_pending_steer(self) -> str | None:
         """Return the pending steer text (if any) and clear the slot.
 
         Safe to call from the owning event loop after appending tool results.
@@ -3378,7 +3379,7 @@ class AIAgent:
     def _record_file_mutation_result(
         self,
         tool_name: str,
-        args: Dict[str, Any],
+        args: dict[str, Any],
         result: Any,
         is_error: bool,
     ) -> None:
@@ -3475,7 +3476,7 @@ class AIAgent:
         return cls._FOOTER_PATH_RE.sub(lambda m: f"`{m.group(0)}`", text)
 
     @classmethod
-    def _format_file_mutation_failure_footer(cls, failed: Dict[str, Dict[str, Any]]) -> str:
+    def _format_file_mutation_failure_footer(cls, failed: dict[str, dict[str, Any]]) -> str:
         """Render the per-turn failed-mutation dict as a user-facing footer.
 
         Displays up to 10 paths with their first error preview, then a
@@ -3652,7 +3653,7 @@ class AIAgent:
         self,
         desc: str,
         *,
-        provenance: Optional[ActivityProvenance] = None,
+        provenance: ActivityProvenance | None = None,
         force_persist: bool = False,
     ) -> None:
         """Update activity state and queue its native-async DB projection."""
@@ -3880,10 +3881,10 @@ class AIAgent:
                 state.remaining_usd or "?",
                 state.paid_access,
                 state.denominator_kind,
-                ("%.0f%%" % (used * 100)) if used is not None else "n/a",
-                ("%.1f¢" % (spent / 10000)) if spent is not None else "n/a",
-                ("%.0fs" % state.age_seconds) if state.age_seconds != float("inf") else "n/a",
-                (" · disabled=%s" % state.disabled_reason) if state.disabled_reason else "",
+                f"{used * 100:.0f}%" if used is not None else "n/a",
+                f"{spent / 10000:.1f}¢" if spent is not None else "n/a",
+                f"{state.age_seconds:.0f}s" if state.age_seconds != float("inf") else "n/a",
+                f" · disabled={state.disabled_reason}" if state.disabled_reason else "",
             )
 
         # Threshold notices — shared with the cold-start seed (see _emit_credits_notices).
@@ -4000,7 +4001,7 @@ class AIAgent:
             },
         )
 
-    async def shutdown_memory_provider(self, messages: list = None) -> None:
+    async def shutdown_memory_provider(self, messages: list | None = None) -> None:
         """Shut down memory and context providers at a real session boundary."""
         memory_manager = getattr(self, "_memory_manager", None)
         if memory_manager:
@@ -4029,7 +4030,7 @@ class AIAgent:
             except Exception:
                 pass
 
-    async def commit_memory_session(self, messages: list = None) -> None:
+    async def commit_memory_session(self, messages: list | None = None) -> None:
         """Commit provider state at a compression boundary without teardown."""
         memory_manager = getattr(self, "_memory_manager", None)
         if memory_manager:
@@ -4547,7 +4548,7 @@ class AIAgent:
         except Exception:
             logger.debug("Async session DB close failed", exc_info=True)
 
-    def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
+    def _hydrate_todo_store(self, history: list[dict[str, Any]]) -> None:
         """
         Recover todo state from conversation history.
         
@@ -4605,7 +4606,7 @@ class AIAgent:
     @classmethod
     def _tool_response_matches_todo_call(
         cls,
-        history: List[Dict[str, Any]],
+        history: list[dict[str, Any]],
         tool_index: int,
     ) -> bool:
         """Return True when a tool result belongs to a prior assistant todo call.
@@ -4634,7 +4635,7 @@ class AIAgent:
     @classmethod
     def _assistant_has_todo_tool_call(
         cls,
-        assistant_msg: Dict[str, Any],
+        assistant_msg: dict[str, Any],
         tool_call_id: str,
     ) -> bool:
         """True when the assistant message issued a ``todo`` call with this id."""
@@ -4663,12 +4664,12 @@ class AIAgent:
 
 
 
-    async def _build_system_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
+    async def _build_system_prompt_parts(self, system_message: str | None = None) -> dict[str, str]:
         """Forwarder — see ``agent.system_prompt.build_system_prompt_parts``."""
         from agent.system_prompt import build_system_prompt_parts
         return await build_system_prompt_parts(self, system_message=system_message)
 
-    async def _build_system_prompt(self, system_message: str = None) -> str:
+    async def _build_system_prompt(self, system_message: str | None = None) -> str:
         """Forwarder — see ``agent.system_prompt.build_system_prompt``."""
         from agent.system_prompt import build_system_prompt
         return await build_system_prompt(self, system_message=system_message)
@@ -4702,14 +4703,14 @@ class AIAgent:
     _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
 
     @staticmethod
-    def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Forwarder — see ``agent.agent_runtime_helpers.sanitize_api_messages``."""
         from agent.agent_runtime_helpers import sanitize_api_messages
         return sanitize_api_messages(messages)
 
     @staticmethod
     def _is_thinking_only_assistant(
-        msg: Dict[str, Any],
+        msg: dict[str, Any],
         *,
         drop_codex_reasoning_items: bool = True,
     ) -> bool:
@@ -4777,10 +4778,10 @@ class AIAgent:
 
     @staticmethod
     def _drop_thinking_only_and_merge_users(
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         *,
         drop_codex_reasoning_items: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Forwarder — see ``agent.agent_runtime_helpers.drop_thinking_only_and_merge_users``."""
         from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
         return drop_thinking_only_and_merge_users(
@@ -4870,14 +4871,14 @@ class AIAgent:
         return _codex_deterministic_call_id(fn_name, arguments, index)
 
     @staticmethod
-    def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
+    def _split_responses_tool_id(raw_id: Any) -> tuple[str | None, str | None]:
         """Split a stored tool id into (call_id, response_item_id)."""
         return _codex_split_responses_tool_id(raw_id)
 
     def _derive_responses_function_call_id(
         self,
         call_id: str,
-        response_item_id: Optional[str] = None,
+        response_item_id: str | None = None,
     ) -> str:
         """Build a valid Responses `function_call.id` (must start with `fc_`)."""
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
@@ -4977,7 +4978,7 @@ class AIAgent:
     def _apply_user_default_headers(
         self,
         *,
-        config: Optional[Dict[str, Any]] = None,
+        config: dict[str, Any] | None = None,
     ) -> None:
         """Merge user-configured request headers onto the OpenAI client.
 
@@ -5423,10 +5424,10 @@ class AIAgent:
     async def _recover_with_credential_pool(
         self,
         *,
-        status_code: Optional[int],
+        status_code: int | None,
         has_retried_429: bool,
-        classified_reason: Optional[FailoverReason] = None,
-        error_context: Optional[Dict[str, Any]] = None,
+        classified_reason: FailoverReason | None = None,
+        error_context: dict[str, Any] | None = None,
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
@@ -5450,10 +5451,10 @@ class AIAgent:
         *,
         user_message: str,
         original_user_message: Any,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
 
@@ -5471,10 +5472,10 @@ class AIAgent:
         api_kwargs: dict,
         *,
         use_streaming: bool = False,
-        on_first_delta: Optional[Callable[[], None]] = None,
-        on_stream_activity: Optional[Callable[[], None]] = None,
-        _on_stream_text: Optional[Callable[[], None]] = None,
-        _stream_diag: Optional[Dict[str, Any]] = None,
+        on_first_delta: Callable[[], None] | None = None,
+        on_stream_activity: Callable[[], None] | None = None,
+        _on_stream_text: Callable[[], None] | None = None,
+        _stream_diag: dict[str, Any] | None = None,
     ):
         """Execute one model request without blocking the event loop.
 
@@ -6128,8 +6129,8 @@ class AIAgent:
 
     def _extract_codex_interim_visible_parts(
         self,
-        assistant_msg: Dict[str, Any],
-    ) -> List[str]:
+        assistant_msg: dict[str, Any],
+    ) -> list[str]:
         """Extract visible Codex commentary as one string per message item.
 
         Codex Responses can keep user-facing mid-turn narration as structured
@@ -6146,7 +6147,7 @@ class AIAgent:
         if not isinstance(items, list):
             return []
 
-        messages: List[str] = []
+        messages: list[str] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -6158,7 +6159,7 @@ class AIAgent:
             content_parts = item.get("content")
             if not isinstance(content_parts, list):
                 continue
-            item_parts: List[str] = []
+            item_parts: list[str] = []
             for part in content_parts:
                 if not isinstance(part, dict):
                     continue
@@ -6175,13 +6176,13 @@ class AIAgent:
                 messages.append(visible)
         return messages
 
-    def _extract_codex_interim_visible_text(self, assistant_msg: Dict[str, Any]) -> str:
+    def _extract_codex_interim_visible_text(self, assistant_msg: dict[str, Any]) -> str:
         """Extract all visible Codex commentary for comparison/fallback."""
         return "\n\n".join(
             self._extract_codex_interim_visible_parts(assistant_msg)
         ).strip()
 
-    def _interim_assistant_visible_text(self, assistant_msg: Dict[str, Any]) -> str:
+    def _interim_assistant_visible_text(self, assistant_msg: dict[str, Any]) -> str:
         """Return the exact assistant text eligible for interim delivery.
 
         Prefer structured Codex commentary over top-level content. A Codex
@@ -6230,7 +6231,7 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
+        self, assistant_msg: dict[str, Any]
     ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
@@ -6246,7 +6247,7 @@ class AIAgent:
         if cb is None or not isinstance(assistant_msg, dict):
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
-        undelivered_parts: List[str] = []
+        undelivered_parts: list[str] = []
         pending_keys: set[str] = set()
         for part in commentary_parts:
             key = self._normalize_interim_visible_text(part)
@@ -6544,7 +6545,7 @@ class AIAgent:
     @staticmethod
     async def _materialize_data_url_for_vision(
         image_url: str,
-    ) -> tuple[str, Optional[Path]]:
+    ) -> tuple[str, Path | None]:
         header, _, data = str(image_url or "").partition(",")
         if len(data) > AIAgent._MAX_DATA_URL_BASE64_BYTES:
             logger.warning(
@@ -6563,7 +6564,7 @@ class AIAgent:
             "image/jpeg": ".jpg",
             "image/jpg": ".jpg",
         }.get(mime, ".jpg")
-        path: Optional[Path] = None
+        path: Path | None = None
         try:
             async with aiofiles.tempfile.NamedTemporaryFile(
                 prefix="anthropic_image_",
@@ -6602,7 +6603,7 @@ class AIAgent:
         )
 
         vision_source = str(image_url or "")
-        cleanup_path: Optional[Path] = None
+        cleanup_path: Path | None = None
         if vision_source.startswith("data:"):
             vision_source, cleanup_path = (
                 await self._materialize_data_url_for_vision(vision_source)
@@ -6699,8 +6700,8 @@ class AIAgent:
         if not self._content_has_image_parts(content):
             return content
 
-        text_parts: List[str] = []
-        image_notes: List[str] = []
+        text_parts: list[str] = []
+        image_notes: list[str] = []
         for part in content:
             if isinstance(part, str):
                 if part.strip():
@@ -6743,7 +6744,7 @@ class AIAgent:
             return suffix
         return "[A multimodal message was converted to text for Anthropic compatibility.]"
 
-    def _get_transport(self, api_mode: str = None):
+    def _get_transport(self, api_mode: str | None = None):
         """Return the cached transport for the given (or current) api_mode.
 
         Lazy-initializes on first call per api_mode. Returns None if no
@@ -6939,7 +6940,7 @@ class AIAgent:
                 continue
 
             # Salvage any text parts so the model still sees some signal.
-            text_parts: List[str] = []
+            text_parts: list[str] = []
             had_image = False
             for part in content:
                 if not isinstance(part, dict):
@@ -7079,7 +7080,7 @@ class AIAgent:
     async def _build_api_kwargs(
         self,
         api_messages: list,
-        tools_for_api: Optional[list] = None,
+        tools_for_api: list | None = None,
     ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         return await _chat_completion_helpers.build_api_kwargs(
@@ -7091,10 +7092,10 @@ class AIAgent:
     def _direct_native_anthropic_tool_cache_capability(
         self,
         *,
-        provider: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_mode: Optional[str] = None,
-        model: Optional[str] = None,
+        provider: str | None = None,
+        base_url: str | None = None,
+        api_mode: str | None = None,
+        model: str | None = None,
     ) -> bool:
         from agent.agent_runtime_helpers import (
             _direct_native_anthropic_tool_cache_capability,
@@ -7223,7 +7224,7 @@ class AIAgent:
         cache[key] = (supported, _time.monotonic())
         return bool(supported)
 
-    async def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
+    async def _resolve_lmstudio_summary_reasoning_effort(self) -> str | None:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
@@ -7401,7 +7402,7 @@ class AIAgent:
         messages: list,
         *,
         logger=None,
-        session_id: str = None,
+        session_id: str | None = None,
         cursor=None,
     ) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.sanitize_tool_call_arguments``."""
@@ -7428,9 +7429,9 @@ class AIAgent:
         messages: list,
         system_message: str,
         *,
-        approx_tokens: int = None,
+        approx_tokens: int | None = None,
         task_id: str = "default",
-        focus_topic: str = None,
+        focus_topic: str | None = None,
         force: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
@@ -7697,7 +7698,7 @@ class AIAgent:
             self, messages, api_call_count
         )
 
-    async def _conversation_root_id(self) -> Optional[str]:
+    async def _conversation_root_id(self) -> str | None:
         """Resolve the stable conversation id for Portal usage attribution.
 
         Returns the session-lineage ROOT id rather than the current segment
@@ -7729,16 +7730,16 @@ class AIAgent:
     async def run_conversation(
         self,
         user_message: Any,
-        system_message: str = None,
-        conversation_history: List[Dict[str, Any]] = None,
-        task_id: str = None,
-        stream_callback: Optional[callable] = None,
-        persist_user_message: Optional[Any] = None,
-        persist_user_timestamp: Optional[float] = None,
-        persist_user_display_kind: Optional[str] = None,
-        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
-        moa_config: Optional[dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        system_message: str | None = None,
+        conversation_history: list[dict[str, Any]] | None = None,
+        task_id: str | None = None,
+        stream_callback: Callable[..., Any] | None = None,
+        persist_user_message: Any | None = None,
+        persist_user_timestamp: float | None = None,
+        persist_user_display_kind: str | None = None,
+        persist_user_display_metadata: dict[str, Any] | None = None,
+        moa_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         turn_lock = self._get_turn_lock()
         await turn_lock.acquire()
@@ -7829,7 +7830,7 @@ class AIAgent:
                 _reset_session_runtime_config(session_runtime_token)
                 turn_lock.release()
 
-    async def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    async def chat(self, message: str, stream_callback: Callable[..., Any] | None = None) -> str:
         """
         Simple chat interface that returns just the final response.
 
@@ -7845,13 +7846,13 @@ class AIAgent:
 
 
 async def main(
-    query: str = None,
+    query: str | None = None,
     model: str = "",
-    api_key: str = None,
+    api_key: str | None = None,
     base_url: str = "",
     max_turns: int = 10,
-    enabled_toolsets: str = None,
-    disabled_toolsets: str = None,
+    enabled_toolsets: str | None = None,
+    disabled_toolsets: str | None = None,
     list_tools: bool = False,
     save_trajectories: bool = False,
     save_sample: bool = False,

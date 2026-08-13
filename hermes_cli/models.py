@@ -20,7 +20,7 @@ import aiofiles.os
 import httpx
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 from agent.secret_scope import get_secret
 from agent.ssl_verify import _create_httpx_client
@@ -781,7 +781,7 @@ async def _resolve_nous_portal_url() -> str:
         return "https://portal.nousresearch.com"
 
 
-def _extract_model_name(entry: Any) -> Optional[str]:
+def _extract_model_name(entry: Any) -> str | None:
     if not isinstance(entry, dict):
         return None
     model_name = entry.get("modelName")
@@ -793,10 +793,10 @@ def _extract_model_name(entry: Any) -> Optional[str]:
 async def get_nous_recommended_aux_model(
     *,
     vision: bool = False,
-    free_tier: Optional[bool] = None,
+    free_tier: bool | None = None,
     portal_base_url: str = "",
     force_refresh: bool = False,
-) -> Optional[str]:
+) -> str | None:
     """Return the Portal's recommended model name for an auxiliary task."""
     base = portal_base_url or await _resolve_nous_portal_url()
     payload = await fetch_nous_recommended_models(
@@ -1346,7 +1346,7 @@ _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset({
 })
 
 
-def normalize_provider(provider: Optional[str]) -> str:
+def normalize_provider(provider: str | None) -> str:
     """Normalize provider aliases to Hermes' canonical provider ids.
 
     Note: ``"auto"`` passes through unchanged — use
@@ -1467,7 +1467,7 @@ _copilot_context_cache_time: float = 0.0
 _COPILOT_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
 
-def _lmstudio_server_root(base_url: Optional[str]) -> Optional[str]:
+def _lmstudio_server_root(base_url: str | None) -> str | None:
     """Return the LM Studio server root for native ``/api/v1`` endpoints.
 
     Users commonly copy either the OpenAI-compatible runtime URL
@@ -1484,7 +1484,7 @@ def _lmstudio_server_root(base_url: Optional[str]) -> Optional[str]:
     return root or None
 
 
-def _lmstudio_request_headers(api_key: Optional[str] = None) -> dict:
+def _lmstudio_request_headers(api_key: str | None = None) -> dict:
     """Build HTTP headers for LM Studio native API requests."""
     headers = {"User-Agent": _HERMES_USER_AGENT}
     token = str(api_key or "").strip()
@@ -1494,10 +1494,10 @@ def _lmstudio_request_headers(api_key: Optional[str] = None) -> dict:
 
 
 async def _lmstudio_fetch_raw_models(
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
     timeout: float = 5.0,
-) -> Optional[list[dict]]:
+) -> list[dict] | None:
     """Fetch LM Studio's raw native model catalog without blocking the loop."""
     server_root = _lmstudio_server_root(base_url)
     if not server_root:
@@ -1540,10 +1540,10 @@ async def _lmstudio_fetch_raw_models(
 
 
 async def probe_lmstudio_models(
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
     timeout: float = 5.0,
-) -> Optional[list[str]]:
+) -> list[str] | None:
     """Probe LM Studio and return chat-capable model keys when reachable."""
     raw_models = await _lmstudio_fetch_raw_models(
         api_key=api_key,
@@ -1566,8 +1566,8 @@ async def probe_lmstudio_models(
 
 
 async def fetch_lmstudio_models(
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
     timeout: float = 5.0,
 ) -> list[str]:
     """Fetch LM Studio chat-capable model keys, or ``[]`` when unreachable."""
@@ -1582,37 +1582,37 @@ async def fetch_lmstudio_models(
 class LMStudioLoadResult(NamedTuple):
     """Verified LM Studio runtime plus load-attempt provenance."""
 
-    context_length: Optional[int]
+    context_length: int | None
     load_attempted: bool = False
     rejected: bool = False
 
 
 async def ensure_lmstudio_model_loaded(
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str],
-    target_context_length: Optional[int],
+    base_url: str | None,
+    api_key: str | None,
+    target_context_length: int | None,
     timeout: float = 120.0,
     *,
     return_load_result: bool = False,
-) -> Optional[int] | LMStudioLoadResult:
+) -> int | None | LMStudioLoadResult:
     """Ensure ``model`` is loaded and return its verified runtime context."""
 
     def _result(
-        context_length: Optional[int],
+        context_length: int | None,
         *,
         load_attempted: bool = False,
         rejected: bool = False,
-    ) -> Optional[int] | LMStudioLoadResult:
+    ) -> int | None | LMStudioLoadResult:
         value = LMStudioLoadResult(context_length, load_attempted, rejected)
         return value if return_load_result else context_length
 
-    def _positive_int(value: Any) -> Optional[int]:
+    def _positive_int(value: Any) -> int | None:
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
         return None
 
-    def _loaded_context(entry: dict) -> Optional[int]:
+    def _loaded_context(entry: dict) -> int | None:
         instances = entry.get("loaded_instances")
         if not isinstance(instances, list):
             return None
@@ -1624,7 +1624,7 @@ async def ensure_lmstudio_model_loaded(
                 return parsed
         return None
 
-    def _find_entry(raw_models: list[dict]) -> Optional[dict]:
+    def _find_entry(raw_models: list[dict]) -> dict | None:
         for raw in raw_models:
             if isinstance(raw, dict) and (
                 raw.get("key") == model or raw.get("id") == model
@@ -1726,8 +1726,8 @@ async def ensure_lmstudio_model_loaded(
 
 async def lmstudio_model_reasoning_options(
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str] = None,
+    base_url: str | None,
+    api_key: str | None = None,
     timeout: float = 5.0,
 ) -> list[str]:
     """Return the reasoning ``allowed_options`` LM Studio publishes for ``model``.
@@ -1765,10 +1765,10 @@ async def lmstudio_model_reasoning_options(
 
 async def ollama_model_supports_thinking(
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str] = None,
+    base_url: str | None,
+    api_key: str | None = None,
     timeout: float = 5.0,
-) -> Optional[bool]:
+) -> bool | None:
     """Return True if an Ollama (Cloud or local) model advertises ``thinking``.
 
     Probes the native ``/api/show`` endpoint and checks the ``capabilities``
@@ -1859,8 +1859,8 @@ _COPILOT_MODEL_ALIASES = {
 
 
 def _copilot_catalog_ids(
-    catalog: Optional[list[dict[str, Any]]] = None,
-    api_key: Optional[str] = None,
+    catalog: list[dict[str, Any]] | None = None,
+    api_key: str | None = None,
 ) -> set[str]:
     if not catalog:
         return set()
@@ -1872,10 +1872,10 @@ def _copilot_catalog_ids(
 
 
 def normalize_copilot_model_id(
-    model_id: Optional[str],
+    model_id: str | None,
     *,
-    catalog: Optional[list[dict[str, Any]]] = None,
-    api_key: Optional[str] = None,
+    catalog: list[dict[str, Any]] | None = None,
+    api_key: str | None = None,
 ) -> str:
     raw = str(model_id or "").strip()
     if not raw:
@@ -1922,7 +1922,7 @@ def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
     return []
 
 
-def _is_github_models_base_url(base_url: Optional[str]) -> bool:
+def _is_github_models_base_url(base_url: str | None) -> bool:
     """Return whether *base_url* is one of GitHub Models' API roots."""
     normalized = (base_url or "").strip().rstrip("/").lower()
     return (
@@ -1950,10 +1950,10 @@ def _should_use_copilot_responses_api(model_id: str) -> bool:
 
 
 def copilot_model_api_mode(
-    model_id: Optional[str],
+    model_id: str | None,
     *,
-    catalog: Optional[list[dict[str, Any]]] = None,
-    api_key: Optional[str] = None,
+    catalog: list[dict[str, Any]] | None = None,
+    api_key: str | None = None,
 ) -> str:
     """Determine the API mode for a Copilot model.
 
@@ -1994,7 +1994,7 @@ _AZURE_FOUNDRY_RESPONSES_PREFIXES = (
 )
 
 
-def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
+def azure_foundry_model_api_mode(model_name: str | None) -> str | None:
     """Infer Azure Foundry api_mode from a deployment/model name.
 
     Returns ``"codex_responses"`` when the model name matches a family that
@@ -2024,7 +2024,7 @@ def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
 
 
 def normalize_opencode_model_id(
-    provider_id: Optional[str], model_id: Optional[str]
+    provider_id: str | None, model_id: str | None
 ) -> str:
     """Normalize OpenCode config IDs to the bare model slug used in API requests."""
     provider = normalize_provider(provider_id)
@@ -2038,7 +2038,7 @@ def normalize_opencode_model_id(
     return current
 
 
-def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str]) -> str:
+def opencode_model_api_mode(provider_id: str | None, model_id: str | None) -> str:
     """Determine the API mode for an OpenCode Zen / Go model.
 
     OpenCode routes different models behind different API surfaces:
@@ -2083,7 +2083,7 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
 
 
 def normalize_opencode_base_url(
-    provider_id: Optional[str], api_mode: Optional[str], base_url: Optional[str]
+    provider_id: str | None, api_mode: str | None, base_url: str | None
 ) -> str:
     """Normalize an OpenCode Zen / Go base URL for the target API mode.
 
@@ -2129,10 +2129,10 @@ def normalize_opencode_base_url(
 
 
 def github_model_reasoning_efforts(
-    model_id: Optional[str],
+    model_id: str | None,
     *,
-    catalog: Optional[list[dict[str, Any]]] = None,
-    api_key: Optional[str] = None,
+    catalog: list[dict[str, Any]] | None = None,
+    api_key: str | None = None,
 ) -> list[str]:
     """Return supported reasoning-effort levels for a Copilot-visible model."""
     normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
@@ -2222,7 +2222,7 @@ def _deepinfra_credential_discriminator(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
 
 
-def deepinfra_base_url(section: Optional[dict] = None) -> str:
+def deepinfra_base_url(section: dict | None = None) -> str:
     """Resolve the normalized DeepInfra OpenAI-compatible base URL.
 
     Precedence is the upstream contract: config-section ``base_url``, then
@@ -2251,7 +2251,7 @@ async def _fetch_deepinfra_catalog(
     *,
     timeout: float = 5.0,
     force_refresh: bool = False,
-) -> Optional[list[dict]]:
+) -> list[dict] | None:
     """Fetch and cache the shared DeepInfra catalog with native async HTTP."""
     cache_base, url = _deepinfra_catalog_url()
     api_key = (get_secret("DEEPINFRA_API_KEY", "") or "").strip()
@@ -2296,7 +2296,7 @@ async def _fetch_deepinfra_models_by_tag(
     *,
     timeout: float = 5.0,
     force_refresh: bool = False,
-) -> Optional[list[dict]]:
+) -> list[dict] | None:
     """Return DeepInfra models whose ``metadata.tags`` includes *tag*."""
     data = await _fetch_deepinfra_catalog(
         timeout=timeout,

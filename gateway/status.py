@@ -6,7 +6,8 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import aiofiles
 
@@ -337,7 +338,7 @@ async def _pid_exists(pid: int) -> bool:
         except OSError:
             try:
                 status = await _ps_process_status(normalized_pid)
-            except (FileNotFoundError, OSError, asyncio.TimeoutError):
+            except (TimeoutError, FileNotFoundError, OSError):
                 return False
             return bool(status) and not status.startswith("Z")
 
@@ -353,7 +354,7 @@ async def _pid_exists(pid: int) -> bool:
         status = await _ps_process_status(normalized_pid)
     except PermissionError:
         return True
-    except (FileNotFoundError, OSError, asyncio.TimeoutError):
+    except (TimeoutError, FileNotFoundError, OSError):
         return False
     return bool(status) and not status.startswith("Z")
 

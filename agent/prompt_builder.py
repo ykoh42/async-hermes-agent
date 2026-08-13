@@ -17,7 +17,6 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -76,7 +75,7 @@ def _scan_context_content(content: str, filename: str) -> str:
     return content
 
 
-async def _find_git_root(start: Path) -> Optional[Path]:
+async def _find_git_root(start: Path) -> Path | None:
     """Walk *start* and its parents looking for a ``.git`` directory.
 
     Returns the directory containing ``.git``, or ``None`` if we hit the
@@ -95,7 +94,7 @@ async def _find_git_root(start: Path) -> Optional[Path]:
 _HERMES_MD_NAMES = (".hermes.md", "HERMES.md")
 
 
-async def _find_hermes_md(cwd: Path) -> Optional[Path]:
+async def _find_hermes_md(cwd: Path) -> Path | None:
     """Discover the nearest ``.hermes.md`` or ``HERMES.md``.
 
     Search order: *cwd* first, then each parent directory up to (and
@@ -511,7 +510,7 @@ async def build_environment_hints() -> str:
 # don't get macOS-only wording ("Mac", "Space", cmd+s). The module-level
 # COMPUTER_USE_GUIDANCE constant renders the macOS variant for backwards
 # compatibility; system_prompt.py selects the host-appropriate variant.
-def computer_use_guidance(platform_name: Optional[str] = None) -> str:
+def computer_use_guidance(platform_name: str | None = None) -> str:
     """Return platform-aware computer-use guidance for the system prompt.
 
     ``platform_name`` is an ``sys.platform``-style string ("darwin",
@@ -678,7 +677,7 @@ _CONTEXT_FILE_WINDOW_FRACTION = 0.06
 _CONTEXT_FILE_DYNAMIC_CEILING = 500_000
 
 
-def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
+def _dynamic_context_file_max_chars(context_length: int | None) -> int:
     """Derive a char cap from the model's context window.
 
     Returns at least ``CONTEXT_FILE_MAX_CHARS`` (the historical 20K floor) and
@@ -696,7 +695,7 @@ def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
 
 
 async def _get_context_file_max_chars(
-    context_length: Optional[int] = None,
+    context_length: int | None = None,
 ) -> int:
     """Resolve the context-file cap without synchronous config I/O."""
     try:
@@ -722,7 +721,7 @@ async def _get_context_file_max_chars(
 # per async task, so concurrent gateway-session prompt builds can't drain or
 # clear each other's pending warnings (cross-session leak). Each build runs in
 # its own context, collects its own warnings, and drains them synchronously.
-_truncation_warnings: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
+_truncation_warnings: "contextvars.ContextVar[list | None]" = contextvars.ContextVar(
     "context_file_truncation_warnings", default=None
 )
 
@@ -820,7 +819,7 @@ async def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-async def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+async def _load_skills_snapshot(skills_dir: Path) -> dict | None:
     """Load a valid skills snapshot without synchronous file I/O."""
     snapshot_path = _skills_prompt_snapshot_path()
     try:
@@ -1348,9 +1347,9 @@ async def build_nous_subscription_prompt(
 def _truncate_content(
     content: str,
     filename: str,
-    max_chars: Optional[int] = None,
-    context_length: Optional[int] = None,
-    read_path: Optional[str] = None,
+    max_chars: int | None = None,
+    context_length: int | None = None,
+    read_path: str | None = None,
 ) -> str:
     """Head/tail truncation with a marker in the middle.
 
@@ -1385,7 +1384,7 @@ def _truncate_content(
     return head + marker + tail
 
 
-async def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
+async def load_soul_md(context_length: int | None = None) -> str | None:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
@@ -1414,9 +1413,9 @@ async def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
 
 async def _load_hermes_md(
     cwd_path: Path,
-    context_length: Optional[int] = None,
+    context_length: int | None = None,
     *,
-    max_chars: Optional[int] = None,
+    max_chars: int | None = None,
 ) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = await _find_hermes_md(cwd_path)
@@ -1446,9 +1445,9 @@ async def _load_hermes_md(
 
 async def _load_agents_md(
     cwd_path: Path,
-    context_length: Optional[int] = None,
+    context_length: int | None = None,
     *,
-    max_chars: Optional[int] = None,
+    max_chars: int | None = None,
 ) -> str:
     """AGENTS.md — top-level only (no recursive walk)."""
     for name in ["AGENTS.md", "agents.md"]:
@@ -1471,9 +1470,9 @@ async def _load_agents_md(
 
 async def _load_claude_md(
     cwd_path: Path,
-    context_length: Optional[int] = None,
+    context_length: int | None = None,
     *,
-    max_chars: Optional[int] = None,
+    max_chars: int | None = None,
 ) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
@@ -1496,9 +1495,9 @@ async def _load_claude_md(
 
 async def _load_cursorrules(
     cwd_path: Path,
-    context_length: Optional[int] = None,
+    context_length: int | None = None,
     *,
-    max_chars: Optional[int] = None,
+    max_chars: int | None = None,
 ) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
@@ -1542,9 +1541,9 @@ async def _load_cursorrules(
 
 
 async def build_context_files_prompt(
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     skip_soul: bool = False,
-    context_length: Optional[int] = None,
+    context_length: int | None = None,
     allow_install_tree_fallback: bool = False,
 ) -> str:
     """Discover and load context files for the system prompt.

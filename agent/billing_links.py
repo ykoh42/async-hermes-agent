@@ -11,7 +11,6 @@ TUI, desktop) renders one structured signal instead of re-parsing error text.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Optional
 
 from utils import base_url_host_matches
 
@@ -29,7 +28,7 @@ class BillingBlock:
     provider: str
     provider_label: str
     model: str
-    billing_url: Optional[str]
+    billing_url: str | None
     is_nous: bool
     message: str
 
@@ -77,12 +76,12 @@ def is_nous_inference_route(provider: str, base_url: str) -> bool:
     return base_url_host_matches(str(base_url or ""), "inference-api.nousresearch.com")
 
 
-def _nous_billing_url() -> Optional[str]:
+def _nous_billing_url() -> str | None:
     """Static fallback used when a Nous route reports a billing error."""
     return "https://portal.nousresearch.com/billing"
 
 
-def _resolve_provider_link(slug: str, base_url: str) -> tuple[str, Optional[str]]:
+def _resolve_provider_link(slug: str, base_url: str) -> tuple[str, str | None]:
     """Resolve ``(label, url)``: exact slug → base_url host → readable-label fallback."""
     hit = _BY_SLUG.get(slug)
     if hit:

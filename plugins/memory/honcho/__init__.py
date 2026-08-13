@@ -22,7 +22,8 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 import aiofiles
 import aiofiles.os
@@ -243,10 +244,10 @@ ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCH
 class HonchoMemoryProvider(MemoryProvider):
     """Honcho AI-native memory with dialectic Q&A and persistent user modeling."""
 
-    def backup_paths(self) -> List[str]:
+    def backup_paths(self) -> list[str]:
         """Honcho keeps its peer/session config under ~/.honcho when no
         profile-local honcho.json exists (see client.resolve_config_path)."""
-        paths: List[str] = []
+        paths: list[str] = []
         try:
             from .client import resolve_global_config_path
             global_cfg = resolve_global_config_path()
@@ -258,7 +259,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def __init__(
         self,
-        query_rewriter: Optional[Callable[[str], Awaitable[str]]] = None,
+        query_rewriter: Callable[[str], Awaitable[str]] | None = None,
     ):
         self._manager = None   # HonchoSessionManager
         self._config = None    # HonchoClientConfig
@@ -266,14 +267,14 @@ class HonchoMemoryProvider(MemoryProvider):
         self._query_rewriter = query_rewriter
         self._prefetch_result = ""
         self._prefetch_lock = asyncio.Lock()
-        self._prefetch_task: Optional[asyncio.Task[None]] = None
+        self._prefetch_task: asyncio.Task[None] | None = None
 
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
 
         # Base context cache — refreshed on context_cadence, not frozen
-        self._base_context_cache: Optional[str] = None
+        self._base_context_cache: str | None = None
         self._base_context_lock = asyncio.Lock()
-        self._base_task: Optional[asyncio.Task[None]] = None
+        self._base_task: asyncio.Task[None] | None = None
 
         # Recall cadence and liveness state.
         self._turn_count = 0
@@ -295,9 +296,9 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Tools-only mode may defer session initialization until a tool call.
         self._session_initialized = False
-        self._lazy_init_kwargs: Optional[dict] = None
-        self._lazy_init_session_id: Optional[str] = None
-        self._init_task: Optional[asyncio.Task[None]] = None
+        self._lazy_init_kwargs: dict | None = None
+        self._lazy_init_session_id: str | None = None
+        self._init_task: asyncio.Task[None] | None = None
         self._init_lock = asyncio.Lock()
         self._init_error = ""
         self._owned_tasks: set[asyncio.Task[None]] = set()
@@ -1327,7 +1328,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         return chunks
 
-    def _empty_profile_hint(self, peer: str) -> Dict[str, Any]:
+    def _empty_profile_hint(self, peer: str) -> dict[str, Any]:
         """Build a diagnostic hint when honcho_profile returns an empty card.
 
         A literal "No profile facts available yet." tells the model nothing
@@ -1343,7 +1344,7 @@ class HonchoMemoryProvider(MemoryProvider):
              (honcho-ai server < 3.x)
         """
         cfg = self._config
-        reasons: List[str] = []
+        reasons: list[str] = []
 
         if cfg is not None:
             if peer == "user":
@@ -1425,7 +1426,7 @@ class HonchoMemoryProvider(MemoryProvider):
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Mirror built-in user profile writes as Honcho conclusions.
 
@@ -1451,7 +1452,7 @@ class HonchoMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Honcho memory mirror failed: %s", e)
 
-    async def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
         if self._cron_skipped:
             return
@@ -1464,7 +1465,7 @@ class HonchoMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Honcho session-end flush failed: %s", e)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Return tool schemas, respecting recall_mode.
 
         Context-only mode exposes no Honcho tools.

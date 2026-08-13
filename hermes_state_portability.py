@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
 from hermes_state_common import (
@@ -49,14 +49,14 @@ class SessionPortabilityMixin:
         self,
         session_ids,
         compact_rows: bool = False,
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> dict[str, dict[str, Any]]:
         """Fetch enriched session rows in bounded native-async batches."""
         ids = [session_id for session_id in session_ids if session_id]
         if not ids:
             return {}
         chunk_size = 900
         if len(ids) > chunk_size:
-            result: Dict[str, Dict[str, Any]] = {}
+            result: dict[str, dict[str, Any]] = {}
             for start in range(0, len(ids), chunk_size):
                 result.update(
                     await self._get_session_rich_rows_batch(
@@ -110,7 +110,7 @@ class SessionPortabilityMixin:
         self,
         session_id: str,
         compact_rows: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return one enriched row with the same shape as session listings."""
         return (
             await self._get_session_rich_rows_batch(
@@ -123,7 +123,7 @@ class SessionPortabilityMixin:
         self,
         session_id: str,
         compact_rows: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Public wrapper for the upstream single-session rich-row API."""
         return await self._get_session_rich_row(
             session_id,
@@ -133,7 +133,7 @@ class SessionPortabilityMixin:
     async def distinct_session_cwds(
         self,
         include_archived: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return distinct non-empty session working directories and usage."""
         where = "cwd IS NOT NULL AND TRIM(cwd) != ''"
         if not include_archived:
@@ -155,7 +155,7 @@ class SessionPortabilityMixin:
     async def list_skill_scaffolded_sessions(
         self,
         limit: int = 200,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return titled sessions whose first user turn invoked a skill."""
         rows = await self._read_fetchall(  # type: ignore[unresolved-attribute]
             """
@@ -196,7 +196,7 @@ class SessionPortabilityMixin:
     async def export_session(
         self,
         session_id: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Export a single session with all active messages as a dict."""
         session = await self.get_session(  # type: ignore[unresolved-attribute]
             session_id
@@ -211,7 +211,7 @@ class SessionPortabilityMixin:
     async def export_session_lineage(
         self,
         session_id: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Export a compression lineage as one logical session dict."""
         lineage_ids = await self.get_compression_lineage(  # type: ignore[unresolved-attribute]
             session_id
@@ -241,8 +241,8 @@ class SessionPortabilityMixin:
 
     async def export_all(
         self,
-        source: str = None,  # type: ignore[invalid-parameter-default]
-    ) -> List[Dict[str, Any]]:
+        source: str | None = None,  # type: ignore[invalid-parameter-default]
+    ) -> list[dict[str, Any]]:
         """Export every matching session and its active messages."""
         sessions = await self.search_sessions(  # type: ignore[unresolved-attribute]
             source=source,
@@ -257,7 +257,7 @@ class SessionPortabilityMixin:
         return results
 
     @staticmethod
-    def _import_text_or_none(value: Any, field: str) -> Optional[str]:
+    def _import_text_or_none(value: Any, field: str) -> str | None:
         if value is None:
             return None
         if isinstance(value, str):
@@ -265,7 +265,7 @@ class SessionPortabilityMixin:
         raise ValueError(f"{field} must be a string")
 
     @staticmethod
-    def _import_json_object_or_none(value: Any, field: str) -> Optional[str]:
+    def _import_json_object_or_none(value: Any, field: str) -> str | None:
         if value is None:
             return None
         if isinstance(value, str):
@@ -284,7 +284,7 @@ class SessionPortabilityMixin:
             raise ValueError(f"{field} must be JSON serializable") from exc
 
     @staticmethod
-    def _float_or_none(value: Any) -> Optional[float]:
+    def _float_or_none(value: Any) -> float | None:
         if value is None:
             return None
         try:
@@ -293,7 +293,7 @@ class SessionPortabilityMixin:
             return None
 
     @staticmethod
-    def _import_int_or_none(value: Any, field: str) -> Optional[int]:
+    def _import_int_or_none(value: Any, field: str) -> int | None:
         if value is None:
             return None
         try:
@@ -320,16 +320,16 @@ class SessionPortabilityMixin:
             return value
 
     @staticmethod
-    def _import_error(index: int, session_id: str, error: str) -> Dict[str, Any]:
-        item: Dict[str, Any] = {"index": index, "error": error}
+    def _import_error(index: int, session_id: str, error: str) -> dict[str, Any]:
+        item: dict[str, Any] = {"index": index, "error": error}
         if session_id:
             item["session_id"] = session_id
         return item
 
     async def import_sessions(
         self,
-        sessions: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        sessions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Import sessions exported by :meth:`export_session` or ``export_all``."""
         if not isinstance(sessions, list):
             raise ValueError("sessions must be a list")
@@ -338,8 +338,8 @@ class SessionPortabilityMixin:
                 f"sessions must contain at most {self._IMPORT_MAX_SESSIONS} entries"  # type: ignore[unresolved-attribute]
             )
 
-        normalized: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
+        normalized: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         total_messages = 0
         total_bytes = 0
@@ -468,7 +468,7 @@ class SessionPortabilityMixin:
                         field,
                     )
 
-                clean_messages: List[Dict[str, Any]] = []
+                clean_messages: list[dict[str, Any]] = []
                 for message_index, message in enumerate(messages):
                     clean_message = dict(message)
                     role = clean_message.get("role")
@@ -521,9 +521,9 @@ class SessionPortabilityMixin:
             }
 
         async def _import(connection):
-            imported_ids: List[str] = []
-            skipped_ids: List[str] = []
-            parent_updates: List[tuple[str, str]] = []
+            imported_ids: list[str] = []
+            skipped_ids: list[str] = []
+            parent_updates: list[tuple[str, str]] = []
             detached = 0
 
             for item in normalized:
@@ -615,7 +615,7 @@ class SessionPortabilityMixin:
                     },
                 )
 
-                sanitized_messages: List[Dict[str, Any]] = []
+                sanitized_messages: list[dict[str, Any]] = []
                 for message in messages:
                     clean = dict(message)
                     for key in (

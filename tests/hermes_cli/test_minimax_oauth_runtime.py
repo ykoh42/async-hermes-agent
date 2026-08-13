@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -23,7 +23,7 @@ def _state(**overrides):
         "refresh_token": "refresh-token",
         "expires_at": datetime.fromtimestamp(
             time.time() + 3600,
-            tz=timezone.utc,
+            tz=UTC,
         ).isoformat(),
     }
     state.update(overrides)

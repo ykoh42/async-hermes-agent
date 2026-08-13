@@ -6,7 +6,7 @@ import asyncio
 import gc
 import importlib
 import weakref
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +28,7 @@ class _Credentials:
         await asyncio.sleep(0)
         self.refresh_count += 1
         self.token = self._next_token
-        self.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+        self.expiry = datetime.now(UTC) + timedelta(hours=1)
 
 
 class _Request:

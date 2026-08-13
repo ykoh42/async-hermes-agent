@@ -39,7 +39,8 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Dict, Optional
+from typing import Any
+from collections.abc import Awaitable
 from urllib.parse import urlparse
 from agent.secret_scope import UnscopedSecretError, get_secret
 # ``agent.auxiliary_client`` pulls credential_pool → hermes_cli.auth → httpx
@@ -149,7 +150,7 @@ async def _validate_image_url(url: str) -> bool:
     return await is_safe_url(url)
 
 
-def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
+def _detect_image_mime_type_from_bytes(data: bytes) -> str | None:
     """Magic-byte MIME sniff on raw bytes (authoritative; no extension trust).
 
     Returns ``None`` for anything without a recognized image header — including
@@ -301,7 +302,7 @@ async def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
 
 async def _normalize_to_supported_image(
     image_path: Path, detected_mime: str
-) -> tuple[Optional[Path], Optional[str], Optional[str]]:
+) -> tuple[Path | None, str | None, str | None]:
     """Ensure an image is in a vision-provider-supported format.
 
     Returns a 3-tuple ``(path, mime, error)``:
@@ -527,14 +528,14 @@ def _determine_mime_type(image_path: Path) -> str:
 
 
 async def _image_to_base64_data_url(
-    image_path: Path, mime_type: Optional[str] = None
+    image_path: Path, mime_type: str | None = None
 ) -> str:
     """
     Convert an image file to a base64-encoded data URL.
     
     Args:
         image_path (Path): Path to the image file
-        mime_type (Optional[str]): MIME type of the image (auto-detected if None)
+        mime_type (str | None): MIME type of the image (auto-detected if None)
         
     Returns:
         str: Base64-encoded data URL (e.g., "data:image/jpeg;base64,...")
@@ -617,9 +618,9 @@ async def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> bool
 
 async def _resize_image_for_vision(
     image_path: Path,
-    mime_type: Optional[str] = None,
+    mime_type: str | None = None,
     max_base64_bytes: int = _RESIZE_TARGET_BYTES,
-    max_dimension: Optional[int] = None,
+    max_dimension: int | None = None,
 ) -> str:
     """Convert an image to a base64 data URL, auto-resizing if too large.
 
@@ -886,7 +887,7 @@ def _build_native_vision_tool_result(
     question: str,
     image_data_url: str,
     image_size_bytes: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the multimodal tool-result envelope returned by the fast path.
 
     Shape:
@@ -939,7 +940,7 @@ def _build_native_vision_tool_result(
 async def _vision_analyze_native(
     image_url: str,
     question: str,
-    task_id: Optional[str] = None,
+    task_id: str | None = None,
 ) -> Any:
     """Fast path for vision-capable main models.
 
@@ -956,7 +957,7 @@ async def _vision_analyze_native(
     if not isinstance(image_url, str) or not image_url.strip():
         return tool_error("image_url is required", success=False)
 
-    temp_image_path: Optional[Path] = None
+    temp_image_path: Path | None = None
     should_cleanup = False
     try:
         from tools.interrupt import is_interrupted
@@ -1071,8 +1072,8 @@ async def _vision_analyze_native(
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
-    model: str = None,
-    task_id: Optional[str] = None,
+    model: str | None = None,
+    task_id: str | None = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1461,7 +1462,7 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
-async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+async def _handle_vision_analyze(args: dict[str, Any], **kw: Any) -> str:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     task_id = kw.get("task_id")
@@ -1525,14 +1526,14 @@ _MAX_VIDEO_BASE64_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
 _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
 
 
-def _detect_video_mime_type(video_path: Path) -> Optional[str]:
+def _detect_video_mime_type(video_path: Path) -> str | None:
     """Return a video MIME type based on file extension, or None if unsupported."""
     ext = video_path.suffix.lower()
     return _VIDEO_MIME_TYPES.get(ext)
 
 
 async def _video_to_base64_data_url(
-    video_path: Path, mime_type: Optional[str] = None,
+    video_path: Path, mime_type: str | None = None,
 ) -> str:
     """Convert a video file to a base64-encoded data URL."""
     async with aiofiles.open(video_path, "rb") as video_file:
@@ -1621,7 +1622,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
 async def video_analyze_tool(
     video_url: str,
     user_prompt: str,
-    model: str = None,
+    model: str | None = None,
 ) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
     if not isinstance(user_prompt, str):
@@ -1862,7 +1863,7 @@ VIDEO_ANALYZE_SCHEMA = {
 }
 
 
-async def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> str:
+async def _handle_video_analyze(args: dict[str, Any], **kw: Any) -> str:
     video_url = args.get("video_url", "")
     question = args.get("question", "")
     full_prompt = (

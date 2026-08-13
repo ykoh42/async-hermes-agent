@@ -39,15 +39,14 @@ from __future__ import annotations
 import logging
 import inspect
 import sys
-from typing import Dict, List, Optional
 
 from agent.browser_provider import BrowserProvider
 
 logger = logging.getLogger(__name__)
 
 
-_providers: Dict[str, BrowserProvider] = {}
-_plugin_providers: Dict[object, Dict[str, BrowserProvider]] = {}
+_providers: dict[str, BrowserProvider] = {}
+_plugin_providers: dict[object, dict[str, BrowserProvider]] = {}
 
 
 def _plugin_scope(
@@ -63,7 +62,7 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> Dict[str, BrowserProvider]:
+def _provider_snapshot() -> dict[str, BrowserProvider]:
     providers = dict(_providers)
     scope = _plugin_scope()
     if scope is not None:
@@ -118,13 +117,13 @@ def register_provider(provider: BrowserProvider) -> None:
         )
 
 
-def list_providers() -> List[BrowserProvider]:
+def list_providers() -> list[BrowserProvider]:
     """Return all registered providers, sorted by name."""
     items = list(_provider_snapshot().values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> Optional[BrowserProvider]:
+def get_provider(name: str) -> BrowserProvider | None:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
@@ -147,7 +146,7 @@ _LEGACY_PREFERENCE = (
 )
 
 
-async def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
+async def _resolve(configured: str | None) -> BrowserProvider | None:
     """Resolve the active browser provider.
 
     Resolution rules (in order):

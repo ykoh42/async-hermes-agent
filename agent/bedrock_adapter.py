@@ -40,7 +40,8 @@ import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any
+from collections.abc import Mapping
 
 import aiofiles
 import aiofiles.os
@@ -83,8 +84,8 @@ except Exception as exc:
 # Compatibility projections for upstream's private cache dictionaries. Native
 # async ownership is held by the scoped state below; these remain available to
 # tests and integrations that inspect or seed the historical cache surface.
-_bedrock_runtime_client_cache: Dict[str, Any] = {}
-_bedrock_control_client_cache: Dict[str, Any] = {}
+_bedrock_runtime_client_cache: dict[str, Any] = {}
+_bedrock_control_client_cache: dict[str, Any] = {}
 
 
 @dataclass
@@ -113,7 +114,7 @@ class _BedrockScopeState:
     )
     discovery_tasks: dict[
         tuple[str, tuple[str, ...], tuple[Any, ...]],
-        asyncio.Task[List[Dict[str, Any]]],
+        asyncio.Task[list[dict[str, Any]]],
     ] = field(default_factory=dict)
     discovery_waiters: dict[
         tuple[str, tuple[str, ...], tuple[Any, ...]], int
@@ -286,7 +287,7 @@ def _aws_setting(settings: Mapping[str, Any], name: str) -> str:
 
 
 def _aws_environment_settings(
-    env: Optional[Mapping[str, str]] = None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[Mapping[str, Any], bool]:
     """Return the AWS settings authoritative for the current request."""
     multiplexed = is_multiplex_active()
@@ -426,7 +427,7 @@ def _configure_scoped_aws_session(
 
 
 def _aws_environment_identity(
-    env: Optional[Mapping[str, str]] = None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[Any, ...]:
     """Return the secret-safe environment portion of AWS identity."""
     settings, _multiplexed = _aws_environment_settings(env)
@@ -733,7 +734,7 @@ async def _release_bedrock_lifecycle_owned(
     owner: object, state: _BedrockScopeState
 ) -> None:
     to_close: list[_CachedBedrockClient] = []
-    discovery_tasks: list[asyncio.Task[List[Dict[str, Any]]]] = []
+    discovery_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
     async with _BedrockStateLock(state):
         state.consumers.discard(owner)
         with _bedrock_scope_guard:
@@ -910,8 +911,8 @@ _AWS_CREDENTIAL_ENV_VARS = [
 
 
 async def resolve_aws_auth_env_var(
-    env: Optional[Dict[str, str]] = None,
-) -> Optional[str]:
+    env: dict[str, str] | None = None,
+) -> str | None:
     """Return the name of the AWS auth source that is active, or None.
 
     Checks environment variables first, then falls back to aiobotocore's credential
@@ -973,7 +974,7 @@ async def resolve_aws_auth_env_var(
     return None
 
 
-async def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
+async def has_aws_credentials(env: dict[str, str] | None = None) -> bool:
     """Return True if any AWS credential source is detected.
 
     Checks environment variables first (fast, no I/O), then uses aiobotocore's
@@ -988,7 +989,7 @@ async def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     return await resolve_aws_auth_env_var(env) is not None
 
 
-async def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
+async def resolve_bedrock_region(env: dict[str, str] | None = None) -> str:
     """Resolve the AWS region for Bedrock API calls.
 
     Priority:
@@ -1034,7 +1035,7 @@ async def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     return "us-east-1"
 
 
-async def bedrock_model_ids_or_none() -> Optional[List[str]]:
+async def bedrock_model_ids_or_none() -> list[str] | None:
     """Live-discover Bedrock model IDs for the active region.
 
     Returns a list of model ID strings if discovery succeeds and yields
@@ -1137,7 +1138,7 @@ def is_anthropic_bedrock_model(model_id: str) -> bool:
 # Message format conversion: OpenAI → Bedrock Converse
 # ---------------------------------------------------------------------------
 
-def convert_tools_to_converse(tools: List[Dict]) -> List[Dict]:
+def convert_tools_to_converse(tools: list[dict]) -> list[dict]:
     """Convert OpenAI-format tool definitions to Bedrock Converse ``toolConfig``.
 
     OpenAI format::
@@ -1188,7 +1189,7 @@ def _safe_text(text) -> str:
     return text if text.strip() else _EMPTY_TEXT_PLACEHOLDER
 
 
-def _convert_content_to_converse(content) -> List[Dict]:
+def _convert_content_to_converse(content) -> list[dict]:
     """Convert OpenAI message content (string or list) to Converse content blocks.
 
     Handles:
@@ -1251,8 +1252,8 @@ def _convert_content_to_converse(content) -> List[Dict]:
 
 
 def convert_messages_to_converse(
-    messages: List[Dict],
-) -> Tuple[Optional[List[Dict]], List[Dict]]:
+    messages: list[dict],
+) -> tuple[list[dict] | None, list[dict]]:
     """Convert OpenAI-format messages to Bedrock Converse format.
 
     Returns ``(system_prompt, converse_messages)`` where:
@@ -1269,8 +1270,8 @@ def convert_messages_to_converse(
     Converse requires strict user/assistant alternation. Consecutive messages
     with the same role are merged into a single message.
     """
-    system_blocks: List[Dict] = []
-    converse_msgs: List[Dict] = []
+    system_blocks: list[dict] = []
+    converse_msgs: list[dict] = []
 
     for msg in messages:
         role = msg.get("role", "")
@@ -1390,7 +1391,7 @@ def _converse_stop_reason_to_openai(stop_reason: str) -> str:
     return mapping.get(stop_reason, "stop")
 
 
-def normalize_converse_response(response: Dict) -> SimpleNamespace:
+def normalize_converse_response(response: dict) -> SimpleNamespace:
     """Convert a Bedrock Converse API response to an OpenAI-compatible object.
 
     The agent loop in ``run_agent.py`` expects responses shaped like
@@ -1531,14 +1532,14 @@ async def stream_converse_with_callbacks(
         An OpenAI-compatible SimpleNamespace response, identical in shape to
         ``normalize_converse_response()``.
     """
-    text_parts: List[str] = []
-    reasoning_parts: List[str] = []
-    tool_calls: List[SimpleNamespace] = []
-    current_tool: Optional[Dict] = None
-    current_text_buffer: List[str] = []
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[SimpleNamespace] = []
+    current_tool: dict | None = None
+    current_text_buffer: list[str] = []
     has_tool_use = False
     stop_reason = "end_turn"
-    usage_data: Dict[str, int] = {}
+    usage_data: dict[str, int] = {}
 
     async for event in event_stream.get("stream", []):
         # Wire-level liveness signal: fire on EVERY yielded event (text, tool
@@ -1672,14 +1673,14 @@ async def stream_converse_with_callbacks(
 
 def build_converse_kwargs(
     model: str,
-    messages: List[Dict],
-    tools: Optional[List[Dict]] = None,
+    messages: list[dict],
+    tools: list[dict] | None = None,
     max_tokens: int = 4096,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    stop_sequences: Optional[List[str]] = None,
-    guardrail_config: Optional[Dict] = None,
-) -> Dict[str, Any]:
+    temperature: float | None = None,
+    top_p: float | None = None,
+    stop_sequences: list[str] | None = None,
+    guardrail_config: dict | None = None,
+) -> dict[str, Any]:
     """Build kwargs for ``bedrock-runtime.converse()`` or ``converse_stream()``.
 
     Converts OpenAI-format inputs to Converse API parameters.
@@ -1687,7 +1688,7 @@ def build_converse_kwargs(
     system_prompt, converse_messages = convert_messages_to_converse(messages)
     cache_enabled = _model_supports_prompt_cache(model)
 
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "modelId": model,
         "messages": converse_messages,
         "inferenceConfig": {
@@ -1747,13 +1748,13 @@ def build_converse_kwargs(
 async def call_converse(
     region: str,
     model: str,
-    messages: List[Dict],
-    tools: Optional[List[Dict]] = None,
+    messages: list[dict],
+    tools: list[dict] | None = None,
     max_tokens: int = 4096,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    stop_sequences: Optional[List[str]] = None,
-    guardrail_config: Optional[Dict] = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    stop_sequences: list[str] | None = None,
+    guardrail_config: dict | None = None,
 ) -> SimpleNamespace:
     """Call Bedrock Converse API (non-streaming) and return an OpenAI-compatible response.
 
@@ -1793,13 +1794,13 @@ async def call_converse(
 async def call_converse_stream(
     region: str,
     model: str,
-    messages: List[Dict],
-    tools: Optional[List[Dict]] = None,
+    messages: list[dict],
+    tools: list[dict] | None = None,
     max_tokens: int = 4096,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    stop_sequences: Optional[List[str]] = None,
-    guardrail_config: Optional[Dict] = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    stop_sequences: list[str] | None = None,
+    guardrail_config: dict | None = None,
 ) -> SimpleNamespace:
     """Call Bedrock ConverseStream API and return an OpenAI-compatible response.
 
@@ -1852,7 +1853,7 @@ async def call_converse_stream(
 # Model discovery
 # ---------------------------------------------------------------------------
 
-_discovery_cache: Dict[Any, Any] = {}
+_discovery_cache: dict[Any, Any] = {}
 _DISCOVERY_CACHE_TTL_SECONDS = 3600
 
 
@@ -1904,8 +1905,8 @@ async def _finish_cancelled_discovery(
 
 async def discover_bedrock_models(
     region: str,
-    provider_filter: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
+    provider_filter: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Discover available Bedrock foundation models and inference profiles.
 
     Returns a list of model info dicts with keys:
@@ -2014,8 +2015,8 @@ async def _discover_bedrock_models_uncached(
     session: Any,
     create_kwargs: dict[str, Any],
     region: str,
-    provider_filter: Optional[List[str]],
-) -> List[Dict[str, Any]]:
+    provider_filter: list[str] | None,
+) -> list[dict[str, Any]]:
     import time
 
     models = []
@@ -2200,7 +2201,7 @@ def classify_bedrock_error(error_message: str) -> str:
 # context window sizes.  Used by agent/model_metadata.py when dynamic
 # detection is unavailable.
 
-BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
+BEDROCK_CONTEXT_LENGTHS: dict[str, int] = {
     # Anthropic Claude models on Bedrock.
     # Context windows per Anthropic's official models comparison
     # (https://platform.claude.com/docs/en/about-claude/models/overview).
@@ -2277,7 +2278,7 @@ def _static_bedrock_context_length(model_id: str) -> int:
 
 async def probe_bedrock_context_length(
     model_id: str, region: str
-) -> Optional[int]:
+) -> int | None:
     """Discover a Bedrock model's real context window by provoking a length error.
 
     Bedrock does not expose the context window via any metadata API

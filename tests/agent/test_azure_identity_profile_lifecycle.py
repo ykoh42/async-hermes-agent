@@ -30,7 +30,7 @@ def azure_adapter(monkeypatch):
         module._issued_providers.clear()
 
     class Credential:
-        instances: list["Credential"] = []
+        instances: list[Credential] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs

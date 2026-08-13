@@ -81,7 +81,7 @@ import re
 from enum import Enum
 from collections.abc import MutableMapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -196,9 +196,9 @@ async def _iter_files(directory: Path):
             yield result
 
 
-async def _linked_skill_files(skill_dir: Path) -> Dict[str, List[str]]:
+async def _linked_skill_files(skill_dir: Path) -> dict[str, list[str]]:
     """Build the retained linked-file catalog with upstream filters."""
-    linked: Dict[str, List[str]] = {}
+    linked: dict[str, list[str]] = {}
     references = skill_dir / "references"
     if await aiofiles.os.path.isdir(references):
         linked_references = [
@@ -242,9 +242,9 @@ async def _linked_skill_files(skill_dir: Path) -> Dict[str, List[str]]:
     return linked
 
 
-async def _available_skill_files(skill_dir: Path) -> Dict[str, List[str]]:
+async def _available_skill_files(skill_dir: Path) -> dict[str, list[str]]:
     """Return the upstream missing-file recovery inventory."""
-    available: Dict[str, List[str]] = {
+    available: dict[str, list[str]] = {
         "references": [],
         "templates": [],
         "assets": [],
@@ -278,7 +278,7 @@ _PLATFORM_MAP = {
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _skill_lookup_path_error(name: str) -> Optional[str]:
+def _skill_lookup_path_error(name: str) -> str | None:
     """Return an error if a local skill lookup *name* can escape search roots.
 
     The skill ``name`` is joined onto each trusted search dir to build the
@@ -303,7 +303,7 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
     return None
 
 
-async def load_env() -> Dict[str, str]:
+async def load_env() -> dict[str, str]:
     """Read the profile environment file without blocking the event loop."""
     env_path = get_hermes_home() / ".env"
     if not await aiofiles.os.path.isfile(env_path):
@@ -312,7 +312,7 @@ async def load_env() -> Dict[str, str]:
     async with aiofiles.open(env_path, encoding="utf-8") as handle:
         contents = await handle.read()
 
-    env_vars: Dict[str, str] = {}
+    env_vars: dict[str, str] = {}
     for line in contents.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -326,13 +326,13 @@ async def load_env() -> Dict[str, str]:
 
 def _required_environment_variable_available(
     name: str,
-    env_snapshot: Dict[str, str],
+    env_snapshot: dict[str, str],
 ) -> bool:
     """Preserve dotenv-first readiness without crossing profile scopes."""
     return bool(env_snapshot.get(name) or get_secret(name))
 
 
-class SkillReadinessStatus(str, Enum):
+class SkillReadinessStatus(str, Enum):  # noqa: UP042 - preserve legacy str() output
     AVAILABLE = "available"
     SETUP_NEEDED = "setup_needed"
     UNSUPPORTED = "unsupported"
@@ -362,7 +362,7 @@ _INJECTION_PATTERNS = [
 ]
 
 
-def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
+def skill_matches_platform(frontmatter: dict[str, Any]) -> bool:
     """Check if a skill is compatible with the current OS platform.
 
     Delegates to ``agent.skill_utils.skill_matches_platform`` — kept here
@@ -372,7 +372,7 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
     return _impl(frontmatter)
 
 
-async def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
+async def skill_matches_environment(frontmatter: dict[str, Any]) -> bool:
     """Check if a skill is relevant to the current runtime environment.
 
     Delegates to ``agent.skill_utils.skill_matches_environment`` — kept here
@@ -384,7 +384,7 @@ async def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     return await _impl(frontmatter)
 
 
-def _normalize_prerequisite_values(value: Any) -> List[str]:
+def _normalize_prerequisite_values(value: Any) -> list[str]:
     if not value:
         return []
     if isinstance(value, str):
@@ -393,8 +393,8 @@ def _normalize_prerequisite_values(value: Any) -> List[str]:
 
 
 def _collect_prerequisite_values(
-    frontmatter: Dict[str, Any],
-) -> Tuple[List[str], List[str]]:
+    frontmatter: dict[str, Any],
+) -> tuple[list[str], list[str]]:
     prereqs = frontmatter.get("prerequisites")
     if not prereqs or not isinstance(prereqs, dict):
         return [], []
@@ -404,7 +404,7 @@ def _collect_prerequisite_values(
     )
 
 
-def _normalize_setup_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_setup_metadata(frontmatter: dict[str, Any]) -> dict[str, Any]:
     setup = frontmatter.get("setup")
     if not isinstance(setup, dict):
         return {"help": None, "collect_secrets": []}
@@ -422,7 +422,7 @@ def _normalize_setup_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(collect_secrets_raw, list):
         collect_secrets_raw = []
 
-    collect_secrets: List[Dict[str, Any]] = []
+    collect_secrets: list[dict[str, Any]] = []
     for item in collect_secrets_raw:
         if not isinstance(item, dict):
             continue
@@ -434,7 +434,7 @@ def _normalize_setup_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
         prompt = str(item.get("prompt") or f"Enter value for {env_var}").strip()
         provider_url = str(item.get("provider_url") or item.get("url") or "").strip()
 
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             "env_var": env_var,
             "prompt": prompt,
             "secret": bool(item.get("secret", True)),
@@ -450,9 +450,9 @@ def _normalize_setup_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_required_environment_variables(
-    frontmatter: Dict[str, Any],
-    legacy_env_vars: List[str] | None = None,
-) -> List[Dict[str, Any]]:
+    frontmatter: dict[str, Any],
+    legacy_env_vars: list[str] | None = None,
+) -> list[dict[str, Any]]:
     setup = _normalize_setup_metadata(frontmatter)
     required_raw = frontmatter.get("required_environment_variables")
     if isinstance(required_raw, dict):
@@ -460,17 +460,17 @@ def _get_required_environment_variables(
     if not isinstance(required_raw, list):
         required_raw = []
 
-    required: List[Dict[str, Any]] = []
+    required: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def _append_required(entry: Dict[str, Any]) -> None:
+    def _append_required(entry: dict[str, Any]) -> None:
         env_name = str(entry.get("name") or entry.get("env_var") or "").strip()
         if not env_name or env_name in seen:
             return
         if not _ENV_VAR_NAME_RE.match(env_name):
             return
 
-        normalized: Dict[str, Any] = {
+        normalized: dict[str, Any] = {
             "name": env_name,
             "prompt": str(entry.get("prompt") or f"Enter value for {env_name}").strip(),
         }
@@ -520,7 +520,7 @@ def _get_required_environment_variables(
 
 def _build_setup_note(
     readiness_status: SkillReadinessStatus,
-    missing: List[str],
+    missing: list[str],
     setup_help: str | None = None,
 ) -> str | None:
     if readiness_status == SkillReadinessStatus.SETUP_NEEDED:
@@ -549,8 +549,8 @@ def _gateway_setup_hint() -> str:
 
 async def _capture_required_environment_variables(
     skill_name: str,
-    missing_entries: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    missing_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
     if not missing_entries:
         return {
             "missing_names": [],
@@ -574,7 +574,7 @@ async def _capture_required_environment_variables(
         }
 
     setup_skipped = False
-    remaining_names: List[str] = []
+    remaining_names: list[str] = []
     for entry in missing_entries:
         metadata = {"skill_name": skill_name}
         if entry.get("help"):
@@ -619,8 +619,8 @@ async def _capture_required_environment_variables(
 
 
 async def _missing_required_credential_files(
-    frontmatter: Dict[str, Any],
-) -> List[str]:
+    frontmatter: dict[str, Any],
+) -> list[str]:
     """Return unavailable/refused skill credential paths without remote mounts."""
     entries = frontmatter.get("required_credential_files", [])
     if not isinstance(entries, list):
@@ -631,7 +631,7 @@ async def _missing_required_credential_files(
         resolved_home = Path(await _realpath(hermes_home))
     except OSError:
         resolved_home = hermes_home
-    missing: List[str] = []
+    missing: list[str] = []
     for entry in entries:
         if isinstance(entry, str):
             relative_path = entry.strip()
@@ -674,7 +674,7 @@ def check_skills_requirements() -> bool:
     return True
 
 
-def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     """Parse YAML frontmatter from markdown content.
 
     Delegates to ``agent.skill_utils.parse_frontmatter`` — kept here
@@ -684,7 +684,7 @@ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return parse_frontmatter(content)
 
 
-async def _get_category_from_path(skill_path: Path) -> Optional[str]:
+async def _get_category_from_path(skill_path: Path) -> str | None:
     """
     Extract category from skill path based on directory structure.
 
@@ -706,7 +706,7 @@ async def _get_category_from_path(skill_path: Path) -> Optional[str]:
     return None
 
 
-def _parse_tags(tags_value) -> List[str]:
+def _parse_tags(tags_value) -> list[str]:
     """
     Parse tags from frontmatter value.
 
@@ -737,7 +737,7 @@ def _parse_tags(tags_value) -> List[str]:
 
 
 
-async def _is_skill_disabled(name: str, platform: str = None) -> bool:
+async def _is_skill_disabled(name: str, platform: str | None = None) -> bool:
     """Check if a skill is disabled in config.
 
     Resolves the active platform from (in order of precedence):
@@ -748,7 +748,7 @@ async def _is_skill_disabled(name: str, platform: str = None) -> bool:
     return name in await _get_disabled_skill_names(platform)
 
 
-def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _sort_skills(skills: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
@@ -761,7 +761,7 @@ async def _read_skill_text(path: Path, *, limit: int | None = None) -> str:
         return await (handle.read(limit) if limit is not None else handle.read())
 
 
-async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+async def _find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any]]:
     """List local and external skills through the async file boundary.
 
     Results are cached per discovery signature and returned as copies because
@@ -780,7 +780,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any
     if cached is not None and cached[0] == signature and now - cached[1] < _SKILLS_CACHE_TTL_SECONDS:
         return [dict(skill) for skill in cached[2]]
 
-    skills: List[Dict[str, Any]] = []
+    skills: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for root in roots:
         async for skill_md in _iter_skill_index_files(root, "SKILL.md"):
@@ -826,7 +826,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any
     return [dict(skill) for skill in skills]
 
 
-async def skills_list(category: str = None, task_id: str = None) -> str:
+async def skills_list(category: str | None = None, task_id: str | None = None) -> str:
     """Native async implementation behind the ``skills_list`` tool."""
     try:
         active_skills_dir = _skills_dir()
@@ -983,8 +983,8 @@ async def _serve_plugin_skill(
 
 async def skill_view(
     name: str,
-    file_path: str = None,
-    task_id: str = None,
+    file_path: str | None = None,
+    task_id: str | None = None,
     preprocess: bool = True,
 ) -> str:
     """View a local, externally configured, or plugin-provided skill."""

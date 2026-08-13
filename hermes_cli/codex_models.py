@@ -6,7 +6,6 @@ import base64
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional
 
 import aiofiles
 import aiofiles.os
@@ -16,7 +15,7 @@ from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CODEX_MODELS: List[str] = [
+DEFAULT_CODEX_MODELS: list[str] = [
     # GPT-5.6 series (Sol/Terra/Luna + -pro high-effort modes) — GA 2026-07-09
     # (previewed 2026-06-26).
     "gpt-5.6-sol",
@@ -56,7 +55,7 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # live discovery will pick them up automatically via _fetch_models_from_api.
 ]
 
-_FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
+_FORWARD_COMPAT_TEMPLATE_MODELS: list[tuple[str, tuple[str, ...]]] = [
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-sol-pro", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),
@@ -74,14 +73,14 @@ _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
 ]
 
 
-def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
+def _add_forward_compat_models(model_ids: list[str]) -> list[str]:
     """Add Clawdbot-style synthetic forward-compat Codex models.
 
     If a newer Codex slug isn't returned by live discovery, surface it when an
     older compatible template model is present. This mirrors Clawdbot's
     synthetic catalog / forward-compat behavior for GPT-5 Codex variants.
     """
-    ordered: List[str] = []
+    ordered: list[str] = []
     seen: set[str] = set()
     for model_id in model_ids:
         if model_id not in seen:
@@ -98,7 +97,7 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
     return ordered
 
 
-def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
+def _extract_chatgpt_account_id(access_token: str) -> str | None:
     """Best-effort extraction of ``chatgpt_account_id`` from the OAuth JWT.
 
     The Codex backend requires the ``ChatGPT-Account-Id`` header for the
@@ -128,7 +127,7 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
         return None
 
 
-async def _fetch_models_from_api(access_token: str) -> List[str]:
+async def _fetch_models_from_api(access_token: str) -> list[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority."""
     try:
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -171,7 +170,7 @@ async def _fetch_models_from_api(access_token: str) -> List[str]:
     return _add_forward_compat_models([slug for _, slug in sortable])
 
 
-async def _read_default_model(codex_home: Path) -> Optional[str]:
+async def _read_default_model(codex_home: Path) -> str | None:
     config_path = codex_home / "config.toml"
     if not await aiofiles.os.path.exists(config_path):
         return None
@@ -190,7 +189,7 @@ async def _read_default_model(codex_home: Path) -> Optional[str]:
     return None
 
 
-async def _read_cache_models(codex_home: Path) -> List[str]:
+async def _read_cache_models(codex_home: Path) -> list[str]:
     cache_path = codex_home / "models_cache.json"
     if not await aiofiles.os.path.exists(cache_path):
         return []
@@ -221,20 +220,20 @@ async def _read_cache_models(codex_home: Path) -> List[str]:
             sortable.append((rank, slug))
 
     sortable.sort(key=lambda item: (item[0], item[1]))
-    deduped: List[str] = []
+    deduped: list[str] = []
     for _, slug in sortable:
         if slug not in deduped:
             deduped.append(slug)
     return deduped
 
 
-async def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
+async def get_codex_model_ids(access_token: str | None = None) -> list[str]:
     """Return available Codex model IDs, trying API first, then local sources.
     
     Resolution order: API (live, if token provided) > config.toml default >
     local cache > hardcoded defaults.
     """
-    ordered: List[str] = []
+    ordered: list[str] = []
 
     # Try live API if we have a token
     if access_token:

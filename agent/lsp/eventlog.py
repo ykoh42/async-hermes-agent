@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List, Tuple
 
 # Dedicated logger name so the documented grep recipe survives a
 # ``logging.getLogger(__name__)`` rename of any internal module.
@@ -77,7 +76,7 @@ def _emit(server_id: str, level: int, message: str) -> None:
     event_log.log(level, "lsp[%s] %s", server_id, message)
 
 
-def _announce_once(bucket: set, key: Tuple) -> bool:
+def _announce_once(bucket: set, key: tuple) -> bool:
     """Return True if *key* has not been announced for *bucket* yet.
 
     The check-and-add contains no await and is atomic on the event loop.
@@ -184,7 +183,7 @@ def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) ->
     )
 
 
-def log_reaped(keys: List[Tuple[str, str]], idle_timeout: float) -> None:
+def log_reaped(keys: list[tuple[str, str]], idle_timeout: float) -> None:
     """Idle clients were shut down by the reaper.  INFO — one line per
     sweep so users can correlate memory drops with LSP activity.
 

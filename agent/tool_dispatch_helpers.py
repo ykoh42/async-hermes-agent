@@ -30,7 +30,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
@@ -112,7 +112,7 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Path | None = None) -> list[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
     ``kind`` is ``"parallel"`` (a maximal contiguous run of parallel-safe
@@ -246,7 +246,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     return len(segments) == 1 and segments[0][0] == "parallel"
 
 
-def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path:
+def _canonical_path(raw_path: str, execution_cwd: Path | None = None) -> Path:
     """Return a canonical, OS-aware path for overlap detection.
 
     Uses ``os.path.realpath`` to resolve symlinks on existing path components
@@ -265,8 +265,8 @@ def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path
 def _extract_parallel_scope_paths(
     tool_name: str,
     function_args: dict,
-    execution_cwd: Optional[Path] = None,
-) -> List[Path]:
+    execution_cwd: Path | None = None,
+) -> list[Path]:
     """Return every canonical path this call reserves for overlap checks.
 
     *execution_cwd* should be the working directory that the tool will
@@ -282,7 +282,7 @@ def _extract_parallel_scope_paths(
     if tool_name not in _PATH_SCOPED_TOOLS:
         return []
 
-    raw_paths: List[str] = []
+    raw_paths: list[str] = []
     if tool_name == "patch" and (function_args.get("mode") or "replace") == "patch":
         raw_paths.extend(_extract_file_mutation_targets(tool_name, function_args))
     else:
@@ -297,7 +297,7 @@ def _extract_parallel_scope_paths(
             # parallelism).
             raw_paths.append(".")
 
-    scoped: List[Path] = []
+    scoped: list[Path] = []
     seen: set[str] = set()
     for raw in raw_paths:
         if not isinstance(raw, str) or not raw.strip():
@@ -314,8 +314,8 @@ def _extract_parallel_scope_paths(
 def _extract_parallel_scope_path(
     tool_name: str,
     function_args: dict,
-    execution_cwd: Optional[Path] = None,
-) -> Optional[Path]:
+    execution_cwd: Path | None = None,
+) -> Path | None:
     """Return the primary canonical file target for path-scoped tools.
 
     Thin view over ``_extract_parallel_scope_paths`` kept for callers/tests
@@ -383,7 +383,7 @@ def _multimodal_text_summary(value: Any) -> str:
         return str(value)
 
 
-def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
+def _append_subdir_hint_to_multimodal(value: dict[str, Any], hint: str) -> None:
     """Mutate a multimodal tool-result envelope to append a subdir hint.
 
     The hint is added to the first text part so the model sees it; image
@@ -404,7 +404,7 @@ def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
         value["text_summary"] = value["text_summary"] + hint
 
 
-def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
+def _extract_file_mutation_targets(tool_name: str, args: dict[str, Any]) -> list[str]:
     """Return the file paths a ``write_file`` or ``patch`` call is targeting.
 
     For ``write_file`` and ``patch`` in replace mode this is just ``args["path"]``.
@@ -426,7 +426,7 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
         body = args.get("patch") or ""
         if not isinstance(body, str) or not body:
             return []
-        paths: List[str] = []
+        paths: list[str] = []
         # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser / file_tools:
         # they accept ``***Update File:`` with no space after the asterisks.
         for _m in re.finditer(
@@ -454,9 +454,9 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
 
 def _extract_landed_file_mutation_paths(
     tool_name: str,
-    args: Dict[str, Any],
+    args: dict[str, Any],
     result: Any,
-) -> List[str]:
+) -> list[str]:
     """Return the concrete file paths a successful mutation reports."""
     targets = _extract_file_mutation_targets(tool_name, args)
     if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
@@ -506,7 +506,7 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     return text
 
 
-def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _trajectory_normalize_msg(msg: dict[str, Any]) -> dict[str, Any]:
     """Strip image blobs from a message for trajectory saving.
 
     Returns a shallow copy with multimodal tool results replaced by their
@@ -598,7 +598,7 @@ _UNTRUSTED_WRAP_MIN_CHARS = 32
 _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 
-def _is_untrusted_tool(name: Optional[str]) -> bool:
+def _is_untrusted_tool(name: str | None) -> bool:
     if not name:
         return False
     if name in _UNTRUSTED_TOOL_NAMES:
@@ -606,7 +606,7 @@ def _is_untrusted_tool(name: Optional[str]) -> bool:
     return any(name.startswith(p) for p in _UNTRUSTED_TOOL_PREFIXES)
 
 
-def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, Any]]:
+def _tool_output_risk_metadata(name: str, content: Any) -> dict[str, Any] | None:
     """Classify textual attacker-controlled output without retaining a copy.
 
     The advisory metadata is internal-only. It records deterministic finding
@@ -630,7 +630,7 @@ def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, An
     else:
         return None
 
-    findings: List[str] = []
+    findings: list[str] = []
     for text in text_parts:
         for finding in scan_for_threats(text, scope="context"):
             if finding not in findings:

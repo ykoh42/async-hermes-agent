@@ -15,9 +15,10 @@ import shlex
 import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any
+from collections.abc import AsyncIterator
 from weakref import WeakKeyDictionary
 
 import aiofiles.os
@@ -55,11 +56,11 @@ class VerificationEvidence:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _retention_cutoff() -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=_MAX_EVIDENCE_AGE_DAYS)).isoformat()
+    return (datetime.now(UTC) - timedelta(days=_MAX_EVIDENCE_AGE_DAYS)).isoformat()
 
 
 def _db_path() -> Path:
@@ -181,7 +182,7 @@ def _canonical_tokens(canonical: str) -> list[str]:
         return []
 
 
-def _find_subsequence(tokens: list[str], needle: list[str]) -> Optional[int]:
+def _find_subsequence(tokens: list[str], needle: list[str]) -> int | None:
     if not tokens or not needle or len(needle) > len(tokens):
         return None
     cleaned = [_clean_token(t) for t in tokens]
@@ -226,7 +227,7 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     return candidates
 
 
-def _find_canonical_match(command: str, canonical_commands: list[str]) -> Optional[tuple[str, list[str]]]:
+def _find_canonical_match(command: str, canonical_commands: list[str]) -> tuple[str, list[str]] | None:
     """Return ``(canonical, trailing_args)`` for the first detected command."""
 
     segments = _split_segment_tokens(command)
@@ -320,7 +321,7 @@ async def _is_temp_script_path(token: str, root: str | Path | None) -> bool:
 
 async def _ad_hoc_script_args(
     tokens: list[str], root: str | Path | None
-) -> Optional[list[str]]:
+) -> list[str] | None:
     candidate_tokens = _strip_command_prefix(tokens)
     if not candidate_tokens:
         return None
@@ -340,7 +341,7 @@ async def _ad_hoc_script_args(
 
 async def _find_ad_hoc_match(
     command: str, root: str | Path | None
-) -> Optional[list[str]]:
+) -> list[str] | None:
     # Try both posix=True (default) and posix=False (Windows backslash paths)
     # so ad-hoc verification scripts with backslash paths are matched on Windows.
     for posix in (True, False):
@@ -435,7 +436,7 @@ async def classify_verification_command(
     session_id: str | None = None,
     exit_code: int = 0,
     output: str = "",
-) -> Optional[VerificationEvidence]:
+) -> VerificationEvidence | None:
     """Classify a terminal command as verification evidence, if applicable."""
 
     if not command or not isinstance(command, str):
@@ -482,7 +483,7 @@ async def record_terminal_result(
     session_id: str | None,
     exit_code: int,
     output: str = "",
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Record a foreground terminal result when it is verification evidence."""
 
     evidence = await classify_verification_command(
@@ -545,7 +546,7 @@ async def mark_workspace_edited(
     session_id: str | None,
     cwd: str | Path | None,
     paths: list[str] | tuple[str, ...] | None = None,
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Mark verification evidence stale after a successful file edit."""
 
     try:
@@ -578,7 +579,7 @@ async def mark_workspace_edited(
                 existing = set(json.loads(row["changed_paths_json"] or "[]"))
             except (TypeError, ValueError):
                 existing = set()
-        merged = sorted((existing | set(changed_paths)))[-200:]
+        merged = sorted(existing | set(changed_paths))[-200:]
         await conn.execute(
             """
             INSERT INTO verification_state(

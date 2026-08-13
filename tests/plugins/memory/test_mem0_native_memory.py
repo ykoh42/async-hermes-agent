@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 import hashlib
 import json
 from types import SimpleNamespace
@@ -826,7 +826,7 @@ async def test_memory_add_preserves_temporal_and_memory_type_validation(tmp_path
     result = await memory.add(
         "fact",
         user_id="u1",
-        expiration_date=datetime(2026, 8, 10, 1, 2, tzinfo=timezone.utc),
+        expiration_date=datetime(2026, 8, 10, 1, 2, tzinfo=UTC),
         infer=False,
     )
     payload = _FakeVector.instances[0].rows[result["results"][0]["id"]].payload

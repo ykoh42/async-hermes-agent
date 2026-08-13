@@ -82,7 +82,7 @@ class _FakeManager:
 
 @dataclass
 class _FakeSession:
-    sessions: list["_FakeSession"]
+    sessions: list[_FakeSession]
     default_access_key: str = "DEFAULT-CHAIN"
     components: dict = field(default_factory=dict)
     create_calls: list[dict] = field(default_factory=list)

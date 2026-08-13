@@ -39,7 +39,7 @@ import os
 import re
 import asyncio
 import contextvars
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 from agent.secret_scope import UnscopedSecretError, is_multiplex_active
 
@@ -78,7 +78,7 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _web_extract_url(value: Any) -> Optional[str]:
+def _web_extract_url(value: Any) -> str | None:
     """Return a usable URL from a model-supplied extract item.
 
     Models sometimes forward a complete web-search result instead of its URL.
@@ -433,7 +433,7 @@ def convert_base64_images_to_links(text: str) -> str:
     return out
 
 
-async def _store_full_text(url: str, content: str) -> Optional[str]:
+async def _store_full_text(url: str, content: str) -> str | None:
     """Write the full extracted page to cache/web and return its absolute path.
 
     The file is mounted read-only into remote backends (Docker/Modal/SSH) via
@@ -710,9 +710,9 @@ async def web_search_tool(query: str, limit: int = 5) -> str:
 
 
 async def web_extract_tool(
-    urls: List[Any],
-    format: str = None,
-    char_limit: Optional[int] = None,
+    urls: list[Any],
+    format: str | None = None,
+    char_limit: int | None = None,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
@@ -726,10 +726,10 @@ async def web_extract_tool(
     ``[IMAGE: alt]`` placeholders (real image URLs are preserved as links).
 
     Args:
-        urls (List[Any]): URL strings or search-result objects containing a
+        urls (list[Any]): URL strings or search-result objects containing a
             string ``url`` or ``href`` field
         format (str): Desired output format ("markdown" or "html", optional)
-        char_limit (Optional[int]): Per-page char budget sent to the model
+        char_limit (int | None): Per-page char budget sent to the model
             (default: web.extract_char_limit or 15000). Larger pages truncate.
 
     Security: URLs are checked for embedded secrets before fetching.
@@ -748,9 +748,9 @@ async def web_extract_tool(
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE
     from urllib.parse import unquote
-    normalized_urls: List[str] = []
-    normalized_indices: List[int] = []
-    invalid_urls: Dict[int, Dict[str, Any]] = {}
+    normalized_urls: list[str] = []
+    normalized_indices: list[int] = []
+    invalid_urls: dict[int, dict[str, Any]] = {}
     for index, item in enumerate(urls):
         _url = _web_extract_url(item)
         if _url is None:
@@ -811,7 +811,7 @@ async def web_extract_tool(
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []
         safe_indices = []
-        ssrf_blocked: Dict[int, Dict[str, Any]] = {}
+        ssrf_blocked: dict[int, dict[str, Any]] = {}
         for index, url in zip(normalized_indices, normalized_urls):
             if not await is_safe_url(url):
                 ssrf_blocked[index] = {
@@ -1053,7 +1053,7 @@ async def check_web_api_key() -> bool:
         return False
 
 
-async def _standalone_status() -> tuple[bool, str, str, Optional[str], str]:
+async def _standalone_status() -> tuple[bool, str, str, str | None, str]:
     """Resolve direct-module diagnostics on one event loop."""
     web_available = await check_web_api_key()
     firecrawl_key = await _env_value("FIRECRAWL_API_KEY")

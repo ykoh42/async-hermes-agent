@@ -18,7 +18,7 @@ import logging
 import os
 import shlex
 from pathlib import Path
-from typing import Dict, Any, Optional, Set
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -74,9 +74,9 @@ class SubdirectoryHintTracker:
             tool_result += hints  # append to the tool result string
     """
 
-    def __init__(self, working_dir: Optional[str] = None):
+    def __init__(self, working_dir: str | None = None):
         self.working_dir = Path(working_dir) if working_dir else None
-        self._loaded_dirs: Set[Path] = set()
+        self._loaded_dirs: set[Path] = set()
         self._lock = asyncio.Lock()
 
     async def _ensure_initialized(self) -> None:
@@ -92,8 +92,8 @@ class SubdirectoryHintTracker:
     async def check_tool_call(
         self,
         tool_name: str,
-        tool_args: Dict[str, Any],
-    ) -> Optional[str]:
+        tool_args: dict[str, Any],
+    ) -> str | None:
         """Check tool call arguments for new directories and load any hint files.
 
         Returns formatted hint text to append to the tool result, or None.
@@ -116,10 +116,10 @@ class SubdirectoryHintTracker:
         return "\n\n" + "\n\n".join(all_hints)
 
     async def _extract_directories(
-        self, tool_name: str, args: Dict[str, Any]
+        self, tool_name: str, args: dict[str, Any]
     ) -> list:
         """Extract directory paths from tool call arguments."""
-        candidates: Set[Path] = set()
+        candidates: set[Path] = set()
 
         # Direct path arguments
         for key in _PATH_ARG_KEYS:
@@ -135,7 +135,7 @@ class SubdirectoryHintTracker:
 
         return list(candidates)
 
-    async def _add_path_candidate(self, raw_path: str, candidates: Set[Path]):
+    async def _add_path_candidate(self, raw_path: str, candidates: set[Path]):
         """Resolve a raw path and add its directory + ancestors to candidates.
 
         Walks up from the resolved directory toward the filesystem root,
@@ -171,7 +171,7 @@ class SubdirectoryHintTracker:
             pass
 
     async def _extract_paths_from_command(
-        self, cmd: str, candidates: Set[Path]
+        self, cmd: str, candidates: set[Path]
     ) -> None:
         """Extract path-like tokens from a shell command string."""
         try:
@@ -224,7 +224,7 @@ class SubdirectoryHintTracker:
 
     async def _load_hints_for_directory(
         self, directory: Path
-    ) -> Optional[str]:
+    ) -> str | None:
         """Load hint files from a directory. Returns formatted text or None.
 
         Only loads hints from directories within the working directory tree.
@@ -259,7 +259,7 @@ class SubdirectoryHintTracker:
                 continue
             try:
                 async with aiofiles.open(
-                    hint_path, "r", encoding="utf-8"
+                    hint_path, encoding="utf-8"
                 ) as handle:
                     content = (await handle.read()).strip()
                 if not content:

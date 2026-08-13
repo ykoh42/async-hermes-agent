@@ -90,7 +90,7 @@ def test_upstream_file_operations_surface_is_native_async():
     )
     assert str(inspect.signature(ShellFileOperations.search)) == (
         "(self, pattern: str, path: str = '.', target: str = 'content', "
-        "file_glob: Optional[str] = None, limit: int = 50, offset: int = 0, "
+        "file_glob: str | None = None, limit: int = 50, offset: int = 0, "
         "output_mode: str = 'content', context: int = 0) -> "
         "tools.file_operations.SearchResult"
     )

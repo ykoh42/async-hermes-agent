@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, Mapping
+from typing import Any
+from collections.abc import Mapping
 
 
 # Sources Hermes owns and can intentionally persist in auth.json.  Everything
@@ -151,7 +152,7 @@ def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:
 def sanitize_borrowed_credential_payload(
     payload: Mapping[str, Any],
     provider_id: Any = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return a disk-safe credential-pool payload.
 
     Owned sources (manual entries and Hermes-owned OAuth/device-code state)

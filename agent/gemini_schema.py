@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict
+from typing import Any
 
 # Gemini's ``FunctionDeclaration.parameters`` field accepts the ``Schema``
 # object, which is only a subset of OpenAPI 3.0 / JSON Schema.  Strip fields
@@ -34,7 +34,7 @@ _GEMINI_SCHEMA_ALLOWED_KEYS = {
 }
 
 
-def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
+def sanitize_gemini_schema(schema: Any) -> dict[str, Any]:
     """Return a Gemini-compatible copy of a tool parameter schema.
 
     Hermes tool schemas are OpenAI-flavored JSON Schema and may contain keys
@@ -47,14 +47,14 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
     if not isinstance(schema, dict):
         return {}
 
-    cleaned: Dict[str, Any] = {}
+    cleaned: dict[str, Any] = {}
     for key, value in schema.items():
         if key not in _GEMINI_SCHEMA_ALLOWED_KEYS:
             continue
         if key == "properties":
             if not isinstance(value, dict):
                 continue
-            props: Dict[str, Any] = {}
+            props: dict[str, Any] = {}
             for prop_name, prop_schema in value.items():
                 if not isinstance(prop_name, str):
                     continue
@@ -131,7 +131,7 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
     return cleaned
 
 
-def sanitize_gemini_tool_parameters(parameters: Any) -> Dict[str, Any]:
+def sanitize_gemini_tool_parameters(parameters: Any) -> dict[str, Any]:
     """Normalize tool parameters to a valid Gemini object schema."""
 
     cleaned = sanitize_gemini_schema(parameters)

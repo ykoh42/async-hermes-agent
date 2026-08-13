@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 import hashlib
 import inspect
 import json
@@ -187,7 +187,7 @@ def _normalize_timestamp(timestamp: str | None) -> str | None:
         return timestamp
     if parsed.tzinfo is None:
         return timestamp
-    return parsed.astimezone(timezone.utc).isoformat()
+    return parsed.astimezone(UTC).isoformat()
 
 
 def _is_expired(payload: dict[str, Any] | None) -> bool:
@@ -195,7 +195,7 @@ def _is_expired(payload: dict[str, Any] | None) -> bool:
         return False
     try:
         return date.fromisoformat(str(payload["expiration_date"])) < datetime.now(
-            timezone.utc
+            UTC
         ).date()
     except ValueError:
         return False
@@ -553,7 +553,7 @@ class Memory:
         payload["data"] = text
         payload["hash"] = hashlib.md5(text.encode()).hexdigest()
         if "created_at" not in payload:
-            payload["created_at"] = datetime.now(timezone.utc).isoformat()
+            payload["created_at"] = datetime.now(UTC).isoformat()
         payload["updated_at"] = payload["created_at"]
         payload["text_lemmatized"] = await self.nlp.lemmatize(text)
         await self.vector_store.insert(
@@ -757,7 +757,7 @@ class Memory:
             memory_metadata["hash"] = memory_hash
             if "created_at" not in memory_metadata:
                 memory_metadata["created_at"] = datetime.now(
-                    timezone.utc
+                    UTC
                 ).isoformat()
             memory_metadata["updated_at"] = memory_metadata["created_at"]
             if memory.get("attributed_to"):
@@ -1166,7 +1166,7 @@ class Memory:
         payload["hash"] = hashlib.md5(data.encode()).hexdigest()
         payload["text_lemmatized"] = await self.nlp.lemmatize(data)
         payload["created_at"] = existing.payload.get("created_at")
-        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        payload["updated_at"] = datetime.now(UTC).isoformat()
         if "actor_id" in existing.payload:
             payload["actor_id"] = existing.payload["actor_id"]
         embedding = await self.embedding_model.embed(data, "update")
@@ -1217,7 +1217,7 @@ class Memory:
             None,
             "DELETE",
             created_at=_normalize_timestamp(payload.get("created_at")),
-            updated_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(UTC).isoformat(),
             actor_id=payload.get("actor_id"),
             role=payload.get("role"),
             is_deleted=1,

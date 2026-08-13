@@ -18,7 +18,8 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 import aiofiles
 import aiofiles.os
@@ -301,11 +302,11 @@ async def _sanitize_subprocess_env(
 
 
 async def build_subprocess_env(
-    base: "Mapping[str, str] | None" = None,
+    base: Mapping[str, str] | None = None,
     *,
     inherit_profile_home: bool = True,
     scrub_secrets: bool = True,
-    extra: "Mapping[str, str] | None" = None,
+    extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the environment for ``asyncio.create_subprocess_exec``."""
     source = dict(base) if base is not None else os.environ.copy()
@@ -723,7 +724,7 @@ class LocalEnvironment(BaseEnvironment):
         """Keep task-local profile-home values out of shared snapshots."""
         return ("HERMES_HOME", "HERMES_REAL_HOME", "HOME")
 
-    def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
+    def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None):
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         initial_env = os.environ.copy()
         if env:

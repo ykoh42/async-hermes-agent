@@ -15,7 +15,7 @@ Mirrors ``plugins/image_gen/deepinfra`` (which does the same for
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any
 
 from agent.video_gen_provider import OpenAICompatibleVideoGenProvider
 
@@ -33,7 +33,7 @@ class DeepInfraVideoGenProvider(OpenAICompatibleVideoGenProvider):
     def display_name(self) -> str:
         return "DeepInfra"
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         """Return ``video-gen``-tagged DeepInfra models from the live catalog.
 
         Empty list when the catalog is unreachable — the picker then shows no
@@ -45,7 +45,7 @@ class DeepInfraVideoGenProvider(OpenAICompatibleVideoGenProvider):
             logger.debug("Cannot import _fetch_deepinfra_models_by_tag: %s", exc)
             return []
         items = await _fetch_deepinfra_models_by_tag("video-gen") or []
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for item in items:
             mid = item.get("id")
             if not mid:
@@ -58,7 +58,7 @@ class DeepInfraVideoGenProvider(OpenAICompatibleVideoGenProvider):
             })
         return out
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         return {
             "modalities": ["text", "image"],
             "aspect_ratios": ["16:9", "9:16", "1:1"],
@@ -70,7 +70,7 @@ class DeepInfraVideoGenProvider(OpenAICompatibleVideoGenProvider):
             "max_reference_images": 0,
         }
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "DeepInfra",
             "badge": "paid",

@@ -20,7 +20,8 @@ from collections import deque
 from collections.abc import Collection
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Awaitable, Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, TypeVar
+from collections.abc import Awaitable, Callable
 
 import aiofiles
 import aiofiles.os
@@ -66,7 +67,7 @@ _os_open = aiofiles.os.wrap(os.open)
 _os_close = aiofiles.os.wrap(os.close)
 _os_lseek = aiofiles.os.wrap(os.lseek)
 _utime = aiofiles.os.wrap(os.utime)
-_live_connection_counts: Dict[str, int] = {}
+_live_connection_counts: dict[str, int] = {}
 
 _DISK_FULL_MARKERS = (
     "no space left on device",
@@ -88,19 +89,19 @@ _WAL_INCOMPAT_MARKERS = (
     "disk i/o error",
 )
 
-_last_init_error: Optional[str] = None
+_last_init_error: str | None = None
 _wal_fallback_warned_paths: set[str] = set()
 _wal_reset_bug_warned_paths: set[str] = set()
 _repair_attempted_paths: set[str] = set()
 
 
-def _set_last_init_error(msg: Optional[str]) -> None:
+def _set_last_init_error(msg: str | None) -> None:
     """Record or clear the most recent state database initialization error."""
     global _last_init_error
     _last_init_error = msg
 
 
-def get_last_init_error() -> Optional[str]:
+def get_last_init_error() -> str | None:
     """Return the most recent state database initialization error."""
     return _last_init_error
 
@@ -121,7 +122,7 @@ def format_session_db_unavailable(
     return f"{prefix}: {cause}{hint}."
 
 
-async def _on_disk_journal_mode(conn) -> Optional[str]:
+async def _on_disk_journal_mode(conn) -> str | None:
     """Read the effective journal mode without changing it."""
     try:
         row = await (await conn.execute("PRAGMA journal_mode")).fetchone()
@@ -159,7 +160,7 @@ async def _enforce_macos_synchronous_full(conn) -> None:
 
 
 def is_sqlite_wal_reset_vulnerable(
-    version_info: Optional[tuple] = None,
+    version_info: tuple | None = None,
 ) -> bool:
     """Return whether the linked SQLite contains the WAL-reset bug."""
     values = list(
@@ -462,7 +463,7 @@ def _claim_repair_attempt(db_path: Path) -> bool:
     return True
 
 
-async def _backup_db_file(db_path: Path) -> Optional[Path]:
+async def _backup_db_file(db_path: Path) -> Path | None:
     """Copy a malformed database and its sidecars beside the original."""
     tracking_key = str(await _realpath(str(db_path)))
     if _live_connection_counts.get(tracking_key, 0) > 0:
@@ -509,7 +510,7 @@ async def _backup_db_file(db_path: Path) -> Optional[Path]:
         return None
 
 
-async def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+async def _db_opens_cleanly(db_path: Path) -> str | None:
     """Probe database integrity plus the FTS read and write paths."""
     conn = await aiosqlite.connect(db_path, isolation_level=None)
     try:
@@ -548,7 +549,7 @@ async def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 return f"fts5 read probe failed on {fts_table}: {exc}"
 
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
-        write_error: Optional[sqlite3.OperationalError] = None
+        write_error: sqlite3.OperationalError | None = None
         try:
             await conn.execute("BEGIN IMMEDIATE")
             await conn.execute(
@@ -585,9 +586,9 @@ async def repair_state_db_schema(
     db_path: Path,
     *,
     backup: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Repair malformed schema, FTS, and stale B-tree index damage."""
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "repaired": False,
         "strategy": None,
         "backup_path": None,
@@ -813,7 +814,7 @@ async def is_zeroed_state_db(
     return all(byte == 0 for byte in head)
 
 
-async def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
+async def quarantine_zeroed_state_db(path: Path) -> Path | None:
     """Move a zeroed database aside under a cross-process startup lock."""
     lock_path = path.with_name(path.name + ".quarantine.lock")
     await aiofiles.os.makedirs(lock_path.parent, exist_ok=True)
@@ -978,7 +979,7 @@ def _scrub_surrogates(value: Any) -> Any:
     return _sanitize_surrogates(value) if isinstance(value, str) else value
 
 
-def workspace_key(row: Dict[str, Any]) -> Optional[str]:
+def workspace_key(row: dict[str, Any]) -> str | None:
     """A session's workspace grouping key: its git repo root when known, else
     its cwd.
 
@@ -999,7 +1000,7 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
-async def _collect_delegate_child_ids(connection, parent_ids: List[str]) -> List[str]:
+async def _collect_delegate_child_ids(connection, parent_ids: list[str]) -> list[str]:
     """Return recursively discovered delegate children, excluding parents."""
     delegate_from = _delegate_from_json()
     seeds = {session_id for session_id in parent_ids if session_id}
@@ -1020,7 +1021,7 @@ async def _collect_delegate_child_ids(connection, parent_ids: List[str]) -> List
     return [session_id for session_id in found if session_id not in seeds]
 
 
-async def _delete_delegate_children(connection, parent_ids: List[str]) -> List[str]:
+async def _delete_delegate_children(connection, parent_ids: list[str]) -> list[str]:
     session_ids = await _collect_delegate_child_ids(connection, parent_ids)
     if session_ids:
         placeholders = ",".join("?" for _ in session_ids)
@@ -1040,7 +1041,7 @@ async def _delete_delegate_children(connection, parent_ids: List[str]) -> List[s
     return session_ids
 
 
-def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
+def _cwd_prefix_clause(cwd_prefix: str) -> tuple[str, list[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [
         prefix,
@@ -1049,7 +1050,7 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     ]
 
 
-def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
+def _workspace_key_clause(key: str) -> tuple[str, list[str]]:
     """Match sessions whose ``workspace_key(row)`` equals ``key``.
 
     Mirrors :func:`workspace_key`: a session belongs to workspace ``key``
@@ -1084,7 +1085,7 @@ _REVIEW_HARNESS_PREFIXES = (
 )
 
 
-def _is_background_review_harness_message(message: Dict[str, Any]) -> bool:
+def _is_background_review_harness_message(message: dict[str, Any]) -> bool:
     if not isinstance(message, dict) or message.get("role") not in {"user", "system"}:
         return False
     content = message.get("content")
@@ -1094,11 +1095,11 @@ def _is_background_review_harness_message(message: Dict[str, Any]) -> bool:
 
 
 def _strip_background_review_harness(
-    messages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if not messages:
         return messages
-    result: List[Dict[str, Any]] = []
+    result: list[dict[str, Any]] = []
     skip_next_assistant = False
     for message in messages:
         if _is_background_review_harness_message(message):
@@ -1276,7 +1277,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
 
     @staticmethod
-    def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
+    def _encode_display_metadata(display_metadata: Any) -> str | None:
         """Serialize ``display_metadata`` for its TEXT column without double-encoding.
 
         Import/replace paths can hand us an already-serialized JSON string (the
@@ -1306,7 +1307,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
 
     @staticmethod
-    def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+    def _decode_display_metadata(raw: Any) -> dict[str, Any] | None:
         """Decode a ``display_metadata`` column into the dict every reader expects.
 
         Every message read path must go through this. Returning the raw TEXT
@@ -1330,7 +1331,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
 
     @staticmethod
-    def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
+    def _is_duplicate_replayed_user_message(messages: list[dict[str, Any]], msg: dict[str, Any]) -> bool:
         if msg.get("role") != "user":
             return False
         content = msg.get("content")
@@ -1352,7 +1353,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_ancestors: bool,
         repair_alternation: bool,
         include_row_ids: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
         Extracted from get_messages_as_conversation so get_resume_conversations
@@ -1474,7 +1475,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def __init__(
         self,
-        db_path: "os.PathLike[str] | str" = None,
+        db_path: "os.PathLike[str] | str | None" = None,
         read_only: bool = False,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else _default_db_path()
@@ -1495,7 +1496,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._write_count = 0
         self._fts_usermerge_floor_applied = False
         self._closed = False
-        self._close_task: Optional[asyncio.Task[None]] = None
+        self._close_task: asyncio.Task[None] | None = None
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_cjk_loaded = False
@@ -1503,9 +1504,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_runtime_rebuild_attempted = False
         self._fts_unavailable_warned = False
         self._trigram_unavailable_warned = False
-        self._token_queue: deque[Tuple[str, Dict[str, Any]]] = deque()
+        self._token_queue: deque[tuple[str, dict[str, Any]]] = deque()
         self._token_queue_cond = asyncio.Condition()
-        self._token_writer_task: Optional[asyncio.Task[None]] = None
+        self._token_writer_task: asyncio.Task[None] | None = None
         self._token_writer_stop = False
         self._token_writer_busy = False
 
@@ -1529,7 +1530,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._read_lock = asyncio.Lock()
         return self._read_lock
 
-    async def _get_connection(self, patience_s: Optional[float] = None):
+    async def _get_connection(self, patience_s: float | None = None):
         if self._closed:
             raise RuntimeError("SessionDB is closed")
         if self._connection is not None:
@@ -1648,7 +1649,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             deadline = time.monotonic() + connection_patience
             while True:
-                database_error: Optional[sqlite3.DatabaseError] = None
+                database_error: sqlite3.DatabaseError | None = None
                 try:
                     connection = await _connect_and_initialize()
                 except sqlite3.DatabaseError as caught:
@@ -1941,7 +1942,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
     @staticmethod
-    async def _store_system_prompt(connection, system_prompt: Optional[str]) -> Optional[str]:
+    async def _store_system_prompt(connection, system_prompt: str | None) -> str | None:
         if system_prompt is None:
             return None
         prompt_hash = _system_prompt_hash(system_prompt)
@@ -1962,7 +1963,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         await cursor.close()
 
     @staticmethod
-    def _session_row_dict(row) -> Dict[str, Any]:
+    def _session_row_dict(row) -> dict[str, Any]:
         data = dict(row)
         if "_system_prompt_resolved" in data:
             resolved = data.pop("_system_prompt_resolved")
@@ -1973,13 +1974,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def _execute_write(
         self,
         fn: Callable[[aiosqlite.Connection], Awaitable[T]],
-        patience_s: Optional[float] = None,
+        patience_s: float | None = None,
     ) -> T:
         """Execute one native-async write transaction with jitter retries."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
-        compression_deadline: Optional[float] = None
+        compression_deadline: float | None = None
 
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
@@ -2103,7 +2104,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         connection,
         session_id: str,
-        compression_lock_holder: Optional[str],
+        compression_lock_holder: str | None,
     ) -> None:
         """Apply transcript admission guards inside the active transaction."""
         active_lock = await (
@@ -2137,18 +2138,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         source: str,
-        model: str = None,
-        model_config: Dict[str, Any] = None,
-        system_prompt: str = None,
-        user_id: str = None,
-        session_key: Optional[str] = None,
-        chat_id: str = None,
-        chat_type: str = None,
-        thread_id: str = None,
-        parent_session_id: str = None,
-        cwd: str = None,
-        profile_name: str = None,
-        git_repo_root: str = None,
+        model: str | None = None,
+        model_config: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
+        user_id: str | None = None,
+        session_key: str | None = None,
+        chat_id: str | None = None,
+        chat_type: str | None = None,
+        thread_id: str | None = None,
+        parent_session_id: str | None = None,
+        cwd: str | None = None,
+        profile_name: str | None = None,
+        git_repo_root: str | None = None,
     ) -> None:
         """Insert or enrich one session row through the async writer."""
         async def _create(connection):
@@ -2271,7 +2272,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         source: str = "unknown",
-        model: str = None,
+        model: str | None = None,
         **kwargs,
     ) -> str:
         """Ensure a session row exists and preserve the upstream return value."""
@@ -2287,8 +2288,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         cwd: str,
-        git_branch: str = None,
-        git_repo_root: str = None,
+        git_branch: str | None = None,
+        git_repo_root: str | None = None,
     ) -> None:
         """Persist workspace identity without blocking the event loop."""
         if not session_id or not cwd:
@@ -2318,25 +2319,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         role: str,
-        content: str = None,
-        tool_name: str = None,
+        content: str | None = None,
+        tool_name: str | None = None,
         tool_calls: Any = None,
-        tool_call_id: str = None,
-        token_count: int = None,
-        finish_reason: str = None,
-        reasoning: str = None,
-        reasoning_content: str = None,
+        tool_call_id: str | None = None,
+        token_count: int | None = None,
+        finish_reason: str | None = None,
+        reasoning: str | None = None,
+        reasoning_content: str | None = None,
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
-        platform_message_id: str = None,
+        platform_message_id: str | None = None,
         observed: bool = False,
-        effect_disposition: Optional[str] = None,
+        effect_disposition: str | None = None,
         timestamp: Any = None,
-        api_content: Optional[str] = None,
-        display_kind: Optional[str] = None,
-        display_metadata: Optional[Dict[str, Any]] = None,
-        compression_lock_holder: Optional[str] = None,
+        api_content: str | None = None,
+        display_kind: str | None = None,
+        display_metadata: dict[str, Any] | None = None,
+        compression_lock_holder: str | None = None,
     ) -> int:
         """Append one transcript row using the same wire serialization as SessionDB."""
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -2406,7 +2407,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         connection,
         session_id: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> tuple[int, int]:
         """Insert transcript rows in the caller's active transaction."""
         now_ts = time.time()
@@ -2493,9 +2494,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def append_messages_batch(
         self,
         session_id: str,
-        messages: List[Dict[str, Any]],
-        compression_lock_holder: Optional[str] = None,
-        chunk_rows: Optional[int] = None,
+        messages: list[dict[str, Any]],
+        compression_lock_holder: str | None = None,
+        chunk_rows: int | None = None,
     ) -> int:
         """Append one turn atomically, optionally chunking large copy jobs."""
         if not messages:
@@ -2541,7 +2542,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def replace_messages(
         self,
         session_id: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         active_only: bool = False,
     ) -> None:
         """Atomically replace all or only active transcript rows."""
@@ -2704,7 +2705,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except sqlite3.Error as exc:
             logger.warning("release_compression_lock(%s) failed: %s", session_id, exc)
 
-    async def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+    async def get_compression_lock_holder(self, session_id: str) -> str | None:
         """Return the live compression-lease owner, if any."""
         if not session_id:
             return None
@@ -2721,10 +2722,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def touch_session_activity(
         self,
         session_id: str,
-        ts: Optional[float] = None,
+        ts: float | None = None,
         *,
-        description: Optional[str] = None,
-        provenance: Optional[ActivityProvenance] = None,
+        description: str | None = None,
+        provenance: ActivityProvenance | None = None,
     ) -> None:
         """Stamp durable mid-turn activity without moving time backwards."""
         if not session_id:
@@ -2789,7 +2790,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def get_session_activity(
         self,
         session_id: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return the durable activity snapshot for *session_id*, or None."""
         if not session_id:
             return None
@@ -2807,7 +2808,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def archive_and_compact(
         self,
         session_id: str,
-        compacted_messages: List[Dict[str, Any]],
+        compacted_messages: list[dict[str, Any]],
     ) -> int:
         """Atomically archive live rows and insert the compacted transcript."""
         async def _archive(connection):
@@ -2895,7 +2896,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return await self._execute_write(_archive)
 
     async def update_system_prompt(
-        self, session_id: str, system_prompt: Optional[str]
+        self, session_id: str, system_prompt: str | None
     ) -> None:
         """Persist the assembled prompt without a synchronous SQLite call."""
         async def _update(connection):
@@ -2915,10 +2916,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         *,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-        model_options: Optional[Dict[str, Any]] = None,
-        route_source: Optional[str] = None,
+        model: str | None = None,
+        provider: str | None = None,
+        model_options: dict[str, Any] | None = None,
+        route_source: str | None = None,
         confirmed: bool = False,
     ) -> None:
         """Merge a runtime lock while preserving unrelated model metadata."""
@@ -2939,7 +2940,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if row is None:
                 return
-            config: Dict[str, Any] = {}
+            config: dict[str, Any] = {}
             raw = row["model_config"]
             if isinstance(raw, str) and raw.strip():
                 try:
@@ -2962,7 +2963,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         model_config_json: str,
-        model: Optional[str] = None,
+        model: str | None = None,
     ) -> None:
         """Update model metadata while preserving a stored model when omitted."""
         await self.flush_token_counts()
@@ -2976,7 +2977,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         await self._execute_write(_update)
 
-    async def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
+    async def backfill_repo_roots(self, cwd_to_root: dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
 
         Backfills history so projects light up for sessions created before the
@@ -3044,15 +3045,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         task: str,
         *,
-        model: Optional[str] = None,
-        billing_provider: Optional[str] = None,
-        billing_base_url: Optional[str] = None,
+        model: str | None = None,
+        billing_provider: str | None = None,
+        billing_base_url: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
-        estimated_cost_usd: Optional[float] = None,
+        estimated_cost_usd: float | None = None,
     ) -> None:
         """Record one auxiliary-model usage delta for the session."""
         if not session_id or not task:
@@ -3087,18 +3088,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         input_tokens: int = 0,
         output_tokens: int = 0,
-        model: str = None,
+        model: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
-        estimated_cost_usd: Optional[float] = None,
-        actual_cost_usd: Optional[float] = None,
-        cost_status: Optional[str] = None,
-        cost_source: Optional[str] = None,
-        pricing_version: Optional[str] = None,
-        billing_provider: Optional[str] = None,
-        billing_base_url: Optional[str] = None,
-        billing_mode: Optional[str] = None,
+        estimated_cost_usd: float | None = None,
+        actual_cost_usd: float | None = None,
+        cost_status: str | None = None,
+        cost_source: str | None = None,
+        pricing_version: str | None = None,
+        billing_provider: str | None = None,
+        billing_base_url: str | None = None,
+        billing_mode: str | None = None,
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
@@ -3240,19 +3241,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         conn,
         session_id: str,
         *,
-        model: Optional[str],
-        billing_provider: Optional[str],
-        billing_base_url: Optional[str],
-        billing_mode: Optional[str],
+        model: str | None,
+        billing_provider: str | None,
+        billing_base_url: str | None,
+        billing_mode: str | None,
         input_tokens: int,
         output_tokens: int,
         cache_read_tokens: int,
         cache_write_tokens: int,
         reasoning_tokens: int,
-        estimated_cost_usd: Optional[float],
-        actual_cost_usd: Optional[float],
-        cost_status: Optional[str],
-        cost_source: Optional[str],
+        estimated_cost_usd: float | None,
+        actual_cost_usd: float | None,
+        cost_status: str | None,
+        cost_source: str | None,
         api_call_count: int,
         task: str = "",
     ) -> None:
@@ -3418,7 +3419,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def _apply_token_batch(
         self,
-        batch: List[Tuple[str, Dict[str, Any]]],
+        batch: list[tuple[str, dict[str, Any]]],
     ) -> None:
         """Apply queued deltas in order, coalescing where safe."""
         try:
@@ -3447,10 +3448,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def _coalesce_token_deltas(
         self,
-        batch: List[Tuple[str, Dict[str, Any]]],
-    ) -> List[Tuple[str, Dict[str, Any]]]:
+        batch: list[tuple[str, dict[str, Any]]],
+    ) -> list[tuple[str, dict[str, Any]]]:
         """Merge adjacent incremental deltas with an identical route."""
-        groups: List[Tuple[Optional[tuple], str, Dict[str, Any]]] = []
+        groups: list[tuple[tuple | None, str, dict[str, Any]]] = []
         for queued_session_id, queued_kwargs in batch:
             key = None
             if not queued_kwargs.get("absolute"):
@@ -3522,7 +3523,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         provider: str,
         base_url: str,
-        billing_mode: Optional[str] = None,
+        billing_mode: str | None = None,
     ) -> None:
         """Persist a model-route change through the native async connection."""
         async def _update_route(connection):
@@ -3540,7 +3541,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         await self._execute_write(_update_route)
 
-    async def get_meta(self, key: str) -> Optional[str]:
+    async def get_meta(self, key: str) -> str | None:
         """Read a value from the durable ``state_meta`` store."""
         connection = await self._get_connection()
         cursor = await connection.execute(
@@ -3554,7 +3555,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         key: str,
         value: str,
         *,
-        cursor: Optional[sqlite3.Cursor] = None,
+        cursor: sqlite3.Cursor | None = None,
     ) -> None:
         """Atomically upsert a value in the durable ``state_meta`` store."""
 
@@ -3575,7 +3576,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         await self._execute_write(_set)
 
-    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Return one session row through the adapter's async connection."""
         async with self._read_ctx() as connection:
             row = await (
@@ -3591,7 +3592,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def resolve_session_id(
         self, session_id_or_prefix: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """Resolve an exact or uniquely prefixed session id."""
         exact = await self.get_session(session_id_or_prefix)
         if exact:
@@ -3634,7 +3635,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     async def _remove_session_files(
-        sessions_dir: Optional[Path], session_id: str
+        sessions_dir: Path | None, session_id: str
     ) -> None:
         if sessions_dir is None:
             return
@@ -3660,7 +3661,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except OSError:
                 pass
 
-    async def get_session_delete_targets(self, session_id: str) -> List[str]:
+    async def get_session_delete_targets(self, session_id: str) -> list[str]:
         connection = await self._get_connection()
         exists = await (
             await connection.execute(
@@ -3675,10 +3676,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def delete_session(
         self,
         session_id: str,
-        sessions_dir: Optional[Path] = None,
-        expected_delete_ids: Optional[List[str]] = None,
+        sessions_dir: Path | None = None,
+        expected_delete_ids: list[str] | None = None,
     ) -> bool:
-        removed_delegate_ids: List[str] = []
+        removed_delegate_ids: list[str] = []
         expected_ids = (
             set(expected_delete_ids) if expected_delete_ids is not None else None
         )
@@ -3723,7 +3724,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def delete_session_if_empty(
         self,
         session_id: str,
-        sessions_dir: Optional[Path] = None,
+        sessions_dir: Path | None = None,
     ) -> bool:
         async def _delete(connection):
             cursor = await connection.execute(
@@ -3751,8 +3752,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def delete_sessions(
         self,
-        session_ids: List[str],
-        sessions_dir: Optional[Path] = None,
+        session_ids: list[str],
+        sessions_dir: Path | None = None,
     ) -> int:
         ids = list(
             {
@@ -3763,8 +3764,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         if not ids:
             return 0
-        removed_ids: List[str] = []
-        removed_delegate_ids: List[str] = []
+        removed_ids: list[str] = []
+        removed_delegate_ids: list[str] = []
 
         async def _delete(connection):
             placeholders = ",".join("?" for _ in ids)
@@ -3806,9 +3807,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return count
 
     async def delete_empty_sessions(
-        self, sessions_dir: Optional[Path] = None
+        self, sessions_dir: Path | None = None
     ) -> int:
-        removed_ids: List[str] = []
+        removed_ids: list[str] = []
 
         async def _delete(connection):
             rows = await (
@@ -3846,30 +3847,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _prune_filter_where(
         *,
-        last_active_before: Optional[float] = None,
-        last_active_after: Optional[float] = None,
-        started_before: Optional[float] = None,
-        started_after: Optional[float] = None,
-        source: Optional[str] = None,
-        title_like: Optional[str] = None,
-        end_reason: Optional[str] = None,
-        cwd_prefix: Optional[str] = None,
-        min_messages: Optional[int] = None,
-        max_messages: Optional[int] = None,
-        archived: Optional[bool] = None,
-        model_like: Optional[str] = None,
-        provider: Optional[str] = None,
-        user_id: Optional[str] = None,
-        chat_id: Optional[str] = None,
-        chat_type: Optional[str] = None,
-        branch_like: Optional[str] = None,
-        min_tokens: Optional[int] = None,
-        max_tokens: Optional[int] = None,
-        min_cost: Optional[float] = None,
-        max_cost: Optional[float] = None,
-        min_tool_calls: Optional[int] = None,
-        max_tool_calls: Optional[int] = None,
-    ) -> Tuple[str, list]:
+        last_active_before: float | None = None,
+        last_active_after: float | None = None,
+        started_before: float | None = None,
+        started_after: float | None = None,
+        source: str | None = None,
+        title_like: str | None = None,
+        end_reason: str | None = None,
+        cwd_prefix: str | None = None,
+        min_messages: int | None = None,
+        max_messages: int | None = None,
+        archived: bool | None = None,
+        model_like: str | None = None,
+        provider: str | None = None,
+        user_id: str | None = None,
+        chat_id: str | None = None,
+        chat_type: str | None = None,
+        branch_like: str | None = None,
+        min_tokens: int | None = None,
+        max_tokens: int | None = None,
+        min_cost: float | None = None,
+        max_cost: float | None = None,
+        min_tool_calls: int | None = None,
+        max_tool_calls: int | None = None,
+    ) -> tuple[str, list]:
         clauses = ["s.ended_at IS NOT NULL"]
         params: list[Any] = []
         if last_active_before is not None:
@@ -3963,10 +3964,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def list_prune_candidates(
         self,
-        older_than_days: Optional[float] = None,
-        source: str = None,
+        older_than_days: float | None = None,
+        source: str | None = None,
         **filters,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return sessions a matching prune/archive call would touch."""
         if (
             filters.get("last_active_before") is None
@@ -3996,8 +3997,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def archive_sessions(
         self,
-        older_than_days: Optional[float] = None,
-        source: str = None,
+        older_than_days: float | None = None,
+        source: str | None = None,
         **filters,
     ) -> int:
         """Bulk-archive every session matching the prune filter surface."""
@@ -4038,9 +4039,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def prune_sessions(
         self,
-        older_than_days: Optional[float] = 90,
-        source: str = None,
-        sessions_dir: Optional[Path] = None,
+        older_than_days: float | None = 90,
+        source: str | None = None,
+        sessions_dir: Path | None = None,
         **filters,
     ) -> int:
         if (
@@ -4052,7 +4053,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 float(older_than_days) * 86_400
             )
         where, params = self._prune_filter_where(source=source, **filters)
-        removed_ids: List[str] = []
+        removed_ids: list[str] = []
 
         async def _delete(connection):
             rows = await (
@@ -4087,10 +4088,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return count
 
     async def prune_empty_ghost_sessions(
-        self, sessions_dir: "Optional[Path]" = None
+        self, sessions_dir: "Path | None" = None
     ) -> int:
         cutoff = time.time() - 86_400
-        removed_ids: List[str] = []
+        removed_ids: list[str] = []
 
         async def _delete(connection):
             rows = await (
@@ -4161,7 +4162,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _decode_message_row(
         row, *, operation: str = "get_messages"
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Decode one SQLite message row without touching ``SessionDB``."""
         message = dict(row)
         if "content" in message:
@@ -4185,9 +4186,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         include_inactive: bool = False,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Load a session's messages through the native async connection."""
         active_clause = "" if include_inactive else " AND active = 1"
         query = (
@@ -4203,7 +4204,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             rows = await cursor.fetchall()
         return [self._decode_message_row(row) for row in rows]
 
-    async def message_count(self, session_id: str = None) -> int:
+    async def message_count(self, session_id: str | None = None) -> int:
         """Count messages, optionally for one session."""
         connection = await self._get_connection()
         if session_id:
@@ -4225,7 +4226,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         role: str = "user",
         offset: int = 0,
         require_text: bool = True,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Return the latest visible active message id for a user-facing role."""
         if not session_id or role not in {"user", "assistant"} or offset < 0:
             return None
@@ -4247,13 +4248,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def latest_user_message_row_id(
         self, session_id: str
-    ) -> Optional[int]:
+    ) -> int | None:
         """Return the latest active user message id."""
         return await self.latest_message_row_id(session_id, role="user")
 
     async def get_message_role(
         self, session_id: str, row_id: int
-    ) -> Optional[str]:
+    ) -> str | None:
         """Return the role of an active message owned by *session_id*."""
         if not session_id:
             return None
@@ -4284,7 +4285,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def rewind_to_message(
         self, session_id: str, target_message_id: int
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Soft-delete the target user message and every later active row."""
         connection = await self._get_connection()
         row = await (
@@ -4372,7 +4373,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         around_message_id: int,
         window: int = 5,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return an async anchored message window with boundary counts."""
         window = max(0, int(window))
         async with self._read_ctx() as connection:
@@ -4415,7 +4416,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def _get_message_storage_state(
         self, message_id: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return storage flags for one message id without a raw connection."""
         if not message_id:
             return None
@@ -4429,7 +4430,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return dict(row) if row is not None else None
 
 
-    async def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+    async def get_session_by_title(self, title: str) -> dict[str, Any] | None:
         """Look up a session title through the async connection."""
         async with self._read_ctx() as connection:
             row = await (
@@ -4443,7 +4444,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return self._session_row_dict(row) if row is not None else None
 
-    async def resolve_session_by_title(self, title: str) -> Optional[str]:
+    async def resolve_session_by_title(self, title: str) -> str | None:
         """Resolve an exact or numbered continuation title asynchronously."""
         exact = await self.get_session_by_title(title)
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -4523,11 +4524,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def search_sessions(
         self,
-        source: str = None,
+        source: str | None = None,
         limit: int = 20,
         offset: int = 0,
-        workspace_key: str = None,
-    ) -> List[Dict[str, Any]]:
+        workspace_key: str | None = None,
+    ) -> list[dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
         Returns rows enriched with a computed ``last_active`` column
@@ -4574,14 +4575,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def session_count(
         self,
-        source: str = None,
-        sources: List[str] = None,
-        cwd_prefix: str = None,
+        source: str | None = None,
+        sources: list[str] | None = None,
+        cwd_prefix: str | None = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
         exclude_children: bool = False,
-        exclude_sources: List[str] = None,
+        exclude_sources: list[str] | None = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -4643,7 +4644,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_archived: bool = False,
         archived_only: bool = False,
         exclude_children: bool = False,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         """Return a ``{source: count}`` dict via a single ``GROUP BY`` query.
 
         Replaces the O(N) ``list_sessions_rich`` histogram loop with an
@@ -4713,9 +4714,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
 
     _SESSION_COMPACT_EXCLUDED = frozenset({"system_prompt", "system_prompt_hash"})
-    _session_compact_cols_sql: Optional[str] = None
+    _session_compact_cols_sql: str | None = None
 
-    async def get_compression_tip(self, session_id: str) -> Optional[str]:
+    async def get_compression_tip(self, session_id: str) -> str | None:
         """Walk a compression-continuation chain and return its live tip."""
         connection = await self._get_connection()
         current = session_id
@@ -4855,7 +4856,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return best if best is not None else session_id
 
-    def _is_branch_child_row(self, session: Dict[str, Any]) -> bool:
+    def _is_branch_child_row(self, session: dict[str, Any]) -> bool:
         raw = session.get("model_config")
         if not raw:
             return False
@@ -4866,7 +4867,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return isinstance(cfg, dict) and cfg.get("_branched_from") is not None
 
     async def _is_compression_child_row(
-        self, child: Dict[str, Any]
+        self, child: dict[str, Any]
     ) -> bool:
         parent_id = child.get("parent_session_id")
         if not parent_id or self._is_branch_child_row(child):
@@ -4874,7 +4875,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         parent = await self.get_session(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
 
-    async def get_compression_lineage(self, session_id: str) -> List[str]:
+    async def get_compression_lineage(self, session_id: str) -> list[str]:
         """Return compression ancestors through tip in chronological order."""
         session = await self.get_session(session_id)
         if not session or self._is_branch_child_row(session):
@@ -4923,10 +4924,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def list_sessions_rich(
         self,
-        source: str = None,
-        sources: List[str] = None,
-        exclude_sources: List[str] = None,
-        cwd_prefix: str = None,
+        source: str | None = None,
+        sources: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+        cwd_prefix: str | None = None,
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
@@ -4935,12 +4936,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         order_by_last_active: bool = False,
         include_archived: bool = False,
         archived_only: bool = False,
-        id_query: str = None,
-        search_query: str = None,
+        id_query: str | None = None,
+        search_query: str | None = None,
         compact_rows: bool = False,
         include_pinned: bool = False,
-        session_key: str = None,
-    ) -> List[Dict[str, Any]]:
+        session_key: str | None = None,
+    ) -> list[dict[str, Any]]:
         """List enriched sessions with upstream filtering and projection."""
         await self.flush_token_counts()
         where_clauses: list[str] = []
@@ -4995,8 +4996,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         if order_by_last_active:
             outer_where = where_sql
-            query_params: List[Any] = []
-            filter_clauses: List[str] = []
+            query_params: list[Any] = []
+            filter_clauses: list[str] = []
 
             def _like_pattern(needle: str) -> str:
                 escaped = (
@@ -5144,7 +5145,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 sessions.append(session)
 
         if project_compression_tips and not include_children:
-            tip_ids_by_root: Dict[str, str] = {}
+            tip_ids_by_root: dict[str, str] = {}
             for session in sessions:
                 if session.get("end_reason") != "compression":
                     continue
@@ -5192,7 +5193,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def get_compression_failure_cooldown(
         self, session_id: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         if not session_id:
             return None
         connection = await self._get_connection()
@@ -5217,7 +5218,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def get_compression_failure_cooldown_row(
         self, session_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return the exact stored cooldown columns without expiry filtering."""
         if not session_id:
             return {"session_exists": False, "cooldown_until": None, "error": None}
@@ -5239,7 +5240,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
 
     async def restore_compression_failure_cooldown_row(
-        self, session_id: str, snapshot: Dict[str, Any]
+        self, session_id: str, snapshot: dict[str, Any]
     ) -> None:
         """Restore and verify an exact cooldown-row snapshot."""
         expected_exists = bool(snapshot.get("session_exists", False))
@@ -5279,7 +5280,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
     async def record_compression_failure_cooldown(
-        self, session_id: str, cooldown_until: float, error: Optional[str] = None
+        self, session_id: str, cooldown_until: float, error: str | None = None
     ) -> None:
         if not session_id:
             return
@@ -5393,7 +5394,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Load a conversation through the native async SQLite connection."""
         session_ids = [session_id]
         if include_ancestors:
@@ -5420,7 +5421,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def get_resume_conversations(
         self, session_id: str
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
 
         ``session.resume`` needs two projections of the same lineage:
@@ -5475,7 +5476,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def get_ancestor_display_prefix(
         self, session_id: str
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return the ancestor-only display messages for a session lineage.
 
         These are messages from parent/grandparent sessions (compression
@@ -5520,7 +5521,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def _session_lineage_root_to_tip(
         self, session_id: str
-    ) -> List[str]:
+    ) -> list[str]:
         if not session_id:
             return [session_id]
 
@@ -5550,7 +5551,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     async def find_live_compression_child(
         self, parent_session_id: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return the one unambiguous live compression child, if it exists."""
         if not parent_session_id:
             return None
@@ -5585,7 +5586,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
-    async def get_session_title(self, session_id: str) -> Optional[str]:
+    async def get_session_title(self, session_id: str) -> str | None:
         """Read a title without using the synchronous connection."""
         connection = await self._get_connection()
         row = await (
@@ -5620,7 +5621,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     MAX_TITLE_LENGTH = 100
 
     @staticmethod
-    def sanitize_title(title: Optional[str]) -> Optional[str]:
+    def sanitize_title(title: str | None) -> str | None:
         """Validate and sanitize a session title.
 
         - Strips leading/trailing whitespace
@@ -5869,13 +5870,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         parent_session_id: str,
         child_session_id: str,
         source: str,
-        messages: List[Dict[str, Any]],
-        model: str = None,
-        model_config: Dict[str, Any] = None,
-        system_prompt: str = None,
-        cwd: str = None,
-        profile_name: str = None,
-        compression_lock_holder: str = None,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        model_config: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
+        cwd: str | None = None,
+        profile_name: str | None = None,
+        compression_lock_holder: str | None = None,
         require_compression_lease: bool = True,
     ) -> None:
         """Publish a compressed continuation without a sync SQLite bridge."""
@@ -6021,7 +6022,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         await self._execute_write(_publish)
 
-    async def logical_size_bytes(self) -> Optional[int]:
+    async def logical_size_bytes(self) -> int | None:
         """Return SQLite's logical database size in bytes."""
         try:
             async with self._get_write_lock():
@@ -6076,11 +6077,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         retention_days: int = 90,
         min_interval_hours: int = 24,
         vacuum: bool = True,
-        sessions_dir: Optional[Path] = None,
+        sessions_dir: Path | None = None,
         min_vacuum_interval_days: int = 30,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Run throttled session pruning and optional VACUUM maintenance."""
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "skipped": False,
             "pruned": 0,
             "vacuumed": False,
@@ -6139,9 +6140,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         idle_days: float = 3,
         min_interval_hours: int = 24,
         exclude_pinned: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Run throttled soft archival for sessions idle beyond the cutoff."""
-        result: Dict[str, Any] = {"skipped": False, "archived": 0}
+        result: dict[str, Any] = {"skipped": False, "archived": 0}
         try:
             last_raw = await self.get_meta("last_auto_archive")
             now = time.time()

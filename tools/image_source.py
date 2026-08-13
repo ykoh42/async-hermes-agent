@@ -24,7 +24,6 @@ import aiofiles.os
 import aiofiles.tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 # Raw-bytes INGEST budget — what the resolver will load before handing off.
 # This is deliberately the 50MB download cap (tools/vision_tools._VISION_MAX_DOWNLOAD_BYTES),
@@ -64,7 +63,7 @@ class NotAnImage(ImageResolutionError):
 
 @dataclass
 class ResolveContext:
-    task_id: Optional[str] = None
+    task_id: str | None = None
 
 
 @dataclass
@@ -150,7 +149,7 @@ def _resolve_data_url(s: str) -> tuple[bytes, str]:
     return data, declared  # real mime verified in _finalize via magic bytes
 
 
-async def _http_block_reason(url: str) -> Optional[str]:
+async def _http_block_reason(url: str) -> str | None:
     """Return a human-readable block reason, or None when the URL is allowed.
 
     Pre-flight short-circuit: policy-blocked URLs are refused BEFORE any
@@ -245,7 +244,7 @@ def _finalize(
     raise NotAnImage("source is not a recognized image", src=src, origin=origin)
 
 
-def _detect_video_mime(data: bytes, src: str) -> Optional[str]:
+def _detect_video_mime(data: bytes, src: str) -> str | None:
     """Video MIME from the extension table, else the mp4/mov container magic.
 
     The magic fallback covers extensionless sources (data: URLs, URLs with

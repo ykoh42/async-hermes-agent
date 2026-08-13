@@ -9,7 +9,8 @@ import os
 import threading
 import weakref
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 import aiofiles.os as _aiofiles_os
 
@@ -88,11 +89,11 @@ _DEFAULT_CREDENTIAL_EXCLUDES = (
 )
 
 _CredentialCacheKey = tuple[str, "EntraIdentityConfig", str]
-_credential_caches: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[_CredentialCacheKey, Any]]" = (
+_credential_caches: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[_CredentialCacheKey, Any]] = (
     weakref.WeakKeyDictionary()
 )
 _credential_leases: dict[int, int] = {}
-_issued_providers: "weakref.WeakSet[Any]" = weakref.WeakSet()
+_issued_providers: weakref.WeakSet[Any] = weakref.WeakSet()
 _credential_cache_guard = threading.RLock()
 
 
@@ -127,7 +128,7 @@ class EntraIdentityConfig:
         scope = str(self.scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
         object.__setattr__(self, "scope", scope)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "scope": self.scope,
             "exclude_interactive_browser": self.exclude_interactive_browser,
@@ -136,10 +137,10 @@ class EntraIdentityConfig:
     @classmethod
     def from_dict(
         cls,
-        data: Optional[Dict[str, Any]],
+        data: dict[str, Any] | None,
         *,
-        default_scope: Optional[str] = None,
-    ) -> "EntraIdentityConfig":
+        default_scope: str | None = None,
+    ) -> EntraIdentityConfig:
         data = data or {}
         return cls(
             scope=(
@@ -187,8 +188,8 @@ def _credential_kwargs(
     settings: dict[str, str],
     *,
     multiplexed: bool,
-) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {}
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
     if not config.exclude_interactive_browser:
         raise RuntimeError(
             "InteractiveBrowserCredential is unavailable in azure.identity.aio; "
@@ -281,7 +282,7 @@ def _credential_kwargs(
 
 def _credential_fingerprint(
     settings: dict[str, str],
-    kwargs: Dict[str, Any],
+    kwargs: dict[str, Any],
 ) -> str:
     digest = hashlib.sha256()
     for name in _AZURE_IDENTITY_ENV_NAMES:
@@ -398,10 +399,10 @@ async def reset_credential_cache() -> None:
 
 
 async def build_token_provider(
-    scope: Optional[str] = None,
+    scope: str | None = None,
     *,
-    config: Optional[EntraIdentityConfig] = None,
-    base_url: Optional[str] = None,
+    config: EntraIdentityConfig | None = None,
+    base_url: str | None = None,
     exclude_interactive_browser: bool = True,
 ) -> Callable[[], Awaitable[str]]:
     """Return Microsoft's native coroutine bearer-token provider."""
@@ -522,9 +523,9 @@ async def build_bearer_http_client(
 
 
 async def has_azure_identity_credentials(
-    scope: Optional[str] = None,
+    scope: str | None = None,
     *,
-    config: Optional[EntraIdentityConfig] = None,
+    config: EntraIdentityConfig | None = None,
     timeout_seconds: float = 10.0,
     allow_install: bool = True,
     **overrides: Any,
@@ -551,13 +552,13 @@ async def has_azure_identity_credentials(
 
 
 async def describe_active_credential(
-    config: Optional[EntraIdentityConfig] = None,
+    config: EntraIdentityConfig | None = None,
     *,
-    scope: Optional[str] = None,
+    scope: str | None = None,
     timeout_seconds: float = 10.0,
     allow_install: bool = True,
     **overrides: Any,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return non-secret diagnostics for the active async identity chain."""
     del allow_install
     if config is None:
@@ -565,7 +566,7 @@ async def describe_active_credential(
             scope=(scope or "").strip() or SCOPE_AI_AZURE_DEFAULT,
             **overrides,
         )
-    info: Dict[str, Any] = {"ok": False, "scope": config.scope}
+    info: dict[str, Any] = {"ok": False, "scope": config.scope}
     if not has_azure_identity_installed():
         info["error"] = "azure-identity not installed"
         info["hint"] = "pip install 'async-hermes-agent[azure-identity]'"

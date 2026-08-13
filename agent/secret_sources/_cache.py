@@ -29,7 +29,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Generic, Optional, TypeVar
+from typing import Generic, TypeVar
+from collections.abc import Callable
 
 __all__ = [
     "FetchResult",
@@ -61,7 +62,7 @@ from agent.secret_sources.base import (  # noqa: E402
 class CachedFetch:
     """A set of fetched secret values plus when they were fetched."""
 
-    secrets: Dict[str, str]
+    secrets: dict[str, str]
     fetched_at: float
 
     def is_fresh(self, ttl_seconds: float) -> bool:
@@ -75,7 +76,7 @@ class CachedFetch:
 # ---------------------------------------------------------------------------
 
 
-def resolve_cache_home(home_path: Optional[Path] = None) -> Path:
+def resolve_cache_home(home_path: Path | None = None) -> Path:
     """Resolve the Hermes home used for cache paths.
 
     ``home_path`` is whatever ``load_hermes_dotenv()`` already resolved;
@@ -90,7 +91,7 @@ def resolve_cache_home(home_path: Optional[Path] = None) -> Path:
 
 
 async def _canonical_cache_home(
-    home_path: Optional[Path] = None,
+    home_path: Path | None = None,
 ) -> tuple[str, Path]:
     """Return the physical profile identity and its cache path.
 
@@ -159,15 +160,15 @@ class DiskCache(Generic[K]):
         stem = basename.split(".", 1)[0]
         self._tmp_prefix = f".{stem}_"
 
-    def path(self, home_path: Optional[Path] = None) -> Path:
+    def path(self, home_path: Path | None = None) -> Path:
         return resolve_cache_home(home_path) / "cache" / self._basename
 
     async def read(
         self,
         key: K,
         ttl_seconds: float,
-        home_path: Optional[Path] = None,
-    ) -> Optional[CachedFetch]:
+        home_path: Path | None = None,
+    ) -> CachedFetch | None:
         """Return a fresh cached entry for ``key``, or None.
 
         Best-effort: any I/O or parse error, a key mismatch, or a stale entry
@@ -177,7 +178,7 @@ class DiskCache(Generic[K]):
             return None
         path = self.path(home_path)
         try:
-            async with aiofiles.open(path, "r", encoding="utf-8") as file:
+            async with aiofiles.open(path, encoding="utf-8") as file:
                 payload = json.loads(await file.read())
         except (OSError, json.JSONDecodeError):
             return None
@@ -191,7 +192,7 @@ class DiskCache(Generic[K]):
             return None
         # JSON permits non-string values; env vars need strings, so coerce by
         # dropping anything that isn't a str→str pair.
-        typed: Dict[str, str] = {
+        typed: dict[str, str] = {
             k: v
             for k, v in secrets.items()
             if isinstance(k, str) and isinstance(v, str)
@@ -206,7 +207,7 @@ class DiskCache(Generic[K]):
         key: K,
         entry: CachedFetch,
         ttl_seconds: float,
-        home_path: Optional[Path] = None,
+        home_path: Path | None = None,
     ) -> None:
         """Persist ``entry`` for ``key`` atomically at mode ``0600``.
 
@@ -258,7 +259,7 @@ class DiskCache(Generic[K]):
         except OSError:
             pass  # best-effort — a disk-cache miss next invocation is fine
 
-    async def clear(self, home_path: Optional[Path] = None) -> None:
+    async def clear(self, home_path: Path | None = None) -> None:
         """Delete the on-disk cache file if present (idempotent)."""
         try:
             await aiofiles.os.remove(self.path(home_path))

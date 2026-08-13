@@ -410,7 +410,7 @@ async def _read_failure_reason() -> str | None:
         mtime = (await aiofiles.os.stat(p)).st_mtime
         if (time.time() - mtime) >= _MARKER_TTL:
             return None
-        async with aiofiles.open(p, "r", encoding="utf-8") as f:
+        async with aiofiles.open(p, encoding="utf-8") as f:
             return (await f.read()).strip()
     except OSError:
         return None

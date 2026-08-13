@@ -35,15 +35,14 @@ from __future__ import annotations
 import logging
 import sys
 import threading
-from typing import Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
 
-_providers: Dict[str, WebSearchProvider] = {}
-_plugin_providers: Dict[object, Dict[str, WebSearchProvider]] = {}
+_providers: dict[str, WebSearchProvider] = {}
+_plugin_providers: dict[object, dict[str, WebSearchProvider]] = {}
 _lock = threading.Lock()
 
 
@@ -60,7 +59,7 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> Dict[str, WebSearchProvider]:
+def _provider_snapshot() -> dict[str, WebSearchProvider]:
     with _lock:
         providers = dict(_providers)
         scope = _plugin_scope()
@@ -113,13 +112,13 @@ def register_provider(provider: WebSearchProvider) -> None:
         )
 
 
-def list_providers() -> List[WebSearchProvider]:
+def list_providers() -> list[WebSearchProvider]:
     """Return all registered providers, sorted by name."""
     items = list(_provider_snapshot().values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> Optional[WebSearchProvider]:
+def get_provider(name: str) -> WebSearchProvider | None:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
@@ -131,7 +130,7 @@ def get_provider(name: str) -> Optional[WebSearchProvider]:
 # ---------------------------------------------------------------------------
 
 
-def _read_config_key(*path: str) -> Optional[str]:
+def _read_config_key(*path: str) -> str | None:
     """Registry fallbacks are config-free; the async tool resolves overrides."""
     return None
 
@@ -154,8 +153,8 @@ _LEGACY_PREFERENCE = (
 
 
 async def _resolve(
-    configured: Optional[str], *, capability: str
-) -> Optional[WebSearchProvider]:
+    configured: str | None, *, capability: str
+) -> WebSearchProvider | None:
     """Resolve the active provider for a capability ("search" | "extract").
 
     Resolution rules (in order):
@@ -243,7 +242,7 @@ async def _resolve(
     return None
 
 
-def _disabled_web_plugin_for(configured: Optional[str] = None, *, capability: Optional[str] = None) -> Optional[str]:
+def _disabled_web_plugin_for(configured: str | None = None, *, capability: str | None = None) -> str | None:
     """Return the plugin key of a *disabled* bundled web plugin that would
     have provided the configured backend, or None.
 
@@ -302,7 +301,7 @@ def _disabled_web_plugin_for(configured: Optional[str] = None, *, capability: Op
     return None
 
 
-async def get_active_search_provider() -> Optional[WebSearchProvider]:
+async def get_active_search_provider() -> WebSearchProvider | None:
     """Resolve the currently-active web search provider.
 
     Reads ``web.search_backend`` (preferred) or ``web.backend`` (shared
@@ -312,7 +311,7 @@ async def get_active_search_provider() -> Optional[WebSearchProvider]:
     return await _resolve(explicit, capability="search")
 
 
-async def get_active_extract_provider() -> Optional[WebSearchProvider]:
+async def get_active_extract_provider() -> WebSearchProvider | None:
     """Resolve the currently-active web extract provider.
 
     Reads ``web.extract_backend`` (preferred) or ``web.backend`` (shared

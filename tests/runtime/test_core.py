@@ -2415,7 +2415,7 @@ async def test_native_file_tools_do_not_use_a_sync_dispatch_bridge(monkeypatch, 
     finally:
         blockbuster.deactivate()
 
-    assert written["bytes_written"] == len("first\nsecond\n".encode())
+    assert written["bytes_written"] == len(b"first\nsecond\n")
     assert patched["success"] is True
     assert "-second" in patched["diff"]
     assert "+third" in patched["diff"]
@@ -4589,7 +4589,7 @@ async def test_registry_handler_is_awaited(monkeypatch):
     name = "__async_core_test_tool__"
 
     async def handler(args, **kwargs):
-        return '{"value": %d}' % (args["value"] + 1)
+        return f'{{"value": {args["value"] + 1}}}'
 
     registry.register(
         name=name,

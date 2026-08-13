@@ -22,7 +22,8 @@ import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import aiofiles
 import aiofiles.os
@@ -165,7 +166,7 @@ class OAuthCredential:
     consent_peer_name: str | None = None
 
     @classmethod
-    def from_host_block(cls, block: dict[str, Any]) -> "OAuthCredential | None":
+    def from_host_block(cls, block: dict[str, Any]) -> OAuthCredential | None:
         """Build a credential from a honcho.json host block, or None if incomplete."""
         oauth = block.get("oauth")
         access = block.get("apiKey")

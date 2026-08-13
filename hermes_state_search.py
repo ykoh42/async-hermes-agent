@@ -12,7 +12,8 @@ import logging
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any
+from collections.abc import Callable, Collection
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
@@ -48,8 +49,8 @@ class SessionSearchMixin:
 
     @classmethod
     def _search_message_fields(
-        cls, fields: Optional[Collection[str]]
-    ) -> Optional[Tuple[str, ...]]:
+        cls, fields: Collection[str] | None
+    ) -> tuple[str, ...] | None:
         """Validate and canonically order an optional search projection."""
         if fields is None:
             return None
@@ -79,7 +80,7 @@ class SessionSearchMixin:
         except sqlite3.Error as exc:
             logger.warning("FTS incremental merge failed: %s", exc)
 
-    async def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
+    async def fts_rebuild_status(self) -> dict[str, Any] | None:
         """Return deferred FTS rebuild progress without sync metadata access."""
         rows = await self._read_fetchall(
             "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
@@ -253,7 +254,7 @@ class SessionSearchMixin:
             return False
         return bool(more)
 
-    async def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+    async def fts_cjk_rebuild_status(self) -> dict[str, Any] | None:
         """CJK-index backfill progress, or None when none is pending."""
         rows = await self._read_fetchall(
             "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
@@ -613,9 +614,9 @@ class SessionSearchMixin:
     async def optimize_fts_storage(
         self,
         *,
-        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_cb: Callable[[dict[str, Any]], None] | None = None,
         vacuum: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Migrate legacy FTS storage and finish all resumable backfills."""
         connection = await self._get_connection()
         if not self._fts_enabled:
@@ -795,8 +796,8 @@ class SessionSearchMixin:
         around_message_id: int,
         window: int = 5,
         bookend: int = 3,
-        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
-    ) -> Dict[str, Any]:
+        keep_roles: tuple[str, ...] | None = ("user", "assistant"),
+    ) -> dict[str, Any]:
         """Return an anchored window and bookends using only aiosqlite."""
         primitive = await self.get_messages_around(
             session_id, around_message_id, window=window
@@ -819,8 +820,8 @@ class SessionSearchMixin:
                 if row.get("id") == around_message_id or row.get("role") in allowed
             ]
         bookend = max(0, int(bookend))
-        starts: list[Dict[str, Any]] = []
-        ends: list[Dict[str, Any]] = []
+        starts: list[dict[str, Any]] = []
+        ends: list[dict[str, Any]] = []
         if bookend:
             role_sql = ""
             role_params: list[Any] = []
@@ -859,7 +860,7 @@ class SessionSearchMixin:
         session_id: str,
         limit: int = 20,
         include_inactive: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return the most-recent real user turns, newest first."""
         active_clause = "" if include_inactive else " AND active = 1"
         connection = await self._get_connection()
@@ -875,7 +876,7 @@ class SessionSearchMixin:
         finally:
             await cursor.close()
 
-        result: List[Dict[str, Any]] = []
+        result: list[dict[str, Any]] = []
         for row in rows:
             decoded = self._decode_content(row["content"])
             if isinstance(decoded, list):
@@ -1045,12 +1046,12 @@ class SessionSearchMixin:
         table: str = "messages_fts_trigram",
         order_by_sql: str,
         include_inactive: bool,
-        source_filter: List[str] = None,
-        exclude_sources: List[str] = None,
-        role_filter: List[str] = None,
+        source_filter: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None,
         limit: int = 20,
         offset: int = 0,
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """Search one of the two upstream substring-capable FTS indexes."""
         if table not in {"messages_fts_trigram", "messages_fts_cjk"}:
             raise ValueError(f"unsupported FTS table: {table}")
@@ -1117,15 +1118,15 @@ class SessionSearchMixin:
     async def search_messages(
         self,
         query: str,
-        source_filter: List[str] = None,
-        exclude_sources: List[str] = None,
-        role_filter: List[str] = None,
+        source_filter: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None,
         limit: int = 20,
         offset: int = 0,
-        sort: str = None,
+        sort: str | None = None,
         include_inactive: bool = False,
-        fields: Optional[Collection[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        fields: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Instrumented native-async message search.
 
         This preserves the v2026.8.3 routing and result contract while keeping
@@ -1192,15 +1193,15 @@ class SessionSearchMixin:
     async def _search_messages_impl(
         self,
         query: str,
-        source_filter: List[str] = None,
-        exclude_sources: List[str] = None,
-        role_filter: List[str] = None,
+        source_filter: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None,
         limit: int = 20,
         offset: int = 0,
-        sort: str = None,
+        sort: str | None = None,
         include_inactive: bool = False,
-        fields: Optional[Collection[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        fields: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Full-text search with v2026.8.3 routing and result semantics."""
         result_fields = self._search_message_fields(fields)
         await self._get_connection()
@@ -1255,7 +1256,7 @@ class SessionSearchMixin:
         """
         params.extend([limit, offset])
 
-        matches: List[Dict[str, Any]] = []
+        matches: list[dict[str, Any]] = []
         is_cjk = self._contains_cjk(query)
         used_like = False
         if is_cjk:
@@ -1270,7 +1271,7 @@ class SessionSearchMixin:
                 self._count_cjk(token) < 3 for token in cjk_tokens
             )
             wants_tool_rows = bool(role_filter) and "tool" in role_filter
-            substring_matches: Optional[List[Dict[str, Any]]] = None
+            substring_matches: list[dict[str, Any]] | None = None
             if (
                 self._fts_cjk_available
                 and not wants_tool_rows
@@ -1519,10 +1520,10 @@ class SessionSearchMixin:
         limit: int,
         *,
         include_inactive: bool = False,
-        source_filter: Optional[List[str]] = None,
-        exclude_sources: Optional[List[str]] = None,
-        role_filter: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        source_filter: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """LIKE-scan only the deferred FTS rebuild's unindexed id range."""
         status = await self.fts_rebuild_status()
         if status is None or limit <= 0:
@@ -1591,10 +1592,10 @@ class SessionSearchMixin:
         query: str,
         limit: int = 20,
         include_archived: bool = True,
-        source: str = None,
-        sources: List[str] = None,
-        exclude_sources: List[str] = None,
-    ) -> List[Dict[str, Any]]:
+        source: str | None = None,
+        sources: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Search surfaced sessions by exact, prefix, or substring id."""
         needle = (query or "").strip().lower()
         if not needle or limit <= 0:
@@ -1610,7 +1611,7 @@ class SessionSearchMixin:
             id_query=needle,
         )
 
-        def score(row: Dict[str, Any]) -> int:
+        def score(row: dict[str, Any]) -> int:
             ids = [
                 str(row.get("id") or ""),
                 str(row.get("_lineage_root_id") or ""),
@@ -1682,7 +1683,7 @@ class SessionSearchMixin:
         self,
         *,
         max_pages: int,
-        max_commands: Optional[int] = None,
+        max_commands: int | None = None,
     ) -> int:
         """Run upstream's bounded FTS5 ``'merge'`` protocol natively."""
         if isinstance(max_pages, bool) or not isinstance(max_pages, int):

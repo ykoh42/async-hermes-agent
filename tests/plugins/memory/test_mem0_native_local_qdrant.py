@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 import uuid
 
@@ -184,7 +184,7 @@ async def test_embedded_qdrant_normalizes_upstream_payload_value_types(tmp_path)
     await store.update(
         vector_id,
         payload={
-            "created_at": datetime(2026, 8, 9, tzinfo=timezone.utc),
+            "created_at": datetime(2026, 8, 9, tzinfo=UTC),
             "source_id": vector_id,
             "source_path": Path("/tmp/source"),
         },

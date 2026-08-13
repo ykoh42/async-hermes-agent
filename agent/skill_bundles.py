@@ -50,7 +50,7 @@ import re
 import threading
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -65,11 +65,11 @@ logger = logging.getLogger(__name__)
 _BUNDLE_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _BUNDLE_MULTI_HYPHEN = re.compile(r"-{2,}")
 
-_bundles_cache: Dict[str, Dict[str, Any]] = {}
-_bundles_cache_mtime: Optional[float] = None
-_bundles_cache_by_dir: Dict[
+_bundles_cache: dict[str, dict[str, Any]] = {}
+_bundles_cache_mtime: float | None = None
+_bundles_cache_by_dir: dict[
     str,
-    Tuple[Dict[str, Dict[str, Any]], Optional[float]],
+    tuple[dict[str, dict[str, Any]], float | None],
 ] = {}
 _bundles_cache_projection_key: str | None = None
 _BUNDLE_CACHE_GUARD = threading.RLock()
@@ -86,7 +86,7 @@ class _BundleScanClaim:
     ] = field(default_factory=list)
 
 
-_BUNDLE_SCAN_CLAIMS: Dict[str, _BundleScanClaim] = {}
+_BUNDLE_SCAN_CLAIMS: dict[str, _BundleScanClaim] = {}
 
 
 def _bundles_dir() -> Path:
@@ -109,8 +109,8 @@ async def _bundle_cache_key() -> str:
 
 async def _active_bundle_cache() -> tuple[
     str,
-    Dict[str, Dict[str, Any]],
-    Optional[float],
+    dict[str, dict[str, Any]],
+    float | None,
 ]:
     """Project the active profile cache onto the upstream private globals."""
     global _bundles_cache, _bundles_cache_mtime, _bundles_cache_projection_key
@@ -132,9 +132,9 @@ async def _active_bundle_cache() -> tuple[
 
 def _store_bundle_cache(
     key: str,
-    bundles: Dict[str, Dict[str, Any]],
-    mtime: Optional[float],
-) -> Dict[str, Dict[str, Any]]:
+    bundles: dict[str, dict[str, Any]],
+    mtime: float | None,
+) -> dict[str, dict[str, Any]]:
     global _bundles_cache, _bundles_cache_mtime, _bundles_cache_projection_key
     with _BUNDLE_CACHE_GUARD:
         _bundles_cache = bundles
@@ -209,12 +209,12 @@ def _slugify(name: str) -> str:
     return cmd
 
 
-async def _iter_bundle_files() -> List[Path]:
+async def _iter_bundle_files() -> list[Path]:
     base = _bundles_dir()
     if not await aiofiles.os.path.isdir(base):
         return []
     names = await aiofiles.os.listdir(base)
-    files: List[Path] = []
+    files: list[Path] = []
     for suffix in (".yaml", ".yml"):
         files.extend(
             sorted(base / name for name in names if name.endswith(suffix))
@@ -222,7 +222,7 @@ async def _iter_bundle_files() -> List[Path]:
     return files
 
 
-async def _max_mtime(files: List[Path]) -> float:
+async def _max_mtime(files: list[Path]) -> float:
     """Highest mtime across the bundle files plus the dir itself.
 
     Watching the directory mtime catches deletions; watching individual
@@ -243,7 +243,7 @@ async def _max_mtime(files: List[Path]) -> float:
     return max(mtimes) if mtimes else 0.0
 
 
-async def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
+async def _load_bundle_file(path: Path) -> dict[str, Any] | None:
     """Parse a single bundle YAML file. Returns ``None`` on any error.
 
     Errors are logged at WARNING level. We don't raise — a broken bundle
@@ -296,7 +296,7 @@ async def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
     }
 
 
-async def scan_bundles() -> Dict[str, Dict[str, Any]]:
+async def scan_bundles() -> dict[str, dict[str, Any]]:
     """Scan the bundles directory and rebuild the cache.
 
     Returns the same mapping as :func:`get_skill_bundles` — ``"/slug"`` →
@@ -310,7 +310,7 @@ async def scan_bundles() -> Dict[str, Dict[str, Any]]:
         return await scan_bundles()
     try:
         files = await _iter_bundle_files()
-        out: Dict[str, Dict[str, Any]] = {}
+        out: dict[str, dict[str, Any]] = {}
         for f in files:
             info = await _load_bundle_file(f)
             if not info:
@@ -328,7 +328,7 @@ async def scan_bundles() -> Dict[str, Dict[str, Any]]:
         _finish_bundle_scan(cache_key, claim)
 
 
-async def get_skill_bundles() -> Dict[str, Dict[str, Any]]:
+async def get_skill_bundles() -> dict[str, dict[str, Any]]:
     """Return the current bundle mapping, rescanning when disk changed.
 
     Cheap to call repeatedly: only rescans when the bundles directory or
@@ -348,7 +348,7 @@ async def get_skill_bundles() -> Dict[str, Dict[str, Any]]:
     return cached
 
 
-async def resolve_bundle_command_key(command: str) -> Optional[str]:
+async def resolve_bundle_command_key(command: str) -> str | None:
     """Resolve a user-typed command to its canonical bundle slash key.
 
     Hyphens and underscores are treated interchangeably to mirror the
@@ -361,14 +361,14 @@ async def resolve_bundle_command_key(command: str) -> Optional[str]:
     return cmd_key if cmd_key in await get_skill_bundles() else None
 
 
-async def reload_bundles() -> Dict[str, Any]:
+async def reload_bundles() -> dict[str, Any]:
     """Re-scan the bundles directory and return a diff.
 
     Mirrors :func:`agent.skill_commands.reload_skills` so callers can use
     the same display logic. Returns a dict with ``added``, ``removed``,
     ``unchanged``, and ``total`` keys.
     """
-    def _snapshot(cmds: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    def _snapshot(cmds: dict[str, dict[str, Any]]) -> dict[str, str]:
         return {k.lstrip("/"): (v or {}).get("description", "") for k, v in cmds.items()}
 
     _key, cached, _mtime = await _active_bundle_cache()
@@ -388,7 +388,7 @@ async def reload_bundles() -> Dict[str, Any]:
     }
 
 
-async def list_bundles() -> List[Dict[str, Any]]:
+async def list_bundles() -> list[dict[str, Any]]:
     """Return a sorted list of bundle info dicts for display."""
     bundles = await get_skill_bundles()
     return sorted(bundles.values(), key=lambda b: b["slug"])
@@ -399,7 +399,7 @@ async def build_bundle_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     platform: str | None = None,
-) -> Optional[Tuple[str, List[str], List[str]]]:
+) -> tuple[str, list[str], list[str]] | None:
     """Build the user message content for a bundle slash command invocation.
 
     Returns ``(message, loaded_skill_names, missing_skill_names)`` or
@@ -436,10 +436,10 @@ async def build_bundle_invocation_message(
     except Exception:
         disabled_names = set()
 
-    loaded_names: List[str] = []
-    missing: List[str] = []
-    disabled: List[str] = []
-    skill_blocks: List[str] = []
+    loaded_names: list[str] = []
+    missing: list[str] = []
+    disabled: list[str] = []
+    skill_blocks: list[str] = []
     seen: set[str] = set()
 
     bundle_name = info["name"]
@@ -522,7 +522,7 @@ def bundle_path_for(name: str) -> Path:
 
 async def save_bundle(
     name: str,
-    skills: List[str],
+    skills: list[str],
     description: str = "",
     instruction: str = "",
     overwrite: bool = False,
@@ -544,7 +544,7 @@ async def save_bundle(
         raise FileExistsError(f"Bundle already exists at {path}")
 
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
-    payload: Dict[str, Any] = {"name": name, "skills": cleaned_skills}
+    payload: dict[str, Any] = {"name": name, "skills": cleaned_skills}
     if description:
         payload["description"] = description
     if instruction:
@@ -571,7 +571,7 @@ async def delete_bundle(name: str) -> Path:
     return path
 
 
-async def get_bundle(name: str) -> Optional[Dict[str, Any]]:
+async def get_bundle(name: str) -> dict[str, Any] | None:
     """Look up a bundle by name (slug-normalized)."""
     slug = _slugify(name)
     return (await get_skill_bundles()).get(f"/{slug}")

@@ -7,7 +7,7 @@ import datetime
 import json
 import os
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -108,7 +108,7 @@ def hermes_xai_user_agent() -> str:
     return f"Hermes-Agent/{package_version}"
 
 
-def hermes_xai_default_headers() -> Dict[str, str]:
+def hermes_xai_default_headers() -> dict[str, str]:
     """Default headers for OpenAI-SDK and raw HTTP clients talking to xAI.
 
     Replaces the OpenAI Python SDK's identifying ``User-Agent: OpenAI/Python …``
@@ -118,7 +118,7 @@ def hermes_xai_default_headers() -> Dict[str, str]:
     return {"User-Agent": hermes_xai_user_agent()}
 
 
-async def _load_config_section(section_name: str) -> Dict[str, Any]:
+async def _load_config_section(section_name: str) -> dict[str, Any]:
     """Return a top-level Hermes config section as a dict, or empty."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -142,7 +142,7 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
-def _coerce_expires_after(value: Any) -> Optional[int]:
+def _coerce_expires_after(value: Any) -> int | None:
     """Normalize an xAI storage TTL."""
     if value is None:
         return None
@@ -162,7 +162,7 @@ def _coerce_expires_after(value: Any) -> Optional[int]:
     return SAFE_XAI_STORAGE_EXPIRES_AFTER_SECONDS
 
 
-async def read_xai_imagine_storage_config(section_name: str) -> Dict[str, Any]:
+async def read_xai_imagine_storage_config(section_name: str) -> dict[str, Any]:
     """Read xAI Imagine storage settings from image/video provider config."""
     section = await _load_config_section(section_name)
     xai_section = section.get("xai") if isinstance(section, dict) else None
@@ -180,7 +180,7 @@ async def build_xai_storage_options(
     *,
     filename_prefix: str,
     extension: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Return an xAI ``storage_options`` payload, or None when disabled."""
     cfg = await read_xai_imagine_storage_config(section_name)
     if not cfg["enabled"]:
@@ -190,7 +190,7 @@ async def build_xai_storage_options(
     ts = now.strftime("%Y%m%d-%H%M%S")
     short = uuid.uuid4().hex[:8]
     ext = extension.lstrip(".") or "bin"
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "filename": f"{filename_prefix}-{ts}-{short}.{ext}",
         "public_url": bool(cfg["public_url"]),
     }
@@ -217,7 +217,7 @@ async def xai_storage_notice_text(section_name: str) -> str:
     )
 
 
-async def maybe_mark_xai_storage_notice_seen(section_name: str) -> Optional[str]:
+async def maybe_mark_xai_storage_notice_seen(section_name: str) -> str | None:
     """Return the storage notice once per Hermes home, then mark it seen."""
     notice = await xai_storage_notice_text(section_name)
     if not notice:
@@ -240,8 +240,8 @@ async def maybe_mark_xai_storage_notice_seen(section_name: str) -> Optional[str]
 async def resolve_xai_http_credentials(
     *,
     force_refresh: bool = False,
-    api_key_hint: Optional[str] = None,
-) -> Dict[str, str]:
+    api_key_hint: str | None = None,
+) -> dict[str, str]:
     """Resolve xAI credentials through coroutine-native pool operations."""
     from agent.secret_scope import (
         UnscopedSecretError,

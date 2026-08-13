@@ -39,7 +39,6 @@ import re
 import signal as _signal
 import sys
 from pathlib import Path
-from typing import Dict, Optional
 
 # Reuse the exact result shape the bitwarden source returns so
 # hermes_cli.env_loader can consume both providers identically.
@@ -96,7 +95,7 @@ def unquote_dotenv_value(raw: str) -> str:
     return t
 
 
-def parse_secret_output(stdout: str, wanted_key: str) -> Optional[str]:
+def parse_secret_output(stdout: str, wanted_key: str) -> str | None:
     """Parse a secret-fetch helper's stdout.  Supports BOTH shapes:
 
     * a bare value (single secret): the whole trimmed stdout is the value.
@@ -168,7 +167,7 @@ async def _run_helper(
     secret_key: str,
     timeout_seconds: float,
     max_output_bytes: int,
-) -> Optional[str]:
+) -> str | None:
     """Run the helper via ``/bin/sh -c`` and return its stdout, or None.
 
     The key is passed as DATA via ``HERMES_SECRET_KEY`` — never interpolated
@@ -280,14 +279,14 @@ async def _run_helper(
     return stdout_bytes.decode("utf-8", errors="replace")
 
 
-def _parse_dotenv_map(stdout: str) -> Dict[str, str]:
+def _parse_dotenv_map(stdout: str) -> dict[str, str]:
     """Parse a KEY=VALUE blob into a map (the list/enumerate path).
 
     Mirrors the TS ``list()``: only env-shaped lines contribute; comments
     and non-matching lines are skipped.  A bare-value helper yields ``{}``
     — per-key resolution via :func:`get_command_secret` still works.
     """
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for raw in stdout.replace("\r\n", "\n").split("\n"):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -305,7 +304,7 @@ async def get_command_secret(
     key: str,
     timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
     max_output_bytes: int = _MAX_OUTPUT_BYTES,
-) -> Optional[str]:
+) -> str | None:
     """Resolve a single secret by running the helper with the key in
     ``HERMES_SECRET_KEY``.  Returns None on any failure — never raises."""
     command = (command or "").strip()
@@ -322,7 +321,7 @@ async def list_command_secrets(
     command: str,
     timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
     max_output_bytes: int = _MAX_OUTPUT_BYTES,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Enumerate secrets by running the helper ONCE with an empty key.
 
     Returns the dotenv map ONLY when the helper emits a KEY=VALUE blob;
@@ -348,7 +347,7 @@ async def apply_command_secrets(
     override_existing: bool = False,
     timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
     max_output_bytes: int = _MAX_OUTPUT_BYTES,
-    home_path: Optional[Path] = None,
+    home_path: Path | None = None,
 ) -> FetchResult:
     """Run the helper once at startup and set its KEY=VALUE output on
     ``os.environ``.

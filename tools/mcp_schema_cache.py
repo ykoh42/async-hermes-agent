@@ -17,7 +17,7 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -71,7 +71,7 @@ def config_fingerprint(config: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-async def _load_all() -> Dict[str, Any]:
+async def _load_all() -> dict[str, Any]:
     path = _cache_path()
     if not await aiofiles.os.path.exists(path):
         return {}
@@ -84,7 +84,7 @@ async def _load_all() -> Dict[str, Any]:
         return {}
 
 
-async def _save_all(data: Dict[str, Any]) -> None:
+async def _save_all(data: dict[str, Any]) -> None:
     """Atomically persist the user-writable cache without blocking the loop."""
     path = _cache_path()
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
@@ -104,7 +104,7 @@ async def _save_all(data: Dict[str, Any]) -> None:
             pass
 
 
-async def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
+async def get_cached_entry(server_name: str, fingerprint: str) -> dict | None:
     """Return cached entry when fingerprint matches, else None."""
     async with await _cache_lock():
         entry = (await _load_all()).get(server_name)
@@ -123,8 +123,8 @@ async def write_cache_entry(
     server_name: str,
     fingerprint: str,
     *,
-    tools: List[dict],
-    utility_tools: Optional[List[dict]] = None,
+    tools: list[dict],
+    utility_tools: list[dict] | None = None,
 ) -> None:
     """Persist tool schemas after a successful live connect."""
     entry = {
@@ -151,12 +151,12 @@ async def clear_cache_entry(server_name: str) -> None:
             await _save_all(data)
 
 
-def tools_from_cache_entry(entry: dict) -> List[dict]:
+def tools_from_cache_entry(entry: dict) -> list[dict]:
     """Return cached MCP tool dicts (name, description, inputSchema)."""
     tools = entry.get("tools")
     return list(tools) if isinstance(tools, list) else []
 
 
-def utility_tools_from_cache_entry(entry: dict) -> List[dict]:
+def utility_tools_from_cache_entry(entry: dict) -> list[dict]:
     util = entry.get("utility_tools")
     return list(util) if isinstance(util, list) else []

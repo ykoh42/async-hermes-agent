@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from agent.secret_scope import get_secret
 from agent.ssl_verify import _create_httpx_client, _create_openai_sdk_client
@@ -106,7 +106,7 @@ async def _close_http_client_after_request(
 
 API_MODEL = "gpt-image-2"
 
-_MODELS: Dict[str, Dict[str, Any]] = {
+_MODELS: dict[str, dict[str, Any]] = {
     "gpt-image-2-low": {
         "display": "GPT Image 2 (Low)",
         "speed": "~15s",
@@ -136,7 +136,7 @@ _SIZES = {
 }
 
 
-async def _load_openai_config() -> Dict[str, Any]:
+async def _load_openai_config() -> dict[str, Any]:
     """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
     try:
         from hermes_cli.config import load_config_readonly
@@ -149,7 +149,7 @@ async def _load_openai_config() -> Dict[str, Any]:
         return {}
 
 
-async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
+async def _resolve_model() -> tuple[str, dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
     env_override = get_secret("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
@@ -157,7 +157,7 @@ async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
 
     cfg = await _load_openai_config()
     openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
-    candidate: Optional[str] = None
+    candidate: str | None = None
     if isinstance(openai_cfg, dict):
         value = openai_cfg.get("model")
         if isinstance(value, str) and value in _MODELS:
@@ -178,7 +178,7 @@ async def _resolve_model() -> Tuple[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-async def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
+async def _load_image_bytes(ref: str) -> tuple[bytes, str]:
     """Load image bytes from a URL or local file path.
 
     Returns ``(data, filename)``. Raises on any network / IO error so the
@@ -243,7 +243,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
             return False
         return True
 
-    async def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": model_id,
@@ -255,10 +255,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
             for model_id, meta in _MODELS.items()
         ]
 
-    async def default_model(self) -> Optional[str]:
+    async def default_model(self) -> str | None:
         return DEFAULT_MODEL
 
-    async def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "OpenAI",
             "badge": "paid",
@@ -272,7 +272,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
             ],
         }
 
-    async def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         # gpt-image-2 supports editing via images.edit() with up to 16 source
         # images.
         return {"modalities": ["text", "image"], "max_reference_images": 16}
@@ -282,10 +282,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
-        image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        image_url: str | None = None,
+        reference_image_urls: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
 
@@ -324,7 +324,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         size = _SIZES.get(aspect, _SIZES["square"])
 
         # Collect source images (primary + references) for image-to-image.
-        sources: List[str] = []
+        sources: list[str] = []
         if isinstance(image_url, str) and image_url.strip():
             sources.append(image_url.strip())
         for ref in (normalize_reference_images(reference_image_urls) or []):
@@ -386,7 +386,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         else:
             # gpt-image-2 returns b64_json unconditionally and REJECTS
             # ``response_format`` as an unknown parameter. Don't send it.
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "model": API_MODEL,
                 "prompt": prompt,
                 "size": size,
@@ -477,7 +477,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra: dict[str, Any] = {"size": size, "quality": meta["quality"]}
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 

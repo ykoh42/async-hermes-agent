@@ -43,7 +43,6 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import aiofiles
 import aiofiles.os
@@ -93,9 +92,9 @@ _BWS_RUN_TIMEOUT = 30
 
 # In-process cache so repeated load_hermes_dotenv() calls (CLI startup,
 # gateway hot-reload, test suites) don't re-fetch from BSM.
-_CacheKey = Tuple[str, str, str, str]
+_CacheKey = tuple[str, str, str, str]
 # (access_token_fingerprint, project_id, server_url, canonical_home)
-_CACHE: Dict[_CacheKey, _CachedFetch] = {}
+_CACHE: dict[_CacheKey, _CachedFetch] = {}
 
 # Disk-persisted cache so back-to-back CLI invocations (e.g. `hermes chat -q ...`
 # called from scripts, cron, the gateway forking new agents) don't each pay the
@@ -123,7 +122,7 @@ def _cache_key_str(cache_key: _CacheKey) -> str:
 _DISK_CACHE: DiskCache = DiskCache(_DISK_CACHE_BASENAME, key_serializer=_cache_key_str)
 
 
-def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
+def _disk_cache_path(home_path: Path | None = None) -> Path:
     """Return the disk cache path under hermes_home/cache/.
 
     Thin wrapper over the shared DiskCache, kept for tests and any direct
@@ -132,7 +131,7 @@ def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
     return _DISK_CACHE.path(home_path)
 
 
-def _encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
+def _encrypted_disk_cache_path(home_path: Path | None = None) -> Path:
     """Return the encrypted disk cache path under hermes_home/cache/."""
     from agent.secret_sources._cache import resolve_cache_home
 
@@ -151,7 +150,7 @@ def _hermes_bin_dir() -> Path:
     return get_hermes_home() / "bin"
 
 
-async def find_bws(*, install_if_missing: bool = False) -> Optional[Path]:
+async def find_bws(*, install_if_missing: bool = False) -> Path | None:
     """Return a path to a usable ``bws`` binary, or None.
 
     Resolution order:
@@ -439,7 +438,7 @@ async def _write_encrypted_disk_cache(
     cache_key: _CacheKey,
     access_token: str,
     entry: _CachedFetch,
-    home_path: Optional[Path] = None,
+    home_path: Path | None = None,
 ) -> None:
     """Persist an encrypted last-good cache entry atomically.
 
@@ -512,8 +511,8 @@ async def _read_encrypted_disk_cache(
     cache_key: _CacheKey,
     access_token: str,
     max_age_seconds: float,
-    home_path: Optional[Path] = None,
-) -> Optional[_CachedFetch]:
+    home_path: Path | None = None,
+) -> _CachedFetch | None:
     """Return a decrypted encrypted-cache entry if it matches and is in-window."""
     if max_age_seconds <= 0:
         return None
@@ -559,14 +558,14 @@ async def fetch_bitwarden_secrets(
     *,
     access_token: str,
     project_id: str,
-    binary: Optional[Path] = None,
+    binary: Path | None = None,
     cache_ttl_seconds: float = 300,
     use_cache: bool = True,
     server_url: str = "",
-    home_path: Optional[Path] = None,
+    home_path: Path | None = None,
     encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
-) -> Tuple[Dict[str, str], List[str]]:
+) -> tuple[dict[str, str], list[str]]:
     """Pull the secrets for ``project_id`` from Bitwarden Secrets Manager.
 
     Returns ``(secrets_dict, warnings_list)``.
@@ -735,7 +734,7 @@ def _summarize_bws_stderr(raw: str) -> str:
     text = raw.replace("\x1b", "").strip()
     if not text:
         return text
-    causes: List[str] = []
+    causes: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith(("Location:", "Backtrace omitted", "Run with ")):
@@ -751,7 +750,7 @@ def _summarize_bws_stderr(raw: str) -> str:
 
 async def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
-) -> Tuple[Dict[str, str], List[str]]:
+) -> tuple[dict[str, str], list[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
     # bws child intentionally receives the access token.  Under a profile-local
     # fetch it must not inherit sibling credentials from process-global env.
@@ -817,8 +816,8 @@ async def _run_bws_list(
     if not isinstance(payload, list):
         raise RuntimeError(f"bws returned unexpected shape: {type(payload).__name__}")
 
-    secrets: Dict[str, str] = {}
-    warnings: List[str] = []
+    secrets: dict[str, str] = {}
+    warnings: list[str] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
@@ -847,7 +846,7 @@ async def apply_bitwarden_secrets(
     cache_ttl_seconds: float = 300,
     auto_install: bool = True,
     server_url: str = "",
-    home_path: Optional[Path] = None,
+    home_path: Path | None = None,
     encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
 ) -> FetchResult:
@@ -1120,7 +1119,7 @@ def _classify_bws_error(message: str) -> ErrorKind:
 # ---------------------------------------------------------------------------
 
 
-async def clear_caches(home_path: Optional[Path] = None) -> None:
+async def clear_caches(home_path: Path | None = None) -> None:
     """Drop in-process AND disk caches (plaintext and encrypted).
 
     Used after a token rotation (`hermes secrets bitwarden token`) so the
@@ -1136,7 +1135,7 @@ async def clear_caches(home_path: Optional[Path] = None) -> None:
         pass
 
 
-async def _reset_cache_for_tests(home_path: Optional[Path] = None) -> None:
+async def _reset_cache_for_tests(home_path: Path | None = None) -> None:
     """Clear in-process AND disk caches.
 
     Tests can pass ``home_path`` to scope the disk cleanup to a tmpdir.

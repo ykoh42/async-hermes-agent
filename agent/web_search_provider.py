@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import abc
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import aiofiles
 
@@ -78,7 +78,7 @@ async def get_provider_env(name: str) -> str:
 
     Returns the stripped value, or ``""`` when unset.
     """
-    val: Optional[str] = None
+    val: str | None = None
     try:
         from hermes_cli.config import (
             _parse_env_value,
@@ -91,7 +91,6 @@ async def get_provider_env(name: str) -> str:
             try:
                 async with aiofiles.open(
                     get_env_path(),
-                    "r",
                     encoding="utf-8-sig",
                     errors="replace",
                 ) as env_file:
@@ -172,7 +171,7 @@ class WebSearchProvider(abc.ABC):
         """
         return False
 
-    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute a web search.
 
         Override when :meth:`supports_search` returns True. The default
@@ -183,7 +182,7 @@ class WebSearchProvider(abc.ABC):
             f"{self.name} does not support search (override supports_search)"
         )
 
-    async def extract(self, urls: List[str], **kwargs: Any) -> Any:
+    async def extract(self, urls: list[str], **kwargs: Any) -> Any:
         """Extract content from one or more URLs.
 
         Override when :meth:`supports_extract` returns True. The default
@@ -216,7 +215,7 @@ class WebSearchProvider(abc.ABC):
             f"{self.name} does not support extract (override supports_extract)"
         )
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         """Return provider metadata for the ``hermes tools`` picker.
 
         Used by ``hermes_cli/tools_config.py`` to inject this provider as a

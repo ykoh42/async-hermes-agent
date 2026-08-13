@@ -29,7 +29,6 @@ Part 2 of Fixes #52310.
 
 from __future__ import annotations
 
-from typing import Optional
 
 
 # Substring set that identifies a transport-layer failure on the
@@ -102,7 +101,7 @@ def is_thinking_timeout(classified: object, model: str, error_msg: str) -> bool:
 
 
 def build_thinking_timeout_guidance(
-    provider: str, model: str, model_label: Optional[str] = None,
+    provider: str, model: str, model_label: str | None = None,
 ) -> str:
     """Return the user-facing guidance string appended to ``_final_response``.
 

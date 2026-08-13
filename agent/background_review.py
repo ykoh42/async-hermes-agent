@@ -23,7 +23,7 @@ import copy
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
+async def _resolve_review_runtime(agent: Any) -> dict[str, Any]:
     """Resolve provider/model/credentials for the review fork.
 
     Default (auto / unset / same as parent): inherit the parent's live runtime
@@ -110,7 +110,7 @@ async def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         return parent
 
 
-def _msg_text(m: Dict) -> str:
+def _msg_text(m: dict) -> str:
     c = m.get("content")
     if isinstance(c, str):
         return c.strip()
@@ -119,7 +119,7 @@ def _msg_text(m: Dict) -> str:
     return ""
 
 
-def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]:
+def _digest_history(messages_snapshot: list[dict], tail: int = 24) -> list[dict]:
     """Compact replay for the routed (different-model) path only.
 
     Keeps the recent ``tail`` messages verbatim, collapses older turns into one
@@ -137,7 +137,7 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
             return msgs
         keep = msgs[-tail:]
     old = msgs[:-len(keep)]
-    lines: List[str] = []
+    lines: list[str] = []
     for m in old:
         if not isinstance(m, dict):
             continue
@@ -407,10 +407,10 @@ _COMBINED_REVIEW_PROMPT = (
 
 
 def summarize_background_review_actions(
-    review_messages: List[Dict],
-    prior_snapshot: List[Dict],
+    review_messages: list[dict],
+    prior_snapshot: list[dict],
     notification_mode: str = "on",
-) -> List[str]:
+) -> list[str]:
     """Build the human-facing action summary for a background review pass.
 
     Walks the review agent's session messages and collects successful memory
@@ -478,7 +478,7 @@ def summarize_background_review_actions(
                     "new_string": args.get("new_string", ""),
                 }
 
-    actions: List[str] = []
+    actions: list[str] = []
     for msg in review_messages or []:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
@@ -626,13 +626,13 @@ def summarize_background_review_actions(
 def build_memory_write_metadata(
     agent: Any,
     *,
-    write_origin: Optional[str] = None,
-    execution_context: Optional[str] = None,
-    task_id: Optional[str] = None,
-    tool_call_id: Optional[str] = None,
-) -> Dict[str, Any]:
+    write_origin: str | None = None,
+    execution_context: str | None = None,
+    task_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> dict[str, Any]:
     """Build provenance metadata for external memory-provider mirrors."""
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "write_origin": write_origin or getattr(agent, "_memory_write_origin", "assistant_tool"),
         "execution_context": (
             execution_context
@@ -652,9 +652,9 @@ def build_memory_write_metadata(
 
 async def _run_review(
     agent: Any,
-    messages_snapshot: List[Dict],
+    messages_snapshot: list[dict],
     prompt: str,
-    tools_snapshot: Optional[List[Dict]],
+    tools_snapshot: list[dict] | None,
     valid_tool_names_snapshot: frozenset[str],
     tool_snapshot_generation: int,
 ) -> None:
@@ -676,7 +676,7 @@ async def _run_review(
     prior_approval_callback = _get_approval_callback()
     set_approval_callback(_bg_review_auto_deny)
     review_agent = None
-    review_messages: List[Dict] = []
+    review_messages: list[dict] = []
 
     async def _close_review_agent() -> None:
         nonlocal review_agent
@@ -719,7 +719,7 @@ async def _run_review(
         runtime = await _resolve_review_runtime(agent)
         routed = bool(runtime.get("routed"))
 
-        fork_kwargs: Dict[str, Any] = {}
+        fork_kwargs: dict[str, Any] = {}
         if isinstance(runtime.get("max_tokens"), int):
             fork_kwargs["max_tokens"] = runtime["max_tokens"]
         if isinstance(runtime.get("command"), str) and runtime["command"]:
@@ -906,7 +906,7 @@ async def _run_review(
 
 def spawn_background_review_thread(
     agent: Any,
-    messages_snapshot: List[Dict],
+    messages_snapshot: list[dict],
     review_memory: bool = False,
     review_skills: bool = False,
 ):

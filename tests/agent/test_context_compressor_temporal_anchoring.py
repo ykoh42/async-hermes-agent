@@ -11,7 +11,7 @@ summarizer prompt. ``test_context_compressor_summary_continuity`` already
 proves ``compress()`` routes into ``_generate_summary``.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -48,7 +48,7 @@ def _turns():
 
 
 def _fixed_now():
-    return datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc)
+    return datetime(2026, 6, 7, 12, 0, tzinfo=UTC)
 
 
 
@@ -81,7 +81,7 @@ async def test_clock_failure_omits_rule_but_compaction_still_runs():
 async def test_anchoring_rule_uses_date_from_hermes_time_now():
     """The date is taken from hermes_time.now(), which respects the user's TZ."""
     compressor = _compressor()
-    fixed = datetime(2025, 12, 31, 23, 30, tzinfo=timezone.utc)
+    fixed = datetime(2025, 12, 31, 23, 30, tzinfo=UTC)
     with patch.object(hermes_time, "now", AsyncMock(return_value=fixed)), patch(
         "agent.context_compressor.call_llm",
         new=AsyncMock(return_value=_response("summary")),

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator, Mapping, MutableMapping
+from collections.abc import Iterator, Mapping, MutableMapping
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",

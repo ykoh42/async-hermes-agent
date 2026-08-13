@@ -11,7 +11,8 @@ import subprocess
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
+from collections.abc import AsyncIterator
 
 import aiofiles
 import aiofiles.os
@@ -370,7 +371,7 @@ async def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
 
 
 class _ACPChatCompletions:
-    def __init__(self, client: "CopilotACPClient"):
+    def __init__(self, client: CopilotACPClient):
         self._client = client
 
     async def create(self, **kwargs: Any) -> Any:
@@ -378,7 +379,7 @@ class _ACPChatCompletions:
 
 
 class _ACPChatNamespace:
-    def __init__(self, client: "CopilotACPClient"):
+    def __init__(self, client: CopilotACPClient):
         self.completions = _ACPChatCompletions(client)
 
 
@@ -448,7 +449,7 @@ class CopilotACPClient:
                 process.kill()
             await _finish_owned_task(asyncio.create_task(process.wait()))
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if process.returncode is None:
                 process.kill()
             await _finish_owned_task(asyncio.create_task(process.wait()))
@@ -585,7 +586,7 @@ class CopilotACPClient:
                     raw_line = await asyncio.wait_for(
                         process.stdout.readline(), timeout=min(0.1, remaining)
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
                 if not raw_line:
                     if process.returncode is None:

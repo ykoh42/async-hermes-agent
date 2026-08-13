@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional
 
 import httpx
 
@@ -83,7 +82,7 @@ async def read_streaming_error_body(
     iterator is sufficient to release the response stream; the provider's
     own read timeout remains the lower-level socket guard.
     """
-    chunks: List[bytes] = []
+    chunks: list[bytes] = []
     total = 0
 
     async def _drain() -> None:
@@ -101,7 +100,7 @@ async def read_streaming_error_body(
 
     try:
         await asyncio.wait_for(_drain(), timeout=timeout_s)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.debug(
             "bounded async error-body read: hard timeout after %.1fs (%d bytes so far)",
             timeout_s,
@@ -129,7 +128,7 @@ async def read_error_body_or_default(
     *,
     max_bytes: int = DEFAULT_ERROR_BODY_MAX_BYTES,
     timeout_s: float = DEFAULT_ERROR_BODY_TIMEOUT_S,
-) -> Optional[str]:
+) -> str | None:
     """Like ``read_streaming_error_body`` but returns ``None`` on empty body.
 
     Convenience for callers that distinguish "no body" from "empty string".

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any
 
 from hermes_cli.config import load_config_readonly
 from plugins.video_gen.xai import (
@@ -28,13 +28,13 @@ async def _check_xai_video_requirements() -> bool:
     return await _configured_for_xai_video() and await has_xai_video_credentials()
 
 
-def _clean_string(value: Any) -> Optional[str]:
+def _clean_string(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
 
 
-def _coerce_int(value: Any) -> Optional[int]:
+def _coerce_int(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool):
@@ -57,7 +57,7 @@ def _provider_not_configured_error() -> str:
     })
 
 
-def _normalize_public_video_url(video_url: Any) -> Optional[str]:
+def _normalize_public_video_url(video_url: Any) -> str | None:
     """Require a public HTTPS MP4 URL (``http``/``https`` only)."""
     cleaned = _clean_string(video_url)
     if not cleaned:
@@ -67,7 +67,7 @@ def _normalize_public_video_url(video_url: Any) -> Optional[str]:
     return None
 
 
-XAI_VIDEO_EDIT_SCHEMA: Dict[str, Any] = {
+XAI_VIDEO_EDIT_SCHEMA: dict[str, Any] = {
     "name": "xai_video_edit",
     "description": (
         "Edit an existing video with xAI Imagine. This is separate from "
@@ -99,7 +99,7 @@ XAI_VIDEO_EDIT_SCHEMA: Dict[str, Any] = {
 }
 
 
-XAI_VIDEO_EXTEND_SCHEMA: Dict[str, Any] = {
+XAI_VIDEO_EXTEND_SCHEMA: dict[str, Any] = {
     "name": "xai_video_extend",
     "description": (
         "Extend an existing video with xAI Imagine. This is separate from "
@@ -138,7 +138,7 @@ XAI_VIDEO_EXTEND_SCHEMA: Dict[str, Any] = {
 }
 
 
-async def _handle_xai_video_edit(args: Dict[str, Any], **_kw: Any) -> str:
+async def _handle_xai_video_edit(args: dict[str, Any], **_kw: Any) -> str:
     prompt = _clean_string(args.get("prompt"))
     video_url = _normalize_public_video_url(args.get("video_url"))
     model = _clean_string(args.get("model"))
@@ -161,7 +161,7 @@ async def _handle_xai_video_edit(args: Dict[str, Any], **_kw: Any) -> str:
     return json.dumps(result)
 
 
-async def _handle_xai_video_extend(args: Dict[str, Any], **_kw: Any) -> str:
+async def _handle_xai_video_extend(args: dict[str, Any], **_kw: Any) -> str:
     prompt = _clean_string(args.get("prompt"))
     video_url = _normalize_public_video_url(args.get("video_url"))
     model = _clean_string(args.get("model"))

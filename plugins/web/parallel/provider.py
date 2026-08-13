@@ -29,7 +29,7 @@ import threading
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any
 
 import aiofiles.os
 
@@ -444,7 +444,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute a Parallel search through the native async SDK.
 
         Uses the ``beta.search`` endpoint with the configured mode
@@ -494,8 +494,8 @@ class ParallelWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": f"Parallel search failed: {exc}"}
 
     async def extract(
-        self, urls: List[str], **kwargs: Any
-    ) -> List[Dict[str, Any]]:
+        self, urls: list[str], **kwargs: Any
+    ) -> list[dict[str, Any]]:
         """Extract content from one or more URLs via the async SDK.
 
         Returns the legacy list-of-results shape that
@@ -518,7 +518,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
                     full_content=True,
                 )
 
-            results: List[Dict[str, Any]] = []
+            results: list[dict[str, Any]] = []
             for result in response.results or []:
                 content = result.full_content or ""
                 if not content:
@@ -561,7 +561,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
                 for u in urls
             ]
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Parallel",
             "badge": "paid",

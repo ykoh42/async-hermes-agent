@@ -26,7 +26,7 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, Dict
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -48,7 +48,7 @@ class DebugSession:
         self.enabled = os.getenv(env_var, "false").lower() == "true"
         self.session_id = str(uuid.uuid4()) if self.enabled else ""
         self.log_dir = get_hermes_home() / "logs"
-        self._calls: list[Dict[str, Any]] = []
+        self._calls: list[dict[str, Any]] = []
         self._start_time = datetime.datetime.now().isoformat() if self.enabled else ""
 
         if self.enabled:
@@ -59,7 +59,7 @@ class DebugSession:
     def active(self) -> bool:
         return self.enabled
 
-    def log_call(self, call_name: str, call_data: Dict[str, Any]) -> None:
+    def log_call(self, call_name: str, call_data: dict[str, Any]) -> None:
         """Append a tool-call entry to the in-memory log."""
         if not self.enabled:
             return
@@ -91,7 +91,7 @@ class DebugSession:
         except Exception as e:
             logger.error("Error saving %s debug log: %s", self.tool_name, e)
 
-    def get_session_info(self) -> Dict[str, Any]:
+    def get_session_info(self) -> dict[str, Any]:
         """Return a summary dict suitable for returning from get_debug_session_info()."""
         if not self.enabled:
             return {

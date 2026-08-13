@@ -30,7 +30,8 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -66,7 +67,7 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
-) -> Optional[str]:
+) -> str | None:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
@@ -97,7 +98,7 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
-def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
+def substitute_api_content(api_msg: dict[str, Any]) -> str | None:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
     Used at every API-bound message-build site (the ``api_messages`` build in
@@ -120,7 +121,7 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     return sidecar
 
 
-def drop_stale_api_content(msg: Dict[str, Any]) -> None:
+def drop_stale_api_content(msg: dict[str, Any]) -> None:
     """Drop the ``api_content`` sidecar from a message whose content was rewritten.
 
     Called from every content-rewrite path (historical image strip,
@@ -132,7 +133,7 @@ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
-def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
+def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> int:
     """Locate this turn's user message after compaction rebuilt ``messages``.
 
     Compression replaces list entries with fresh copies (and may append a
@@ -199,7 +200,7 @@ def _compression_warrants_another_preflight_pass(
 
 
 def _should_run_preflight_estimate(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     protect_first_n: int,
     protect_last_n: int,
     threshold_tokens: int,
@@ -269,11 +270,11 @@ class TurnContext:
     # Clean message preserved for transcripts / memory queries (no nudge injection).
     original_user_message: Any
     # Working message list for this turn (loop appends to it).
-    messages: List[Dict[str, Any]]
+    messages: list[dict[str, Any]]
     # May be reset to None by preflight compression (new session created).
-    conversation_history: Optional[List[Dict[str, Any]]]
+    conversation_history: list[dict[str, Any]] | None
     # Cached system prompt active for this turn (may be rebuilt by compression).
-    active_system_prompt: Optional[str]
+    active_system_prompt: str | None
     # Task / turn identifiers.
     effective_task_id: str
     turn_id: str
@@ -292,15 +293,15 @@ class TurnContext:
 async def build_turn_context(
     agent,
     user_message: Any,
-    system_message: Optional[str],
-    conversation_history: Optional[List[Dict[str, Any]]],
-    task_id: Optional[str],
+    system_message: str | None,
+    conversation_history: list[dict[str, Any]] | None,
+    task_id: str | None,
     stream_callback,
-    persist_user_message: Optional[Any],
-    persist_user_timestamp: Optional[float] = None,
+    persist_user_message: Any | None,
+    persist_user_timestamp: float | None = None,
     *,
-    persist_user_display_kind: Optional[str] = None,
-    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    persist_user_display_kind: str | None = None,
+    persist_user_display_metadata: dict[str, Any] | None = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,

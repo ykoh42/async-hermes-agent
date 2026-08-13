@@ -38,7 +38,8 @@ reference.
 from __future__ import annotations
 
 import copy
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any
+from collections.abc import Callable
 
 #: Auto-migration support floor. Configs whose on-disk ``_config_version`` is
 #: below this are NOT auto-migrated any more (policy decision, July 2026):
@@ -73,7 +74,7 @@ def _cfg():
     return config
 
 
-def _migrate_to_12(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_12(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 11 → 12: migrate custom_providers list → providers dict ──
     _c = _cfg()
     read_raw_config = _c.read_raw_config
@@ -143,7 +144,7 @@ def _migrate_to_12(results: Dict[str, Any], quiet: bool) -> None:
                     print(f"    → {key}: {ep.get('api', '')}")
 
 
-def _migrate_to_13(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_13(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 12 → 13: clear dead LLM_MODEL / OPENAI_MODEL from .env ──
     # These env vars were written by the old setup wizard but nothing reads
     # them anymore (config.yaml is the sole source of truth since March 2026).
@@ -163,7 +164,7 @@ def _migrate_to_13(results: Dict[str, Any], quiet: bool) -> None:
             pass
 
 
-def _migrate_to_17(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_17(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 16 → 17: remove legacy compression.summary_* keys ──
     _c = _cfg()
     read_raw_config = _c.read_raw_config
@@ -205,7 +206,7 @@ def _migrate_to_17(results: Dict[str, Any], quiet: bool) -> None:
                     print("  ✓ Removed unused compression.summary_* keys")
 
 
-def _migrate_to_21(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_21(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 20 → 21: plugins are now opt-in; grandfather existing user plugins ──
     # The loader now requires plugins to appear in ``plugins.enabled`` before
     # loading. Existing installs had all discovered plugins loading by default
@@ -234,7 +235,7 @@ def _migrate_to_21(results: Dict[str, Any], quiet: bool) -> None:
         disabled_set = set(disabled)
 
         # Scan ``$HERMES_HOME/plugins/`` for currently installed user plugins.
-        grandfathered: List[str] = []
+        grandfathered: list[str] = []
         try:
             user_plugins_dir = get_hermes_home() / "plugins"
             if user_plugins_dir.is_dir():
@@ -277,7 +278,7 @@ def _migrate_to_21(results: Dict[str, Any], quiet: bool) -> None:
                 )
 
 
-def _migrate_to_25(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_25(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 24 → 25: lower model_catalog TTL 24h → 1h ──
     # The model picker now refreshes its curated list hourly so freshly
     # published model-catalog.json deploys reach users without a day-long
@@ -298,7 +299,7 @@ def _migrate_to_25(results: Dict[str, Any], quiet: bool) -> None:
             print("  ✓ Lowered model_catalog.ttl_hours to 1 (hourly picker refresh)")
 
 
-def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_29(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 28 → 29: retire the removed write-mode gates ──
     # The library build has no curator/CLI approval queue. Remove the historical
     # keys instead of migrating them into configuration that no runtime path
@@ -329,7 +330,7 @@ def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
             print("  ✓ Removed obsolete memory/skills write gates")
 
 
-def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
+def _migrate_to_33(results: dict[str, Any], quiet: bool) -> None:
     # ── Version 32 → 33: unify delegation concurrency caps ──
     # delegation.max_async_children is deprecated: max_concurrent_children now
     # caps both a single batch's parallelism and concurrent background
@@ -373,7 +374,7 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
 #: observe earlier steps' writes via read_raw_config() (filesystem state).
-MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
+MIGRATIONS: tuple[tuple[int, Callable[[dict[str, Any], bool], None]], ...] = (
     # v12 is the support floor: configs already AT v12 (or newer) still get
     # every remaining step below. Only configs BELOW 12 are refused by the
     # floor gate in run_migrations().
@@ -387,7 +388,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
 )
 
 
-def run_migrations(current_ver: int, results: Dict[str, Any], quiet: bool) -> None:
+def run_migrations(current_ver: int, results: dict[str, Any], quiet: bool) -> None:
     """Apply every registered migration whose target version exceeds *current_ver*.
 
     Replicates the original ladder's semantics exactly: *current_ver* is the

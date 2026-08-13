@@ -59,7 +59,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -192,7 +192,7 @@ _EDIT_FORMAT_GUIDANCE: dict[str, tuple[tuple[str, ...], str]] = {
 }
 
 
-def _model_family(model: Optional[str]) -> Optional[str]:
+def _model_family(model: str | None) -> str | None:
     """Classify a model id into an edit-format family key, or ``None``.
 
     Used to steer the coding posture toward the edit tool format a model was
@@ -208,7 +208,7 @@ def _model_family(model: Optional[str]) -> Optional[str]:
     return None
 
 
-def _edit_format_line(model: Optional[str]) -> str:
+def _edit_format_line(model: str | None) -> str:
     """The edit-format guidance line for this model's family (``""`` if none)."""
     family = _model_family(model)
     if family is None:
@@ -294,9 +294,9 @@ class ContextProfile:
     """
 
     name: str
-    toolset: Optional[str] = None
+    toolset: str | None = None
     guidance: str = ""
-    model_hint: Optional[str] = None
+    model_hint: str | None = None
     memory_policy: str = "default"
     compact_skill_categories: tuple[str, ...] = ()
 
@@ -338,7 +338,7 @@ def get_profile(name: str) -> ContextProfile:
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
+def _coding_instructions(config: dict[str, Any] | None) -> str:
     """Standing operator instructions for the coding posture (config).
 
     ``agent.coding_instructions`` — a string or list of strings appended to the
@@ -354,7 +354,7 @@ def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
     return str(raw or "").strip()
 
 
-async def _load_coding_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+async def _load_coding_config(config: dict[str, Any] | None) -> dict[str, Any]:
     if config is not None:
         return config
     try:
@@ -366,7 +366,7 @@ async def _load_coding_config(config: Optional[dict[str, Any]]) -> dict[str, Any
         return {}
 
 
-def _coding_mode(config: Optional[dict[str, Any]]) -> str:
+def _coding_mode(config: dict[str, Any] | None) -> str:
     """Normalize the configured coding-context mode without I/O."""
     raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
     mode = str(raw).strip().lower()
@@ -379,7 +379,7 @@ def _coding_mode(config: Optional[dict[str, Any]]) -> str:
     return "auto"
 
 
-async def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
+async def _resolve_cwd(cwd: str | Path | None) -> Path:
     """Resolve a session cwd without synchronous directory validation."""
     if cwd:
         return Path(cwd).expanduser()
@@ -393,14 +393,14 @@ async def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 
 
 
-async def _home() -> Optional[Path]:
+async def _home() -> Path | None:
     try:
         return Path(await _realpath(Path.home()))
     except (OSError, RuntimeError):
         return None
 
 
-async def _git_root(cwd: Path) -> Optional[Path]:
+async def _git_root(cwd: Path) -> Path | None:
     """Find a git root using awaitable metadata checks."""
     current = cwd if cwd.is_absolute() else Path(await aiofiles.os.getcwd()) / cwd
     for parent in [current, *current.parents]:
@@ -416,7 +416,7 @@ async def _git_root(cwd: Path) -> Optional[Path]:
 
 
 
-async def _marker_root(cwd: Path) -> Optional[Path]:
+async def _marker_root(cwd: Path) -> Path | None:
     """Find the nearest project marker without blocking metadata calls."""
     current = cwd if cwd.is_absolute() else Path(await aiofiles.os.getcwd()) / cwd
     home = await _home()
@@ -479,7 +479,7 @@ class RuntimeMode:
     # The model id this session runs (e.g. "anthropic/claude-opus-4.8"). Used
     # only to steer edit-format guidance toward the model's family — see
     # ``_edit_format_line``. Fixed for the session, so cache-safe.
-    model: Optional[str] = None
+    model: str | None = None
     # Standing operator instructions (``agent.coding_instructions``), appended
     # as an extra stable system block. Empty unless the user configures it.
     instructions: str = ""
@@ -493,8 +493,8 @@ class RuntimeMode:
         return self.profile.name == CODING_PROFILE.name
 
     async def toolset_selection(
-        self, config: Optional[dict[str, Any]] = None
-    ) -> Optional[list[str]]:
+        self, config: dict[str, Any] | None = None
+    ) -> list[str] | None:
         """Toolset list for this posture, or ``None`` to keep the platform default.
 
         Non-``None`` only under the opt-in ``focus`` mode. The default posture
@@ -570,10 +570,10 @@ class RuntimeMode:
 
 async def resolve_runtime_mode(
     *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
-    model: Optional[str] = None,
+    platform: str | None = None,
+    cwd: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> RuntimeMode:
     """Resolve a runtime mode without blocking the active event loop."""
     resolved_config = await _load_coding_config(config)
@@ -597,9 +597,9 @@ async def resolve_runtime_mode(
 
 async def is_coding_context(
     *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
+    platform: str | None = None,
+    cwd: str | Path | None = None,
+    config: dict[str, Any] | None = None,
 ) -> bool:
     """Whether Hermes should operate in its coding posture right now."""
     return (await resolve_runtime_mode(platform=platform, cwd=cwd, config=config)).is_coding
@@ -607,10 +607,10 @@ async def is_coding_context(
 
 async def coding_selection(
     *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
-) -> Optional[list[str]]:
+    platform: str | None = None,
+    cwd: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> list[str] | None:
     """Toolset selection for the coding posture.
 
     ``None`` unless the user opted into ``focus`` mode AND the posture is
@@ -624,10 +624,10 @@ async def coding_selection(
 
 async def coding_system_blocks(
     *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
-    model: Optional[str] = None,
+    platform: str | None = None,
+    cwd: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> list[str]:
     """Stable system-prompt blocks for the current posture (empty when general).
 
@@ -643,9 +643,9 @@ async def coding_system_blocks(
 
 async def coding_compact_skill_categories(
     *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
+    platform: str | None = None,
+    cwd: str | Path | None = None,
+    config: dict[str, Any] | None = None,
 ) -> frozenset[str]:
     """Skill categories the active posture demotes to names-only in the index.
 
@@ -663,10 +663,10 @@ async def coding_compact_skill_categories(
 
 async def coding_system_prompt_parts(
     *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
-    model: Optional[str] = None,
+    platform: str | None = None,
+    cwd: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Async prompt parts used by the agent's active system-prompt path."""
     mode = await resolve_runtime_mode(
@@ -675,7 +675,7 @@ async def coding_system_prompt_parts(
     return await mode.system_prompt_parts()
 
 
-async def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
+async def _enabled_mcp_servers(config: dict[str, Any] | None) -> list[str]:
     """Names of MCP servers the user has enabled — kept in the coding posture.
 
     MCP servers (figma, browser, tophat, …) are explicitly configured and part
@@ -749,8 +749,8 @@ class ProjectFacts:
 
 
 async def project_facts_for(
-    cwd: Optional[str | Path] = None,
-) -> Optional[dict[str, Any]]:
+    cwd: str | Path | None = None,
+) -> dict[str, Any] | None:
     """Structured project facts for ``cwd`` — ``None`` outside a workspace.
 
     Same detection the system-prompt snapshot uses (git root, else marker root),
@@ -821,7 +821,7 @@ async def _git(cwd: Path, *args: str) -> str:
         stdout, _ = await asyncio.wait_for(
             asyncio.shield(communicate), timeout=_GIT_TIMEOUT
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         try:
             process.kill()
         except ProcessLookupError:
@@ -870,7 +870,7 @@ async def _read_small(path: Path) -> str:
         stat = await aiofiles.os.stat(path)
         if stat.st_size > _MAX_FACT_FILE_BYTES:
             return ""
-        async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as handle:
+        async with aiofiles.open(path, encoding="utf-8", errors="replace") as handle:
             return await handle.read()
     except (OSError, UnicodeError):
         return ""
@@ -962,7 +962,7 @@ def _render_project_facts(facts: ProjectFacts) -> list[str]:
     return lines
 
 
-async def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
+async def build_coding_workspace_block(cwd: str | Path | None = None) -> str:
     """Async workspace snapshot preserving the synchronous output format."""
     resolved = await _resolve_cwd(cwd)
     git_root = await _git_root(resolved)

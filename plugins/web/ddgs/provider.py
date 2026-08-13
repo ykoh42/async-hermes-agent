@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -78,10 +78,10 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
 
 # Optional test-only hook name forwarded to the child (see _search_worker.py).
 # Production search() never sets this.
-_test_hook: Optional[str] = None
+_test_hook: str | None = None
 
 # Last worker Popen started by ``_run_ddgs_search_bounded`` (test reap checks).
-_last_worker_proc: Optional[Any] = None
+_last_worker_proc: Any | None = None
 
 
 async def _finish_worker_cleanup(
@@ -107,7 +107,7 @@ async def _finish_worker_cleanup(
             await asyncio.wait_for(
                 asyncio.shield(drain_task), timeout=_TERMINATE_GRACE_SECS
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if proc.returncode is None:
                 proc.kill()
             await drain_task
@@ -299,7 +299,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return False
 
-    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute a DuckDuckGo search and return normalized results.
 
         The synchronous ``ddgs`` call runs in a disposable child process with
@@ -349,7 +349,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
         )
         return {"success": True, "data": {"web": web_results}}
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "DuckDuckGo (ddgs)",
             "badge": "free · no key · search only",

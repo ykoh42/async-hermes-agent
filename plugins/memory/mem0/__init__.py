@@ -37,7 +37,7 @@ import os
 from pathlib import Path
 import secrets
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -231,7 +231,7 @@ class Mem0MemoryProvider(MemoryProvider):
     """
 
     def __init__(self):
-        self._config: Dict[str, Any] = {}
+        self._config: dict[str, Any] = {}
         self._backend = None
         self._mode = "platform"
         self._api_key = ""
@@ -438,7 +438,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     )
                     self._init_error = str(exc)
 
-    def _read_filters(self) -> Dict[str, Any]:
+    def _read_filters(self) -> dict[str, Any]:
         # Scoped to user_id only — by design — so recall surfaces memories
         # written from any gateway/agent under this principal. Writes attach
         # agent_id (and metadata.channel) so per-agent / per-channel views are
@@ -446,7 +446,7 @@ class Mem0MemoryProvider(MemoryProvider):
         # cross-agent recall.
         return {"user_id": self._user_id}
 
-    def _write_metadata(self) -> Dict[str, Any]:
+    def _write_metadata(self) -> dict[str, Any]:
         # Tag every write with the gateway channel so the dashboard can offer
         # per-channel filtered views without coupling identity to the channel.
         return {"channel": self._channel} if self._channel else {}
@@ -573,7 +573,7 @@ class Mem0MemoryProvider(MemoryProvider):
             self._record_failure()
             logger.warning("Mem0 sync failed: %s", exc)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
 
     async def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:

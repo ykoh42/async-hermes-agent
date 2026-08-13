@@ -19,7 +19,8 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Mapping, Optional
+from typing import Any
+from collections.abc import Callable, Mapping
 
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli import plugins as _plugins_bootstrap  # noqa: F401
@@ -37,7 +38,7 @@ class SubagentLifecycleError(ValueError):
     """A request cannot be safely accepted by the public lifecycle API."""
 
 
-class SubagentState(str, enum.Enum):
+class SubagentState(str, enum.Enum):  # noqa: UP042 - preserve legacy str() output
     PENDING = "PENDING"
     STARTING = "STARTING"
     RUNNING = "RUNNING"
@@ -52,27 +53,27 @@ class SubagentState(str, enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class SubagentLaunchRequest:
     goal: str
-    context: Optional[str] = None
+    context: str | None = None
     role: str = "leaf"
-    model: Optional[str] = None
-    allowed_toolsets: Optional[tuple[str, ...]] = None
+    model: str | None = None
+    allowed_toolsets: tuple[str, ...] | None = None
     blocked_tools: tuple[str, ...] = ()
-    working_directory: Optional[str] = None
-    parent_session_id: Optional[str] = None
-    correlation_id: Optional[str] = None
+    working_directory: str | None = None
+    parent_session_id: str | None = None
+    correlation_id: str | None = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
-    timeout_seconds: Optional[float] = None
+    timeout_seconds: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class SubagentHandle:
     contract_version: int
     subagent_id: str
-    parent_session_id: Optional[str]
-    correlation_id: Optional[str]
+    parent_session_id: str | None
+    correlation_id: str | None
     created_at: float
-    provider: Optional[str]
-    model: Optional[str]
+    provider: str | None
+    model: str | None
     role: str
     depth: int
     capability: str
@@ -81,7 +82,7 @@ class SubagentHandle:
         return dataclasses.asdict(self)
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "SubagentHandle":
+    def from_dict(cls, value: Mapping[str, Any]) -> SubagentHandle:
         try:
             return cls(**dict(value))
         except (TypeError, ValueError) as exc:
@@ -93,7 +94,7 @@ class SubagentStatus:
     handle: SubagentHandle
     state: SubagentState
     updated_at: float
-    diagnostic: Optional[str] = None
+    diagnostic: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,7 +103,7 @@ class SubagentTerminalState:
     state: SubagentState
     completed: bool
     timed_out: bool = False
-    diagnostic: Optional[str] = None
+    diagnostic: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,22 +120,22 @@ class SubagentResult:
     handle: SubagentHandle
     terminal_state: SubagentState
     ready: bool
-    summary: Optional[str] = None
-    structured_payload: Optional[Mapping[str, Any]] = None
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    error_classification: Optional[str] = None
-    error_message: Optional[str] = None
+    summary: str | None = None
+    structured_payload: Mapping[str, Any] | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+    error_classification: str | None = None
+    error_message: str | None = None
     usage_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     tool_execution_summary: Mapping[str, Any] = dataclasses.field(default_factory=dict)
-    result_hash: Optional[str] = None
+    result_hash: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class SubagentReconnectResult:
     connected: bool
     state: SubagentState
-    diagnostic: Optional[str] = None
+    diagnostic: str | None = None
 
 
 @dataclasses.dataclass
@@ -143,10 +144,10 @@ class _Record:
     state: SubagentState
     updated_at: float
     agent: Any = None
-    future: Optional[asyncio.Task[None]] = None
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    result: Optional[SubagentResult] = None
+    future: asyncio.Task[None] | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+    result: SubagentResult | None = None
 
 
 class _Registry:
@@ -155,7 +156,7 @@ class _Registry:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.records: dict[str, _Record] = {}
-        self.correlations: dict[tuple[Optional[str], str], str] = {}
+        self.correlations: dict[tuple[str | None, str], str] = {}
 
 
 _REGISTRY = _Registry()
@@ -268,7 +269,7 @@ class SubagentLifecycleService:
             return SubagentStatus(record.handle, record.state, record.updated_at)
 
     async def wait(
-        self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None
+        self, handle: SubagentHandle, *, timeout_seconds: float | None = None
     ) -> SubagentTerminalState:
         record = self._record(handle)
         if record is None:
@@ -347,7 +348,7 @@ class SubagentLifecycleService:
         with _REGISTRY.lock:
             return SubagentReconnectResult(True, record.state)
 
-    def _record(self, handle: SubagentHandle) -> Optional[_Record]:
+    def _record(self, handle: SubagentHandle) -> _Record | None:
         if (
             not isinstance(handle, SubagentHandle)
             or type(handle.contract_version) is not int
@@ -481,7 +482,7 @@ class SubagentLifecycleService:
 
     @staticmethod
     def _capability(
-        subagent_id: str, parent_session_id: Optional[str], created_at: float
+        subagent_id: str, parent_session_id: str | None, created_at: float
     ) -> str:
         value = f"{subagent_id}|{parent_session_id or ''}|{created_at:.6f}".encode()
         return hmac.new(_SECRET, value, hashlib.sha256).hexdigest()

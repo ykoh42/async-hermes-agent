@@ -33,7 +33,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -79,17 +79,17 @@ def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
     return bool(memory_manager and memory_manager.has_tool(function_name))
 
 
-def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
+def convert_to_trajectory_format(agent, messages: list[dict[str, Any]], user_query: str, completed: bool) -> list[dict[str, Any]]:
     """
     Convert internal message format to trajectory format for saving.
     
     Args:
-        messages (List[Dict]): Internal message history
+        messages (list[dict]): Internal message history
         user_query (str): Original user query
         completed (bool): Whether the conversation completed successfully
         
     Returns:
-        List[Dict]: Messages in trajectory format
+        list[dict]: Messages in trajectory format
     """
     # Normalize multimodal tool results — trajectories are text-only, so
     # replace image-bearing tool messages with their text_summary to avoid
@@ -257,8 +257,8 @@ def sanitize_tool_call_arguments(
     messages: list,
     *,
     logger=None,
-    session_id: str = None,
-    cursor: Optional[dict] = None,
+    session_id: str | None = None,
+    cursor: dict | None = None,
 ) -> int:
     """Repair corrupted assistant tool-call argument JSON in-place.
 
@@ -415,11 +415,11 @@ def sanitize_tool_call_arguments(
 # never see (#64934).  Keyed by session_id so that route produces the same
 # named warning.  Process-local by design — same visibility scope as the
 # per-agent marker it extends.
-_INFLIGHT_TURNS_BY_SESSION: Dict[Tuple[str, str], Tuple[str, float]] = {}
+_INFLIGHT_TURNS_BY_SESSION: dict[tuple[str, str], tuple[str, float]] = {}
 _INFLIGHT_TURNS_BY_SESSION_GUARD = threading.RLock()
 
 
-def _turn_session_scope_key(session_id: str) -> Tuple[str, str]:
+def _turn_session_scope_key(session_id: str) -> tuple[str, str]:
     """Key the diagnostic slot by the active library profile and session."""
     profile = os.path.normcase(os.path.normpath(os.fspath(get_hermes_home())))
     return profile, session_id
@@ -521,7 +521,7 @@ def note_turn_persisted(agent):
     agent._inflight_turn_session_scope_key = None
 
 
-def repair_message_sequence(agent, messages: List[Dict]) -> int:
+def repair_message_sequence(agent, messages: list[dict]) -> int:
     """Collapse malformed role-alternation left in the live history.
 
     Providers (OpenAI, OpenRouter, Anthropic) expect strict alternation:
@@ -582,20 +582,20 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     # that must be replayed verbatim. Collapsing them corrupts the
     # Responses replay chain (the duplicate-detection logic at
     # conversation_loop.py already de-dups identical codex interims).
-    def _is_codex_interim(m: Dict) -> bool:
+    def _is_codex_interim(m: dict) -> bool:
         return bool(
             m.get("codex_reasoning_items")
             or m.get("codex_message_items")
             or m.get("finish_reason") == "incomplete"
         )
 
-    def _is_verification_candidate(m: Dict) -> bool:
+    def _is_verification_candidate(m: dict) -> bool:
         return m.get("finish_reason") in {
             "verification_required",
             "verify_hook_continue",
         }
 
-    collapsed: List[Dict] = []
+    collapsed: list[dict] = []
     for msg in messages:
         if (
             collapsed
@@ -665,7 +665,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     # ``_get_tool_call_id_static``'s ``call_id || id`` — a match set must
     # accept every legitimate reference, not just the canonical one (#58168).
     known_tool_ids: set = set()
-    filtered: List[Dict] = []
+    filtered: list[dict] = []
     for msg in collapsed:
         if not isinstance(msg, dict):
             filtered.append(msg)
@@ -703,7 +703,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
 
     # Pass 2: merge consecutive user messages. Preserves all user input
     # so nothing the user typed is lost.
-    merged: List[Dict] = []
+    merged: list[dict] = []
     for msg in filtered:
         if (
             merged
@@ -740,7 +740,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     return repairs
 
 
-def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
+def repair_message_sequence_with_cursor(agent, messages: list[dict]) -> int:
     """Run :func:`repair_message_sequence` and keep the SessionDB flush
     cursor consistent with the compacted list (#44837).
 
@@ -931,10 +931,10 @@ def sync_credential_pool_entry_id(agent) -> None:
 async def recover_with_credential_pool(
     agent,
     *,
-    status_code: Optional[int],
+    status_code: int | None,
     has_retried_429: bool,
-    classified_reason: Optional[FailoverReason] = None,
-    error_context: Optional[Dict[str, Any]] = None,
+    classified_reason: FailoverReason | None = None,
+    error_context: dict[str, Any] | None = None,
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation.
 
@@ -1357,10 +1357,10 @@ async def try_recover_primary_transport(
 
 
 def drop_thinking_only_and_merge_users(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     *,
     drop_codex_reasoning_items: bool = True,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
 
     Runs on the per-call ``api_messages`` copy only. The stored
@@ -1393,7 +1393,7 @@ def drop_thinking_only_and_merge_users(
         return messages
 
     # Pass 2: merge any newly-adjacent user messages.
-    merged: List[Dict[str, Any]] = []
+    merged: list[dict[str, Any]] = []
     merges = 0
     for m in kept:
         prev = merged[-1] if merged else None
@@ -1425,7 +1425,7 @@ def drop_thinking_only_and_merge_users(
                 else:
                     prev_copy["content"] = list(prev_content)
             elif isinstance(prev_content, str) and isinstance(cur_content, list):
-                new_blocks: List[Dict[str, Any]] = []
+                new_blocks: list[dict[str, Any]] = []
                 if prev_content:
                     new_blocks.append({"type": "text", "text": prev_content})
                 new_blocks.extend(cur_content)
@@ -1751,7 +1751,7 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
 
 
 
-def extract_reasoning(agent, assistant_message) -> Optional[str]:
+def extract_reasoning(agent, assistant_message) -> str | None:
     """
     Extract reasoning/thinking content from an assistant message.
     
@@ -1835,11 +1835,11 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 async def dump_api_request_debug(
     agent,
-    api_kwargs: Dict[str, Any],
+    api_kwargs: dict[str, Any],
     *,
     reason: str,
-    error: Optional[Exception] = None,
-) -> Optional[Path]:
+    error: Exception | None = None,
+) -> Path | None:
     """
     Dump a debug-friendly HTTP request record for the active inference API.
 
@@ -1858,7 +1858,7 @@ async def dump_api_request_debug(
         except Exception as e:
             _ra().logger.debug("Could not extract API key for debug dump: %s", e)
 
-        dump_payload: Dict[str, Any] = {
+        dump_payload: dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "session_id": agent.session_id,
             "reason": reason,
@@ -1874,7 +1874,7 @@ async def dump_api_request_debug(
         }
 
         if error is not None:
-            error_info: Dict[str, Any] = {
+            error_info: dict[str, Any] = {
                 "type": type(error).__name__,
                 "message": str(error),
             }
@@ -1949,10 +1949,10 @@ async def dump_api_request_debug(
 def _direct_native_anthropic_tool_cache_capability(
     agent,
     *,
-    provider: Optional[str] = None,
-    base_url: Optional[str] = None,
-    api_mode: Optional[str] = None,
-    model: Optional[str] = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+    api_mode: str | None = None,
+    model: str | None = None,
 ) -> bool:
     """Return whether the resolved destination accepts native tool markers."""
     del provider, model
@@ -1985,7 +1985,7 @@ async def prompt_caching_disabled_from_config() -> bool:
     return cache_ttl_means_disabled(ttl)
 
 
-async def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
+async def blank_cache_policy_stub(cache_disabled: bool | None = None):
     """Build the canonical destination-only prompt-cache policy stub."""
     from types import SimpleNamespace
 
@@ -2002,14 +2002,14 @@ async def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
 
 async def plan_cache_sections_for_destination(
     messages: list,
-    tools: Optional[list],
+    tools: list | None,
     *,
     provider: str,
     base_url: str,
     api_mode: str,
     model: str,
-    cache_disabled: Optional[bool] = None,
-) -> tuple[list, Optional[list]]:
+    cache_disabled: bool | None = None,
+) -> tuple[list, list | None]:
     """Build request-local cache sections for an explicitly named route."""
     from agent.prompt_caching import (
         build_prompt_cache_plan,
@@ -2049,10 +2049,10 @@ async def plan_cache_sections_for_destination(
 def anthropic_prompt_cache_policy(
     agent,
     *,
-    provider: Optional[str] = None,
-    base_url: Optional[str] = None,
-    api_mode: Optional[str] = None,
-    model: Optional[str] = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+    api_mode: str | None = None,
+    model: str | None = None,
 ) -> tuple[bool, bool]:
     """Decide whether to apply Anthropic prompt caching and which layout to use.
 
@@ -2758,11 +2758,11 @@ async def invoke_tool(
     function_name: str,
     function_args: dict,
     effective_task_id: str,
-    tool_call_id: Optional[str] = None,
-    messages: list = None,
+    tool_call_id: str | None = None,
+    messages: list | None = None,
     pre_tool_block_checked: bool = False,
     skip_tool_request_middleware: bool = False,
-    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    tool_request_middleware_trace: list[dict[str, Any]] | None = None,
     skip_tool_execution_middleware: bool = False,
 ) -> str:
     """Invoke one registry tool through the native async dispatch path."""
@@ -2915,7 +2915,7 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 _INTERRUPTED_PLACEHOLDER = "[response interrupted]"
 
 
-def _msg_has_payload(msg: Dict[str, Any]) -> bool:
+def _msg_has_payload(msg: dict[str, Any]) -> bool:
     """True if ``msg`` carries anything the API treats as non-empty content.
 
     Covers string content, non-empty multimodal content lists, tool_calls,
@@ -2964,8 +2964,8 @@ def _msg_has_payload(msg: Dict[str, Any]) -> bool:
 
 
 def repair_empty_non_final_messages(
-    messages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Heal empty-content non-final messages before they reach the provider.
 
     Root-cause context: a stream that dies with 0 recovered characters (peer
@@ -2998,7 +2998,7 @@ def repair_empty_non_final_messages(
     if not messages or len(messages) < 2:
         return messages
 
-    repaired: List[Dict[str, Any]] = []
+    repaired: list[dict[str, Any]] = []
     healed = 0
     last_idx = len(messages) - 1
     for idx, msg in enumerate(messages):
@@ -3031,7 +3031,7 @@ def repair_empty_non_final_messages(
     return messages
 
 
-def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def sanitize_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
     Runs unconditionally — not gated on whether the context compressor
@@ -3075,7 +3075,7 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # ``repair_message_sequence``, which would destructively rewrite the
     # persisted trajectory. Shallow-copy the message before dropping the key so
     # stored history (and prompt caching) stays byte-stable.
-    normalized: List[Dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
     dropped_empty_tool_calls = 0
     for msg in messages:
         if (
@@ -3173,7 +3173,7 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # 2. Inject stub results for calls whose result was dropped
     missing_results = surviving_call_ids - result_call_ids
     if missing_results:
-        patched: List[Dict[str, Any]] = []
+        patched: list[dict[str, Any]] = []
         for msg in messages:
             patched.append(msg)
             if msg.get("role") == "assistant":
@@ -3202,7 +3202,7 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     #   (b) drop later tool result messages reusing an already-seen id
     seen_assistant_call_ids: set = set()
     seen_result_call_ids: set = set()
-    deduped: List[Dict[str, Any]] = []
+    deduped: list[dict[str, Any]] = []
     removed_dupes = 0
     for msg in messages:
         role = msg.get("role")
@@ -3243,7 +3243,7 @@ def looks_like_codex_intermediate_ack(
     agent,
     user_message: Any,
     assistant_content: str,
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     require_workspace: bool = True,
 ) -> bool:
     """Detect a planning/ack message that should continue instead of ending the turn.
@@ -3433,9 +3433,9 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     )
 
 
-def extract_api_error_context(error: Exception) -> Dict[str, Any]:
+def extract_api_error_context(error: Exception) -> dict[str, Any]:
     """Extract structured rate-limit details from provider errors."""
-    context: Dict[str, Any] = {}
+    context: dict[str, Any] = {}
 
     body = getattr(error, "body", None)
     payload = None
