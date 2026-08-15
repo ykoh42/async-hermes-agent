@@ -113,6 +113,29 @@ _POSTGRES_INDEX_DDL = (
     "coalesce(content, '') || ' ' || coalesce(tool_name, '')))",
 )
 
+_POSTGRES_INDEX_NAMES = frozenset(
+    {
+        "idx_sessions_source",
+        "idx_sessions_source_id",
+        "idx_sessions_parent",
+        "idx_sessions_started",
+        "idx_messages_session",
+        "idx_messages_session_id",
+        "idx_messages_assistant_calls_by_session",
+        "idx_compression_locks_expires",
+        "idx_session_model_usage_session",
+        "idx_session_model_usage_model",
+        "idx_messages_session_active",
+        "idx_messages_active_null",
+        "idx_sessions_session_key",
+        "idx_sessions_gateway_peer",
+        "idx_sessions_handoff_state",
+        "idx_sessions_system_prompt_hash",
+        "idx_messages_platform_msg_id",
+        "messages_hermes_search_idx",
+    }
+)
+
 _POSTGRES_FOREIGN_KEYS = (
     (
         "fk_sessions_parent_session_id",
@@ -134,6 +157,9 @@ _POSTGRES_FOREIGN_KEYS = (
         "session_model_usage",
         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE",
     ),
+)
+_POSTGRES_FOREIGN_KEY_NAMES = frozenset(
+    name for name, _table, _definition in _POSTGRES_FOREIGN_KEYS
 )
 
 
@@ -438,6 +464,74 @@ class SessionDB:
         for statement in _POSTGRES_INDEX_DDL:
             await connection.execute(_sa.text(statement))
 
+    async def _postgres_schema_is_current(
+        self, connection: Any, metadata: Any
+    ) -> bool:
+        """Return whether the additive PostgreSQL schema work is complete.
+
+        Every SessionDB instance performs the readiness handshake in its own
+        process.  Avoid re-running DDL for an already-current schema: a
+        second process entering ``CREATE TABLE``/``ALTER TABLE`` while the
+        first process is serving normal writes can otherwise deadlock on
+        relation locks.  The catalog checks are read-only and run while the
+        advisory transaction lock is held, so a process that observed a
+        partial schema simply waits for the migrator and rechecks it here.
+        """
+        schema_table = await connection.execute(
+            _sa.text("SELECT to_regclass(:table_name)"),
+            {"table_name": "schema_version"},
+        )
+        if schema_table.scalar_one_or_none() is None:
+            return False
+        current_version = (
+            await connection.execute(
+                _sa.text("SELECT max(version) FROM schema_version")
+            )
+        ).scalar_one()
+        if current_version is None or int(current_version) != SCHEMA_VERSION:
+            return False
+
+        for table in metadata.tables.values():
+            table_name = str(table.name)
+            exists = await connection.execute(
+                _sa.text("SELECT to_regclass(:table_name)"),
+                {"table_name": table_name},
+            )
+            if exists.scalar_one_or_none() is None:
+                return False
+            columns = await connection.execute(
+                _sa.text(
+                    "SELECT attname FROM pg_attribute "
+                    "WHERE attrelid = to_regclass(:table_name) "
+                    "AND attnum > 0 AND NOT attisdropped"
+                ),
+                {"table_name": table_name},
+            )
+            present_columns = {str(row[0]) for row in columns}
+            if any(column.name not in present_columns for column in table.columns):
+                return False
+
+        index_rows = await connection.execute(
+            _sa.text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = current_schema()"
+            )
+        )
+        if not _POSTGRES_INDEX_NAMES.issubset(
+            {str(row[0]) for row in index_rows}
+        ):
+            return False
+
+        constraint_rows = await connection.execute(
+            _sa.text(
+                "SELECT c.conname FROM pg_constraint AS c "
+                "JOIN pg_namespace AS n ON n.oid = c.connamespace "
+                "WHERE c.contype = 'f' AND n.nspname = current_schema()"
+            )
+        )
+        constraint_names = {str(row[0]) for row in constraint_rows}
+        return _POSTGRES_FOREIGN_KEY_NAMES.issubset(constraint_names)
+
     async def _ensure_ready(self) -> None:
         if self._closed:
             raise RuntimeError("SessionDB is closed")
@@ -685,6 +779,9 @@ class SessionDB:
                     _sa.text("SELECT pg_advisory_xact_lock(:key)"),
                     {"key": 731948251},
                 )
+                if await self._postgres_schema_is_current(connection, metadata):
+                    self._ready = True
+                    return
                 await connection.run_sync(metadata.create_all)
                 # ``create_all`` intentionally does not alter an existing
                 # table.  Keep the migration boundary explicit and additive
