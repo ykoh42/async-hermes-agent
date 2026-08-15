@@ -69,6 +69,73 @@ _POSTGRES_CONNECT_KEYS = frozenset(
 )
 _POSTGRES_READ_ONLY_SETTING = "default_transaction_read_only"
 
+# Keep the retained SQLite access paths indexed on PostgreSQL as well.  These
+# statements use fixed identifiers only; no caller-controlled SQL is interpolated.
+_POSTGRES_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source "
+    "ON sessions(source)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source_id "
+    "ON sessions(source, id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
+    "ON sessions(parent_session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_started "
+    "ON sessions(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_session "
+    "ON messages(session_id, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_session_id "
+    "ON messages(session_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session "
+    "ON messages(session_id) "
+    "WHERE role = 'assistant' AND tool_calls IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_compression_locks_expires "
+    "ON compression_locks(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
+    "ON session_model_usage(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
+    "ON session_model_usage(model)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_session_active "
+    "ON messages(session_id, active, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_active_null "
+    "ON messages(active) WHERE active IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+    "ON sessions(session_key, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer "
+    "ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state "
+    "ON sessions(handoff_state, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
+    "ON sessions(system_prompt_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+    "ON messages(session_id, platform_message_id) "
+    "WHERE platform_message_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS messages_hermes_search_idx "
+    "ON messages USING GIN (to_tsvector('simple', "
+    "coalesce(content, '') || ' ' || coalesce(tool_name, '')))",
+)
+
+_POSTGRES_FOREIGN_KEYS = (
+    (
+        "fk_sessions_parent_session_id",
+        "sessions",
+        "FOREIGN KEY (parent_session_id) REFERENCES sessions(id)",
+    ),
+    (
+        "fk_sessions_system_prompt_hash",
+        "sessions",
+        "FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)",
+    ),
+    (
+        "fk_messages_session_id",
+        "messages",
+        "FOREIGN KEY (session_id) REFERENCES sessions(id)",
+    ),
+    (
+        "fk_session_model_usage_session_id",
+        "session_model_usage",
+        "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE",
+    ),
+)
+
 
 def _config_number(
     value: Any,
@@ -331,6 +398,46 @@ class SessionDB:
         self._engine_options = dict(options)
         return dict(options)
 
+    async def _ensure_postgres_constraints(self, connection: Any) -> None:
+        """Add retained foreign-key constraints to an older PG schema.
+
+        ``MetaData.create_all`` creates these constraints for a fresh database,
+        but it deliberately does not alter existing tables.  Keep the additive
+        migration explicit and serialized by the surrounding advisory lock.
+        Invalid legacy rows are surfaced to the caller rather than silently
+        weakening referential integrity.
+        """
+        for name, table, definition in _POSTGRES_FOREIGN_KEYS:
+            present = await connection.execute(
+                _sa.text(
+                    "SELECT 1 FROM pg_constraint "
+                    "WHERE conname = :name "
+                    "AND conrelid = to_regclass(:table)"
+                ),
+                {"name": name, "table": table},
+            )
+            if present.scalar_one_or_none() is not None:
+                continue
+            try:
+                await connection.execute(
+                    _sa.text(
+                        f'ALTER TABLE "{table}" ADD CONSTRAINT "{name}" '
+                        f"{definition}"
+                    )
+                )
+            except Exception as exc:
+                # Another process may have created the same fixed constraint
+                # after the existence check.  All other errors, including
+                # invalid legacy references, remain fatal.
+                original = getattr(exc, "orig", None)
+                if getattr(original, "sqlstate", None) != "42710":
+                    raise
+
+    async def _ensure_postgres_indexes(self, connection: Any) -> None:
+        """Create the fixed indexes used by retained SQLite query paths."""
+        for statement in _POSTGRES_INDEX_DDL:
+            await connection.execute(_sa.text(statement))
+
     async def _ensure_ready(self) -> None:
         if self._closed:
             raise RuntimeError("SessionDB is closed")
@@ -395,12 +502,26 @@ class SessionDB:
                     _sa.Column("model", _sa.Text),
                     _sa.Column("model_config", _sa.Text),
                     _sa.Column("system_prompt", _sa.Text),
-                    _sa.Column("system_prompt_hash", _sa.String(128)),
+                    _sa.Column(
+                        "system_prompt_hash",
+                        _sa.String(128),
+                        _sa.ForeignKey(
+                            "system_prompts.hash",
+                            name="fk_sessions_system_prompt_hash",
+                        ),
+                    ),
                     _sa.Column("payload", _sa.Text, nullable=False),
                     _sa.Column("started_at", _sa.Float, nullable=False),
                     _sa.Column("ended_at", _sa.Float),
                     _sa.Column("end_reason", _sa.Text),
-                    _sa.Column("parent_session_id", _sa.String(255)),
+                    _sa.Column(
+                        "parent_session_id",
+                        _sa.String(255),
+                        _sa.ForeignKey(
+                            "sessions.id",
+                            name="fk_sessions_parent_session_id",
+                        ),
+                    ),
                     _sa.Column("message_count", _sa.Integer, nullable=False, default=0),
                     _sa.Column("tool_call_count", _sa.Integer, nullable=False, default=0),
                     _sa.Column("input_tokens", _sa.Integer, nullable=False, default=0),
@@ -443,7 +564,15 @@ class SessionDB:
                     "messages",
                     metadata,
                     _sa.Column("id", _sa.BigInteger, _sa.Identity(), primary_key=True),
-                    _sa.Column("session_id", _sa.String(255), nullable=False),
+                    _sa.Column(
+                        "session_id",
+                        _sa.String(255),
+                        _sa.ForeignKey(
+                            "sessions.id",
+                            name="fk_messages_session_id",
+                        ),
+                        nullable=False,
+                    ),
                     _sa.Column("payload", _sa.Text, nullable=False),
                     _sa.Column("role", _sa.String(64), nullable=False),
                     _sa.Column("content", _sa.Text),
@@ -471,7 +600,16 @@ class SessionDB:
                     "session_model_usage",
                     metadata,
                     _sa.Column("id", _sa.BigInteger, _sa.Identity(), primary_key=True),
-                    _sa.Column("session_id", _sa.String(255), nullable=False),
+                    _sa.Column(
+                        "session_id",
+                        _sa.String(255),
+                        _sa.ForeignKey(
+                            "sessions.id",
+                            name="fk_session_model_usage_session_id",
+                            ondelete="CASCADE",
+                        ),
+                        nullable=False,
+                    ),
                     _sa.Column("model", _sa.Text),
                     _sa.Column("billing_provider", _sa.Text),
                     _sa.Column("billing_base_url", _sa.Text),
@@ -564,6 +702,8 @@ class SessionDB:
                                 f"{type_sql}"
                             )
                         )
+                await self._ensure_postgres_constraints(connection)
+                await self._ensure_postgres_indexes(connection)
                 current_version = (
                     await connection.execute(
                         _sa.text("SELECT max(version) FROM schema_version")
@@ -579,13 +719,6 @@ class SessionDB:
                         "ON CONFLICT (version) DO NOTHING"
                     ),
                     {"version": SCHEMA_VERSION},
-                )
-                await connection.execute(
-                    _sa.text(
-                        "CREATE INDEX IF NOT EXISTS messages_hermes_search_idx "
-                        "ON messages USING GIN (to_tsvector('simple', "
-                        "coalesce(content, '') || ' ' || coalesce(tool_name, '')))"
-                    )
                 )
             self._ready = True
 
@@ -1293,7 +1426,23 @@ class SessionDB:
 
     async def _append(self, connection, values: dict[str, Any]) -> int:
         session_id = str(values["session_id"])
-        session = await self._session(connection, session_id)
+        # Lock the parent row before inserting the child message.  PostgreSQL
+        # takes a key-share lock for the FK check; acquiring the update lock
+        # first gives concurrent appends one stable order and avoids a
+        # deadlock between that FK lock and the counter update below.
+        session_table = self._tables["sessions"]
+        session_row = (
+            await connection.execute(
+                _sa.select(session_table)
+                .where(session_table.c.id == session_id)
+                .with_for_update()
+            )
+        ).first()
+        session = (
+            self._session_from_row(session_row)
+            if session_row is not None
+            else None
+        )
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
         lock_table = self._tables["compression_locks"]

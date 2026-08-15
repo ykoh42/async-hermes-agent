@@ -3855,12 +3855,12 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
         raise AssertionError("the public async turn must not call asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
+    blockbuster = BlockBuster()
     try:
         async with (
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),
         ):
-            blockbuster = BlockBuster()
             blockbuster.activate()
             try:
                 result = await agent.run_conversation("hello async")

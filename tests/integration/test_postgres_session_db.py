@@ -364,6 +364,124 @@ async def test_postgres_crud_search_and_lock_contract():
 
 
 @pytest.mark.asyncio
+async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    from sqlalchemy import text
+
+    database = PostgresSessionDB(dsn)
+    try:
+        await database._ensure_ready()
+        async with database._engine.connect() as connection:
+            tables = {
+                row[0]
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = current_schema()"
+                        )
+                    )
+                ).all()
+            }
+            assert {
+                "schema_version",
+                "system_prompts",
+                "sessions",
+                "messages",
+                "session_model_usage",
+                "state_meta",
+                "compression_locks",
+            } <= tables
+
+            indexes = {
+                row[0]
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = current_schema()"
+                        )
+                    )
+                ).all()
+            }
+            assert {
+                "idx_sessions_source",
+                "idx_sessions_source_id",
+                "idx_sessions_parent",
+                "idx_sessions_started",
+                "idx_messages_session",
+                "idx_messages_session_id",
+                "idx_messages_assistant_calls_by_session",
+                "idx_compression_locks_expires",
+                "idx_session_model_usage_session",
+                "idx_session_model_usage_model",
+                "idx_messages_session_active",
+                "idx_messages_active_null",
+                "idx_sessions_session_key",
+                "idx_sessions_handoff_state",
+                "idx_sessions_system_prompt_hash",
+                "idx_messages_platform_msg_id",
+                "messages_hermes_search_idx",
+            } <= indexes
+
+            constraints = {
+                row[0]
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT conname FROM pg_constraint "
+                            "WHERE conrelid = to_regclass('sessions') "
+                            "OR conrelid = to_regclass('messages') "
+                            "OR conrelid = to_regclass('session_model_usage')"
+                        )
+                    )
+                ).all()
+            }
+            assert {
+                "fk_sessions_parent_session_id",
+                "fk_sessions_system_prompt_hash",
+                "fk_messages_session_id",
+                "fk_session_model_usage_session_id",
+            } <= constraints
+
+            # ``create_all`` alone does not repair an older database.  The
+            # backend's additive migration must restore a dropped retained
+            # index and constraint without changing the public contract.
+            await connection.commit()
+        async with database._engine.begin() as connection:
+            await connection.execute(text("DROP INDEX IF EXISTS idx_sessions_parent"))
+            await connection.execute(
+                text('ALTER TABLE messages DROP CONSTRAINT IF EXISTS "fk_messages_session_id"')
+            )
+        await database.close()
+        database = PostgresSessionDB(dsn)
+        await database._ensure_ready()
+        async with database._engine.connect() as connection:
+            assert (
+                await connection.execute(
+                    text(
+                        "SELECT 1 FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND indexname = 'idx_sessions_parent'"
+                    )
+                )
+            ).scalar_one_or_none() == 1
+            assert (
+                await connection.execute(
+                    text(
+                        "SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'fk_messages_session_id' "
+                        "AND conrelid = to_regclass('messages')"
+                    )
+                )
+            ).scalar_one_or_none() == 1
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_close_repeated_cancellation_is_deterministic():
     dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
     if not dsn:

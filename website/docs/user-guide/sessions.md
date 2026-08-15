@@ -45,8 +45,9 @@ async def stored_conversation():
 schema initialize on the first awaited operation. Passing it explicitly starts
 durable transcript persistence at the turn prologue and selects the database
 path. A recall tool may otherwise open the default `$HERMES_HOME/state.db`
-lazily. In either case the agent closes the database it owns during shutdown.
-`SessionDB.close()` is idempotent.
+lazily. An injected store is borrowed by the agent; the host that created it
+closes it once during worker shutdown. Only a lazily created default store is
+owned by the agent. `SessionDB.close()` is idempotent.
 
 ## Use PostgreSQL for a service
 
@@ -84,7 +85,9 @@ style; only the import and explicit DSN change. A store reads the active
 profile's `database.postgres` pool and driver settings once when its first
 database operation initializes the engine. Create a new store after changing
 those settings. See [SessionDB storage and PostgreSQL settings](../developer-guide/session-storage.md)
-for the supported options.
+for the supported options. Writable initialization creates or additively
+reconciles the retained tables and indexes; read-only initialization never
+migrates an existing database.
 
 For a read-only endpoint, pass `read_only=True`:
 

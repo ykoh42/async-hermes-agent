@@ -60,10 +60,12 @@ agent owns the handle. With a store attached at construction, a turn creates or
 enriches the session row before its first provider request and incrementally
 persists messages during the tool loop.
 
-If you inject a database, lifecycle ownership transfers to that agent:
-`await agent.close()` closes the attached `SessionDB`. Do not share one
-instance among independently owned agents; give each agent its own instance or
-put coordination behind a host abstraction that respects this close contract.
+An injected database is borrowed by the agent: `await agent.close()` ends the
+agent's session work but does not close the attached `SessionDB`. The host that
+created the store owns its lifecycle and should close it once during application
+shutdown. In a service, create one store per worker lifespan and share that
+store among the worker's agents; do not let an individual agent close the
+shared store.
 
 ## Stored data
 
@@ -170,6 +172,15 @@ The profile selected when the store is constructed owns these settings. The
 async connection is still initialized at the first awaited operation, and the
 validated options remain fixed for that store's lifetime. Changing the config
 requires a newly created store. TLS and endpoint selection remain DSN concerns.
+
+On a writable store, first initialization creates or additively reconciles the
+retained tables, foreign keys, and query indexes under a PostgreSQL advisory
+transaction lock, then records the retained schema version. It does not run
+Alembic or perform destructive rewrites. A read-only store only validates the
+existing version and never creates or migrates schema. When a future upstream
+release changes the SQLite schema, the corresponding PostgreSQL column/data
+migration must be ported and tested before that release is advertised for
+existing PostgreSQL databases.
 
 For a read replica or a search/diagnostic connection, use:
 
