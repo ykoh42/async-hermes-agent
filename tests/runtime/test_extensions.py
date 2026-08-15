@@ -12,6 +12,7 @@ from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
+import agent.plugin_stream_hooks as _plugin_stream_hooks_bootstrap  # noqa: F401
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from tools import env_probe, mcp_tool

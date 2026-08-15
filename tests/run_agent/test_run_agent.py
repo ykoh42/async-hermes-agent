@@ -1973,7 +1973,7 @@ class TestConcurrentToolExecution:
     ):
         from agent.tool_executor import execute_tool_calls_concurrent
 
-        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.5")
         cancelled = []
 
         async def never_returns(*_args, **kwargs):
@@ -2005,7 +2005,7 @@ class TestConcurrentToolExecution:
         assert sorted(cancelled) == ["c1", "c2"]
         assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
         assert all(
-            "Error executing tool 'web_search': timed out after 0.1s"
+            "Error executing tool 'web_search': timed out after 0.5s"
             in message["content"]
             for message in messages
         )

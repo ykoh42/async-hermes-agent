@@ -313,7 +313,12 @@ def test_concurrent_event_loops_keep_profile_subprocesses_isolated(
 async def _wait_for_pid(path: Path) -> int:
     for _ in range(500):
         if path.exists():
-            return int(path.read_text(encoding="utf-8"))
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+                if value:
+                    return int(value)
+            except (OSError, ValueError):
+                pass
         await asyncio.sleep(0.01)
     raise AssertionError(f"timed out waiting for {path}")
 
