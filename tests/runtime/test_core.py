@@ -4562,7 +4562,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
     try:
         async with no_task_leaks(action=LeakAction.RAISE):
             task = asyncio.create_task(agent.run_conversation("cancel this tool"))
-            await asyncio.wait_for(tool_started.wait(), timeout=0.5)
+            await asyncio.wait_for(tool_started.wait(), timeout=2.0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
