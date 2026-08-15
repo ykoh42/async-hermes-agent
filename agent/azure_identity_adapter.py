@@ -7,11 +7,13 @@ import hashlib
 import logging
 import os
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
 from collections.abc import Awaitable, Callable
 
+import aiofiles
 import aiofiles.os as _aiofiles_os
 
 from agent.secret_scope import (
@@ -46,14 +48,16 @@ _AZURE_IDENTITY_ENV_NAMES = (
     "AZURE_TENANT_ID",
     "AZURE_TOKEN_CREDENTIALS",
     "AZURE_USERNAME",
+    "AZURE_KUBERNETES_TOKEN_PROXY",
+    "AZURE_KUBERNETES_SNI_NAME",
+    "AZURE_KUBERNETES_CA_FILE",
+    "AZURE_KUBERNETES_CA_DATA",
 )
 _UNSUPPORTED_SCOPED_IDENTITY_ENV_NAMES = (
     "AZURE_CLIENT_CERTIFICATE_PASSWORD",
     "AZURE_CLIENT_CERTIFICATE_PATH",
     "AZURE_CLIENT_SECRET",
     "AZURE_CLIENT_SEND_CERTIFICATE_CHAIN",
-    "AZURE_FEDERATED_TOKEN_FILE",
-    "AZURE_TOKEN_CREDENTIALS",
     "AZURE_USERNAME",
 )
 _CLIENT_SECRET_ENV_NAMES = (
@@ -74,7 +78,6 @@ _UNSUPPORTED_TOKEN_CREDENTIALS = frozenset(
         "azuredeveloperclicredential",
         "azurepowershellcredential",
         "visualstudiocodecredential",
-        "workloadidentitycredential",
     }
 )
 _DEFAULT_CREDENTIAL_EXCLUDES = (
@@ -86,6 +89,16 @@ _DEFAULT_CREDENTIAL_EXCLUDES = (
     "exclude_cli_credential",
     "exclude_developer_cli_credential",
     "exclude_powershell_credential",
+)
+_WORKLOAD_IDENTITY_SELECTOR = "workloadidentitycredential"
+_WORKLOAD_TOKEN_REFRESH_SECONDS = 600.0
+_WORKLOAD_TOKEN_MAX_BYTES = 64 * 1024
+_WORKLOAD_TOKEN_READ_TIMEOUT_SECONDS = 1.0
+_WORKLOAD_PROXY_ENV_NAMES = (
+    "AZURE_KUBERNETES_TOKEN_PROXY",
+    "AZURE_KUBERNETES_SNI_NAME",
+    "AZURE_KUBERNETES_CA_FILE",
+    "AZURE_KUBERNETES_CA_DATA",
 )
 
 _CredentialCacheKey = tuple[str, "EntraIdentityConfig", str]
@@ -183,6 +196,180 @@ def _identity_environment() -> tuple[dict[str, str], bool]:
     )
 
 
+def _workload_identity_parameters(
+    settings: dict[str, str],
+    *,
+    multiplexed: bool,
+) -> dict[str, str] | None:
+    """Return explicit Workload Identity inputs when that credential wins."""
+    selector = settings.get("AZURE_TOKEN_CREDENTIALS", "").strip().lower()
+    token_file_path = settings.get("AZURE_FEDERATED_TOKEN_FILE", "").strip()
+    client_secret_configured = all(
+        settings.get(name, "").strip() for name in _CLIENT_SECRET_ENV_NAMES
+    )
+
+    if selector == "managedidentitycredential":
+        return None
+    if selector not in ("", _WORKLOAD_IDENTITY_SELECTOR):
+        return None
+    if selector == "" and client_secret_configured:
+        return None
+
+    if multiplexed and any(
+        os.environ.get(name, "").strip() for name in _WORKLOAD_PROXY_ENV_NAMES
+    ):
+        raise RuntimeError(
+            "Process-global Azure Workload Identity proxy settings cannot be "
+            "used while profile multiplexing is enabled"
+        )
+    if any(settings.get(name, "").strip() for name in _WORKLOAD_PROXY_ENV_NAMES):
+        raise RuntimeError(
+            "Azure Workload Identity token proxy/identity binding is not supported "
+            "by the bounded native-async adapter"
+        )
+
+    if not token_file_path:
+        if selector == _WORKLOAD_IDENTITY_SELECTOR:
+            raise RuntimeError(
+                "AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential requires "
+                "AZURE_FEDERATED_TOKEN_FILE"
+            )
+        return None
+
+    missing = [
+        name
+        for name in ("AZURE_TENANT_ID", "AZURE_CLIENT_ID")
+        if not settings.get(name, "").strip()
+    ]
+    if missing:
+        names = ", ".join(missing)
+        raise RuntimeError(
+            "WorkloadIdentityCredential requires profile-scoped "
+            f"{names} before token exchange"
+        )
+    return {
+        "tenant_id": settings["AZURE_TENANT_ID"].strip(),
+        "client_id": settings["AZURE_CLIENT_ID"].strip(),
+        "token_file_path": token_file_path,
+        "authority": settings.get("AZURE_AUTHORITY_HOST", "").strip()
+        or _AZURE_PUBLIC_CLOUD_AUTHORITY,
+    }
+
+
+class _AsyncWorkloadIdentityCredential:
+    """Bounded async adapter for Azure's projected Workload Identity token."""
+
+    def __init__(
+        self,
+        identity: Any,
+        *,
+        tenant_id: str,
+        client_id: str,
+        token_file_path: str,
+        authority: str,
+    ) -> None:
+        unavailable = getattr(identity, "CredentialUnavailableError", None)
+        if unavailable is None:
+            try:
+                from azure.identity import CredentialUnavailableError
+            except ImportError:
+                unavailable = RuntimeError
+            else:
+                unavailable = CredentialUnavailableError
+        self._unavailable_error = unavailable
+        self._token_file_path = token_file_path
+        self._inner = identity.ClientAssertionCredential(
+            tenant_id,
+            client_id,
+            self._cached_assertion,
+            authority=authority,
+        )
+        self._refresh_lock = asyncio.Lock()
+        self._read_task: asyncio.Task[str] | None = None
+        self._assertion: str | None = None
+        self._last_read_at: float | None = None
+        self._closed = False
+
+    def _cached_assertion(self) -> str:
+        assertion = self._assertion
+        if assertion is None:
+            raise self._unavailable_error(
+                "Azure Workload Identity token has not been loaded"
+            )
+        return assertion
+
+    async def _read_assertion_file(self) -> str:
+        try:
+            async with asyncio.timeout(_WORKLOAD_TOKEN_READ_TIMEOUT_SECONDS):
+                async with aiofiles.open(
+                    self._token_file_path,
+                    mode="r",
+                    encoding="utf-8",
+                ) as token_file:
+                    value = await token_file.read(_WORKLOAD_TOKEN_MAX_BYTES + 1)
+        except TimeoutError as exc:
+            raise self._unavailable_error(
+                "Azure Workload Identity token file read timed out",
+            ) from exc
+        except OSError as exc:
+            raise self._unavailable_error(
+                "Azure Workload Identity token file is unavailable",
+            ) from exc
+
+        value = value.strip()
+        if not value:
+            raise ValueError("Azure Workload Identity token file is empty")
+        if len(value.encode("utf-8")) > _WORKLOAD_TOKEN_MAX_BYTES:
+            raise ValueError("Azure Workload Identity token file exceeds 64 KiB")
+        return value
+
+    async def _ensure_assertion(self) -> None:
+        async with self._refresh_lock:
+            if self._closed:
+                raise RuntimeError("Azure Workload Identity credential is closed")
+            now = time.monotonic()
+            if (
+                self._assertion is not None
+                and self._last_read_at is not None
+                and now - self._last_read_at < _WORKLOAD_TOKEN_REFRESH_SECONDS
+            ):
+                return
+
+            task = asyncio.create_task(self._read_assertion_file())
+            self._read_task = task
+            try:
+                assertion = await _finish_owned_task(task)
+            finally:
+                if self._read_task is task:
+                    self._read_task = None
+            self._assertion = assertion
+            self._last_read_at = time.monotonic()
+
+    async def get_token(self, *scopes: str, **kwargs: Any) -> Any:
+        await self._ensure_assertion()
+        return await self._inner.get_token(*scopes, **kwargs)
+
+    async def get_token_info(self, *scopes: str, **kwargs: Any) -> Any:
+        await self._ensure_assertion()
+        get_token_info = getattr(self._inner, "get_token_info", None)
+        if get_token_info is None:
+            token = await self._inner.get_token(*scopes, **kwargs)
+            return token
+        return await get_token_info(*scopes, **kwargs)
+
+    async def close(self) -> None:
+        async def close_owned() -> None:
+            async with self._refresh_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                if self._read_task is not None:
+                    await _finish_owned_task(self._read_task)
+                await self._inner.close()
+
+        await _finish_owned_task(asyncio.create_task(close_owned()))
+
+
 def _credential_kwargs(
     config: EntraIdentityConfig,
     settings: dict[str, str],
@@ -219,6 +406,15 @@ def _credential_kwargs(
         )
 
     selector = settings.get("AZURE_TOKEN_CREDENTIALS", "").strip().lower()
+    if multiplexed and selector not in (
+        "",
+        "managedidentitycredential",
+        _WORKLOAD_IDENTITY_SELECTOR,
+    ):
+        raise RuntimeError(
+            f"AZURE_TOKEN_CREDENTIALS={selector!r} selects an Azure credential "
+            "that is not profile-safe in multiplex mode"
+        )
     if selector in _UNSUPPORTED_TOKEN_CREDENTIALS:
         raise RuntimeError(
             f"AZURE_TOKEN_CREDENTIALS={selector!r} selects an Azure credential "
@@ -252,11 +448,8 @@ def _credential_kwargs(
             "CertificateCredential performs blocking certificate-file reads and "
             "cannot be used by the native-async adapter"
         )
-    elif settings.get("AZURE_FEDERATED_TOKEN_FILE", "").strip():
-        raise RuntimeError(
-            "WorkloadIdentityCredential in azure.identity.aio performs blocking "
-            "token-file reads and cannot be used by the native-async adapter"
-        )
+    elif _workload_identity_parameters(settings, multiplexed=multiplexed) is not None:
+        selected = "exclude_workload_identity_credential"
     elif settings.get("AZURE_USERNAME", "").strip():
         raise RuntimeError(
             "SharedTokenCacheCredential performs blocking persistent-cache I/O "
@@ -296,6 +489,46 @@ def _credential_fingerprint(
         digest.update(repr(value).encode())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+async def _build_workload_identity_chain(
+    identity: Any,
+    parameters: dict[str, str],
+    fallback_kwargs: dict[str, Any],
+) -> Any:
+    workload = _AsyncWorkloadIdentityCredential(identity, **parameters)
+    managed_kwargs = dict(fallback_kwargs)
+    managed_kwargs.update(
+        exclude_environment_credential=True,
+        exclude_workload_identity_credential=True,
+        exclude_managed_identity_credential=False,
+    )
+    managed: Any | None = None
+    construction_error: BaseException | None = None
+    try:
+        managed = identity.DefaultAzureCredential(**managed_kwargs)
+        return identity.ChainedTokenCredential(workload, managed)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        construction_error = exc
+
+    if construction_error is not None:
+        credentials = [workload]
+        if managed is not None:
+            credentials.append(managed)
+        try:
+            await _close_credentials(credentials)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            logger.debug(
+                "Failed to close partially constructed Workload Identity chain",
+                exc_info=True,
+            )
+        raise construction_error
+
+    raise AssertionError("Workload Identity chain construction did not complete")
 
 
 async def _canonical_credential_home() -> str:
@@ -345,14 +578,21 @@ async def _close_credentials(credentials: list[Any]) -> None:
 
 
 async def build_credential(config: EntraIdentityConfig) -> Any:
-    """Return the loop/profile-local async ``DefaultAzureCredential``."""
+    """Return the loop/profile-local async Azure credential chain."""
     loop = asyncio.get_running_loop()
     settings, multiplexed = _identity_environment()
+    workload_parameters = _workload_identity_parameters(
+        settings,
+        multiplexed=multiplexed,
+    )
     kwargs = _credential_kwargs(config, settings, multiplexed=multiplexed)
+    fingerprint = _credential_fingerprint(settings, kwargs)
+    if workload_parameters is not None:
+        fingerprint = f"workload:{fingerprint}"
     key = (
         await _canonical_credential_home(),
         config,
-        _credential_fingerprint(settings, kwargs),
+        fingerprint,
     )
     with _credential_cache_guard:
         cache = _credential_caches.setdefault(loop, {})
@@ -361,7 +601,14 @@ async def build_credential(config: EntraIdentityConfig) -> Any:
             return credential
 
     identity = _require_azure_identity()
-    credential = identity.DefaultAzureCredential(**kwargs)
+    if workload_parameters is not None:
+        credential = await _build_workload_identity_chain(
+            identity,
+            workload_parameters,
+            kwargs,
+        )
+    else:
+        credential = identity.DefaultAzureCredential(**kwargs)
     with _credential_cache_guard:
         cache[key] = credential
     return credential

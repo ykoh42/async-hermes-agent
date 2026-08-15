@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from blockbuster import BlockBuster, BlockingError
+from blockbuster import BlockBuster
 
 from agent import secret_scope
 from hermes_constants import (
@@ -180,7 +180,6 @@ async def test_symlinked_home_and_same_settings_share_one_loop_credential(
     [
         "AZURE_CLIENT_SECRET",
         "AZURE_CLIENT_CERTIFICATE_PATH",
-        "AZURE_FEDERATED_TOKEN_FILE",
         "AZURE_TOKEN_CREDENTIALS",
         "AZURE_USERNAME",
     ],
@@ -270,14 +269,6 @@ async def test_process_global_token_chain_selector_fails_closed_in_multiplex(
 @pytest.mark.parametrize(
     ("settings", "message"),
     [
-        (
-            {
-                "AZURE_CLIENT_ID": "client",
-                "AZURE_TENANT_ID": "tenant",
-                "AZURE_FEDERATED_TOKEN_FILE": "/token",
-            },
-            "WorkloadIdentityCredential",
-        ),
         (
             {
                 "AZURE_CLIENT_ID": "client",
@@ -536,29 +527,6 @@ def test_pinned_aio_sdk_chain_gap_remains_explicit_release_blocker(
     finally:
         sync_credential.close()
         asyncio.run(async_credential.close())
-
-
-def test_pinned_aio_workload_file_read_is_external_blocker(tmp_path):
-    identity = pytest.importorskip("azure.identity.aio")
-    token_file = tmp_path / "federated-token"
-    token_file.write_text("jwt", encoding="utf-8")
-    credential = identity.WorkloadIdentityCredential(
-        tenant_id="00000000-0000-0000-0000-000000000001",
-        client_id="00000000-0000-0000-0000-000000000002",
-        token_file_path=str(token_file),
-    )
-
-    async def reproduce_blocking_read():
-        blocker = BlockBuster()
-        blocker.activate()
-        try:
-            with pytest.raises(BlockingError):
-                credential._get_service_account_token()
-        finally:
-            blocker.deactivate()
-            await credential.close()
-
-    asyncio.run(reproduce_blocking_read())
 
 
 def test_same_profile_uses_distinct_credentials_across_event_loops(

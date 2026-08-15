@@ -119,11 +119,17 @@ list.
 
 The pinned `azure-identity` asynchronous package does not expose the same
 credential chain as its synchronous `DefaultAzureCredential`: broker and
-interactive-browser entries are absent, while workload identity, shared token
-cache, Visual Studio Code, and certificate paths still perform synchronous
-file/cache work. Async Hermes therefore enables only the verified client-secret
-environment or managed-identity route and fails clearly when an unsupported
-chain is selected. Static Azure Foundry API-key authentication is unaffected.
+interactive-browser entries are absent, while shared token cache, Visual Studio
+Code, and certificate paths still perform synchronous file/cache work. Async
+Hermes therefore enables the verified client-secret environment or managed-
+identity route and fails clearly when an unsupported chain is selected. When
+`AZURE_FEDERATED_TOKEN_FILE` configures projected Workload Identity (or
+`AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential` explicitly selects it),
+Async Hermes uses a bounded adapter around the public async
+`ClientAssertionCredential`: it reads the projected file only on first use and
+after the 600-second refresh window, with a 64 KiB limit and a one-second read
+timeout. It does not support the Kubernetes token-proxy/identity-binding
+variables. Static Azure Foundry API-key authentication is unaffected.
 
 The pinned `aiobotocore` transport provides coroutine network requests, but
 client/credential construction still synchronously loads botocore config and
