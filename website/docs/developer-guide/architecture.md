@@ -204,6 +204,7 @@ passing it transfers lifecycle ownership to that agent. Host callbacks and
 configuration remain host-owned.
 
 For details, continue with [Agent Loop Internals](./agent-loop.md),
+[Upstream Differences](./upstream-differences.md),
 [Session Storage](./session-storage.md), and
 [Programmatic Integration](./programmatic-integration.md).
 

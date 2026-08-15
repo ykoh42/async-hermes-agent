@@ -86,6 +86,7 @@ const sidebars: SidebarsConfig = {
           label: 'Architecture',
           items: [
             'developer-guide/architecture',
+            'developer-guide/upstream-differences',
             'developer-guide/agent-loop',
             'developer-guide/session-storage',
           ],

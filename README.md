@@ -313,6 +313,9 @@ The repository preserves original core file and function names to keep future
 upstream imports reviewable. It is a divergent async distribution, not a claim
 that these changes are drop-in mergeable to the synchronous upstream product.
 
+The deliberate differences from upstream `v2026.8.13` are documented in the
+[upstream differences table](https://ykoh42.github.io/async-hermes-agent/developer-guide/upstream-differences).
+
 Hermes Agent is built by [Nous Research](https://nousresearch.com). This
 distribution retains the upstream MIT license; see
 [LICENSE](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.1/LICENSE).
