@@ -11,7 +11,7 @@ package version `0.20.1`). The table below records the deliberate differences
 in the retained library surface. It is a migration guide, not a claim that the
 removed upstream applications are still shipped.
 
-| Area | Upstream `v2026.8.13` | Async Hermes Agent `0.20.1.1` | Integration impact |
+| Area | Upstream `v2026.8.13` | Async Hermes Agent `0.20.1.2` | Integration impact |
 | --- | --- | --- | --- |
 | Public entry points | Retained names and module paths | The same retained names, arguments, defaults, and return shapes; I/O-bearing calls are coroutines | Existing library callers normally add `await` at the call site |
 | Agent construction | Synchronous upstream lifecycle | `AIAgent.__init__()` is state-only; provider, session, MCP, and plugin setup starts at an awaited boundary | Use `async with AIAgent(...)` or `await agent.close()` |
@@ -28,7 +28,7 @@ removed upstream applications are still shipped.
 | FastAPI/service boundary | Upstream product applications may own service surfaces | No FastAPI server, CLI/TUI, messaging bridge, scheduler, dashboard, or desktop application is bundled | The host application owns HTTP lifecycle, auth, routing, quotas, and shutdown |
 | MCP and skills | Upstream product-managed discovery | Retained stdio, Streamable HTTP, and SSE MCP clients plus filesystem/external skill discovery with async lifecycle cleanup | Configure them from the host's Hermes home and close the agent at shutdown |
 | Optional providers and tools | Upstream distribution layout | Provider-specific extras remain opt-in (`anthropic`, `vertex`, `azure-identity`, `bedrock`, memory, web, media, and execution backends) | Install only the extras used by the selected configuration |
-| Python and package version | Upstream baseline `0.20.1` | Python `>=3.11,<3.14`; package `0.20.1.1` (`async_revision=1`) | The first three version segments track upstream; the fourth tracks this async distribution |
+| Python and package version | Upstream baseline `0.20.1` | Python `>=3.11,<3.14`; package `0.20.1.2` (`async_revision=2`) | The first three version segments track upstream; the fourth tracks this async distribution |
 
 ## Intentional public-surface exception
 

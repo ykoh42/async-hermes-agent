@@ -1,4 +1,4 @@
 """Shared configuration and provider support for Hermes Agent."""
 
-__version__ = "0.20.1.1"
+__version__ = "0.20.1.2"
 __release_date__ = "2026.8.13"
