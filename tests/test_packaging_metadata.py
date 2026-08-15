@@ -159,6 +159,7 @@ def test_ci_postgres_matrix_covers_supported_python_and_server_pairs():
     for pair in (
         "python-version: '3.11'\n            postgres-version: '15'",
         "python-version: '3.12'\n            postgres-version: '16'",
+        "python-version: '3.12'\n            postgres-version: '17'",
         "python-version: '3.13'\n            postgres-version: '18'",
     ):
         assert pair in postgres_job
