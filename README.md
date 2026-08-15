@@ -141,6 +141,77 @@ asyncio.run(copy_sessions())
 upstream dictionaries and validation limits. Import restores conversation
 history but deliberately clears stale live-activity fields.
 
+For an explicit PostgreSQL backend, install the opt-in extra and inject one
+worker-owned store into each agent. CI exercises this backend against real
+PostgreSQL services; the local test suite skips those integration tests when
+no `HERMES_POSTGRES_TEST_DSN` is configured. The import and method names stay
+the same; only the backend module and DSN change:
+
+```bash
+uv sync --extra postgres
+```
+
+```python
+from hermes_state_postgres import SessionDB
+from run_agent import AIAgent
+
+db = SessionDB("postgresql+asyncpg://user:password@db.example/hermes")
+try:
+    async with AIAgent(provider="openrouter", session_db=db) as agent:
+        answer = await agent.run_conversation("Question")
+finally:
+    await db.close()
+```
+
+The DSN selects the PostgreSQL endpoint and credentials. Pool and asyncpg
+runtime settings are optional and use the same names as SQLAlchemy and
+asyncpg in the active profile's `config.yaml`:
+
+```yaml
+database:
+  postgres:
+    pool_size: 5
+    max_overflow: 10
+    pool_timeout: 30
+    pool_recycle: -1
+    pool_pre_ping: true
+    pool_use_lifo: false
+    connect_args:
+      timeout: 60
+      command_timeout: null
+      statement_cache_size: 100
+      max_cached_statement_lifetime: 300
+      max_cacheable_statement_size: 15360
+      server_settings:
+        application_name: async-hermes-agent
+        statement_timeout: "60000"
+        lock_timeout: "5000"
+        idle_in_transaction_session_timeout: "600000"
+```
+
+These settings are captured when the store is first initialized and are not
+hot-reloaded; create a new store after changing them. A read-only store keeps
+the same public constructor and enforces both the SessionDB write guard and
+PostgreSQL transaction-level read-only mode:
+
+```python
+readonly_db = SessionDB(
+    "postgresql+asyncpg://user:password@db.example/hermes",
+    read_only=True,
+)
+```
+
+`read_only=True` does not choose a replica automatically; the DSN still
+selects the endpoint. For a service, size the database for the possible
+connection count across workers: approximately
+`workers * (pool_size + max_overflow)`.
+
+The injected store is borrowed by the agent, so a FastAPI or ASGI lifespan
+should create and close one store per worker and share it among that worker's
+agents. SQLite remains the default. PostgreSQL uses native ranking rather than
+SQLite FTS5 BM25 scores, and the independent memory/delegation databases are
+still SQLite-backed.
+
 ## Skills, MCP, and memory
 
 Skills follow the existing Hermes layout. `HERMES_HOME` defaults to

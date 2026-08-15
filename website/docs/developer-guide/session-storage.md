@@ -129,6 +129,61 @@ async def find_messages(db):
 
 `session_search` exposes this storage to the model when its toolset is enabled.
 
+## PostgreSQL settings and read-only connections
+
+The optional PostgreSQL backend keeps the `SessionDB(db_path, read_only=False)`
+constructor shape. Pass an explicit `postgresql+asyncpg://` DSN; do not rely on
+an implicit `DATABASE_URL` lookup inside the library:
+
+```python
+from hermes_state_postgres import SessionDB
+
+db = SessionDB("postgresql+asyncpg://user:password@db.example/hermes")
+```
+
+Pool and asyncpg options belong under the active profile's `config.yaml` and
+use the driver names directly:
+
+```yaml
+database:
+  postgres:
+    pool_size: 5
+    max_overflow: 10
+    pool_timeout: 30
+    pool_recycle: -1
+    pool_pre_ping: true
+    pool_use_lifo: false
+    connect_args:
+      timeout: 60
+      command_timeout: null
+      statement_cache_size: 100
+      max_cached_statement_lifetime: 300
+      max_cacheable_statement_size: 15360
+      server_settings:
+        application_name: async-hermes-agent
+        statement_timeout: "60000"
+        lock_timeout: "5000"
+        idle_in_transaction_session_timeout: "600000"
+```
+
+The profile selected when the store is constructed owns these settings. The
+async connection is still initialized at the first awaited operation, and the
+validated options remain fixed for that store's lifetime. Changing the config
+requires a newly created store. TLS and endpoint selection remain DSN concerns.
+
+For a read replica or a search/diagnostic connection, use:
+
+```python
+readonly_db = SessionDB(read_replica_url, read_only=True)
+```
+
+This refuses SessionDB writes and forces PostgreSQL transactions into
+read-only mode. It does not select a replica automatically, and it requires an
+already initialized schema. A separate PostgreSQL read-only role or replica
+endpoint provides an additional operational permission boundary. When sharing
+one store in a service worker, estimate the possible connection count as
+`workers * (pool_size + max_overflow)`.
+
 ## Crash and cancellation behavior
 
 The turn prologue persists the user message before the first provider request.

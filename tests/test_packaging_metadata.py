@@ -83,6 +83,15 @@ def test_release_versions_match_upstream_revision_policy():
     assert package_lock["packages"][""]["version"] == expected_npm_version
 
 
+def test_postgres_backend_is_optional_and_packaged_as_a_top_level_module():
+    pyproject = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    extra = pyproject["project"]["optional-dependencies"]["postgres"]
+    assert extra == ["SQLAlchemy[asyncio]==2.0.51", "asyncpg==0.31.0"]
+    assert "hermes_state_postgres" in pyproject["tool"]["setuptools"]["py-modules"]
+
+
 def test_release_workflow_installs_ripgrep_before_testing_source():
     """Release runners must provide the binary required by search tests."""
     workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
@@ -139,6 +148,24 @@ def test_python_compatibility_ci_installs_ripgrep_before_testing_source():
 
     assert install_step < test_step
     assert "sudo apt-get install --yes ripgrep" in compat_job[install_step:test_step]
+
+
+def test_ci_postgres_matrix_covers_supported_python_and_server_pairs():
+    """The optional backend is exercised against real PostgreSQL services."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    postgres_job = workflow.split("\n  postgres:", 1)[1]
+    for pair in (
+        "python-version: '3.11'\n            postgres-version: '15'",
+        "python-version: '3.12'\n            postgres-version: '16'",
+        "python-version: '3.13'\n            postgres-version: '18'",
+    ):
+        assert pair in postgres_job
+    assert "--extra postgres" in postgres_job
+    assert "HERMES_POSTGRES_TEST_DSN" in postgres_job
+    assert "tests/integration/test_postgres_session_db.py" in postgres_job
+    assert "tests/integration/test_postgres_compaction_e2e.py" in postgres_job
 
 
 def test_pages_workflow_validates_pull_requests_without_deploying_them():

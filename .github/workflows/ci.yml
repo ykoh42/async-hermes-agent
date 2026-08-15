@@ -49,19 +49,19 @@ jobs:
         run: |
           {
             printf '%s\0' run_agent.py model_tools.py mini_swe_runner.py batch_runner.py \
-              hermes_state.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
+              hermes_state.py hermes_state_postgres.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
             rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
           } | xargs -0 -n 50 uv run ruff check --select F821
           {
             printf '%s\0' run_agent.py model_tools.py mini_swe_runner.py batch_runner.py \
-              hermes_state.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
+              hermes_state.py hermes_state_postgres.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
             rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
           } | xargs -0 -n 50 uv run flake8-async --asyncio \
             --enable=ASYNC102,ASYNC103,ASYNC104,ASYNC105,ASYNC200,ASYNC210,ASYNC211,ASYNC212,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC231,ASYNC232,ASYNC240,ASYNC250,ASYNC251,ASYNC300 \
             --async200-blocking-calls='shutil.which->aiofiles.os.wrap(shutil.which)'
           {
             printf '%s\0' run_agent.py model_tools.py mini_swe_runner.py batch_runner.py \
-              hermes_state.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
+              hermes_state.py hermes_state_postgres.py hermes_state_portability.py hermes_state_schema.py trajectory_compressor.py hermes_constants.py
             rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
           } | xargs -0 -n 50 uv run flake8-async --asyncio --enable=ASYNC120
 
@@ -115,3 +115,60 @@ jobs:
           tests/test_hermes_state.py
           tests/tools/test_terminal_exit_semantics.py
           -- -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+
+  postgres:
+    name: PostgreSQL ${{ matrix.postgres-version }} / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: '3.11'
+            postgres-version: '15'
+          - python-version: '3.12'
+            postgres-version: '16'
+          - python-version: '3.13'
+            postgres-version: '18'
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        env:
+          POSTGRES_USER: hermes
+          POSTGRES_PASSWORD: hermes
+          POSTGRES_DB: hermes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hermes -d hermes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Install project and PostgreSQL test dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra postgres
+
+      - name: Test PostgreSQL SessionDB against the service
+        run: >-
+          uv run pytest -q
+          tests/integration/test_postgres_session_db.py
+          tests/integration/test_postgres_compaction_e2e.py
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+        env:
+          HERMES_POSTGRES_TEST_DSN: postgresql+asyncpg://hermes:hermes@127.0.0.1:5432/hermes

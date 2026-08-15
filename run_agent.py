@@ -754,6 +754,7 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            self._owns_session_db = True
             return self._session_db
         except asyncio.CancelledError:
             raise
@@ -4565,11 +4566,7 @@ class AIAgent:
             pass
         try:
             session_db = getattr(self, "_session_db", None)
-            if session_db is not None and getattr(
-                self,
-                "_close_session_db_on_close",
-                True,
-            ):
+            if session_db is not None and getattr(self, "_owns_session_db", False):
                 await session_db.close()
             self._session_db = None
         except Exception:

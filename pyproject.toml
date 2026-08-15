@@ -193,6 +193,9 @@ hindsight = ["hindsight-client==0.6.1", "packaging==26.0"]
 # its native coroutine ``.aio`` views. The plugin never instantiates the SDK's
 # synchronous HTTP transport.
 honcho = ["honcho-ai==2.2.0"]
+# Explicit PostgreSQL SessionDB backend. SQLAlchemy Core is used with its
+# native asyncpg dialect; SQLite remains the default backend.
+postgres = ["SQLAlchemy[asyncio]==2.0.51", "asyncpg==0.31.0"]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]
@@ -211,6 +214,7 @@ py-modules = [
   "hermes_bootstrap",
   "hermes_constants",
   "hermes_state",
+  "hermes_state_postgres",
   "hermes_state_common",
   "hermes_state_portability",
   "hermes_state_schema",

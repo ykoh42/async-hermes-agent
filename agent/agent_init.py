@@ -89,6 +89,25 @@ logger = logging.getLogger("run_agent")
 
 _warned_unavailable_providers: set[str] = set()
 
+_SESSION_DB_ASYNC_METHODS = (
+    "create_session",
+    "append_message",
+    "get_session",
+    "end_session",
+    "close",
+)
+
+
+def _validate_async_session_db(session_db: Any) -> None:
+    """Reject synchronous stores before they can enter a turn."""
+    for method_name in _SESSION_DB_ASYNC_METHODS:
+        method = getattr(session_db, method_name, None)
+        if method is None or not inspect.iscoroutinefunction(method):
+            raise TypeError(
+                "AIAgent session_db must provide native async SessionDB methods; "
+                f"{method_name} is missing or not async on {type(session_db).__name__}"
+            )
+
 
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn once when a configured memory provider cannot be activated."""
@@ -1891,19 +1910,11 @@ def init_agent(
     # Only the native async implementation is accepted: silently wrapping a
     # synchronous store would reintroduce blocking I/O into the turn path.
     if session_db is not None:
-        from hermes_state import SessionDB
-
-        if not isinstance(session_db, SessionDB):
-            raise TypeError(
-                "AIAgent session_db must be hermes_state.SessionDB; "
-                f"got {type(session_db).__name__}"
-            )
+        _validate_async_session_db(session_db)
     agent._session_db = session_db
-    # Publicly supplied SessionDB instances transfer ownership to a normal
-    # AIAgent. Internal child agents may explicitly borrow the parent's live
-    # connection after construction; their builder flips this flag before the
-    # child can run.
-    agent._close_session_db_on_close = True
+    # A caller-supplied store is borrowed. The lazy default SQLite store is
+    # marked owned when it is created at the awaited recall boundary.
+    agent._owns_session_db = False
     # ``switch_model()`` remains a synchronous state mutation; its billing
     # route is durably recorded by the next native async turn boundary.
     agent._pending_billing_route = None
