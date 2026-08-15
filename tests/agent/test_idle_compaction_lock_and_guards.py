@@ -116,6 +116,7 @@ async def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None
         ), f"expected idle status line, got: {events}"
     finally:
         await agent.close()
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -153,6 +154,7 @@ async def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -
         assert ctx.messages[ctx.current_turn_user_idx]["content"] == "hello again"
     finally:
         await agent.close()
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -196,4 +198,4 @@ async def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> N
         assert len(ctx.messages) == len(_history()) + 1
     finally:
         await agent.close()
-
+        await db.close()

@@ -24,6 +24,7 @@ from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
+import tools.image_source  # noqa: F401  # warm import before BlockBuster
 from run_agent import AIAgent
 
 
