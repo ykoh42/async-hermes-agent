@@ -142,24 +142,27 @@ def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> in
     meaningless. Prefer the LAST user message whose content exactly matches
     this turn's text — the surviving copy in the common case — so the
     injection stamp and the #48677 persist override can't land on a
-    todo-snapshot or historical row. Fall back to the last user message when
-    no exact match survives (merge-summary-into-tail rewrites the content but
-    the trackers still need a live anchor). Returns -1 when the list has no
-    user message at all.
+    todo-snapshot or historical row. Fall back to the last *user-originated*
+    turn when no exact match survives (merge-summary-into-tail rewrites the
+    content but the trackers still need a live anchor). Compaction handoffs
+    must never become the fallback anchor. Returns -1 when the list has no
+    user-originated message at all.
     """
+    from agent.context_compressor import is_user_originated_turn
+
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
             continue
-        if fallback < 0:
-            fallback = i
         if msg.get("content") == user_message:
             return i
+        if fallback < 0 and is_user_originated_turn(msg):
+            fallback = i
     return fallback
 
 
-def _compression_made_progress(
+def compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
     """Return ``True`` if a compression pass materially reduced the request.
@@ -180,6 +183,10 @@ def _compression_made_progress(
     if new_len < orig_len:
         return True
     return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
+
+
+# Keep the historical private name used by the retained compression paths.
+_compression_made_progress = compression_made_progress
 
 
 def _compression_warrants_another_preflight_pass(
@@ -368,6 +375,7 @@ async def build_turn_context(
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
+            session_id=getattr(agent, "session_id", "") or "",
         )
     except Exception:
         pass
@@ -1219,6 +1227,13 @@ async def build_turn_context(
                 ext_prefetch_cache = (
                     await memory_manager.prefetch_all(query)
                 ) or ""
+            if ext_prefetch_cache:
+                try:
+                    recall_indicator = memory_manager.describe_recall()
+                    if recall_indicator:
+                        agent._emit_status(recall_indicator)
+                except Exception:
+                    logger.debug("Memory recall indicator failed", exc_info=True)
         except asyncio.CancelledError:
             raise
         except Exception:

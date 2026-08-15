@@ -79,6 +79,7 @@ from utils import (
     base_url_host_matches,
     base_url_hostname,
     env_float,
+    is_truthy_value,
     model_forces_max_completion_tokens,
     normalize_proxy_env_vars,
 )
@@ -616,6 +617,24 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: dict[str, str] = {
 # can still use this dict directly. Kept in sync with _FALLBACK above.
 _API_KEY_PROVIDER_AUX_MODELS: dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
 
+# Auxiliary tasks that may opt into a provider's fast/cheap model instead of
+# the user's main chat model. The opt-in lives in
+# ``auxiliary.<task>.prefer_fast_model`` so the default ``auto = main model``
+# contract remains true on every settings surface.
+_FAST_MODEL_TASKS: frozenset[str] = frozenset({"title_generation"})
+
+
+def _task_prefers_fast_model(
+    task: str | None,
+    *,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether an eligible task explicitly opts into a fast model."""
+    if task not in _FAST_MODEL_TASKS:
+        return False
+    task_config = _get_auxiliary_task_config(task, config=config)
+    return is_truthy_value(task_config.get("prefer_fast_model"), default=False)
+
 # Vision-specific model overrides for direct providers.
 # When the user's main provider has a dedicated vision/multimodal model that
 # differs from their main chat model, map it here.  The vision auto-detect
@@ -909,28 +928,63 @@ def _codex_cloudflare_headers(access_token: str) -> dict[str, str]:
     return headers
 
 
+# Hosts that expose both an Anthropic-style ``/anthropic`` path and a sibling
+# OpenAI-compatible ``/v1`` path. Anthropic-only gateways must keep their
+# endpoint; rewriting them would turn a valid route into a 404.
+_DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES = (
+    "minimax.io",
+    "minimax.chat",
+    "minimaxi.com",
+)
+_DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES = ("api.minimax.",)
+
+
+def _is_dual_surface_anthropic_host(url: str) -> bool:
+    """Return whether *url* belongs to a known dual-surface MiniMax host."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in _DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES
+    ):
+        return True
+    return any(
+        host.startswith(prefix) for prefix in _DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES
+    )
+
+
 def _to_openai_base_url(base_url: str) -> str:
     """Normalize an Anthropic-style base URL to OpenAI-compatible format.
 
-    Some providers (MiniMax, MiniMax-CN) expose an ``/anthropic`` endpoint for
-    the Anthropic Messages API and a separate ``/v1`` endpoint for OpenAI chat
-    completions.  The auxiliary client uses the OpenAI SDK, so it must hit the
-    ``/v1`` surface.  Passing the raw ``inference_base_url`` causes requests to
-    land on ``/anthropic/chat/completions`` — a 404.
+    MiniMax (and MiniMax-CN) expose an ``/anthropic`` endpoint for the Anthropic
+    Messages API and a separate ``/v1`` endpoint for OpenAI chat completions.
+    Anthropic-only custom gateways must retain their ``/anthropic`` path.
     """
     url = str(base_url or "").strip().rstrip("/")
     if url.endswith("/anthropic"):
-        # ZAI (open.bigmodel.cn) uses /api/anthropic for Anthropic wire
-        # but /api/paas/v4 for OpenAI wire — the generic /v1 rewrite is wrong.
-        if "open.bigmodel.cn" in url or "bigmodel" in url:
-            rewritten = url[: -len("/anthropic")] + "/paas/v4"
+        # ZAI (open.bigmodel.cn/api.z.ai) uses /api/anthropic for Anthropic
+        # wire but /api/coding/paas/v4 for the Coding Plan OpenAI wire — the
+        # generic /v1 rewrite is wrong.
+        if "open.bigmodel.cn" in url or "bigmodel" in url or "api.z.ai" in url:
+            rewritten = url[: -len("/anthropic")] + "/coding/paas/v4"
             logger.debug(
                 "Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten
             )
             return rewritten
-        rewritten = url[: -len("/anthropic")] + "/v1"
-        logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
-        return rewritten
+        if _is_dual_surface_anthropic_host(url):
+            rewritten = url[: -len("/anthropic")] + "/v1"
+            logger.debug(
+                "Auxiliary client: rewrote dual-surface base URL %s → %s",
+                url,
+                rewritten,
+            )
+            return rewritten
+        logger.debug("Auxiliary client: keeping Anthropic-only base URL %s", url)
+        return url
     if "api.kimi.com" in url and url.endswith("/coding"):
         # Kimi Code uses /coding/v1/messages for Anthropic SDK (appends /v1/messages)
         # but /coding/v1/chat/completions for OpenAI SDK (appends /chat/completions)
@@ -1022,14 +1076,24 @@ _ANTHROPIC_COMPATIBLE_HOSTS = frozenset({
 
 
 def _is_anthropic_compatible_host(url: str) -> bool:
-    """Return True if ``url``'s hostname is an Anthropic endpoint we trust for aux calls."""
+    """Return True if ``url`` is a trusted Anthropic-compatible endpoint.
+
+    Native Anthropic hosts and gateways exposing the Messages protocol under
+    an ``/anthropic`` (or ``/anthropic/v1``) suffix are accepted. A bare
+    non-Anthropic endpoint remains rejected so ``provider: anthropic`` cannot
+    accidentally route auxiliary traffic through an OpenAI-compatible host.
+    """
     if not url:
         return False
     try:
         from urllib.parse import urlparse
 
-        host = (urlparse(url).hostname or "").strip().lower().rstrip(".")
-        return host in _ANTHROPIC_COMPATIBLE_HOSTS
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        if host in _ANTHROPIC_COMPATIBLE_HOSTS:
+            return True
+        path = (parsed.path or "").rstrip("/").lower()
+        return path.endswith("/anthropic") or path.endswith("/anthropic/v1")
     except Exception:
         return False
 
@@ -1218,6 +1282,7 @@ class _CodexCompletionsAdapter:
         # out of cache-key routing entirely — for those hosts, skip it here.
         try:
             from agent.transports.codex import (
+                _cache_scope_from_session_id,
                 _content_cache_key,
                 _default_prompt_cache_retention_for_request,
             )
@@ -1231,7 +1296,12 @@ class _CodexCompletionsAdapter:
                 _host_src, "githubcopilot.com"
             ) or base_url_host_matches(_host_src, "models.github.ai")
             if not _is_xai and not _is_github and "prompt_cache_key" not in resp_kwargs:
-                _cache_key = _content_cache_key(instructions, resp_kwargs.get("tools"))
+                _scope = _cache_scope_from_session_id(
+                    _runtime_main_value("session_id")
+                )
+                _cache_key = _content_cache_key(
+                    instructions, resp_kwargs.get("tools"), _scope
+                )
                 if _cache_key:
                     resp_kwargs["prompt_cache_key"] = _cache_key
             if "prompt_cache_retention" not in resp_kwargs:
@@ -2622,6 +2692,7 @@ def set_runtime_main(
     api_key: Any = "",
     api_mode: str = "",
     auth_mode: str = "",
+    session_id: str = "",
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -2642,6 +2713,7 @@ def set_runtime_main(
         ),
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
+        "session_id": (session_id or "").strip(),
     }
     return _RUNTIME_MAIN_CONTEXT.set(runtime)
 
@@ -3135,6 +3207,31 @@ async def _try_anthropic(
         entry,
         _ANTHROPIC_DEFAULT_BASE_URL,
     )
+    if not base_url:
+        # Keep the primary model's Anthropic-compatible path for auxiliary
+        # calls, but never borrow a foreign OpenAI/Codex endpoint. The config
+        # loader is already native async and profile-scoped.
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            cfg = await load_config_readonly()
+            model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+            if isinstance(model_cfg, dict):
+                cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+                cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+                if (
+                    cfg_provider == "anthropic"
+                    and cfg_base_url
+                    and _is_anthropic_compatible_host(cfg_base_url)
+                ):
+                    resolved_base_url = cfg_base_url
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Auxiliary client: Anthropic config base URL lookup failed",
+                exc_info=True,
+            )
     resolved_model = (
         model or _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     )
@@ -4343,6 +4440,7 @@ async def _replan_fallback_cache_sections(
 ) -> tuple[list, list | None]:
     """Strip source decoration and plan cache sections for one destination."""
     from agent.agent_runtime_helpers import plan_cache_sections_for_destination
+    from agent.agent_runtime_helpers import configured_cache_ttl
 
     return await plan_cache_sections_for_destination(
         messages,
@@ -4351,6 +4449,7 @@ async def _replan_fallback_cache_sections(
         base_url=destination.base_url,
         api_mode=destination.api_mode or "",
         model=destination.model or "",
+        cache_ttl=await configured_cache_ttl(),
     )
 
 
@@ -5192,6 +5291,15 @@ async def _resolve_auto(
             runtime_base_url = ""
             runtime_api_key = ""
             runtime_api_mode = ""
+
+    if (
+        _task_prefers_fast_model(task, config=config_snapshot)
+        and main_provider
+        and main_provider not in {"auto", ""}
+    ):
+        fast_model = _get_aux_model_for_provider(main_provider)
+        if fast_model:
+            main_model = fast_model
 
     if main_provider and main_model and main_provider not in {"auto", ""}:
         resolved_provider = main_provider
@@ -6996,6 +7104,7 @@ async def _client_cache_key(
     is_vision: bool = False,
     task: str | None = None,
     model: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> tuple:
     await _activate_auxiliary_cache_scope()
     runtime = _normalize_main_runtime(main_runtime)
@@ -7010,7 +7119,11 @@ async def _client_cache_key(
     # `auto` can now resolve through task-specific or main fallback policy,
     # so the task participates in the cache key. Non-auto providers keep the
     # old cache shape because the explicit provider/model tuple is sufficient.
-    task_key = (task or "") if provider == "auto" else ""
+    task_key = (
+        (task or "", _task_prefers_fast_model(task, config=config))
+        if provider == "auto"
+        else ""
+    )
     pool_hint = await _pool_cache_hint(provider, main_runtime=main_runtime)
     # The model MUST participate in the key. Two concurrent auxiliary calls to
     # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
@@ -7340,6 +7453,7 @@ async def _get_cached_client(
         is_vision=is_vision,
         task=task,
         model=model,
+        config=config,
     )
     stale_client = None
     async with _client_cache_lock:
@@ -7686,6 +7800,72 @@ def _get_auxiliary_task_config(
         pass
 
     return task_config
+
+
+# ---------------------------------------------------------------------------
+# Per-task native-async concurrency limiting
+# ---------------------------------------------------------------------------
+# Upstream bounds background auxiliary work (titles, compression, and plugin
+# tasks) per task key.  The retained runtime has one async entry point rather
+# than separate sync/async implementations, so only the native semaphore is
+# carried over here.  The registry uses weak loop keys and weak semaphore
+# values: an asyncio.run() loop and its semaphore cannot be retained merely by
+# making a short-lived auxiliary call.
+_aux_async_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, tuple[int, weakref.ReferenceType[asyncio.Semaphore]]],
+] = weakref.WeakKeyDictionary()
+_aux_sem_lock = threading.RLock()
+
+
+def _get_task_max_concurrency(
+    task: str | None,
+    *,
+    config: dict[str, Any] | None = None,
+) -> int | None:
+    """Return ``auxiliary.<task>.max_concurrency`` as a positive integer."""
+    if not task or task == "vision":
+        # Vision already uses this key for its CPU encode/resize pool; its LLM
+        # requests intentionally remain concurrent.
+        return None
+    raw = _get_auxiliary_task_config(task, config=config).get("max_concurrency")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _acquire_async_aux_semaphore(
+    task: str | None,
+    *,
+    config: dict[str, Any] | None = None,
+) -> asyncio.Semaphore | None:
+    """Return the current loop's semaphore for *task*, if configured."""
+    limit = _get_task_max_concurrency(task, config=config)
+    if limit is None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+    with _aux_sem_lock:
+        per_task = _aux_async_semaphores.setdefault(loop, {})
+        entry = per_task.get(task)
+        semaphore = entry[1]() if entry is not None else None
+        if semaphore is None or entry[0] != limit:
+            semaphore = asyncio.Semaphore(limit)
+            per_task[task] = (limit, weakref.ref(semaphore))
+        return semaphore
+
+
+def _reset_aux_semaphores() -> None:
+    """Drop cached native semaphores (test helper)."""
+    with _aux_sem_lock:
+        _aux_async_semaphores.clear()
 
 
 def _get_task_timeout(
@@ -8716,7 +8896,7 @@ def extract_content_or_reasoning(response) -> str:
     return ""
 
 
-async def call_llm(
+async def _call_llm_impl(
     task: str | None = None,
     *,
     provider: str | None = None,
@@ -8735,18 +8915,23 @@ async def call_llm(
     api_mode: str | None = None,
     stream: bool = False,
     stream_options: dict | None = None,
+    route_info: dict[str, str] | None = None,
+    _config_snapshot: dict[str, Any] | None = None,
 ) -> Any:
     """Centralized native-async LLM call."""
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
-    from hermes_cli.config import load_config_readonly
-    from hermes_cli.plugins import discover_plugins
-    from providers import _ensure_provider_profiles_loaded
+    if _config_snapshot is None:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.plugins import discover_plugins
+        from providers import _ensure_provider_profiles_loaded
 
-    await _ensure_provider_profiles_loaded()
-    await discover_plugins()
-    config_snapshot = await load_config_readonly()
+        await _ensure_provider_profiles_loaded()
+        await discover_plugins()
+        config_snapshot = await load_config_readonly()
+    else:
+        config_snapshot = _config_snapshot
     (
         resolved_provider,
         resolved_model,
@@ -8756,6 +8941,8 @@ async def call_llm(
     ) = _resolve_task_provider_model(
         task, provider, model, base_url, api_key, config=config_snapshot
     )
+    if route_info is not None:
+        route_info["provider"] = str(resolved_provider or "auto")
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task, config=config_snapshot)
@@ -8857,6 +9044,10 @@ async def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
             )
+
+    if route_info is not None:
+        route_info["provider"] = str(resolved_provider or "auto")
+        route_info["model"] = str(final_model or resolved_model or "default")
 
     effective_timeout = _effective_aux_timeout(
         task,
@@ -9378,4 +9569,70 @@ async def call_llm(
                     "Auxiliary (async): cache eviction after connection error failed",
                     exc_info=True,
                 )
-        raise first_err
+    raise first_err
+
+
+async def call_llm(
+    task: str | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    main_runtime: dict[str, Any] | None = None,
+    messages: list,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    tools: list | None = None,
+    timeout: float | None = None,
+    extra_body: dict | None = None,
+    reasoning_config: dict | None = None,
+    extra_headers: dict[str, str] | None = None,
+    api_mode: str | None = None,
+    stream: bool = False,
+    stream_options: dict | None = None,
+    route_info: dict[str, str] | None = None,
+) -> Any:
+    """Run one native-async auxiliary request under its task limit.
+
+    This is the retained public entry point.  Upstream has separate sync and
+    async call functions; the fork keeps one coroutine and applies the same
+    per-task limit around its complete request/retry/fallback lifecycle.
+    """
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins import discover_plugins
+    from providers import _ensure_provider_profiles_loaded
+
+    # Resolve the same snapshot used by the implementation before acquiring a
+    # permit so plugin-declared task defaults participate in the limit.
+    await _ensure_provider_profiles_loaded()
+    await discover_plugins()
+    config_snapshot = await load_config_readonly()
+    semaphore = _acquire_async_aux_semaphore(task, config=config_snapshot)
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        return await _call_llm_impl(
+            task=task,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            main_runtime=main_runtime,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            reasoning_config=reasoning_config,
+            extra_headers=extra_headers,
+            api_mode=api_mode,
+            stream=stream,
+            stream_options=stream_options,
+            route_info=route_info,
+            _config_snapshot=config_snapshot,
+        )
+    finally:
+        if semaphore is not None:
+            semaphore.release()

@@ -36,9 +36,22 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+INDICATOR_GLYPH = "👁️"
+
+
+@dataclass(frozen=True)
+class RecallStatus:
+    """Describe the memory injected by the provider's latest prefetch."""
+
+    provider_label: str
+    count: int
+    glyph: str = INDICATOR_GLYPH
 
 
 # Prompts that carry no semantic signal — trivial acknowledgements, greetings,
@@ -98,6 +111,10 @@ class MemoryProvider(ABC):
         without blocking the event loop.
         """
 
+    def unavailable_reason(self) -> str:
+        """Return an optional actionable hint when :meth:`is_available` is false."""
+        return ""
+
     @abstractmethod
     async def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize for a session.
@@ -151,6 +168,10 @@ class MemoryProvider(ABC):
         by prefetch() on the next turn. Default is no-op — providers
         that do background prefetching should override this.
         """
+
+    def recall_status(self) -> RecallStatus | None:
+        """Return a deterministic UI summary for the latest memory prefetch."""
+        return None
 
     async def sync_turn(
         self,

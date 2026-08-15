@@ -173,6 +173,21 @@ class TestBuildAnthropicClient:
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }
 
+    async def test_opencode_endpoint_gets_attribution_headers(self):
+        """OpenCode attribution survives the native async Messages path."""
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            await build_anthropic_client(
+                "sk-opencode-secret",
+                base_url="https://opencode.ai/zen/go/v1",
+            )
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
+            headers = kwargs["default_headers"]
+            assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+            assert headers["X-Title"] == "Hermes Agent"
+            assert headers["User-Agent"].startswith("HermesAgent/")
+            assert kwargs["api_key"] == "sk-opencode-secret"
+            assert "anthropic-beta" in headers
+
 
     async def test_azure_foundry_anthropic_endpoint_uses_bearer_auth(self):
         """Azure AI Foundry's /anthropic endpoint requires Authorization: Bearer.
@@ -1316,6 +1331,24 @@ class TestToPlainData:
         obj = SimpleNamespace(type="thinking", thinking="reason", signature="sig")
         result = _to_plain_data(obj)
         assert result == {"type": "thinking", "thinking": "reason", "signature": "sig"}
+
+    async def test_model_dump_warning_kwarg_and_duck_fallback(self):
+        calls = []
+
+        class PydanticLike:
+            def model_dump(self, **kwargs):
+                calls.append(kwargs)
+                assert kwargs == {"warnings": False}
+                return {"value": "ok"}
+
+        assert _to_plain_data(PydanticLike()) == {"value": "ok"}
+        assert calls == [{"warnings": False}]
+
+        class Duck:
+            def model_dump(self):
+                return {"duck": True}
+
+        assert _to_plain_data(Duck()) == {"duck": True}
 
 
 # ---------------------------------------------------------------------------

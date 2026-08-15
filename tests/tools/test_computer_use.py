@@ -400,3 +400,264 @@ async def test_parenthesised_and_value_label_formats():
         200: "RealLabel",
         201: "",
     }
+
+
+class TestCapturePayloadBudget:
+    """Upstream 6c9d6d9d5: capture payloads stay bounded and typed."""
+
+    async def test_element_label_is_capped_in_json(self):
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.tool import _MAX_ELEMENT_LABEL_CHARS, _element_to_dict
+
+        element = UIElement(
+            index=3,
+            role="Document",
+            label="m" * 5000,
+            bounds=(0, 0, 100, 100),
+            app="chrome.exe",
+        )
+        payload = _element_to_dict(element)
+        assert len(payload["label"]) == _MAX_ELEMENT_LABEL_CHARS
+        assert payload["label_truncated"] is True
+
+    async def test_short_label_not_flagged(self):
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.tool import _element_to_dict
+
+        payload = _element_to_dict(
+            UIElement(index=0, role="Button", label="OK", bounds=(0, 0, 10, 10), app="")
+        )
+        assert payload["label"] == "OK"
+        assert "label_truncated" not in payload
+
+    async def test_aux_vision_branch_respects_element_cap(self, monkeypatch, tmp_path):
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use import tool as cu_tool
+
+        elements = [
+            UIElement(index=i, role="Button", label=f"btn{i}", bounds=(0, 0, 10, 10), app="")
+            for i in range(50)
+        ]
+        cap = CaptureResult(
+            mode="som",
+            width=1024,
+            height=768,
+            png_b64="iVBORw0KGgo=",
+            elements=elements,
+            app="X",
+            window_title="t",
+            png_bytes_len=10,
+        )
+
+        async def fake_vision_analyze(_path, _prompt):
+            return json.dumps({"analysis": "a screen"})
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "tools.vision_tools.vision_analyze_tool", fake_vision_analyze
+        )
+        out = await cu_tool._route_capture_through_aux_vision(
+            cap,
+            "summary",
+            visible_elements=elements[:5],
+            truncated_elements=45,
+        )
+        assert out is not None
+        payload = json.loads(out)
+        assert len(payload["elements"]) == 5
+        assert payload["total_elements"] == 50
+        assert payload["truncated_elements"] == 45
+
+
+class TestBoundsSpaceNote:
+    async def test_note_present_when_bounds_exceed_image(self):
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.tool import _bounds_space_note
+
+        elements = [
+            UIElement(index=0, role="Button", label="Close", bounds=(3771, 0, 69, 60), app="")
+        ]
+        note = _bounds_space_note(elements, 1455, 791)
+        assert note is not None
+        assert "native desktop coordinates" in note
+
+    async def test_no_note_when_spaces_match(self):
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.tool import _bounds_space_note
+
+        elements = [
+            UIElement(index=0, role="Button", label="OK", bounds=(10, 10, 50, 20), app="")
+        ]
+        assert _bounds_space_note(elements, 1455, 791) is None
+
+    async def test_no_note_for_empty_or_degenerate(self):
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.tool import _bounds_space_note
+
+        assert _bounds_space_note([], 1455, 791) is None
+        zero = [UIElement(index=0, role="B", label="x", bounds=(0, 0, 0, 0), app="")]
+        assert _bounds_space_note(zero, 1455, 791) is None
+        assert _bounds_space_note(zero, 0, 0) is None
+
+
+class TestEscalationEnrichment:
+    def _refusal(self, **overrides):
+        from tools.computer_use.backend import ActionResult
+
+        values = dict(
+            ok=False,
+            action="type_text",
+            message="refused",
+            code="background_unavailable",
+            escalation={"recommended": "foreground", "reason": "dropped"},
+            meta={"event_kind": "text_input", "target_class": "Chrome_WidgetWin_1"},
+        )
+        values.update(overrides)
+        return ActionResult(**values)
+
+    async def test_browser_text_refusal_gains_page_alternative(self):
+        from tools.computer_use.tool import _enrich_escalation
+
+        enriched = _enrich_escalation(self._refusal())
+        assert enriched["recommended"] == "foreground"
+        assert enriched["alternative"] == "page"
+        assert "cua_browser_type" in enriched["alternative_hint"]
+
+    async def test_non_browser_target_untouched(self):
+        from tools.computer_use.tool import _enrich_escalation
+
+        refusal = self._refusal(meta={"event_kind": "text_input", "target_class": "Notepad"})
+        assert "alternative" not in _enrich_escalation(refusal)
+
+    async def test_non_foreground_recommendation_untouched(self):
+        from tools.computer_use.tool import _enrich_escalation
+
+        refusal = self._refusal(escalation={"recommended": "px"})
+        assert "alternative" not in _enrich_escalation(refusal)
+
+    async def test_missing_escalation_passthrough(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import _enrich_escalation
+
+        assert _enrich_escalation(ActionResult(ok=True, action="click", message="ok")) is None
+
+    async def test_enrichment_survives_action_payload(self):
+        from tools.computer_use.tool import _action_payload
+
+        payload = _action_payload(self._refusal())
+        assert payload["escalation"]["alternative"] == "page"
+        assert payload["verdict"]["decision"] == "escalate"
+
+
+class TestElementSpillFile:
+    """Upstream 1706502aa: dropped detail remains recoverable on disk."""
+
+    def _dense_capture(self):
+        from tools.computer_use.backend import CaptureResult, UIElement
+
+        elements = [
+            UIElement(
+                index=i,
+                role="Document",
+                label=f"msg {i}: " + "x" * 2000,
+                bounds=(100 + i, 200, 3600, 60),
+                app="chrome.exe",
+            )
+            for i in range(120)
+        ]
+        return CaptureResult(
+            mode="som",
+            width=1455,
+            height=791,
+            png_b64=None,
+            elements=elements,
+            app="chrome.exe",
+            window_title="Discord",
+            png_bytes_len=0,
+        )
+
+    async def test_spill_file_holds_full_untruncated_tree(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use.tool import _capture_response
+
+        output = json.loads(await _capture_response(self._dense_capture()))
+        assert "elements_file" in output
+        assert str(output["elements_file"]) in output["summary"]
+        async with aiofiles.open(output["elements_file"], encoding="utf-8") as handle:
+            spill = json.loads(await handle.read())
+        assert spill["total_elements"] == 120
+        assert len(spill["elements"]) == 120
+        assert len(spill["elements"][0]["label"]) > 2000
+        assert spill["elements"][119]["label"].startswith("msg 119")
+
+    async def test_no_spill_when_nothing_dropped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use.tool import _capture_response
+
+        cap = CaptureResult(
+            mode="som",
+            width=1455,
+            height=791,
+            png_b64=None,
+            elements=[UIElement(index=0, role="Button", label="OK", bounds=(10, 10, 50, 20), app="")],
+            app="X",
+            window_title="t",
+            png_bytes_len=0,
+        )
+        output = json.loads(await _capture_response(cap))
+        assert "elements_file" not in output
+
+    async def test_spill_pruning_bounds_cache_growth(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use import tool as cu_tool
+
+        cap = self._dense_capture()
+        for _ in range(cu_tool._MAX_SPILL_FILES + 5):
+            assert await cu_tool._spill_elements_to_file(cap) is not None
+        cache = tmp_path / "cache" / "computer_use"
+        assert len(list(cache.glob("elements_*.json"))) <= cu_tool._MAX_SPILL_FILES
+
+    async def test_spill_failure_never_breaks_capture(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        async def no_spill(_cap):
+            return None
+
+        monkeypatch.setattr(cu_tool, "_spill_elements_to_file", no_spill)
+        output = json.loads(await cu_tool._capture_response(self._dense_capture()))
+        assert output["truncated_elements"] == 20
+        assert "elements_file" not in output
+
+
+class TestBoundsScaleField:
+    async def test_scale_reported_when_spaces_diverge(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use.tool import _capture_response
+
+        elements = [
+            UIElement(index=0, role="Button", label="Close", bounds=(3730, 0, 69, 60), app="")
+        ]
+        cap = CaptureResult(
+            mode="som",
+            width=1455,
+            height=791,
+            png_b64=None,
+            elements=elements,
+            app="chrome.exe",
+            window_title="",
+            png_bytes_len=0,
+        )
+        output = json.loads(await _capture_response(cap))
+        assert output["bounds_scale"] == pytest.approx(3799 / 1455, abs=0.01)
+        assert f"~{output['bounds_scale']}x" in output["summary"]
+
+    async def test_no_scale_when_spaces_match(self):
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.tool import _bounds_scale
+
+        elements = [UIElement(index=0, role="Button", label="OK", bounds=(10, 10, 50, 20), app="")]
+        assert _bounds_scale(elements, 1455, 791) is None
+        assert _bounds_scale([], 1455, 791) is None
+        assert _bounds_scale(elements, 0, 0) is None

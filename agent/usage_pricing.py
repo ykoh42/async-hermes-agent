@@ -18,6 +18,22 @@ _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 
+# Sub-cent costs must remain visible in user-facing reports.  Four decimal
+# places are enough for normal cheap-model turns; values that round to zero
+# at that precision use an explicit lower-bound label instead.
+_SUBCENT_THRESHOLD = Decimal("0.01")
+_INCLUDED_NOTE = "subscription-included; no provider invoice for usage"
+
+
+def format_cost_label(amount: Decimal) -> str:
+    """Format a cost without making a non-zero amount look free."""
+    if amount == _ZERO:
+        return "$0.00"
+    if amount < _SUBCENT_THRESHOLD:
+        label = f"~${amount:.4f}"
+        return label if label != "~$0.0000" else "~$<0.0001"
+    return f"~${amount:.2f}"
+
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
     "provider_cost_api",
@@ -1319,6 +1335,7 @@ async def estimate_usage_cost(
             source="none",
             label="included",
             pricing_version="included-route",
+            notes=(_INCLUDED_NOTE,),
         )
 
     entry: PricingEntry | None = None
@@ -1376,19 +1393,23 @@ async def estimate_usage_cost(
     if entry.request_cost is not None and usage.request_count:
         amount += Decimal(usage.request_count) * entry.request_cost
 
-    notes = (
-        ("OpenRouter cost is estimated from the models API until reconciled.",)
-        if route.provider == "openrouter"
-        else ()
-    )
+    notes: list[str] = []
+    status: CostStatus = "estimated"
+    label = format_cost_label(amount)
+    if entry.source == "none" and amount == _ZERO:
+        status = "included"
+        label = "included"
+        notes.append(_INCLUDED_NOTE)
+    if route.provider == "openrouter":
+        notes.append("OpenRouter cost is estimated from the models API until reconciled.")
     return CostResult(
         amount_usd=amount,
-        status="estimated",
+        status=status,
         source=entry.source,
-        label=f"~${amount:.2f}",
+        label=label,
         fetched_at=entry.fetched_at,
         pricing_version=entry.pricing_version,
-        notes=notes,
+        notes=tuple(notes),
     )
 
 

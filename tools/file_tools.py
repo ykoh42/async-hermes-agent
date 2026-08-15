@@ -13,6 +13,7 @@ import stat
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import MutableMapping
 from pathlib import Path, PurePosixPath
@@ -20,11 +21,13 @@ from pathlib import Path, PurePosixPath
 import aiofiles
 import aiofiles.os
 
+from tools import self_repo_guard as _self_repo_guard_bootstrap  # noqa: F401
 from agent.file_safety import (
     get_cross_profile_warning,
     get_read_block_error,
     get_sandbox_mirror_warning,
     get_write_denied_error,
+    is_write_approval_required,
 )
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
@@ -42,6 +45,7 @@ from tools.file_operations import (
     _looks_like_linter_unusable,
     _parse_search_context_line,
     _strip_bom,
+    describe_binary_file,
     normalize_read_pagination,
     normalize_search_pagination,
 )
@@ -740,6 +744,31 @@ async def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) 
     return False
 
 
+async def _special_file_kind(path: str | Path) -> str | None:
+    """Return a human-readable kind for a non-regular host filesystem node.
+
+    Device-name checks above cannot catch a FIFO or Unix socket hidden in a
+    normal workspace path.  Stat the resolved path asynchronously so a read
+    cannot block forever on a node that has no regular-file EOF semantics.
+    Missing and unstatable paths continue through the normal read error path.
+    """
+    try:
+        mode = (await aiofiles.os.stat(path)).st_mode
+    except OSError:
+        return None
+    if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
+        return None
+    if stat.S_ISFIFO(mode):
+        return "a FIFO (named pipe)"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISCHR(mode):
+        return "a character device"
+    if stat.S_ISBLK(mode):
+        return "a block device"
+    return "a special (non-regular) file"
+
+
 
 
 
@@ -831,6 +860,31 @@ async def _check_cross_profile_path(
     if warning is not None:
         return warning
     return await get_sandbox_mirror_warning(resolved)
+
+
+async def _check_approval_required_write(
+    paths: list[str],
+    *,
+    task_id: str = "default",
+) -> str | None:
+    """Request native approval for non-credential sensitive write targets."""
+    targets = [path for path in paths if await is_write_approval_required(path)]
+    if not targets:
+        return None
+    from tools.approval import request_tool_approval
+
+    display = ", ".join(dict.fromkeys(targets))
+    result = await request_tool_approval(
+        "write_file",
+        (
+            f"Write to SSH config file(s): {display}. SSH config can contain "
+            "ProxyCommand or Match exec directives that run commands."
+        ),
+        rule_key="ssh_config_write",
+    )
+    if result.get("approved"):
+        return None
+    return result.get("message") or "BLOCKED: SSH config write requires approval."
 
 
 
@@ -1028,7 +1082,7 @@ async def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is installed. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1231,6 +1285,36 @@ def _record_read_metadata(
         return state["consecutive"]
 
 
+async def _unicode_variant_match(path: Path) -> Path | None:
+    """Find one unambiguous NFC/NFD filename equivalent on disk."""
+    filename = path.name
+    if not filename:
+        return None
+
+    def canonical(name: str) -> str:
+        value = unicodedata.normalize("NFC", name)
+        for source, target in (
+            ("\u202f", " "),
+            ("\u00a0", " "),
+            ("\u2019", "'"),
+            ("\u2018", "'"),
+        ):
+            value = value.replace(source, target)
+        return value
+
+    try:
+        entries = await aiofiles.os.listdir(path.parent)
+    except OSError:
+        return None
+    target = canonical(filename)
+    candidates = [
+        path.parent / entry
+        for entry in entries
+        if entry != filename and canonical(entry) == target
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 async def _handle_read_file(args, **kw):
     """Read a local text file with native async I/O and stable line gutters."""
     from tools.tool_output_limits import _refresh_tool_output_limits
@@ -1257,10 +1341,31 @@ async def _handle_read_file(args, **kw):
     if isinstance(resolved, str):
         return resolved
 
+    # Remote/container backends own their filesystem and cannot be safely
+    # host-statted here.  The retained local backend can reject the whole
+    # special-file class (FIFO/socket/device), not only conventional /dev
+    # names, before any read implementation is entered.
+    if not _uses_container_paths(task_id):
+        kind = await _special_file_kind(resolved)
+        if kind is not None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "note": (
+                        f"'{path}' is {kind}, not a regular file — reading it "
+                        "would block indefinitely, so no read was attempted. "
+                        "Use terminal utilities if you need to interact with it."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
     # Structured documents are binary containers but intentionally render as
     # text in Hermes. Keep this before the binary-extension guard, matching the
     # upstream read_file contract.
     from tools.read_extract import (
+        ANYDOC_EXTENSIONS,
+        EXTRACTABLE_EXTENSIONS,
         ExtractionError,
         extract_document_text,
         is_extractable_document,
@@ -1269,8 +1374,26 @@ async def _handle_read_file(args, **kw):
     if is_extractable_document(str(resolved)):
         try:
             extracted_text = await extract_document_text(str(resolved))
-        except ExtractionError:
+        except ExtractionError as exc:
             logger.debug("document extraction failed for %s", path, exc_info=True)
+            extension = resolved.suffix.lower()
+            binary_document = extension in ANYDOC_EXTENSIONS or (
+                extension in EXTRACTABLE_EXTENSIONS and extension != ".ipynb"
+            )
+            # A malformed/encrypted/oversized binary document has an actionable
+            # reason. Preserve that reason instead of falling through to the
+            # generic binary-file refusal. Notebook failures remain on the raw
+            # path because notebooks are ordinary JSON and the source is often
+            # still useful for repair.
+            if (
+                binary_document
+                and not str(exc).startswith("Unsupported document type")
+            ):
+                return tool_error(
+                    f"Cannot read '{path}' ({extension}): document extraction "
+                    f"failed — {exc}. Use terminal utilities to inspect or "
+                    "convert the file."
+                )
         else:
             lines = extracted_text.splitlines()
             page = lines[offset - 1:offset - 1 + limit]
@@ -1367,6 +1490,26 @@ async def _handle_read_file(args, **kw):
         async with aiofiles.open(resolved, "rb") as handle:
             data = await handle.read()
     except FileNotFoundError:
+        variant = await _unicode_variant_match(resolved)
+        if variant is not None:
+            repaired = json.loads(
+                await _handle_read_file(
+                    {"path": str(variant), "offset": offset, "limit": limit},
+                    **kw,
+                )
+            )
+            note = (
+                f"Note: '{path}' not found byte-for-byte; resolved to "
+                f"the unicode-equivalent file '{variant}' (invisible "
+                "encoding difference: NFC/NFD or special space/quote "
+                "characters)."
+            )
+            repaired["hint"] = (
+                f"{note} {repaired['hint']}"
+                if repaired.get("hint")
+                else note
+            )
+            return json.dumps(repaired, ensure_ascii=False)
         directory = resolved.parent
         display_directory = os.path.dirname(path) or "."
         filename = os.path.basename(path)
@@ -1418,13 +1561,14 @@ async def _handle_read_file(args, **kw):
         "\ufffd" in sample
         or (sample and non_printable / len(sample) > 0.30)
     ):
+        description = describe_binary_file(data[:1000], len(data))
         return json.dumps(
             ReadResult(
                 file_size=len(data),
                 is_binary=True,
                 error=(
-                    "Binary file - cannot display as text. Use appropriate "
-                    "tools to handle this file type."
+                    f"Binary file ({description}) - cannot display as text. "
+                    "Use appropriate tools to handle this file type."
                 ),
             ).to_dict(),
             ensure_ascii=False,
@@ -1451,7 +1595,14 @@ async def _handle_read_file(args, **kw):
         "is_binary": False,
         "is_image": False,
     }
-    if char_truncated:
+    if offset > total_lines and total_lines:
+        result["hint"] = (
+            f"Offset {offset} is beyond the end of the file, which has "
+            f"{total_lines} lines. Use a lower offset to read existing content."
+        )
+    elif not total_lines:
+        result["hint"] = "The file is empty."
+    elif char_truncated:
         shown_end = offset + lines_kept - 1
         result["truncated_by"] = "bytes"
         result["next_offset"] = next_offset
@@ -1919,6 +2070,11 @@ async def _write_file_native(args, **kw):
     resolved = await _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
+    approval_error = await _check_approval_required_write(
+        [str(resolved)], task_id=task_id
+    )
+    if approval_error:
+        return tool_error(approval_error)
     denied_error = await get_write_denied_error(str(resolved))
     if denied_error:
         return tool_error(denied_error)
@@ -1981,7 +2137,12 @@ class _V4AFileOperations:
             file_size=len(raw_content.encode("utf-8")),
         )
 
-    async def write_file(self, path: str, content: str) -> WriteResult:
+    async def write_file(
+        self,
+        path: str,
+        content: str,
+        pre_content: str | None = None,
+    ) -> WriteResult:
         return await _write_native_result(Path(path), content)
 
     async def delete_file(self, path: str) -> WriteResult:
@@ -2051,6 +2212,12 @@ async def _handle_v4a_patch(
         if denied_error:
             return tool_error(denied_error)
         resolved_by_raw[raw_path] = resolved
+
+    approval_error = await _check_approval_required_write(
+        [str(path) for path in resolved_by_raw.values()], task_id=task_id
+    )
+    if approval_error:
+        return tool_error(approval_error)
 
     for operation in operations:
         operation.file_path = str(resolved_by_raw[operation.file_path])
@@ -2130,6 +2297,11 @@ async def _patch_native(args, **kw):
     resolved = await _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
+    approval_error = await _check_approval_required_write(
+        [str(resolved)], task_id=task_id
+    )
+    if approval_error:
+        return tool_error(approval_error)
     denied_error = await get_write_denied_error(str(resolved))
     if denied_error:
         return tool_error(denied_error)

@@ -61,7 +61,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("openai/gpt-5.4-mini", ""),
     # Google
     ("google/gemini-3.1-pro-preview", ""),
-    ("google/gemini-3.6-flash", ""),
+    ("google/gemini-3.7-flash", ""),
     # xAI
     ("x-ai/grok-4.5", ""),
     # DeepSeek
@@ -69,7 +69,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("deepseek/deepseek-v4-flash", ""),
     ("deepseek/deepseek-v4-flash-0731", "dated snapshot of v4-flash"),
     # Qwen
-    ("qwen/qwen3.7-max", ""),
+    ("qwen/qwen3.8-max", ""),
     # MoonshotAI
     ("moonshotai/kimi-k3", "recommended"),
     # MiniMax
@@ -102,6 +102,173 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+
+
+def parse_openrouter_reasoning_capabilities(
+    item: Any,
+) -> dict[str, Any] | None:
+    """Normalize reasoning metadata from one OpenRouter catalog entry.
+
+    OpenRouter only treats the top-level ``reasoning`` object as authoritative
+    when ``supported_parameters`` explicitly includes ``reasoning``.  A
+    malformed or missing parameter list therefore remains unknown (``None``),
+    while a well-formed list that omits it is a definitive negative.
+    """
+    if not isinstance(item, dict):
+        return None
+    params = item.get("supported_parameters")
+    if not isinstance(params, list):
+        return None
+    if "reasoning" not in params:
+        return {"supports_reasoning": False}
+    reasoning = item.get("reasoning")
+    mandatory = isinstance(reasoning, dict) and reasoning.get("mandatory") is True
+    efforts: list[str] | None = None
+    if isinstance(reasoning, dict):
+        raw_efforts = reasoning.get("supported_efforts")
+        if isinstance(raw_efforts, list):
+            efforts = list(
+                dict.fromkeys(
+                    str(effort).strip().lower()
+                    for effort in raw_efforts
+                    if str(effort).strip()
+                )
+            )
+    return {
+        "supports_reasoning": True,
+        "supported_efforts": efforts,
+        "mandatory": mandatory,
+    }
+
+
+# Public catalog data is safe to share across profiles.  The cache contains
+# no credentials and is only populated from OpenRouter's unauthenticated
+# catalog endpoint.  Failed probes are throttled so a temporarily unavailable
+# catalog cannot add a request to every conversation turn.
+_openrouter_reasoning_caps_cache: dict[str, dict[str, Any] | None] | None = None
+_openrouter_reasoning_caps_failed_at: float | None = None
+
+
+def _cached_openrouter_model_reasoning_capabilities(
+    model_id: str | None,
+) -> dict[str, Any] | None:
+    model = str(model_id or "").strip()
+    if not model or _openrouter_reasoning_caps_cache is None:
+        return None
+    return _openrouter_reasoning_caps_cache.get(model)
+
+
+async def _fetch_openrouter_reasoning_caps(
+    timeout: float = 6.0,
+) -> dict[str, dict[str, Any] | None] | None:
+    """Fetch and cache OpenRouter reasoning capabilities without blocking."""
+    global _openrouter_reasoning_caps_cache, _openrouter_reasoning_caps_failed_at
+    if _openrouter_reasoning_caps_cache is not None:
+        return _openrouter_reasoning_caps_cache
+    if (
+        _openrouter_reasoning_caps_failed_at is not None
+        and time.monotonic() - _openrouter_reasoning_caps_failed_at < 60
+    ):
+        return None
+    try:
+        async with (
+            await _create_httpx_client(
+                timeout=timeout,
+                headers={"Accept": "application/json"},
+            )
+        ) as client:
+            response = await client.get("https://openrouter.ai/api/v1/models")
+            response.raise_for_status()
+            payload = response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _openrouter_reasoning_caps_failed_at = time.monotonic()
+        logger.debug("OpenRouter reasoning catalog fetch failed: %s", exc)
+        return None
+
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        _openrouter_reasoning_caps_failed_at = time.monotonic()
+        return None
+    caps_by_id: dict[str, dict[str, Any] | None] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id:
+            caps_by_id[model_id] = parse_openrouter_reasoning_capabilities(item)
+    if not caps_by_id:
+        _openrouter_reasoning_caps_failed_at = time.monotonic()
+        return None
+    _openrouter_reasoning_caps_cache = caps_by_id
+    _openrouter_reasoning_caps_failed_at = None
+    return caps_by_id
+
+
+async def openrouter_model_reasoning_capabilities(
+    model_id: str | None,
+    *,
+    timeout: float = 6.0,
+    allow_fetch: bool = False,
+) -> dict[str, Any] | None:
+    """Return cached/live reasoning capabilities for an OpenRouter model.
+
+    ``None`` means unknown (catalog not loaded, model unlisted, or malformed
+    metadata), so callers should retain their conservative static fallback.
+    This function is async because the optional catalog fetch uses the native
+    HTTP transport and never blocks the event loop.
+    """
+    global _openrouter_reasoning_caps_cache
+    cached = _cached_openrouter_model_reasoning_capabilities(model_id)
+    if cached is not None or not allow_fetch:
+        return cached
+    fetched = await _fetch_openrouter_reasoning_caps(timeout=timeout)
+    # Keep the helper composable for callers/tests that provide a native
+    # fetcher; the built-in fetcher already publishes this same snapshot.
+    if _openrouter_reasoning_caps_cache is None and fetched is not None:
+        _openrouter_reasoning_caps_cache = fetched
+    return _cached_openrouter_model_reasoning_capabilities(model_id)
+
+
+_REASONING_EFFORT_ORDER = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+
+
+def clamp_reasoning_effort_to_supported(
+    effort: str | None,
+    supported_efforts: list[str] | None,
+) -> str | None:
+    """Clamp a known effort to the nearest supported lower level."""
+    requested = str(effort or "").strip().lower()
+    if not requested or not supported_efforts:
+        return effort
+    supported = [
+        str(level).strip().lower()
+        for level in supported_efforts
+        if str(level).strip().lower() in _REASONING_EFFORT_ORDER
+    ]
+    if not supported or requested in supported:
+        return effort
+    if requested not in _REASONING_EFFORT_ORDER:
+        return effort
+    requested_index = _REASONING_EFFORT_ORDER.index(requested)
+    lower = [
+        level
+        for level in supported
+        if _REASONING_EFFORT_ORDER.index(level) < requested_index
+    ]
+    if lower:
+        return max(lower, key=_REASONING_EFFORT_ORDER.index)
+    return min(supported, key=_REASONING_EFFORT_ORDER.index)
 
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
@@ -193,7 +360,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "openai/gpt-5.4-mini",
         # Google
         "google/gemini-3.1-pro-preview",
-        "google/gemini-3.6-flash",
+        "google/gemini-3.7-flash",
         # xAI
         "x-ai/grok-4.5",
         # DeepSeek
@@ -201,7 +368,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-0731",
         # Qwen
-        "qwen/qwen3.7-max",
+        "qwen/qwen3.8-max",
         # MoonshotAI
         "moonshotai/kimi-k3",
         # MiniMax
@@ -2044,6 +2211,7 @@ def opencode_model_api_mode(provider_id: str | None, model_id: str | None) -> st
     OpenCode routes different models behind different API surfaces:
 
     - GPT-5 / Codex models on Zen use ``/v1/responses``
+    - GPT models on Go use ``/v1/responses``
     - Claude models on Zen use ``/v1/messages``
     - MiniMax and Qwen models on Go use ``/v1/messages``
     - GLM / Kimi / DeepSeek / MiMo on Go use ``/v1/chat/completions``
@@ -2060,6 +2228,9 @@ def opencode_model_api_mode(provider_id: str | None, model_id: str | None) -> st
         return "chat_completions"
 
     if provider == "opencode-go":
+        if normalized.startswith("gpt-"):
+            # GPT models on Go are served through the Responses endpoint.
+            return "codex_responses"
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
         if normalized.startswith("qwen"):

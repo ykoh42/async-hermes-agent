@@ -14,6 +14,29 @@ from hermes_constants import (
 from hermes_cli.nous_account import NousPortalAccountInfo
 
 
+def test_curated_openrouter_and_nous_catalogs_track_upstream_flash_model():
+    """The upstream 2026.8.13 catalog replaces the retired 3.6 flash route."""
+    assert ("google/gemini-3.7-flash", "") in models.OPENROUTER_MODELS
+    assert ("google/gemini-3.6-flash", "") not in models.OPENROUTER_MODELS
+    assert "google/gemini-3.7-flash" in models._PROVIDER_MODELS["nous"]
+    assert "google/gemini-3.6-flash" not in models._PROVIDER_MODELS["nous"]
+
+
+def test_curated_openrouter_and_nous_catalogs_track_upstream_qwen_model():
+    """The upstream catalog replaces the retired Qwen 3.7 Max route."""
+    assert ("qwen/qwen3.8-max", "") in models.OPENROUTER_MODELS
+    assert ("qwen/qwen3.7-max", "") not in models.OPENROUTER_MODELS
+    assert "qwen/qwen3.8-max" in models._PROVIDER_MODELS["nous"]
+    assert "qwen/qwen3.7-max" not in models._PROVIDER_MODELS["nous"]
+
+
+def test_opencode_go_gpt_models_use_responses_api():
+    assert models.opencode_model_api_mode("opencode-go", "gpt-5.6-luna") == "codex_responses"
+    assert models.opencode_model_api_mode(
+        "opencode-go", "opencode-go/gpt-5.6-luna"
+    ) == "codex_responses"
+
+
 @pytest.fixture(autouse=True)
 def _clear_nous_model_caches():
     models._free_tier_cache = None

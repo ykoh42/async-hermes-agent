@@ -18,6 +18,7 @@ from collections.abc import Callable, Collection
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
+    FTS_STALE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
@@ -25,6 +26,7 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
     _session_runtime_config_value,
+    escape_like as _escape_like,
 )
 
 
@@ -154,7 +156,7 @@ class SessionSearchMixin:
         cursor = await connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name LIKE ? ESCAPE '\\'",
-            (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
+            (_escape_like(self._FTS_TRASH_PREFIX) + "%",),
         )
         try:
             trash = [row[0] for row in await cursor.fetchall()]
@@ -1169,6 +1171,8 @@ class SessionSearchMixin:
     def _describe_search_path(self, query: str) -> str:
         """Return the upstream route name used for slow-search diagnostics."""
         try:
+            if self._fts_stale:
+                return "like_scan_fts_stale"
             sanitized = self._sanitize_fts5_query(query or "")
             if not sanitized:
                 return "empty"
@@ -1190,6 +1194,125 @@ class SessionSearchMixin:
         except Exception:
             return "unknown"
 
+    @staticmethod
+    def _compile_like_boolean_query(
+        query: str,
+    ) -> tuple[str, list[Any], str | None]:
+        """Compile the supported FTS boolean subset into LIKE predicates."""
+        groups: list[list[tuple[str, bool]]] = [[]]
+        negate_next = False
+        for raw_token in re.findall(r'"[^"]+"|\S+', query):
+            operator = raw_token.upper()
+            if operator == "OR":
+                if groups[-1]:
+                    groups.append([])
+                negate_next = False
+                continue
+            if operator in {"AND", "NEAR"}:
+                continue
+            if operator == "NOT":
+                negate_next = True
+                continue
+            term = raw_token.strip('"').strip("*").strip()
+            if term:
+                groups[-1].append((term, negate_next))
+                negate_next = False
+
+        compiled_groups: list[str] = []
+        params: list[Any] = []
+        snippet_term: str | None = None
+        for group in groups:
+            if not group or not any(not negated for _, negated in group):
+                continue
+            clauses: list[str] = []
+            for term, negated in group:
+                escaped = _escape_like(term)
+                clause = (
+                    "(COALESCE(m.content, '') LIKE ? ESCAPE '\\' OR "
+                    "COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' OR "
+                    "COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
+                )
+                clauses.append(f"NOT {clause}" if negated else clause)
+                params.extend([f"%{escaped}%"] * 3)
+                if snippet_term is None and not negated:
+                    snippet_term = term
+            compiled_groups.append(f"({' AND '.join(clauses)})")
+        return " OR ".join(compiled_groups), params, snippet_term
+
+    async def _search_messages_like_fallback(
+        self,
+        query: str,
+        *,
+        source_filter: list[str] | None,
+        exclude_sources: list[str] | None,
+        role_filter: list[str] | None,
+        limit: int,
+        offset: int,
+        sort: str | None,
+        include_inactive: bool,
+    ) -> list[dict[str, Any]]:
+        """Search canonical rows while durable FTS state is stale."""
+        predicate, params, snippet_term = self._compile_like_boolean_query(query)
+        if not predicate or snippet_term is None:
+            return []
+        where = [f"({predicate})"]
+        if not include_inactive:
+            where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            where.append(
+                "s.source IN (" + ",".join("?" for _ in source_filter) + ")"
+            )
+            params.extend(source_filter)
+        if exclude_sources is not None:
+            where.append(
+                "s.source NOT IN ("
+                + ",".join("?" for _ in exclude_sources)
+                + ")"
+            )
+            params.extend(exclude_sources)
+        if role_filter:
+            where.append(
+                "m.role IN (" + ",".join("?" for _ in role_filter) + ")"
+            )
+            params.extend(role_filter)
+        order = (
+            "ASC"
+            if isinstance(sort, str) and sort.strip().lower() == "oldest"
+            else "DESC"
+        )
+        sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   substr(m.content, max(1, instr(m.content, ?) - 40), 120) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(where)}
+            ORDER BY m.timestamp {order}, m.id {order}
+            LIMIT ? OFFSET ?
+        """
+        rows = await self._read_fetchall(
+            sql, [snippet_term, *params, limit, offset]
+        )
+        return [dict(row) for row in rows]
+
+    async def _refresh_fts_stale_state(self) -> None:
+        """Observe a fail-open marker written by another process."""
+        if self._fts_stale or not self._fts_enabled:
+            return
+        try:
+            rows = await self._read_fetchall(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (FTS_STALE_KEY,),
+            )
+        except sqlite3.Error:
+            return
+        if rows:
+            self._fts_stale = True
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_available = False
+
     async def _search_messages_impl(
         self,
         query: str,
@@ -1205,10 +1328,25 @@ class SessionSearchMixin:
         """Full-text search with v2026.8.3 routing and result semantics."""
         result_fields = self._search_message_fields(fields)
         await self._get_connection()
-        if not self._fts_enabled or not query or not query.strip():
+        if not query or not query.strip():
             return []
         query = self._sanitize_fts5_query(query)
         if not query:
+            return []
+
+        await self._refresh_fts_stale_state()
+        if self._fts_stale:
+            return await self._search_messages_like_fallback(
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                include_inactive=include_inactive,
+            )
+        if not self._fts_enabled:
             return []
 
         sort_norm = sort.strip().lower() if isinstance(sort, str) else None
@@ -1317,11 +1455,7 @@ class SessionSearchMixin:
                 token_clauses = []
                 like_params: list[Any] = []
                 for token in tokens:
-                    escaped = (
-                        token.replace("\\", "\\\\")
-                        .replace("%", "\\%")
-                        .replace("_", "\\_")
-                    )
+                    escaped = _escape_like(token)
                     token_clauses.append(
                         "(m.content LIKE ? ESCAPE '\\' "
                         "OR m.tool_name LIKE ? ESCAPE '\\' "
@@ -1538,11 +1672,7 @@ class SessionSearchMixin:
         where = ["m.id > ? AND m.id <= ?"]
         params: list[Any] = [status["indexed"], status["total"]]
         for term in terms:
-            escaped = (
-                term.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
+            escaped = _escape_like(term)
             where.append(
                 "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' "
                 "OR m.tool_calls LIKE ? ESCAPE '\\')"

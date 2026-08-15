@@ -11,6 +11,7 @@ from blockbuster import BlockBuster
 from agent.errors import SSLConfigurationError
 from agent.ssl_guard import (
     _CA_BUNDLE_ENV_VARS,
+    _validate_bundle_path,
     verify_ca_bundle,
     verify_ca_bundle_with_fallback,
 )
@@ -103,3 +104,22 @@ async def test_explicit_ca_bundle_must_be_a_file(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_CA_BUNDLE", str(tmp_path))
     with pytest.raises(SSLConfigurationError, match="bundle file"):
         await verify_ca_bundle()
+
+
+async def test_truststore_context_without_certificate_enumeration_is_accepted(
+    monkeypatch,
+    tmp_path,
+):
+    bundle = tmp_path / "truststore.pem"
+    bundle.write_text("placeholder")
+
+    class TruststoreContext:
+        def get_ca_certs(self):
+            raise NotImplementedError
+
+    monkeypatch.setattr(
+        ssl,
+        "create_default_context",
+        lambda **_: TruststoreContext(),
+    )
+    await _validate_bundle_path("HERMES_CA_BUNDLE", str(bundle))

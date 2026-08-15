@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
+# Corrupted tool-call arguments are replaced in the persisted transcript;
+# retain a bounded full copy in logs so the original user payload remains
+# recoverable without allowing pathological requests to flood the log.
+_FULL_ARGS_LOG_BOUND = 100_000
+
 
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).

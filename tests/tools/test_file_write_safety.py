@@ -5,7 +5,11 @@ import os
 
 import pytest
 
-from agent.file_safety import get_write_denied_error
+from agent.file_safety import (
+    get_write_denied_error,
+    is_write_approval_required,
+    is_write_denied,
+)
 from tools.file_operations import _strip_bom
 from tools.file_tools import _check_sensitive_path, patch_tool, write_file_tool
 
@@ -21,6 +25,25 @@ async def test_credential_path_denied():
     error = await get_write_denied_error(os.path.expanduser("~/.ssh/id_rsa"))
     assert error is not None
     assert "protected system/credential file" in error
+
+
+async def test_ssh_config_is_approval_gated_not_hard_denied(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / ".ssh" / "config"
+    assert await is_write_denied(str(target)) is False
+    assert await get_write_denied_error(str(target)) is None
+    assert await is_write_approval_required(str(target)) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["id_rsa", "id_ed25519", "authorized_keys", "id_rsa.pub"],
+)
+async def test_other_ssh_files_remain_hard_denied(tmp_path, monkeypatch, name):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / ".ssh" / name
+    assert await is_write_denied(str(target)) is True
+    assert await is_write_approval_required(str(target)) is False
 
 
 async def test_safe_write_root_bounds_native_write(tmp_path, monkeypatch):

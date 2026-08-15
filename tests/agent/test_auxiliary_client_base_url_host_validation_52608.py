@@ -90,6 +90,49 @@ class TestTryAnthropicBaseUrlHostValidation:
         assert actual == "https://api.anthropic.com"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://proxy.example.com/anthropic",
+            "https://proxy.example.com/anthropic/v1",
+        ],
+    )
+    async def test_anthropic_path_suffix_gateway_is_preserved(
+        self, tmp_path, monkeypatch, base_url
+    ):
+        """Anthropic-compatible gateways may expose only a path-suffixed route."""
+        import yaml
+        from agent.auxiliary_client import _try_anthropic
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+            "model": {
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "base_url": base_url,
+            }
+        }))
+
+        with (
+            patch(
+                "agent.anthropic_adapter.resolve_anthropic_token",
+                new=AsyncMock(return_value="***"),
+            ),
+            patch(
+                "agent.credential_pool.load_pool",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(entries=MagicMock(return_value=[]))
+                ),
+            ),
+            patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
+        ):
+            mock_build.return_value = MagicMock()
+            client, _model = await _try_anthropic()
+
+        assert client is not None
+        assert _extract_base_url_passed_to_build(mock_build) == base_url
+
+    @pytest.mark.asyncio
     async def test_openai_base_url_does_not_leak(self, tmp_path, monkeypatch):
         """Generic non-Anthropic host must not be applied as auxiliary base_url."""
         import yaml
@@ -121,4 +164,3 @@ class TestTryAnthropicBaseUrlHostValidation:
         assert actual == "https://api.anthropic.com", (
             f"Non-Anthropic host must not be applied. Got: {actual!r}"
         )
-

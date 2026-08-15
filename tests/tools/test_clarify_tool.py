@@ -66,7 +66,7 @@ class TestClarifyToolChoicesValidation:
             return "answer"
 
         await clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
-        assert choices_received == ["1", "2", "3"]
+        assert choices_received == ["1 (Recommended)", "2", "3"]
 
 
 class TestClarifyToolCallbackHandling:
@@ -136,7 +136,7 @@ class TestClarifyDictChoices:
             callback=cb,
         ))  # type: ignore
         assert seen == [
-            "Tight, covers all 3 points",
+            "Tight, covers all 3 points (Recommended)",
             "Loose layout",
             "A plain string choice",
         ]
@@ -144,6 +144,18 @@ class TestClarifyDictChoices:
         assert result["user_response"] == "Tight, covers all 3 points"
         assert "{" not in result["user_response"]
         assert all("{" not in c for c in result["choices_offered"])
+
+    def test_recommendation_helpers_are_idempotent_and_reversible(self):
+        from tools.clarify_tool import mark_recommended, strip_recommended
+
+        assert mark_recommended(["one"]) == ["one"]
+        assert mark_recommended(["one", "two"]) == [
+            "one (Recommended)", "two"
+        ]
+        assert mark_recommended(["one (Recommended)", "two"]) == [
+            "one (Recommended)", "two"
+        ]
+        assert strip_recommended(" one (recommended) ") == "one"
 
 
 class TestClarifySchema:

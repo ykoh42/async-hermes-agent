@@ -46,6 +46,8 @@ def _parent_stub():
         _COMBINED_REVIEW_PROMPT="review both",
         _safe_print=output.append,
         _emit_auxiliary_failure=lambda task, exc: failures.append((task, exc)),
+        _active_children=[],
+        _background_review_agent=None,
     )
     return agent, failures, output
 
@@ -295,6 +297,55 @@ async def test_review_cancellation_closes_fork_and_propagates():
     assert stopped.is_set()
     assert captured["shutdown_calls"] >= 1
     assert captured["close_calls"] == 1
+    assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_review_registers_and_unregisters_parent_interrupt_slots():
+    """An in-flight review is visible to interrupt/next-turn cleanup."""
+    parent, failures, _ = _parent_stub()
+    captured = {}
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    recorder = _recorder_class(
+        captured,
+        block_in_run=True,
+        started=started,
+        stopped=stopped,
+    )
+    target, _ = background_review.spawn_background_review_thread(
+        parent,
+        [],
+        review_memory=True,
+    )
+    with (
+        patch("run_agent.AIAgent", recorder),
+        patch.object(
+            background_review,
+            "_resolve_review_runtime",
+            AsyncMock(return_value=_runtime()),
+        ),
+        patch(
+            "model_tools.get_tool_definitions",
+            AsyncMock(
+                return_value=[
+                    {"type": "function", "function": {"name": "memory"}},
+                ]
+            ),
+        ),
+    ):
+        task = asyncio.create_task(target())
+        await started.wait()
+        fork = parent._background_review_agent
+        assert fork is not None
+        assert parent._active_children == [fork]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert stopped.is_set()
+    assert parent._background_review_agent is None
+    assert parent._active_children == []
     assert failures == []
 
 

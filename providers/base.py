@@ -97,6 +97,15 @@ class ProviderProfile:
 
     # ── Hooks (override in subclass for complex providers) ───
 
+    async def resolve_aux_model(self, *, vision: bool = False) -> str:
+        """Return a live cheap-model id for auxiliary tasks, or ``""``.
+
+        Provider profiles that publish a machine-readable recommendation can
+        override this coroutine. The base hook has no I/O and returns an empty
+        string so callers fall back to ``default_aux_model``.
+        """
+        return ""
+
     def get_hostname(self) -> str:
         """Return the provider's base hostname for URL-based detection.
 

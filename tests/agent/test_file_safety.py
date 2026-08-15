@@ -13,10 +13,13 @@ pytestmark = pytest.mark.asyncio
 
 from agent.file_safety import (
     _BLOCKED_PROJECT_ENV_BASENAMES,
+    build_write_approval_paths,
     build_write_denied_paths,
     build_write_denied_prefixes,
     get_read_block_error,
     get_safe_write_roots,
+    get_write_denied_error,
+    is_write_approval_required,
     is_write_denied,
 )
 
@@ -36,6 +39,14 @@ async def test_public_write_safety_api_is_native_async(tmp_path, monkeypatch):
     assert str(tmp_path.resolve()) in roots
     assert await is_write_denied(str(tmp_path / "allowed.txt")) is False
     assert await is_write_denied(str(tmp_path.parent / "outside.txt")) is True
+
+
+async def test_ssh_config_is_approval_gated_not_hard_denied(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh_config = tmp_path / ".ssh" / "config"
+    assert str(ssh_config.resolve()) in await build_write_approval_paths(str(tmp_path))
+    assert await is_write_approval_required(str(ssh_config)) is True
+    assert await get_write_denied_error(str(ssh_config)) is None
 
 
 # ---------------------------------------------------------------------------

@@ -346,6 +346,26 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    async def test_qwen38_max_has_one_million_token_context(self):
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        assert DEFAULT_CONTEXT_LENGTHS["qwen3.8-max"] == 1_000_000
+        with mock_patch(
+            "agent.model_metadata.fetch_model_metadata",
+            new_callable=AsyncMock,
+            return_value={},
+        ), mock_patch(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            new_callable=AsyncMock,
+            return_value={},
+        ), mock_patch(
+            "agent.model_metadata.get_cached_context_length",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            assert await get_model_context_length("qwen/qwen3.8-max") == 1_000_000
+
 
 
 
@@ -1229,6 +1249,13 @@ class TestContextLengthCache:
             with open(cache_file) as f:
                 data = yaml.safe_load(f)
             assert len(data["context_lengths"]) == 1
+
+    @pytest.mark.parametrize("length", [0, -1])
+    async def test_non_positive_context_lengths_are_not_persisted(self, tmp_path, length):
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            await save_context_length("model", "http://x", length)
+            assert await get_cached_context_length("model", "http://x") is None
 
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -37,7 +38,10 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 _MAX_TOOL_WORKERS = 8
+_DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+_START_ORDER_GATE_TIMEOUT_S = 120.0
+_AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -102,6 +106,38 @@ def _budget_for_agent(agent) -> BudgetConfig:
         return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
         return DEFAULT_BUDGET
+
+
+def _image_generate_parallel_limit(config: dict | None = None) -> int:
+    """Return the configured image-generation parallelism cap.
+
+    Configuration is supplied by the awaited dispatch boundary.  Keeping this
+    helper pure means tests and callers never need to perform synchronous file
+    I/O from an event loop.
+    """
+    image_gen = config.get("image_gen") if isinstance(config, dict) else None
+    value = image_gen.get("max_parallel_requests") if isinstance(image_gen, dict) else None
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = _DEFAULT_IMAGE_PARALLEL_REQUESTS
+    return max(1, min(limit, _MAX_TOOL_WORKERS))
+
+
+def _max_workers_for_tool_batch(runnable_calls, config: dict | None = None) -> int:
+    """Return the native worker cap for a parallel tool segment."""
+    if not runnable_calls:
+        return 0
+
+    def _tool_name(call) -> str | None:
+        if isinstance(call, tuple):
+            return call[2] if len(call) >= 3 else None
+        return getattr(getattr(call, "function", None), "name", None)
+
+    max_workers = _MAX_TOOL_WORKERS
+    if any(_tool_name(call) == "image_generate" for call in runnable_calls):
+        max_workers = min(max_workers, _image_generate_parallel_limit(config))
+    return min(len(runnable_calls), max_workers)
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, str | None]:
@@ -253,55 +289,93 @@ class _ManagedToolResult:
 
 
 class _ConcurrentToolAuthorizationGate:
-    """Serialize policy prompts and exclude their queue from batch deadlines."""
+    """Serialize policy prompts with a bounded native-async lock acquire.
 
-    def __init__(self) -> None:
+    The removed CLI/gateway transports owned the upstream human-wait timer.
+    Retained callers use native approval callbacks, so arbitrary callback
+    residency is deliberately *not* treated as deadline exclusion.
+    """
+
+    def __init__(self, *, lock_timeout: float | None = None, session_key: str | None = None) -> None:
         self._serialization_lock = asyncio.Lock()
-        self._pending = 0
-        self._window_started: float | None = None
-        self._excluded_seconds = 0.0
+        self._lock_timeout = (
+            _AUTHORIZATION_GATE_LOCK_TIMEOUT_S
+            if lock_timeout is None
+            else lock_timeout
+        )
+        self._session_key = session_key
 
     async def run(self, callback):
-        now = time.monotonic()
-        if self._pending == 0:
-            self._window_started = now
-        self._pending += 1
+        acquired = False
         try:
-            async with self._serialization_lock:
-                return await callback()
+            await asyncio.wait_for(
+                self._serialization_lock.acquire(),
+                timeout=self._lock_timeout,
+            )
+            acquired = True
+        except TimeoutError:
+            logger.warning(
+                "authorization gate lock not acquired after %.1fs; "
+                "running prompt unserialized",
+                self._lock_timeout,
+            )
+        try:
+            result = callback()
+            return await result if inspect.isawaitable(result) else result
         finally:
-            now = time.monotonic()
-            self._pending -= 1
-            if self._pending == 0:
-                if self._window_started is not None:
-                    self._excluded_seconds += max(
-                        0.0, now - self._window_started
-                    )
-                self._window_started = None
+            if acquired:
+                self._serialization_lock.release()
 
     def excluded_seconds(self) -> float:
-        excluded = self._excluded_seconds
-        if self._window_started is not None:
-            excluded += max(0.0, time.monotonic() - self._window_started)
-        return excluded
+        # The retained library has no synchronous CLI/gateway human-wait
+        # window to exclude.  Authorization callbacks are ordinary async work
+        # and must continue to count against the batch deadline; otherwise a
+        # wedged plugin can keep extending that deadline forever.
+        return 0.0
 
 
 class _OrderedToolStartGate:
-    """Run parallel tool preflight callbacks in model emission order."""
+    """Run parallel tool preflight callbacks in emission order.
+
+    A callback that wedges after claiming its order must not starve later
+    workers forever.  Later workers wait for the prior callback only up to the
+    bounded gate timeout, then proceed independently; normal callbacks still
+    retain strict submission order.
+    """
 
     def __init__(self) -> None:
         self._condition = asyncio.Condition()
         self._next_order = 0
+        self._active_done: asyncio.Event | None = None
 
     async def advance(self, order: int, callback=None) -> None:
         async with self._condition:
             await self._condition.wait_for(lambda: order == self._next_order)
-            try:
-                if callback is not None:
-                    await callback()
-            finally:
-                self._next_order += 1
-                self._condition.notify_all()
+            previous_done = self._active_done
+            current_done = asyncio.Event()
+            self._active_done = current_done
+            self._next_order += 1
+            self._condition.notify_all()
+
+        try:
+            if previous_done is not None:
+                try:
+                    await asyncio.wait_for(
+                        previous_done.wait(),
+                        timeout=_START_ORDER_GATE_TIMEOUT_S,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "tool start-order gate timed out after %.1fs; "
+                        "continuing without waiting for the prior dispatch",
+                        _START_ORDER_GATE_TIMEOUT_S,
+                    )
+            if callback is not None:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            current_done.set()
 
 
 
@@ -1145,7 +1219,18 @@ async def _execute_tool_calls_native(
         else:
             start_gate = _OrderedToolStartGate()
             authorization_gate = _ConcurrentToolAuthorizationGate()
-            semaphore = asyncio.Semaphore(_MAX_TOOL_WORKERS)
+            dispatch_config = None
+            if any(
+                getattr(getattr(call, "function", None), "name", None)
+                == "image_generate"
+                for call in calls
+            ):
+                from hermes_cli.config import load_config_readonly
+
+                dispatch_config = await load_config_readonly()
+            semaphore = asyncio.Semaphore(
+                _max_workers_for_tool_batch(calls, dispatch_config)
+            )
             runtime_state = [None] * len(calls)
 
             async def _run_parallel(index, tool_call):

@@ -203,6 +203,7 @@ class SessionPortabilityMixin:
         )
         if not session:
             return None
+        await self.assert_export_safe(session_id)  # type: ignore[unresolved-attribute]
         messages = await self.get_messages(  # type: ignore[unresolved-attribute]
             session_id
         )
@@ -250,6 +251,7 @@ class SessionPortabilityMixin:
         )
         results = []
         for session in sessions:
+            await self.assert_export_safe(session["id"])  # type: ignore[unresolved-attribute]
             messages = await self.get_messages(  # type: ignore[unresolved-attribute]
                 session["id"]
             )

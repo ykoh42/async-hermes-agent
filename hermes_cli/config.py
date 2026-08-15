@@ -1341,6 +1341,44 @@ def get_compatible_custom_providers(
     return compatible
 
 
+def get_custom_provider_model_capability(
+    model: str,
+    base_url: str,
+    capability: str,
+    custom_providers: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> bool | None:
+    """Return an explicit boolean capability for one custom model route.
+
+    This helper is intentionally synchronous and side-effect free. Async
+    callers pass the already-loaded provider snapshot; when no snapshot is
+    available, returning ``None`` avoids reintroducing a blocking config read
+    into state-only construction or transport policy calculation.
+    """
+    if not model or not base_url or not capability:
+        return None
+    if custom_providers is None:
+        if config is None:
+            return None
+        custom_providers = get_compatible_custom_providers(config)
+    if not isinstance(custom_providers, list):
+        return None
+
+    target_url = normalize_route_base_url(base_url)
+    if not target_url:
+        return None
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        if normalize_route_base_url(entry.get("base_url")) != target_url:
+            continue
+        models = entry.get("models")
+        model_cfg = models.get(model) if isinstance(models, dict) else None
+        if isinstance(model_cfg, dict) and isinstance(model_cfg.get(capability), bool):
+            return bool(model_cfg[capability])
+    return None
+
+
 def _coerce_ssl_verify(value: Any) -> bool | None:
     if value is None:
         return None

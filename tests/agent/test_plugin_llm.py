@@ -566,6 +566,18 @@ class TestAttribution:
         assert provider == "openrouter"
         assert model == "openai/gpt-4o-2024-08-06"
 
+    @pytest.mark.asyncio
+    async def test_successful_fallback_route_wins_attribution(self):
+        from agent.plugin_llm import _resolve_attribution
+
+        provider, model = await _resolve_attribution(
+            provider_override="primary-provider",
+            model_override="primary-model",
+            response=SimpleNamespace(choices=[]),
+            route_info={"provider": "fallback-provider", "model": "fallback-model"},
+        )
+        assert (provider, model) == ("fallback-provider", "fallback-model")
+
 
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,47 @@ class TestFlushAfterCompression:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_archive_compact_model_config_patch_is_atomic_and_nullable(self):
+        """Compression runway metadata follows the active rewrite atomically."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            await db.create_session(
+                session_id="runway-session",
+                source="test",
+                model_config={"keep": "yes", "_old": 1},
+            )
+            await db.append_messages_batch(
+                "runway-session",
+                [{"role": "user", "content": "before"}],
+            )
+            await db.archive_and_compact(
+                "runway-session",
+                [{"role": "assistant", "content": "summary"}],
+                model_config_patch={"_proactive_prune_rearm_tokens": 1234, "_old": None},
+            )
+            assert await db.get_session_model_config_value(
+                "runway-session", "_proactive_prune_rearm_tokens"
+            ) == 1234
+            assert await db.get_session_model_config_value(
+                "runway-session", "_old", None
+            ) is None
+            assert await db.get_session_model_config_value(
+                "runway-session", "keep"
+            ) == "yes"
+            await db.patch_session_model_config(
+                "runway-session", {"_proactive_prune_rearm_tokens": None}
+            )
+            assert await db.get_session_model_config_value(
+                "runway-session", "_proactive_prune_rearm_tokens", 0
+            ) == 0
+            assert [row["content"] for row in await db.get_messages("runway-session")] == [
+                "summary"
+            ]
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_flush_with_stale_history_loses_messages(self):
         """Stale conversation_history no longer causes data loss."""
         from hermes_state import SessionDB

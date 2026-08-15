@@ -39,14 +39,19 @@ from __future__ import annotations
 import logging
 import inspect
 import sys
+import threading
 
 from agent.browser_provider import BrowserProvider
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
 
 _providers: dict[str, BrowserProvider] = {}
 _plugin_providers: dict[object, dict[str, BrowserProvider]] = {}
+_generation = 0
+_scoped_generations: dict[object, int] = {}
+_registry_lock = threading.Lock()
 
 
 def _plugin_scope(
@@ -62,11 +67,11 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> dict[str, BrowserProvider]:
+def _provider_snapshot(scope: str | None = None) -> dict[str, BrowserProvider]:
     providers = dict(_providers)
-    scope = _plugin_scope()
-    if scope is not None:
-        providers.update(_plugin_providers.get(scope, {}))
+    active_scope = scope if scope is not None else _plugin_scope()
+    if active_scope is not None:
+        providers.update(_plugin_providers.get(active_scope, {}))
     return providers
 
 
@@ -74,7 +79,11 @@ def _clear_plugin_scope(scope: object) -> None:
     _plugin_providers.pop(scope, None)
 
 
-def register_provider(provider: BrowserProvider) -> None:
+def register_provider(
+    provider: BrowserProvider,
+    *,
+    scope: str | None = None,
+) -> None:
     """Register a cloud browser provider.
 
     Re-registration (same ``name``) overwrites the previous entry and logs
@@ -98,13 +107,29 @@ def register_provider(provider: BrowserProvider) -> None:
     ):
         if not inspect.iscoroutinefunction(getattr(provider, method_name)):
             raise TypeError(f"Browser provider .{method_name} must be async")
-    scope = _plugin_scope(
-        registration=True,
-        module_name=type(provider).__module__,
+    registration_scope = (
+        scope
+        if scope is not None
+        else _plugin_scope(
+            registration=True,
+            module_name=type(provider).__module__,
+        )
     )
-    target = _plugin_providers.setdefault(scope, {}) if scope is not None else _providers
-    existing = target.get(name)
-    target[name] = provider
+    global _generation
+    with _registry_lock:
+        target = (
+            _plugin_providers.setdefault(registration_scope, {})
+            if registration_scope is not None
+            else _providers
+        )
+        existing = target.get(name)
+        target[name] = provider
+        if registration_scope is None:
+            _generation += 1
+        else:
+            _scoped_generations[registration_scope] = (
+                _scoped_generations.get(registration_scope, 0) + 1
+            )
     if existing is not None:
         logger.debug(
             "Browser provider '%s' re-registered (was %r)",
@@ -117,17 +142,65 @@ def register_provider(provider: BrowserProvider) -> None:
         )
 
 
-def list_providers() -> list[BrowserProvider]:
+def list_providers(*, scope: str | None = None) -> list[BrowserProvider]:
     """Return all registered providers, sorted by name."""
-    items = list(_provider_snapshot().values())
+    items = list(_provider_snapshot(scope).values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> BrowserProvider | None:
+def get_provider(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> BrowserProvider | None:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    return _provider_snapshot().get(name.strip())
+    return _provider_snapshot(scope).get(name.strip())
+
+
+def snapshot_registration(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> BrowserProvider | None:
+    target = _providers if scope is None else _plugin_providers.get(scope, {})
+    return target.get(name.strip())
+
+
+def registry_generation(*, scope: str | None = None) -> tuple[int, int]:
+    """Return a cache fingerprint for global and profile registrations."""
+    active_scope = scope if scope is not None else _plugin_scope()
+    if active_scope is None:
+        active_scope = str(get_hermes_home())
+    with _registry_lock:
+        return _generation, _scoped_generations.get(active_scope, 0)
+
+
+def restore_registration(
+    name: str,
+    current: BrowserProvider,
+    previous: BrowserProvider | None,
+    *,
+    scope: str | None = None,
+) -> bool:
+    global _generation
+    key = name.strip()
+    with _registry_lock:
+        target = _providers if scope is None else _plugin_providers.setdefault(scope, {})
+        if target.get(key) is not current:
+            return False
+        if previous is None:
+            target.pop(key, None)
+        else:
+            target[key] = previous
+        if scope is None:
+            _generation += 1
+        else:
+            _scoped_generations[scope] = _scoped_generations.get(scope, 0) + 1
+            if not target:
+                _plugin_providers.pop(scope, None)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -223,5 +296,9 @@ async def _resolve(configured: str | None) -> BrowserProvider | None:
 
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
-    _providers.clear()
-    _plugin_providers.clear()
+    global _generation
+    with _registry_lock:
+        _providers.clear()
+        _plugin_providers.clear()
+        _scoped_generations.clear()
+        _generation += 1

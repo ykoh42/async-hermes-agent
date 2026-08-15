@@ -24,19 +24,19 @@ or commit rather than tracking `main` implicitly.
 ### One-time migration from the legacy version scheme
 
 GitHub releases through `0.20.4` used a fork-only version sequence. Starting
-with `0.20.0.5`, the first three numeric segments match the upstream Python
-package and the fourth is this distribution's revision. Because Python version
-ordering considers `0.20.4` newer than `0.20.0.5`, replace an old exact pin and
-reinstall this transition release explicitly:
+with `0.20.1.1`, the first three numeric segments match the upstream Python
+package and the fourth is this distribution's revision. This release aligns the
+fork with upstream `v2026.8.13`; replace an old exact pin and reinstall it
+explicitly:
 
 ```bash
-uv pip install --reinstall "async-hermes-agent==0.20.0.5"
+uv pip install --reinstall "async-hermes-agent==0.20.1.1"
 ```
 
 Also update lockfiles, requirements manifests, and direct Git URLs from
-`v0.20.4` to `v0.20.0.5`. Releases after this one resume normal monotonic
-updates within the two-axis scheme, for example `0.20.0.6` for a fork-only
-change or `0.20.1.1` after porting upstream `0.20.1`.
+`v0.20.4` to `v0.20.1.1`. Fork-only follow-ups increment the final segment,
+while a later upstream port changes the first three segments and resets the
+revision to `1`.
 
 ## Update a source checkout
 

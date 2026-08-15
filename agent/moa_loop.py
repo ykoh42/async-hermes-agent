@@ -12,14 +12,29 @@ import hashlib
 import asyncio
 import logging
 import re
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
+
+import aiofiles.os
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
 from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
+
+# Cold-start caches.  The upstream MoA facade avoids repeating preset
+# normalization and provider-runtime discovery on every tool-loop iteration.
+# The retained facade is native-async, so only the tiny in-memory get/set
+# critical sections use a thread lock; no lock is held across an await.
+_preset_cache_lock = threading.Lock()
+_preset_cache: dict[tuple[Any, ...], Any] = {}
+_runtime_cache_lock = threading.Lock()
+_runtime_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_runtime_cache_resolver: Any = None
+_RUNTIME_CACHE_TTL_SECONDS = 300.0
 
 # --- MoA privacy filter (config: moa.privacy_filter — '' | display | full) ---
 #
@@ -335,10 +350,26 @@ async def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     """
     provider = str(slot.get("provider") or "").strip()
     model = str(slot.get("model") or "").strip()
+    cache_key = (provider, model)
+    now = time.monotonic()
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    # A test/configuration can replace the resolver at runtime (and a
+    # downstream host may hot-reload provider policy).  Never reuse a result
+    # produced by a different resolver implementation; this also prevents a
+    # stale patched result from crossing independent call boundaries.
+    global _runtime_cache_resolver
+    with _runtime_cache_lock:
+        if _runtime_cache_resolver is not resolve_runtime_provider:
+            _runtime_cache.clear()
+            _runtime_cache_resolver = resolve_runtime_provider
+        entry = _runtime_cache.get(cache_key)
+    if entry is not None:
+        stamped_at, cached = entry
+        if now - stamped_at < _RUNTIME_CACHE_TTL_SECONDS:
+            return dict(cached)
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-
         rt = await resolve_runtime_provider(requested=provider, target_model=model)
         # Forward the resolved endpoint through to call_llm unconditionally.
         # call_llm's _resolve_task_provider_model() is the single chokepoint that
@@ -368,6 +399,9 @@ async def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
                 out["extra_body"] = dict(extra_body)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("MoA slot runtime resolution failed for %s: %s", _slot_label(slot), exc)
+        return out
+    with _runtime_cache_lock:
+        _runtime_cache[cache_key] = (now, dict(out))
     return out
 
 
@@ -390,6 +424,7 @@ async def _maybe_apply_moa_cache_control(
     runtime: dict[str, Any],
     *,
     cache_disabled: bool | None = None,
+    cache_ttl: str | None = None,
 ) -> list[dict[str, Any]]:
     """Decorate an advisor or aggregator request with cache_control when its
     route honors it.
@@ -406,7 +441,10 @@ async def _maybe_apply_moa_cache_control(
     """
     try:
         from agent.agent_runtime_helpers import blank_cache_policy_stub, anthropic_prompt_cache_policy
-        from agent.prompt_caching import apply_anthropic_cache_control
+        from agent.prompt_caching import (
+            apply_anthropic_cache_control,
+            effective_cache_ttl,
+        )
 
         # The policy function reads agent.* only as fallbacks for kwargs we
         # don't pass; provide a stub so the slot is judged purely on its own
@@ -424,7 +462,13 @@ async def _maybe_apply_moa_cache_control(
         if not should_cache:
             return messages
         return apply_anthropic_cache_control(
-            messages, native_anthropic=native_layout
+            messages,
+            cache_ttl=effective_cache_ttl(
+                cache_ttl or "5m",
+                provider=runtime.get("provider") or "",
+                model=runtime.get("model") or "",
+            ),
+            native_anthropic=native_layout,
         )
     except Exception as exc:  # pragma: no cover - decoration must never break a call
         logger.debug("MoA cache_control decoration skipped: %s", exc)
@@ -440,6 +484,7 @@ async def _run_reference(
     reference_timeout: float | None = None,
     context_length_cache: Any = None,
     cache_disabled: bool | None = None,
+    cache_ttl: str | None = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model and return ``(label, text, accounting)``.
 
@@ -504,7 +549,10 @@ async def _run_reference(
         # (their caching is automatic; markers are ignored harmlessly, but we
         # only decorate when the policy says the route honors them).
         messages = await _maybe_apply_moa_cache_control(
-            messages, runtime, cache_disabled=cache_disabled
+            messages,
+            runtime,
+            cache_disabled=cache_disabled,
+            cache_ttl=cache_ttl,
         )
         # Per-slot max_tokens takes precedence over the preset-level
         # reference_max_tokens passed in by the caller. This lets each
@@ -784,6 +832,9 @@ async def _run_references_parallel(
     cache_disabled = (
         getattr(agent, "_cache_disabled", None) if agent is not None else None
     )
+    cache_ttl = (
+        getattr(agent, "_cache_ttl", None) if agent is not None else None
+    )
 
     async with asyncio.TaskGroup() as group:
         for index, slot in enumerate(reference_models):
@@ -803,6 +854,7 @@ async def _run_references_parallel(
                     reference_timeout=reference_timeout,
                     context_length_cache=context_length_cache,
                     cache_disabled=cache_disabled,
+                    cache_ttl=cache_ttl,
                 )
             )
             tasks[task] = index
@@ -1164,6 +1216,7 @@ async def aggregate_moa_context(
 
     ``agent``, when passed, lets the reference fan-out be aborted early on a
     user interrupt — see ``_run_references_parallel``'s docstring.
+
     """
     reference_models = [slot for slot in reference_models if slot.get("enabled", True)]
     reference_outputs: list[tuple[str, str, Any]] = []
@@ -1249,6 +1302,9 @@ async def aggregate_moa_context(
             agg_runtime,
             cache_disabled=(
                 getattr(agent, "_cache_disabled", None) if agent is not None else None
+            ),
+            cache_ttl=(
+                getattr(agent, "_cache_ttl", None) if agent is not None else None
             ),
         )
         response = await call_llm(
@@ -1465,6 +1521,10 @@ class MoAChatCompletions:
 
         self._pending_reference_usage: Any = CanonicalUsage()
         self._pending_reference_cost: Any = None
+        # Read-only per-advisor metrics for observability hooks.  This is
+        # intentionally separate from consumable accounting so a post-request
+        # hook cannot race or double-consume session usage.
+        self._last_reference_metrics: Any = None
         # Resolved aggregator slot ({provider, model, ...}) from the most recent
         # create(); read by session cost accounting to price the aggregator's
         # acting turn at its real model instead of the virtual preset name.
@@ -1502,6 +1562,10 @@ class MoAChatCompletions:
         self._pending_reference_usage = CanonicalUsage()
         self._pending_reference_cost = None
         return usage, cost
+
+    def last_reference_metrics(self) -> Any:
+        """Return metrics from the most recent reference fan-out."""
+        return self._last_reference_metrics
 
     async def consume_and_save_trace(
         self, session_id: Any = None, aggregator_output_fallback: Any = None
@@ -1662,6 +1726,16 @@ class MoAChatCompletions:
                 api_mode=agg_runtime.get("api_mode") or "",
                 model=agg_runtime.get("model") or "",
                 cache_disabled=cache_disabled,
+                cache_ttl=(
+                    getattr(live_agent, "_cache_ttl", None)
+                    if live_agent is not None
+                    else None
+                ),
+                static_system_prefix=(
+                    getattr(live_agent, "_cached_system_prompt_static", None)
+                    if live_agent is not None
+                    else None
+                ),
             )
             if guidance:
                 _attach_reference_guidance(agg_messages, str(guidance))
@@ -1713,11 +1787,27 @@ class MoAChatCompletions:
                 raise TypeError("_moa_prepared_request must be a dict")
             return await self._call_prepared_aggregator(prepared_request, api_kwargs)
 
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import get_config_path, load_config_readonly
         from hermes_cli.moa_config import resolve_moa_preset
 
         _moa_raw = (await load_config_readonly()).get("moa") or {}
-        preset = resolve_moa_preset(_moa_raw, self.preset_name)
+        try:
+            config_stamp = (await aiofiles.os.stat(get_config_path())).st_mtime_ns
+        except OSError:
+            config_stamp = None
+        preset_cache_key = (config_stamp, self.preset_name)
+        preset = None
+        if config_stamp is not None:
+            with _preset_cache_lock:
+                preset = _preset_cache.get(preset_cache_key)
+        if preset is None:
+            preset = resolve_moa_preset(_moa_raw, self.preset_name)
+            if config_stamp is not None:
+                with _preset_cache_lock:
+                    _preset_cache.clear()
+                    _preset_cache[preset_cache_key] = dict(preset)
+        else:
+            preset = dict(preset)
         # Privacy filter mode: '' (off, default) | 'display' | 'full'. See
         # coerce_privacy_filter / the pattern block at the top of this module.
         # Remembered on self so _call_prepared_aggregator (which may run on a
@@ -1968,6 +2058,16 @@ class MoAChatCompletions:
                 "aggregator_slot": aggregator,
                 "aggregator_temperature": aggregator_temperature,
             }
+            try:
+                from agent.moa_trace import slot_metrics
+
+                self._last_reference_metrics = [
+                    slot_metrics(accounting, label, output=text)
+                    for label, text, accounting in reference_outputs
+                ]
+            except Exception as exc:  # pragma: no cover - observability only
+                logger.debug("MoA reference metrics render failed: %s", exc)
+                self._last_reference_metrics = None
 
             # Surface each reference model's answer to the display BEFORE the
             # aggregator acts — once per turn (only on the iteration that
@@ -2090,6 +2190,10 @@ class MoAClient:
         usage without reaching into ``.chat.completions`` internals.
         """
         return self.chat.completions.consume_reference_usage()
+
+    def last_reference_metrics(self) -> Any:
+        """Return read-only per-advisor metrics from the completions facade."""
+        return self.chat.completions.last_reference_metrics()
 
     @property
     def last_aggregator_slot(self) -> Any:

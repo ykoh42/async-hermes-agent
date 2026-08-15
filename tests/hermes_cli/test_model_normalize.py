@@ -137,3 +137,37 @@ class TestDeepseekCanonicalAndReasonerMapping:
     def test_reasoner_keywords_map_to_v4_flash(self, model):
         assert _normalize_for_deepseek(model) == "deepseek-v4-flash"
 
+
+class TestIssue78796NvidiaPrefixRepair:
+    """A curated bare NVIDIA model id regains its vendor prefix."""
+
+    @pytest.mark.parametrize("model,expected", [
+        ("nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-ultra-550b-a55b"),
+        ("nemotron-3-super-120b-a12b", "nvidia/nemotron-3-super-120b-a12b"),
+        (
+            "nemotron-3-nano-omni-30b-a3b-reasoning",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        ),
+    ])
+    def test_bare_nemotron_regains_prefix(self, model, expected):
+        assert normalize_model_for_provider(model, "nvidia") == expected
+
+    def test_third_party_model_gets_its_catalogue_vendor(self):
+        assert normalize_model_for_provider("glm-5.2", "nvidia") == "z-ai/glm-5.2"
+
+    @pytest.mark.parametrize("model", [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "z-ai/glm-5.2",
+    ])
+    def test_already_prefixed_is_untouched(self, model):
+        assert normalize_model_for_provider(model, "nvidia") == model
+
+    @pytest.mark.parametrize("model", ["my-local-nim-container", "some-finetune-v2"])
+    def test_unknown_names_pass_through(self, model):
+        assert normalize_model_for_provider(model, "nvidia") == model
+
+    def test_other_providers_are_unaffected(self):
+        assert normalize_model_for_provider("my-model", "custom") == "my-model"
+        assert normalize_model_for_provider(
+            "claude-sonnet-4.6", "openrouter"
+        ) == "anthropic/claude-sonnet-4.6"

@@ -1973,7 +1973,7 @@ class TestConcurrentToolExecution:
     ):
         from agent.tool_executor import execute_tool_calls_concurrent
 
-        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.02")
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
         cancelled = []
 
         async def never_returns(*_args, **kwargs):
@@ -2005,7 +2005,7 @@ class TestConcurrentToolExecution:
         assert sorted(cancelled) == ["c1", "c2"]
         assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
         assert all(
-            "Error executing tool 'web_search': timed out after 0.0s"
+            "Error executing tool 'web_search': timed out after 0.1s"
             in message["content"]
             for message in messages
         )
@@ -2069,12 +2069,15 @@ class TestConcurrentToolExecution:
         assert starts == ["c0", "c1", "c2"]
 
     @pytest.mark.asyncio
-    async def test_parallel_authorization_wait_is_excluded_from_batch_timeout(
+    async def test_parallel_authorization_wait_completes_within_batch_timeout(
         self, agent, monkeypatch
     ):
         from agent.tool_executor import execute_tool_calls_concurrent
 
-        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.01")
+        # Retained native authorization callbacks are ordinary async work;
+        # only the actual callback budget matters here (there is no removed
+        # CLI/gateway human-wait window to exclude from the deadline).
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
 
         async def slow_authorization(*_args, **_kwargs):
             await asyncio.sleep(0.02)
@@ -3723,14 +3726,22 @@ class TestRunConversation:
             "assistant",
             "user",
         ]
-        checkpoint = replay[-2]["content"]
-        assert "interrupted by a user correction" in checkpoint
+        checkpoint = replay[-2]
+        # The provider-facing replay expands the sidecar into user content;
+        # the persisted/result transcript keeps the user's visible text and
+        # carries the scaffold separately.
+        provider_checkpoint = replay[-1].get("content", "")
+        assert (
+            checkpoint.get("display_kind") == "hidden"
+            or checkpoint.get("content") == "[response interrupted]"
+        )
+        assert "interrupted by a user correction" in provider_checkpoint
         # Displayed chain-of-thought must NOT be replayed: an assistant turn
         # inlining its own reasoning trips Anthropic's output classifier and
         # bricks the session with deterministic empty responses (July 2026).
-        assert "I should implement this with SQLite." not in checkpoint
-        assert "Reasoning shown before the interruption" not in checkpoint
-        assert replay[-1]["content"] == "No, use Postgres instead."
+        assert "I should implement this with SQLite." not in provider_checkpoint
+        assert "Reasoning shown before the interruption" not in provider_checkpoint
+        assert replay[-1]["content"].endswith("No, use Postgres instead.")
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."
@@ -3816,10 +3827,12 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Corrected answer."
         checkpoint = result["messages"][-3]
-        assert "interrupted by a user correction" in checkpoint["content"]
+        provider_checkpoint = result["messages"][-2].get("api_content", "")
+        assert checkpoint.get("display_kind") == "hidden"
+        assert "interrupted by a user correction" in provider_checkpoint
         # Displayed reasoning is display-only — replaying it as assistant
         # content trips Anthropic's output classifier (July 2026 brickings).
-        assert "Following the original approach." not in checkpoint["content"]
+        assert "Following the original approach." not in provider_checkpoint
         assert result["messages"][-2]["content"] == (
             "Use the corrected approach."
         )
@@ -4457,6 +4470,24 @@ class TestHookPayloadSanitizesSimpleNamespace:
         assert normalized_call["id"] == "call_1"
         assert normalized_call["function"]["name"] == "web_search"
 
+    def test_hook_jsonable_suppresses_model_dump_warnings_and_supports_duck_types(self):
+        calls = []
+
+        class PydanticLike:
+            def model_dump(self, **kwargs):
+                calls.append(kwargs)
+                assert kwargs == {"mode": "json", "warnings": False}
+                return {"value": "ok"}
+
+        assert AIAgent._hook_jsonable(PydanticLike()) == {"value": "ok"}
+        assert calls == [{"mode": "json", "warnings": False}]
+
+        class Duck:
+            def model_dump(self):
+                return {"duck": True}
+
+        assert AIAgent._hook_jsonable(Duck()) == {"duck": True}
+
 
 class TestRetryExhaustion:
     """Regression: retry_count > max_retries was dead code (off-by-one).
@@ -4671,10 +4702,12 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 402
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "billing"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -4704,11 +4737,13 @@ class TestCredentialPoolRecovery:
                 return []
 
             async def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 429
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "rate_limit"
                 return next_entry
 
         agent._credential_pool = _Pool()

@@ -34,6 +34,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import importlib.metadata
+import inspect
 import logging
 import os
 import sys
@@ -335,6 +337,67 @@ async def _import_plugin_dir(
     return module_name
 
 
+def _requires_arguments(fn: object) -> bool:
+    """Return whether an entry-point target requires positional arguments."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        and parameter.default is inspect.Parameter.empty
+        for parameter in signature.parameters.values()
+    )
+
+
+async def _discover_entry_point_providers() -> None:
+    """Load opted-in ``hermes_agent.plugins`` provider entry points first."""
+    try:
+        from hermes_cli.plugins import _get_disabled_plugins, _get_enabled_plugins
+
+        enabled = _get_enabled_plugins()
+        if inspect.isawaitable(enabled):
+            enabled = await enabled
+        disabled = _get_disabled_plugins()
+        if inspect.isawaitable(disabled):
+            disabled = await disabled
+    except Exception:
+        enabled, disabled = None, set()
+    if not enabled:
+        return
+    try:
+        entries = importlib.metadata.entry_points()
+        if hasattr(entries, "select"):
+            entry_points = list(entries.select(group="hermes_agent.plugins"))
+        else:
+            entry_points = list(entries.get("hermes_agent.plugins", []))
+    except Exception as exc:
+        logger.debug("entry-point provider scan skipped: %s", exc)
+        return
+    for entry_point in entry_points:
+        if entry_point.name not in enabled or entry_point.name in disabled:
+            continue
+        try:
+            loaded = entry_point.load()
+            if callable(loaded) and not _requires_arguments(loaded):
+                result = loaded()
+                if inspect.isawaitable(result):
+                    await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to load/invoke entry-point provider %r: %s",
+                entry_point.name,
+                exc,
+            )
+
+
 def _restore_async_discovery_state(
     registry: dict[str, ProviderProfile],
     aliases: dict[str, str],
@@ -387,6 +450,10 @@ async def _discover_providers_impl() -> None:
     global _discovered
     if _discovered:
         return
+
+    # Entry points are the lowest-precedence source: bundled and user
+    # filesystem profiles discovered below intentionally override them.
+    await _discover_entry_point_providers()
 
     if await aiofiles.os.path.isdir(_BUNDLED_PLUGINS_DIR):
         for child_name in sorted(await aiofiles.os.listdir(_BUNDLED_PLUGINS_DIR)):

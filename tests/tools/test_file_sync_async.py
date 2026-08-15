@@ -147,6 +147,57 @@ async def test_file_changed_during_upload_rolls_back_for_retry(
     )
 
 
+@pytest.mark.asyncio
+async def test_sync_back_waits_for_active_sync_transaction(tmp_path, monkeypatch):
+    host = tmp_path / "new.png"
+    host.write_bytes(b"new")
+    remote = "/root/.hermes/cache/images/new.png"
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+    sync_back_started = asyncio.Event()
+
+    async def get_files():
+        return [(str(host), remote)]
+
+    async def upload(_host, _remote):
+        upload_started.set()
+        await release_upload.wait()
+
+    async def no_delete(_paths):
+        return None
+
+    async def bulk_download(destination: Path):
+        sync_back_started.set()
+        async with aiofiles.open(destination, "wb") as handle:
+            await handle.write(_tar_bytes({}))
+
+    monkeypatch.setattr(
+        "tools.environments.file_sync._credential_host_paths",
+        _empty_credentials,
+    )
+    manager = FileSyncManager(
+        get_files,
+        upload,
+        no_delete,
+        sync_interval=0,
+        bulk_download_fn=bulk_download,
+    )
+    # Ensure sync_back has work to do once it obtains the shared transaction
+    # lock, even though the upload is still in progress.
+    manager._pushed_hashes["/_sentinel"] = "0" * 64
+
+    sync_task = asyncio.create_task(manager.sync(force=True))
+    await upload_started.wait()
+    sync_back_task = asyncio.create_task(manager.sync_back(tmp_path))
+    await asyncio.sleep(0)
+    assert not sync_back_started.is_set()
+
+    release_upload.set()
+    await sync_task
+    await sync_back_task
+    assert sync_back_started.is_set()
+
+
 def _tar_bytes(entries: dict[str, bytes], *, symlink: tuple[str, str] | None = None):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:

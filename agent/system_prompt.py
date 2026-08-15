@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import hermes_time as _hermes_time
@@ -54,6 +55,82 @@ from hermes_constants import get_hermes_home
 from tools import env_probe as _env_probe
 
 logger = logging.getLogger(__name__)
+
+
+def _restore_plugin_prompt_sections(prompt: str) -> tuple[Any, ...]:
+    """Recover canonical plugin-section bytes from a persisted prompt."""
+    from hermes_cli.plugins import (
+        PLUGIN_SECTIONS_END,
+        PLUGIN_SECTIONS_START,
+        RenderedPluginSystemPromptSection,
+        format_system_prompt_sections,
+    )
+
+    start = prompt.rfind(PLUGIN_SECTIONS_START)
+    if start < 0:
+        return ()
+    end = prompt.find(PLUGIN_SECTIONS_END, start + len(PLUGIN_SECTIONS_START))
+    if end < 0:
+        return ()
+    frame_end = end + len(PLUGIN_SECTIONS_END)
+    framed = prompt[start:frame_end]
+    body = prompt[start + len(PLUGIN_SECTIONS_START):end].strip("\n")
+    if not body:
+        return ()
+    pattern = re.compile(
+        r"(?:^|\n\n)## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
+        r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n"
+        r"(?P<content>.*?)(?=\n\n## Plugin Context: |\Z)",
+        re.DOTALL,
+    )
+    restored = []
+    for match in pattern.finditer(body):
+        content = match.group("content")
+        if len(content) != int(match.group("chars")):
+            return ()
+        restored.append(
+            RenderedPluginSystemPromptSection(
+                id=match.group("id"),
+                content=content,
+                position="after_memory",
+                plugin="persisted-prompt",
+            )
+        )
+    if not restored or format_system_prompt_sections(restored) != framed:
+        return ()
+    return tuple(restored)
+
+
+def _frozen_plugin_prompt_sections(agent: Any) -> tuple[Any, ...]:
+    """Render once for a new session; never re-run plugin code on rebuild."""
+    attr = "_plugin_system_prompt_sections_snapshot"
+    if hasattr(agent, attr):
+        return getattr(agent, attr)
+    stored_prompt = getattr(agent, "_cached_system_prompt", None)
+    if isinstance(stored_prompt, str) and stored_prompt:
+        rendered = _restore_plugin_prompt_sections(stored_prompt)
+    else:
+        try:
+            from hermes_cli.plugins import render_system_prompt_sections
+
+            rendered = tuple(
+                render_system_prompt_sections(_plugin_session_info(agent))
+            )
+        except Exception as exc:
+            logger.warning("Plugin system prompt sections could not be rendered: %s", exc)
+            rendered = ()
+    setattr(agent, attr, rendered)
+    return rendered
+
+
+def _plugin_session_info(agent: Any) -> dict[str, Any]:
+    return {
+        "session_id": getattr(agent, "session_id", None),
+        "model": getattr(agent, "model", None),
+        "provider": getattr(agent, "provider", None),
+        "platform": getattr(agent, "platform", None),
+        "cwd": str(getattr(agent, "working_dir", None) or ""),
+    }
 
 
 def _ra():
@@ -460,6 +537,20 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
         except Exception:
             logger.debug("External memory system-prompt block failed", exc_info=True)
 
+    # Plugin sections are session-frozen volatile context.  They are rendered
+    # once for a new session and recovered from persisted prompt bytes after a
+    # restart, so invalidation never re-executes plugin callbacks.
+    try:
+        from hermes_cli.plugins import format_system_prompt_sections
+
+        plugin_block = format_system_prompt_sections(
+            list(_frozen_plugin_prompt_sections(agent))
+        )
+        if plugin_block:
+            volatile_parts.append(plugin_block)
+    except Exception:
+        logger.debug("Plugin system-prompt section render failed", exc_info=True)
+
     now = await _hermes_time.now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
@@ -524,6 +615,11 @@ async def invalidate_system_prompt(agent: Any) -> None:
     agent._cached_system_prompt_static = None
     if agent._memory_store:
         await agent._memory_store.load_from_disk()
+
+
+def restore_plugin_prompt_sections(agent: Any, prompt: str) -> None:
+    """Seed the frozen plugin-section snapshot from persisted prompt bytes."""
+    agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt)
 
 
 async def reconstruct_static_prefix(
@@ -609,5 +705,6 @@ __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
     "invalidate_system_prompt",
+    "restore_plugin_prompt_sections",
     "format_tools_for_system_message",
 ]

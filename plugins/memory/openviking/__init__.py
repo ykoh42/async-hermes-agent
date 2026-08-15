@@ -507,8 +507,51 @@ class _VikingClient:
         )
         return self._parse_response(resp)
 
+    async def _authenticated_json(self, path: str) -> dict:
+        """GET JSON with the configured API key, without tenant headers.
+
+        Hosted OpenViking deployments may require authentication even for
+        ``/health``.  Keep the first probe anonymous and retry only when the
+        server explicitly rejects it for authentication, so credentials are
+        never sent to an unrelated or misidentified endpoint.
+        """
+        headers = {"Accept": "application/json"}
+        if self._api_key:
+            headers["X-API-Key"] = self._api_key
+            headers["Authorization"] = "Bearer " + self._api_key
+        if self._agent:
+            headers["X-OpenViking-Actor-Peer"] = self._agent
+        resp = await self._http.get(
+            self._url(path), headers=headers, timeout=3.0
+        )
+        return self._parse_response(resp)
+
+    @staticmethod
+    def _health_requires_credentials(exc: Exception) -> bool:
+        """Return whether an anonymous health probe failed for auth reasons."""
+        status = getattr(exc, "status_code", None)
+        if status in {401, 403}:
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "authenticationerror",
+                "unauthorized",
+                "api key",
+                "apikey",
+                "invalid authentication",
+                "missing or invalid",
+            )
+        )
+
     async def health_payload(self) -> dict:
-        return await self._anonymous_json("/health")
+        try:
+            return await self._anonymous_json("/health")
+        except _OpenVikingHTTPError as exc:
+            if not self._api_key or not self._health_requires_credentials(exc):
+                raise
+            return await self._authenticated_json("/health")
 
     async def openapi_payload(self) -> dict:
         return await self._anonymous_json("/openapi.json")

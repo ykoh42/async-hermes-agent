@@ -11,12 +11,16 @@ credential-guard pipeline applies, and only the type check at the end differs
 (extension-table typing plus an mp4 magic sniff, rather than image magic
 bytes). Every existing call site keeps the image-only default unchanged.
 
-The async library retains only the local terminal backend, so local paths are
-resolved and read through the same awaited filesystem boundary as file tools.
+Local paths are resolved and read through the same awaited filesystem boundary
+as file tools. Non-local backends use their native async ``execute`` boundary
+for paths outside the explicitly permitted Hermes media caches; a backend that
+only exposes synchronous execution fails closed rather than blocking the loop.
 """
 from __future__ import annotations
 
 import base64
+import asyncio
+import inspect
 import os
 import re
 import aiofiles
@@ -131,7 +135,9 @@ async def resolve_image_source(
         async with aiofiles.open(host_target, "rb") as image_file:
             data = await image_file.read()
         return _finalize(data, "", "file", s, permitted)
-    raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
+    if _is_local_terminal_backend():
+        raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
+    return await _resolve_container_fallback(p, ctx, s, permitted)
 
 
 def _resolve_data_url(s: str) -> tuple[bytes, str]:
@@ -194,12 +200,145 @@ async def _download_to_bytes(url: str) -> bytes:
 async def _permitted_host_read_target(
     path: Path,
     _context: ResolveContext,
-) -> Path:
-    """Resolve a local media path without blocking the event loop."""
+) -> Path | None:
+    """Return a safe host-side media path, or None for sandbox reads.
+
+    The local backend may read arbitrary host paths.  Non-local backends may
+    only read Hermes-managed media caches on the host; every other path must
+    go through the active sandbox's native async ``execute`` method.
+    """
+    from agent.secret_scope import get_secret
+
+    backend = str(get_secret("TERMINAL_ENV", "local") or "local").strip().lower()
     try:
-        return Path(await _realpath(path))
+        real = Path(await _realpath(path))
     except OSError:
-        return path
+        return path if backend in {"", "local"} else None
+    if backend in {"", "local"}:
+        return real
+    from tools.credential_files import from_agent_visible_cache_path
+
+    try:
+        real = Path(await _realpath(Path(from_agent_visible_cache_path(str(path)))))
+    except OSError:
+        return None
+    for root in _media_cache_roots():
+        try:
+            real.relative_to(Path(await _realpath(root)))
+            return real
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _is_local_terminal_backend() -> bool:
+    from agent.secret_scope import get_secret
+
+    return str(get_secret("TERMINAL_ENV", "local") or "local").strip().lower() in {
+        "",
+        "local",
+    }
+
+
+def _media_cache_roots() -> list[Path]:
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    return [
+        home / "cache",
+        home / "images",
+        home / "image_cache",
+        home / "audio_cache",
+        home / "video_cache",
+        home / "temp_vision_images",
+        home / "temp_video_files",
+    ]
+
+
+def _get_active_env(task_id: str | None):
+    if not task_id:
+        return None
+    try:
+        from tools.terminal_tool import get_active_env
+
+        return get_active_env(task_id)
+    except Exception:
+        return None
+
+
+async def _ensure_container_env(task_id: str | None) -> None:
+    if not task_id:
+        return
+    try:
+        from tools.terminal_tool import ensure_task_env
+
+        if not inspect.iscoroutinefunction(ensure_task_env):
+            return
+        result = ensure_task_env(task_id)
+        if inspect.isawaitable(result):
+            await result
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # The subsequent active-env check is fail-closed and reports the
+        # actionable sandbox-unavailable error to the caller.
+        return
+
+
+async def _resolve_container_fallback(
+    path: Path,
+    ctx: ResolveContext,
+    src: str,
+    permitted: tuple = ("image",),
+) -> ResolvedImage:
+    """Read a non-cache path inside the active sandbox using native async I/O."""
+    await _ensure_container_env(ctx.task_id)
+    env = _get_active_env(ctx.task_id)
+    if env is None:
+        raise SourceNotFound(
+            f"'{path}' is not reachable inside the sandbox and no active "
+            "sandbox session is available to read it",
+            src=src,
+            origin="container",
+        )
+    import shlex
+
+    execute = getattr(env, "execute", None)
+    if not inspect.iscoroutinefunction(execute):
+        raise RuntimeError(
+            "The configured sandbox backend does not expose a native async "
+            "execute method for media reads."
+        )
+    command = f"head -c {_MAX_INGEST_BYTES + 1} < {shlex.quote(str(path))} | base64 | tr -d '\\n'"
+    last_result: dict = {"returncode": 1, "output": ""}
+    for attempt in range(2):
+        last_result = await execute(command, timeout=30, bounded_capture=True)
+        if last_result.get("returncode", 1) == 0:
+            break
+        if attempt == 0:
+            await asyncio.sleep(0.15)
+    if last_result.get("returncode", 1) != 0:
+        diagnostic = next(
+            (line.strip() for line in str(last_result.get("output") or "").splitlines() if line.strip()),
+            "",
+        )
+        suffix = f" ({diagnostic[:200]})" if diagnostic else ""
+        raise SourceNotFound(
+            f"could not read '{path}' inside the sandbox{suffix}",
+            src=src,
+            origin="container",
+        )
+    try:
+        data = base64.b64decode(last_result.get("output", ""), validate=True)
+    except Exception as exc:
+        raise NotAnImage(
+            f"sandbox returned non-image data for '{path}': {exc}",
+            src=src,
+            origin="container",
+        ) from exc
+    if len(data) > _MAX_INGEST_BYTES:
+        raise SourceTooLarge("media exceeds size limit", src=src, origin="container")
+    return _finalize(data, "", "container", src, permitted)
 
 
 def _finalize(
@@ -261,3 +400,28 @@ def _detect_video_mime(data: bytes, src: str) -> str | None:
     if len(data) > 12 and data[4:8] == b"ftyp":
         return "video/mp4"
     return None
+
+
+async def resolve_local_source_to_data_url(
+    src: str,
+    task_id: str | None,
+    *,
+    permitted: tuple = ("image",),
+) -> str:
+    """Resolve a path-like source through the native confinement boundary.
+
+    URL and data sources are already self-contained and pass through exactly;
+    filesystem paths are read from the active local/cache/sandbox boundary and
+    returned as a provider-safe data URL. Generation tools use this helper so
+    provider plugins never receive an unconstrained host path.
+    """
+    value = (src or "").strip()
+    if not value or value.lower().startswith(("http://", "https://", "data:")):
+        return src
+    resolved = await resolve_image_source(
+        value,
+        ResolveContext(task_id=task_id),
+        permitted=permitted,
+    )
+    encoded = base64.b64encode(resolved.data).decode("ascii")
+    return f"data:{resolved.mime or 'application/octet-stream'};base64,{encoded}"

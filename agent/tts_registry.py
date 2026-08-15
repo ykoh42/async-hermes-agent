@@ -77,11 +77,11 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> dict[str, TTSProvider]:
+def _provider_snapshot(scope: str | None = None) -> dict[str, TTSProvider]:
     providers = dict(_providers)
-    scope = _plugin_scope()
-    if scope is not None:
-        providers.update(_plugin_providers.get(scope, {}))
+    active_scope = scope if scope is not None else _plugin_scope()
+    if active_scope is not None:
+        providers.update(_plugin_providers.get(active_scope, {}))
     return providers
 
 
@@ -89,7 +89,7 @@ def _clear_plugin_scope(scope: object) -> None:
     _plugin_providers.pop(scope, None)
 
 
-def register_provider(provider: TTSProvider) -> None:
+def register_provider(provider: TTSProvider, *, scope: str | None = None) -> None:
     """Register a TTS provider.
 
     Rejects:
@@ -132,11 +132,19 @@ def register_provider(provider: TTSProvider) -> None:
             raise TypeError(f"TTS provider .{method_name} must be async")
     if not inspect.isasyncgenfunction(provider.stream):
         raise TypeError("TTS provider .stream must be an async generator")
-    scope = _plugin_scope(
-        registration=True,
-        module_name=type(provider).__module__,
+    registration_scope = (
+        scope
+        if scope is not None
+        else _plugin_scope(
+            registration=True,
+            module_name=type(provider).__module__,
+        )
     )
-    target = _plugin_providers.setdefault(scope, {}) if scope is not None else _providers
+    target = (
+        _plugin_providers.setdefault(registration_scope, {})
+        if registration_scope is not None
+        else _providers
+    )
     existing = target.get(key)
     target[key] = provider
     if existing is not None:
@@ -151,13 +159,13 @@ def register_provider(provider: TTSProvider) -> None:
         )
 
 
-def list_providers() -> list[TTSProvider]:
+def list_providers(*, scope: str | None = None) -> list[TTSProvider]:
     """Return all registered providers, sorted by name."""
-    items = list(_provider_snapshot().values())
+    items = list(_provider_snapshot(scope).values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> TTSProvider | None:
+def get_provider(name: str, *, scope: str | None = None) -> TTSProvider | None:
     """Return the provider registered under *name*, or None.
 
     Name matching is case-insensitive and whitespace-tolerant — mirrors
@@ -166,7 +174,36 @@ def get_provider(name: str) -> TTSProvider | None:
     """
     if not isinstance(name, str):
         return None
-    return _provider_snapshot().get(name.strip().lower())
+    return _provider_snapshot(scope).get(name.strip().lower())
+
+
+def snapshot_registration(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> TTSProvider | None:
+    target = _providers if scope is None else _plugin_providers.get(scope, {})
+    return target.get(name.strip().lower())
+
+
+def restore_registration(
+    name: str,
+    current: TTSProvider,
+    previous: TTSProvider | None,
+    *,
+    scope: str | None = None,
+) -> bool:
+    target = _providers if scope is None else _plugin_providers.setdefault(scope, {})
+    key = name.strip().lower()
+    if target.get(key) is not current:
+        return False
+    if previous is None:
+        target.pop(key, None)
+    else:
+        target[key] = previous
+    if scope is not None and not target:
+        _plugin_providers.pop(scope, None)
+    return True
 
 
 def _reset_for_tests() -> None:

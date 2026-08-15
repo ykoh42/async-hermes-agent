@@ -528,13 +528,15 @@ async def test_sync_cache_translation_uses_active_profile_backend(
 
 
 @pytest.mark.asyncio
-async def test_cache_mapping_returns_none_without_existing_mounts(tmp_path, monkeypatch):
+async def test_cache_mount_discovery_creates_empty_staging_dirs(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     await get_cache_directory_mounts()
 
-    assert map_cache_path_to_container(str(home / "cache" / "images" / "x")) is None
+    assert map_cache_path_to_container(str(home / "cache" / "images" / "x")) == (
+        "/root/.hermes/cache/images/x"
+    )
 
 
 @pytest.mark.asyncio
@@ -567,7 +569,9 @@ async def test_empty_skill_and_cache_homes_return_empty(tmp_path, monkeypatch):
 
     assert await get_skills_directory_mount() == []
     assert await iter_skills_files() == []
-    assert await get_cache_directory_mounts() == []
+    mounts = await get_cache_directory_mounts()
+    assert mounts
+    assert all(Path(entry["host_path"]).is_dir() for entry in mounts)
     assert await iter_cache_files() == []
 
 

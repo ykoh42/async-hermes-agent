@@ -371,6 +371,28 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_fallback is False
 
+    def test_404_bare_model_id_missing_prefix_is_model_not_found(self):
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(
+            e, provider="nvidia", model="nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+
+    def test_404_correctly_prefixed_model_stays_generic(self):
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(
+            e, provider="nvidia", model="nvidia/nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+
+    def test_404_unknown_bare_model_stays_generic(self):
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(e, provider="nvidia", model="my-local-nim")
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+
     # ── Provider policy-block (OpenRouter privacy/guardrail) ──
 
 
@@ -1047,6 +1069,5 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
 

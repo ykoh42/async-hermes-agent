@@ -168,7 +168,9 @@ class TestBatchMode:
             ]
             await delegate_task(
                 tasks=[
-                    {"goal": "A"}, {"goal": "B"}, {"goal": "C"},
+                    {"goal": "Analyze task A"},
+                    {"goal": "Analyze task B"},
+                    {"goal": "Analyze task C"},
                 ],
                 parent_agent=_make_parent(),
             )
@@ -193,7 +195,10 @@ class TestBatchMode:
                  "_child_role": None},
             ]
             await delegate_task(
-                tasks=[{"goal": "A"}, {"goal": "B"}],
+                tasks=[
+                    {"goal": "Analyze task A"},
+                    {"goal": "Analyze task B"},
+                ],
                 parent_agent=_make_parent(),
             )
 

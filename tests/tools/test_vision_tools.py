@@ -472,6 +472,79 @@ class TestVisionSafetyGuards:
 
         assert not (tmp_path / "cat.png").exists()
 
+    @pytest.mark.asyncio
+    async def test_download_enforces_size_cap_while_streaming(self, tmp_path):
+        from tools.vision_tools import _download_image
+
+        class FakeResponse:
+            url = "https://example.com/big.png"
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield b"12345"
+                yield b"678901"
+
+        class FakeStream:
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.stream.return_value = FakeStream()
+        with (
+            patch("tools.vision_tools._VISION_MAX_DOWNLOAD_BYTES", 10),
+            patch("tools.vision_tools.check_website_access", new=AsyncMock(return_value=None)),
+            patch("tools.url_safety.create_ssrf_safe_client", return_value=client),
+            pytest.raises(ValueError, match="Image too large"),
+        ):
+            await _download_image("https://example.com/big.png", tmp_path / "big.png", max_retries=1)
+
+        assert not (tmp_path / "big.png").exists()
+        assert not list(tmp_path.glob(".big.png.*.tmp"))
+
+    @pytest.mark.asyncio
+    async def test_download_ignores_malformed_content_length(self, tmp_path):
+        from tools.vision_tools import _download_image
+
+        body = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+        class FakeResponse:
+            url = "https://example.com/cat.png"
+            headers = {"content-length": "not-a-number"}
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield body[:4]
+                yield body[4:]
+
+        class FakeStream:
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.stream.return_value = FakeStream()
+        with (
+            patch("tools.vision_tools.check_website_access", new=AsyncMock(return_value=None)),
+            patch("tools.url_safety.create_ssrf_safe_client", return_value=client),
+        ):
+            await _download_image("https://example.com/cat.png", tmp_path / "cat.png", max_retries=1)
+
+        assert (tmp_path / "cat.png").read_bytes() == body
+
 
 # ---------------------------------------------------------------------------
 # check_vision_requirements

@@ -245,8 +245,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           release_notes=""
-          if [ "$RELEASE_TAG" = "v0.20.0.5" ]; then
-            release_notes='Versioning migration: releases through v0.20.4 used the legacy fork-only sequence. Python version ordering will not select 0.20.0.5 as an upgrade from 0.20.4, so replace old pins and run `uv pip install --reinstall "async-hermes-agent==0.20.0.5"` once. Future versions use upstream X.Y.Z plus a fourth async revision.'
+          if [ "$RELEASE_TAG" = "v0.20.1.1" ]; then
+            release_notes='Upstream migration: this release tracks Hermes Agent v2026.8.13 (Python 0.20.1) with async revision 1. Reinstall explicitly when moving from the legacy v0.20.4 fork release; future fork-only releases increment the fourth numeric segment.'
           fi
           if is_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
             test "$is_draft" = true

@@ -372,15 +372,19 @@ class FileSyncManager:
                 logger.warning("file_sync: sync failed, rolled back state: %s", exc)
 
     async def sync_back(self, hermes_home: Path | None = None) -> None:
-        if self._bulk_download_fn is None:
-            return
-        if not self._pushed_hashes and not self._synced_files:
-            logger.debug("sync_back: no prior push state — skipping")
-            return
-        task = asyncio.create_task(
-            self._sync_back_with_retries(hermes_home or get_hermes_home())
-        )
-        await _await_owned(task)
+        # Share the same transaction fence as uploads.  A teardown sync-back
+        # must not observe half-published upload state or overwrite it while a
+        # concurrent sync cycle is still hashing/publishing its snapshot.
+        async with self._sync_lock:
+            if self._bulk_download_fn is None:
+                return
+            if not self._pushed_hashes and not self._synced_files:
+                logger.debug("sync_back: no prior push state — skipping")
+                return
+            task = asyncio.create_task(
+                self._sync_back_with_retries(hermes_home or get_hermes_home())
+            )
+            await _await_owned(task)
 
     async def _sync_back_with_retries(self, hermes_home: Path) -> None:
         lock_path = hermes_home / ".sync.lock"

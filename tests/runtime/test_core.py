@@ -2500,7 +2500,7 @@ async def test_clarify_tool_awaits_the_platform_callback():
     """HITL remains a scheduler barrier without blocking the event loop."""
     async def callback(question, choices, *, multi_select=False):
         assert question == "Choose a trajectory"
-        assert choices == ["A", "B"]
+        assert choices == ["A (Recommended)", "B"]
         assert multi_select is False
         await asyncio.sleep(0)
         return "B"

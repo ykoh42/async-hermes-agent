@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib.machinery
+import importlib.metadata
 import importlib.util
 import inspect
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -42,6 +44,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
+ENTRY_POINTS_GROUP = "hermes_agent.memory_providers"
+_REGISTERED_MEMORY_PROVIDER_SKILLS: dict[str, Path] = {}
 
 # Synthetic parent package for user-installed providers, so they don't
 # collide with bundled providers in sys.modules.
@@ -88,6 +92,20 @@ async def _get_user_plugins_dir() -> Path | None:
         return None
 
 
+async def _get_project_plugins_dir() -> Path | None:
+    """Return the opt-in ``./.hermes/plugins`` directory."""
+    try:
+        from hermes_cli.plugins import _env_enabled
+
+        if not _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+            return None
+        cwd = await aiofiles.os.getcwd()
+        directory = Path(cwd) / ".hermes" / "plugins"
+        return directory if await aiofiles.os.path.isdir(directory) else None
+    except Exception:
+        return None
+
+
 async def _is_memory_provider_dir(path: Path) -> bool:
     """Heuristic: does *path* look like a memory provider plugin?
 
@@ -129,18 +147,36 @@ async def _iter_provider_dirs() -> list[tuple[str, Path]]:
 
     # 2. User-installed providers ($HERMES_HOME/plugins/<name>/)
     user_dir = await _get_user_plugins_dir()
-    if user_dir:
-        for child_name in sorted(await aiofiles.os.listdir(user_dir)):
-            child = user_dir / child_name
+    project_dir = await _get_project_plugins_dir()
+    for source_dir in (user_dir, project_dir):
+        if not source_dir:
+            continue
+        for child_name in sorted(await aiofiles.os.listdir(source_dir)):
+            child = source_dir / child_name
             if not await aiofiles.os.path.isdir(child) or child.name.startswith(("_", ".")):
                 continue
             if child.name in seen:
-                continue  # bundled takes precedence
+                continue  # earlier source wins
             if not await _is_memory_provider_dir(child):
                 continue  # skip non-memory plugins
+            seen.add(child.name)
             dirs.append((child.name, child))
 
     return dirs
+
+
+def _iter_entry_points() -> list[object]:
+    """Enumerate memory-provider entry points without importing providers."""
+    try:
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            return list(eps.select(group=ENTRY_POINTS_GROUP))
+        if isinstance(eps, dict):
+            return list(eps.get(ENTRY_POINTS_GROUP, []))
+        return [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+    except Exception as exc:
+        logger.debug("Memory provider entry-point scan failed: %s", exc)
+        return []
 
 
 async def find_provider_dir(name: str) -> Path | None:
@@ -154,13 +190,48 @@ async def find_provider_dir(name: str) -> Path | None:
         bundled / "__init__.py"
     ):
         return bundled
-    # User-installed
-    user_dir = await _get_user_plugins_dir()
-    if user_dir:
-        user = user_dir / name
-        if await aiofiles.os.path.isdir(user) and await _is_memory_provider_dir(user):
-            return user
+    # User-installed, then opt-in project-local.
+    for source_dir in (
+        await _get_user_plugins_dir(),
+        await _get_project_plugins_dir(),
+    ):
+        if not source_dir:
+            continue
+        candidate = source_dir / name
+        if await aiofiles.os.path.isdir(candidate) and await _is_memory_provider_dir(candidate):
+            return candidate
+    return await _entry_point_package_dir(await find_provider_entry_point(name))
+
+
+async def _entry_point_package_dir(entry_point: object | None) -> Path | None:
+    """Resolve an entry-point package directory without importing it."""
+    if entry_point is None:
+        return None
+    try:
+        module_name = (getattr(entry_point, "value", "") or "").split(":", 1)[0].strip()
+        if not module_name:
+            return None
+        parts = module_name.split(".")
+        for root in sys.path:
+            if not root:
+                continue
+            package_dir = Path(root).joinpath(*parts)
+            if await aiofiles.os.path.isfile(package_dir / "__init__.py"):
+                return package_dir
+            if await aiofiles.os.path.isfile(package_dir.with_suffix(".py")):
+                return None
+    except Exception as exc:
+        logger.debug(
+            "Could not resolve directory for entry point '%s': %s",
+            getattr(entry_point, "name", "?"),
+            exc,
+        )
     return None
+
+
+async def find_provider_entry_point(name: str) -> object | None:
+    """Resolve a provider name to a pip entry point, if installed."""
+    return next((ep for ep in _iter_entry_points() if ep.name == name), None)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +246,9 @@ async def list_memory_provider_names() -> list[str]:
     call at module-import time (e.g. when building the dashboard config
     schema).
     """
-    return sorted({name for name, _ in await _iter_provider_dirs()})
+    names = {name for name, _ in await _iter_provider_dirs()}
+    names.update(ep.name for ep in _iter_entry_points())
+    return sorted(names)
 
 
 async def discover_memory_providers() -> list[tuple[str, str, bool]]:
@@ -186,6 +259,7 @@ async def discover_memory_providers() -> list[tuple[str, str, bool]]:
     """
     results = []
 
+    seen: set[str] = set()
     for name, child in await _iter_provider_dirs():
         # Read description from plugin.yaml if available
         desc = ""
@@ -202,7 +276,10 @@ async def discover_memory_providers() -> list[tuple[str, str, bool]]:
         # Quick availability check — try loading and calling is_available()
         available = True
         try:
-            provider = await _load_provider_from_dir(child)
+            provider = await _load_provider_from_dir(
+                child,
+                register_skills=False,
+            )
             if provider:
                 available = await provider.is_available()
             else:
@@ -211,11 +288,32 @@ async def discover_memory_providers() -> list[tuple[str, str, bool]]:
             available = False
 
         results.append((name, desc, available))
+        seen.add(name)
+
+    for entry_point in _iter_entry_points():
+        name = entry_point.name
+        if name in seen:
+            continue
+        available = True
+        try:
+            provider = await _load_provider_from_entry_point(
+                entry_point,
+                register_skills=False,
+            )
+            available = bool(provider and await provider.is_available())
+        except Exception:
+            available = False
+        results.append((name, "", available))
+        seen.add(name)
 
     return results
 
 
-async def load_memory_provider(name: str) -> MemoryProvider | None:
+async def load_memory_provider(
+    name: str,
+    *,
+    register_skills: bool | None = None,
+) -> MemoryProvider | None:
     """Load and return a MemoryProvider instance by name.
 
     Checks both bundled (``plugins/memory/<name>/``) and user-installed
@@ -224,13 +322,27 @@ async def load_memory_provider(name: str) -> MemoryProvider | None:
 
     Returns None if the provider is not found or fails to load.
     """
+    if register_skills is None:
+        register_skills = name == await _get_active_memory_provider()
+
     provider_dir = await find_provider_dir(name)
-    if not provider_dir:
-        logger.debug("Memory provider '%s' not found in bundled or user plugins", name)
+    entry_point = None if provider_dir else await find_provider_entry_point(name)
+    if not provider_dir and entry_point is None:
+        logger.debug("Memory provider '%s' not found in bundled, user plugins, or entry points", name)
         return None
 
     try:
-        provider = await _load_provider_from_dir(provider_dir)
+        provider = (
+            await _load_provider_from_dir(
+                provider_dir,
+                register_skills=register_skills,
+            )
+            if provider_dir
+            else await _load_provider_from_entry_point(
+                entry_point,
+                register_skills=register_skills,
+            )
+        )
         if provider:
             return provider
         logger.warning("Memory provider '%s' loaded but no provider instance found", name)
@@ -240,7 +352,55 @@ async def load_memory_provider(name: str) -> MemoryProvider | None:
         return None
 
 
-async def _load_provider_from_dir(provider_dir: Path) -> MemoryProvider | None:
+async def _load_provider_from_entry_point(
+    entry_point: object,
+    *,
+    register_skills: bool = True,
+) -> MemoryProvider | None:
+    """Load an entry-point provider without blocking the caller."""
+    from agent.memory_provider import MemoryProvider
+
+    loaded = entry_point.load()
+    if inspect.isawaitable(loaded):
+        loaded = await loaded
+    if isinstance(loaded, MemoryProvider):
+        return loaded
+    if isinstance(loaded, type) and issubclass(loaded, MemoryProvider):
+        return loaded()
+    if hasattr(loaded, "register"):
+        collector = _ProviderCollector(
+            getattr(entry_point, "name", "memory"),
+            register_skills=register_skills,
+        )
+        result = loaded.register(collector)
+        if inspect.isawaitable(result):
+            await result
+        return collector.provider
+    if callable(loaded):
+        result = loaded()
+        if inspect.isawaitable(result):
+            result = await result
+        if isinstance(result, MemoryProvider):
+            return result
+        collector = _ProviderCollector(
+            getattr(entry_point, "name", "memory"),
+            register_skills=register_skills,
+        )
+        try:
+            result = loaded(collector)
+            if inspect.isawaitable(result):
+                await result
+        except TypeError:
+            return None
+        return collector.provider
+    return None
+
+
+async def _load_provider_from_dir(
+    provider_dir: Path,
+    *,
+    register_skills: bool = True,
+) -> MemoryProvider | None:
     """Import a provider module and extract the MemoryProvider instance.
 
     The module must have either:
@@ -311,7 +471,7 @@ async def _load_provider_from_dir(provider_dir: Path) -> MemoryProvider | None:
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
-        collector = _ProviderCollector()
+        collector = _ProviderCollector(name, register_skills=register_skills)
         try:
             registration = mod.register(collector)
             if inspect.isawaitable(registration):
@@ -336,19 +496,55 @@ async def _load_provider_from_dir(provider_dir: Path) -> MemoryProvider | None:
 
 
 class _ProviderCollector:
-    """Fake plugin context that captures register_memory_provider calls."""
+    """Small plugin context used while loading a memory provider."""
 
-    def __init__(self):
+    def __init__(self, name: str = "memory", *, register_skills: bool = True):
+        self.name = name
         self.provider = None
+        self._register_skills = register_skills
+        self._context = None
 
     def register_memory_provider(self, provider):
         self.provider = provider
+
+    def register_skill(self, *args, **kwargs):
+        """Register provider skills only for the active provider."""
+        if not self._register_skills:
+            return
+        try:
+            from hermes_cli.plugins import (
+                PluginContext,
+                PluginManifest,
+                get_plugin_manager,
+            )
+
+            manager = get_plugin_manager()
+            if self._context is None:
+                manifest = PluginManifest(name=self.name, key=self.name)
+                self._context = PluginContext(manifest, manager)
+            self._context.register_skill(*args, **kwargs)
+            skill_name = args[0] if args else kwargs.get("name")
+            if skill_name:
+                qualified = f"{self.name}:{skill_name}"
+                path = manager.find_plugin_skill(qualified)
+                if path is not None:
+                    _REGISTERED_MEMORY_PROVIDER_SKILLS[qualified] = path
+        except Exception as exc:
+            logger.debug(
+                "Memory provider '%s' failed to register skill: %s",
+                self.name,
+                exc,
+            )
 
     # No-op for other registration methods
     def register_tool(self, *args, **kwargs):
         pass
 
     def register_hook(self, *args, **kwargs):
+        pass
+
+    def register_auxiliary_task(self, *args, **kwargs):
+        """Ignore optional auxiliary registration during provider discovery."""
         pass
 
     def register_cli_command(self, *args, **kwargs):

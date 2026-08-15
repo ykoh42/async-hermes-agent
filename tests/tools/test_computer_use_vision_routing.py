@@ -66,10 +66,11 @@ class TestExplicitAuxVisionOverride:
 # should_route_capture_to_aux_vision
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 class TestRouteDecision:
     """End-to-end policy: explicit override > tool-result support > vision caps."""
 
-    def test_explicit_override_routes_to_aux_even_for_vision_main(self):
+    async def test_explicit_override_routes_to_aux_even_for_vision_main(self):
         """Issue #24015 core repro: explicit aux config must win.
 
         Even if the main model fully supports vision (Anthropic / Claude),
@@ -90,11 +91,11 @@ class TestRouteDecision:
              patch.object(vision_routing,
                           "_provider_accepts_multimodal_tool_result",
                           return_value=True):
-            assert vision_routing.should_route_capture_to_aux_vision(
+            assert await vision_routing.should_route_capture_to_aux_vision(
                 "anthropic", "claude-opus-4-5", cfg
             ) is True
 
-    def test_non_vision_main_model_routes_to_aux(self):
+    async def test_non_vision_main_model_routes_to_aux(self):
         """The reported #24015 scenario: tencent/hy3-preview has no vision."""
         from tools.computer_use import vision_routing
 
@@ -103,11 +104,11 @@ class TestRouteDecision:
              patch.object(vision_routing,
                           "_provider_accepts_multimodal_tool_result",
                           return_value=True):
-            assert vision_routing.should_route_capture_to_aux_vision(
+            assert await vision_routing.should_route_capture_to_aux_vision(
                 "openrouter", "tencent/hy3-preview", cfg
             ) is True
 
-    def test_vision_main_model_no_override_keeps_multimodal(self):
+    async def test_vision_main_model_no_override_keeps_multimodal(self):
         """Default path: vision-capable main model + no aux override → native."""
         from tools.computer_use import vision_routing
 
@@ -115,12 +116,12 @@ class TestRouteDecision:
              patch.object(vision_routing,
                           "_provider_accepts_multimodal_tool_result",
                           return_value=True):
-            assert vision_routing.should_route_capture_to_aux_vision(
+            assert await vision_routing.should_route_capture_to_aux_vision(
                 "anthropic", "claude-opus-4-5", None
             ) is False
 
 
-    def test_user_declared_vision_support_keeps_custom_provider_native(self):
+    async def test_user_declared_vision_support_keeps_custom_provider_native(self):
         """Local/custom VLMs use config as their tool-result image escape hatch."""
         from tools.computer_use import vision_routing
 
@@ -134,12 +135,12 @@ class TestRouteDecision:
         with patch.object(vision_routing,
                           "_provider_accepts_multimodal_tool_result",
                           return_value=False):
-            assert vision_routing.should_route_capture_to_aux_vision(
+            assert await vision_routing.should_route_capture_to_aux_vision(
                 "custom", "Qwen3.6-35B-A3B-local-vlm", cfg
             ) is False
 
 
-    def test_unknown_provider_capabilities_fail_closed(self):
+    async def test_unknown_provider_capabilities_fail_closed(self):
         """When tool-result lookup returns None, route to aux (safe default)."""
         from tools.computer_use import vision_routing
 
@@ -147,12 +148,12 @@ class TestRouteDecision:
              patch.object(vision_routing,
                           "_provider_accepts_multimodal_tool_result",
                           return_value=None):
-            assert vision_routing.should_route_capture_to_aux_vision(
+            assert await vision_routing.should_route_capture_to_aux_vision(
                 "exotic-provider", "exotic-model", {}
             ) is True
 
 
-    def test_explicit_override_wins_over_unknown_caps(self):
+    async def test_explicit_override_wins_over_unknown_caps(self):
         """Explicit aux config wins regardless of unknown caps elsewhere."""
         from tools.computer_use import vision_routing
 
@@ -161,7 +162,7 @@ class TestRouteDecision:
              patch.object(vision_routing,
                           "_provider_accepts_multimodal_tool_result",
                           return_value=None):
-            assert vision_routing.should_route_capture_to_aux_vision(
+            assert await vision_routing.should_route_capture_to_aux_vision(
                 "openrouter", "tencent/hy3-preview", cfg
             ) is True
 
@@ -171,9 +172,10 @@ class TestRouteDecision:
 # ---------------------------------------------------------------------------
 
 class TestLookupHelpers:
-    def test_lookup_supports_vision_returns_none_for_blank_provider(self):
+    @pytest.mark.asyncio
+    async def test_lookup_supports_vision_returns_none_for_blank_provider(self):
         from tools.computer_use.vision_routing import _lookup_supports_vision
-        assert _lookup_supports_vision("", "claude") is None
+        assert await _lookup_supports_vision("", "claude") is None
 
 
     def test_provider_accepts_multimodal_tool_result_returns_none_for_blank_provider(self):

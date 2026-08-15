@@ -30,6 +30,7 @@ reference-to-video - with a compact schema:
     negative_prompt          optional (Pixverse/Kling style)
     audio                    optional (Veo3/Pixverse pricing tier)
     seed                     optional
+    upscale                  optional post-generation high-resolution pass
     model                    optional, override the active provider's default
 
 Providers ignore parameters they do not support. The tool layer does
@@ -143,6 +144,14 @@ VIDEO_GENERATE_SCHEMA: dict[str, Any] = {
                 "description": (
                     "Optional seed for reproducible outputs (provider-"
                     "dependent)."
+                ),
+            },
+            "upscale": {
+                "type": "boolean",
+                "description": (
+                    "Optional opt-in post-generation high-resolution pass. "
+                    "Providers without an upscaler ignore it; providers that "
+                    "support it return `upscaled: true` when it succeeds."
                 ),
             },
             "model": {
@@ -311,12 +320,24 @@ async def _handle_video_generate(args: dict[str, Any], **_kw: Any) -> str:
     prompt = (args.get("prompt") or "").strip()
     image_url = (args.get("image_url") or "").strip() or None
     reference_image_urls = _normalize_reference_images(args.get("reference_image_urls"))
+    task_id = _kw.get("task_id")
+    from tools.image_generation_tool import _confine_source_images
+
+    image_url, reference_image_urls, confinement_error = await _confine_source_images(
+        image_url,
+        reference_image_urls,
+        task_id,
+        permitted=("image", "video"),
+    )
+    if confinement_error is not None:
+        return confinement_error
     duration = _coerce_int(args.get("duration"))
     aspect_ratio = (args.get("aspect_ratio") or DEFAULT_ASPECT_RATIO).strip() or DEFAULT_ASPECT_RATIO
     resolution = (args.get("resolution") or DEFAULT_RESOLUTION).strip() or DEFAULT_RESOLUTION
     negative_prompt = (args.get("negative_prompt") or "").strip() or None
     audio = _coerce_bool(args.get("audio"))
     seed = _coerce_int(args.get("seed"))
+    upscale = _coerce_bool(args.get("upscale"))
     model_override = (args.get("model") or "").strip() or None
 
     # Soft validation — providers do their own. Prompt is required by the
@@ -354,6 +375,7 @@ async def _handle_video_generate(args: dict[str, Any], **_kw: Any) -> str:
         "negative_prompt": negative_prompt,
         "audio": audio,
         "seed": seed,
+        "upscale": upscale,
     }
     # Drop None entries so providers see clean defaults.
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

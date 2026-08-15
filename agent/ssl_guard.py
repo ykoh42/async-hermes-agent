@@ -56,7 +56,13 @@ async def _validate_bundle_path(
         raise _ssl_err(
             f"{label} CA bundle at {value} cannot be loaded: {exc}"
         ) from exc
-    if not context.get_ca_certs():
+    try:
+        loaded_certs = context.get_ca_certs()
+    except NotImplementedError:
+        # Windows truststore-backed contexts may validate successfully while
+        # intentionally not exposing their OS certificate enumeration API.
+        return
+    if not loaded_certs:
         raise _ssl_err(f"{label} CA bundle at {value} did not load certificates")
 
 

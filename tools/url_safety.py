@@ -467,6 +467,13 @@ async def is_safe_url(url: str) -> bool:
         return False
 
 
+# Upstream's retained async entry point keeps the ``async_`` spelling even
+# though this native port no longer needs a worker-thread wrapper.  Keep one
+# implementation and expose the original public name so callers only add
+# ``await`` when moving from the synchronous upstream helper.
+async_is_safe_url = is_safe_url
+
+
 class SSRFConnectionBlocked(ValueError):
     """Raised when connect-time DNS resolution violates the URL safety policy."""
 
@@ -613,6 +620,12 @@ def ssrf_safe_http_transport(**kwargs: Any) -> Any:
     return _Transport(**kwargs)
 
 
+# The upstream async transport factory is the retained public spelling.  The
+# native implementation above is already async-only; this is an alias, not a
+# second transport implementation.
+ssrf_safe_async_http_transport = ssrf_safe_http_transport
+
+
 def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any) -> None:
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
     if transport is None or state.get("_hermes_ssrf_guarded", False):
@@ -682,6 +695,11 @@ async def create_ssrf_safe_client(**kwargs: Any) -> Any:
             raise cancellation from setup_error  # noqa: ASYNC104
         raise
     return client
+
+
+# Preserve upstream's async-client name while keeping the single native
+# implementation and its cancellation-safe setup cleanup.
+create_ssrf_safe_async_client = create_ssrf_safe_client
 
 
 def redirect_target_from_response(response: Any) -> str | None:

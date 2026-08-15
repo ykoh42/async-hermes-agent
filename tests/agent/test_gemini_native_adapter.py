@@ -23,6 +23,47 @@ class DummyResponse:
         return self._payload
 
 
+def test_followup_user_turn_is_not_merged_into_function_response_turn():
+    """Keep a human follow-up separate from the preceding tool result."""
+    from agent.gemini_native_adapter import (
+        _INTERRUPTED_RESPONSE_PLACEHOLDER,
+        _build_gemini_contents,
+    )
+
+    messages = [
+        {"role": "user", "content": "Load the skill"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": '{"name":"hermes-agent"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "loaded"},
+        {"role": "user", "content": "Continue"},
+    ]
+
+    contents, _ = _build_gemini_contents(messages)
+
+    assert [content["role"] for content in contents] == [
+        "user",
+        "model",
+        "user",
+        "model",
+        "user",
+    ]
+    assert "functionResponse" in contents[2]["parts"][0]
+    assert contents[3]["parts"] == [{"text": _INTERRUPTED_RESPONSE_PLACEHOLDER}]
+    assert contents[-1]["parts"] == [{"text": "Continue"}]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "headers", "body", "expected"),

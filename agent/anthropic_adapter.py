@@ -34,6 +34,13 @@ from typing import Any
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
+try:
+    import hermes_cli as _hermes_cli
+
+    _HERMES_VERSION = str(_hermes_cli.__version__)
+except Exception:
+    _HERMES_VERSION = "0.0.0"
+
 
 def _getenv(name: str, default: str = "") -> str:
     """Profile-scoped credential lookup with legacy single-profile semantics."""
@@ -554,6 +561,11 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     return normalized.rstrip("/").lower().startswith("https://api.kimi.com/coding")
 
 
+def _is_opencode_endpoint(base_url: str | None) -> bool:
+    """Return True for OpenCode's Zen/Go relay (opencode.ai)."""
+    return base_url_host_matches(base_url or "", "opencode.ai")
+
+
 # Model-name prefixes that identify the Kimi / Moonshot family.  Covers
 # - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
 # - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``,
@@ -1025,12 +1037,14 @@ async def build_anthropic_client(
     )
 
     if _is_kimi_coding_endpoint(base_url):
-        # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
-        # to be recognized as a valid Coding Agent. Without it, returns 403.
-        # Check this BEFORE _requires_bearer_auth since both match api.kimi.com/coding.
+        # Kimi's /coding endpoint requires a non-empty client identity.  Use
+        # the same Hermes attribution headers as the OpenAI-wire provider
+        # profile; this branch runs for the native Anthropic route.
+        from agent.auxiliary_client import _AI_GATEWAY_HEADERS
+
         kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
-            "User-Agent": "claude-code/0.1.0",
+            **_AI_GATEWAY_HEADERS,
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
     elif _requires_bearer_auth(normalized_base_url):
@@ -1067,6 +1081,18 @@ async def build_anthropic_client(
         kwargs["api_key"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+
+    if _is_opencode_endpoint(base_url):
+        # OpenCode identifies clients by request headers, like OpenRouter does.
+        # The OpenAI-wire paths pick these up from profile.default_headers
+        # (plugins/model-providers/opencode-zen), but the Anthropic Messages
+        # route builds its client right here and never sees the profile. Merge
+        # the same set on top of whatever auth branch ran above.
+        headers = dict(kwargs.get("default_headers") or {})
+        headers.setdefault("HTTP-Referer", "https://hermes-agent.nousresearch.com")
+        headers.setdefault("X-Title", "Hermes Agent")
+        headers.setdefault("User-Agent", f"HermesAgent/{_HERMES_VERSION}")
+        kwargs["default_headers"] = headers
 
     client_class = getattr(_anthropic_sdk, "AsyncAnthropic", None)
     if client_class is None:
@@ -1782,7 +1808,14 @@ def _to_plain_data(value: Any, *, _depth: int = 0, _path: set | None = None) -> 
 
     if hasattr(value, "model_dump"):
         _path.add(obj_id)
-        result = _to_plain_data(value.model_dump(), _depth=_depth + 1, _path=_path)
+        try:
+            # Parsed streaming blocks can trigger pydantic's generic-union
+            # serializer warning even though their dumped payload is valid.
+            dumped = value.model_dump(warnings=False)
+        except TypeError:
+            # Preserve support for duck-typed model_dump() implementations.
+            dumped = value.model_dump()
+        result = _to_plain_data(dumped, _depth=_depth + 1, _path=_path)
         _path.discard(obj_id)
         return result
     if isinstance(value, dict):

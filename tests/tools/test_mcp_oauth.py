@@ -610,6 +610,53 @@ async def test_build_client_metadata_token_endpoint_auth(cfg, expected_auth):
     assert "refresh_token" in md.grant_types
 
 
+@pytest.mark.asyncio
+async def test_client_identity_change_discards_cached_tokens_and_metadata(tmp_path):
+    """A pre-registered client change cannot reuse tokens minted for the old client."""
+    from tools import mcp_oauth
+
+    storage = HermesTokenStorage("srv", hermes_home=tmp_path)
+    await mcp_oauth._write_json(
+        storage._client_info_path(),
+        {"client_id": "old-client", "client_secret": "old-secret"},
+    )
+    await mcp_oauth._write_json(storage._tokens_path(), {"access_token": "stale"})
+    await mcp_oauth._write_json(
+        storage._meta_path(), {"token_endpoint": "https://old.example/token"}
+    )
+
+    await mcp_oauth._invalidate_tokens_on_client_change(
+        storage, "new-client", "new-secret"
+    )
+
+    assert not storage._tokens_path().exists()
+    assert not storage._meta_path().exists()
+    assert storage._client_info_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_matching_client_identity_preserves_cached_tokens(tmp_path):
+    """Rebuilding auth with the same registration leaves live cached state intact."""
+    from tools import mcp_oauth
+
+    storage = HermesTokenStorage("srv", hermes_home=tmp_path)
+    await mcp_oauth._write_json(
+        storage._client_info_path(),
+        {"client_id": "same-client", "client_secret": "same-secret"},
+    )
+    await mcp_oauth._write_json(storage._tokens_path(), {"access_token": "live"})
+    await mcp_oauth._write_json(
+        storage._meta_path(), {"token_endpoint": "https://idp/token"}
+    )
+
+    await mcp_oauth._invalidate_tokens_on_client_change(
+        storage, "same-client", "same-secret"
+    )
+
+    assert storage._tokens_path().read_text()
+    assert storage._meta_path().read_text()
+
+
 @pytest.mark.parametrize("cfg, expected", [
     ({"redirect_uri": _PROXY_REDIRECT}, _PROXY_REDIRECT),
     ({}, "http://127.0.0.1:1234/callback"),

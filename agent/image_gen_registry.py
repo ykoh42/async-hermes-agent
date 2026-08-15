@@ -46,11 +46,11 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> dict[str, ImageGenProvider]:
+def _provider_snapshot(scope: str | None = None) -> dict[str, ImageGenProvider]:
     providers = dict(_providers)
-    scope = _plugin_scope()
-    if scope is not None:
-        providers.update(_plugin_providers.get(scope, {}))
+    active_scope = scope if scope is not None else _plugin_scope()
+    if active_scope is not None:
+        providers.update(_plugin_providers.get(active_scope, {}))
     return providers
 
 
@@ -58,7 +58,11 @@ def _clear_plugin_scope(scope: object) -> None:
     _plugin_providers.pop(scope, None)
 
 
-def register_provider(provider: ImageGenProvider) -> None:
+def register_provider(
+    provider: ImageGenProvider,
+    *,
+    scope: str | None = None,
+) -> None:
     """Register an image generation provider.
 
     Re-registration (same ``name``) overwrites the previous entry and logs
@@ -83,11 +87,19 @@ def register_provider(provider: ImageGenProvider) -> None:
     ):
         if not inspect.iscoroutinefunction(getattr(provider, method_name)):
             raise TypeError(f"Image gen provider .{method_name} must be async")
-    scope = _plugin_scope(
-        registration=True,
-        module_name=type(provider).__module__,
+    registration_scope = (
+        scope
+        if scope is not None
+        else _plugin_scope(
+            registration=True,
+            module_name=type(provider).__module__,
+        )
     )
-    target = _plugin_providers.setdefault(scope, {}) if scope is not None else _providers
+    target = (
+        _plugin_providers.setdefault(registration_scope, {})
+        if registration_scope is not None
+        else _providers
+    )
     existing = target.get(name)
     target[name] = provider
     if existing is not None:
@@ -96,17 +108,52 @@ def register_provider(provider: ImageGenProvider) -> None:
         logger.debug("Registered image gen provider '%s' (%s)", name, type(provider).__name__)
 
 
-def list_providers() -> list[ImageGenProvider]:
+def list_providers(*, scope: str | None = None) -> list[ImageGenProvider]:
     """Return all registered providers, sorted by name."""
-    items = list(_provider_snapshot().values())
+    items = list(_provider_snapshot(scope).values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> ImageGenProvider | None:
+def get_provider(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> ImageGenProvider | None:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    return _provider_snapshot().get(name.strip())
+    return _provider_snapshot(scope).get(name.strip())
+
+
+def snapshot_registration(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> ImageGenProvider | None:
+    """Return the registration from exactly one registry layer."""
+    target = _providers if scope is None else _plugin_providers.get(scope, {})
+    return target.get(name.strip())
+
+
+def restore_registration(
+    name: str,
+    current: ImageGenProvider,
+    previous: ImageGenProvider | None,
+    *,
+    scope: str | None = None,
+) -> bool:
+    """Restore a registration only when *current* is still installed."""
+    target = _providers if scope is None else _plugin_providers.setdefault(scope, {})
+    key = name.strip()
+    if target.get(key) is not current:
+        return False
+    if previous is None:
+        target.pop(key, None)
+    else:
+        target[key] = previous
+    if scope is not None and not target:
+        _plugin_providers.pop(scope, None)
+    return True
 
 
 async def get_active_provider() -> ImageGenProvider | None:

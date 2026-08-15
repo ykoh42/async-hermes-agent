@@ -73,6 +73,7 @@ import aiofiles.os
 from agent.redact import redact_cdp_url
 from agent.secret_scope import get_secret
 from agent.ssl_verify import _create_httpx_client
+from tools import self_repo_guard as _self_repo_guard_bootstrap  # noqa: F401
 from hermes_constants import (
     agent_browser_runnable,
     get_hermes_home,
@@ -1176,11 +1177,22 @@ def _browser_install_hint() -> str:
     return "npm install -g agent-browser && agent-browser install --with-deps"
 
 
+NPX_AGENT_BROWSER_SENTINEL = "npx agent-browser"
+"""Internal discovery sentinel for an agent-browser package resolved by npx."""
+
+AGENT_BROWSER_NPX_SPEC = "agent-browser@^0.26.0"
+"""Version range shared by all retained npx agent-browser subprocesses."""
+
+
+def _is_npx_agent_browser_sentinel(browser_cmd: str) -> bool:
+    return browser_cmd.strip() == NPX_AGENT_BROWSER_SENTINEL
+
+
 async def _requires_real_termux_browser_install(browser_cmd: str) -> bool:
     return (
         _is_termux_environment()
         and await _is_local_mode()
-        and browser_cmd.strip() == "npx agent-browser"
+        and _is_npx_agent_browser_sentinel(browser_cmd)
     )
 
 
@@ -1546,9 +1558,9 @@ async def _run_chrome_fallback_command(
     # returns the plain executable on POSIX.  If npx isn't on PATH (Termux,
     # bare container), fall back to the bare name and let Popen raise with
     # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
-    if browser_cmd == "npx agent-browser":
-        _npx_bin = await aiofiles.os.wrap(shutil.which)("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        _npx_bin = await _resolve_npx_bin() or "npx"
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
@@ -2942,6 +2954,18 @@ async def _agent_browser_candidate_present(path: str | None) -> bool:
     )
 
 
+async def _resolve_npx_bin() -> str | None:
+    """Resolve npx using the same extended PATH as browser discovery."""
+    which = aiofiles.os.wrap(shutil.which)
+    extended_path = await _merge_browser_path("")
+    if extended_path:
+        resolved = await which("npx", path=extended_path)
+        if resolved:
+            return str(resolved)
+    resolved = await which("npx")
+    return str(resolved) if resolved else None
+
+
 async def _find_agent_browser(*, validate: bool = True) -> str:
     """
     Find the agent-browser CLI executable.
@@ -3048,13 +3072,11 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
             return str(remember(local_which))
 
     # Check common npx locations (also search the extended fallback PATH)
-    npx_path = await which("npx")
-    if not npx_path and extended_path:
-        npx_path = await which("npx", path=extended_path)
+    npx_path = await _resolve_npx_bin()
     if npx_path:
         if not validate:
-            return "npx agent-browser"
-        return str(remember("npx agent-browser"))
+            return NPX_AGENT_BROWSER_SENTINEL
+        return str(remember(NPX_AGENT_BROWSER_SENTINEL))
 
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")
@@ -3198,9 +3220,9 @@ async def _run_browser_command(
     # Keep concrete executable paths intact, even when they contain spaces.
     # Only the synthetic npx fallback needs to expand into multiple argv items.
     # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
-    if browser_cmd == "npx agent-browser":
-        _npx_bin = await aiofiles.os.wrap(shutil.which)("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        _npx_bin = await _resolve_npx_bin() or "npx"
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
 
@@ -3691,6 +3713,59 @@ def _redact_browser_output(value: Any) -> Any:
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
+
+
+async def evaluate_url_safety(url: str) -> dict[str, object] | None:
+    """Return a blocking error payload for an unsafe URL, or ``None``."""
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    secret_error = {
+        "success": False,
+        "error": (
+            "Blocked: URL contains what appears to be an API key or token. "
+            "Secrets must not be sent in URLs."
+        ),
+    }
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return secret_error
+    normalized = _normalize_url_for_request(url)
+    if _PREFIX_RE.search(normalized) or _PREFIX_RE.search(
+        urllib.parse.unquote(normalized)
+    ):
+        return secret_error
+
+    local = await _is_local_backend()
+    sensitive_query_key = _sensitive_query_param_name(normalized)
+    if sensitive_query_key and not local:
+        return {
+            "success": False,
+            "error": (
+                "Blocked: URL contains a credential-like query parameter "
+                f"({sensitive_query_key}). Cloud browser backends are third-party "
+                "readers; use a local browser/CDP session or remove the sensitive "
+                "query parameter before navigating."
+            ),
+        }
+    if await _is_always_blocked_url(normalized):
+        return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
+    if not local and not await _allow_private_urls() and not await _is_safe_url(normalized):
+        return {
+            "success": False,
+            "error": "Blocked: URL targets a private or internal address",
+        }
+    blocked = await check_website_access(normalized)
+    if blocked:
+        return {
+            "success": False,
+            "error": blocked["message"],
+            "blocked_by_policy": {
+                "host": blocked["host"],
+                "rule": blocked["rule"],
+                "source": blocked["source"],
+            },
+        }
+    return None
 
 
 async def browser_navigate(url: str, task_id: str | None = None) -> str:
@@ -5816,9 +5891,9 @@ async def _maybe_autoinstall_chromium() -> bool:
     except FileNotFoundError:
         return False
 
-    if browser_cmd == "npx agent-browser":
-        npx = await aiofiles.os.wrap(shutil.which)("npx") or "npx"
-        install_cmd = [npx, "-y", "agent-browser", "install"]
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        npx = await _resolve_npx_bin() or "npx"
+        install_cmd = [npx, "--ignore-scripts", "-y", AGENT_BROWSER_NPX_SPEC, "install"]
     else:
         install_cmd = [browser_cmd, "install"]
 

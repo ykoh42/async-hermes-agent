@@ -14,7 +14,7 @@ lives in ``tools.image_generation_tool`` and is exercised by
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -72,10 +72,9 @@ class TestFalImageGenProviderAvailability:
         import tools.image_generation_tool as image_tool
         from plugins.image_gen.fal import FalImageGenProvider
 
-        async def check_fal_api_key():
-            return True
-
-        monkeypatch.setattr(image_tool, "check_fal_api_key", check_fal_api_key)
+        monkeypatch.setattr(
+            image_tool, "check_fal_api_key", AsyncMock(return_value=True)
+        )
         assert await FalImageGenProvider().is_available() is True
 
 
@@ -94,27 +93,33 @@ class TestFalImageGenProviderGenerate:
 
         captured = {}
 
-        async def fake_image_generate_tool(prompt, aspect_ratio, **kwargs):
+        def capture_image_generate_tool(prompt, aspect_ratio, **kwargs):
             captured["prompt"] = prompt
             captured["aspect_ratio"] = aspect_ratio
             captured["kwargs"] = kwargs
             return json.dumps({"success": True, "image": "https://fake/image.png"})
 
-        monkeypatch.setattr(image_tool, "image_generate_tool", fake_image_generate_tool)
-        async def resolve_fal_model():
-            return "fal-ai/flux-2/klein/9b", {}
-
-        monkeypatch.setattr(image_tool, "_resolve_fal_model", resolve_fal_model)
+        monkeypatch.setattr(
+            image_tool,
+            "image_generate_tool",
+            AsyncMock(side_effect=capture_image_generate_tool),
+        )
+        monkeypatch.setattr(
+            image_tool,
+            "_resolve_fal_model",
+            AsyncMock(return_value=("fal-ai/flux-2/klein/9b", {})),
+        )
 
         result = await FalImageGenProvider().generate(
             "a serene mountain landscape",
             aspect_ratio="square",
             seed=42,
+            upscale=True,
         )
 
         assert captured["prompt"] == "a serene mountain landscape"
         assert captured["aspect_ratio"] == "square"
-        assert captured["kwargs"] == {"seed": 42}
+        assert captured["kwargs"] == {"seed": 42, "upscale": True}
         assert result["success"] is True
         assert result["image"] == "https://fake/image.png"
         # Stamped fields for the unified response shape

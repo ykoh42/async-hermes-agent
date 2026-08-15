@@ -22,6 +22,59 @@ _TERMINAL_EVENT_TYPES = frozenset({
 })
 
 
+def _codex_request_failure_details(
+    error: BaseException,
+) -> tuple[int | None, str]:
+    """Return request size and exception class chain without leaking payloads."""
+    request_body_bytes: int | None = None
+    exception_classes: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        exception_classes.append(type(current).__name__)
+        if request_body_bytes is None:
+            try:
+                request = getattr(current, "request", None)
+            except Exception:
+                request = None
+            try:
+                content = (
+                    getattr(request, "content", None)
+                    if request is not None
+                    else None
+                )
+            except Exception:
+                content = None
+            if isinstance(content, str):
+                request_body_bytes = len(content.encode("utf-8"))
+            elif isinstance(content, (bytes, bytearray, memoryview)):
+                request_body_bytes = len(content)
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        current = cause
+    return request_body_bytes, " <- ".join(exception_classes)
+
+
+def _log_codex_request_failure(
+    agent: Any,
+    error: BaseException,
+    *,
+    stream_opened: bool,
+) -> None:
+    request_body_bytes, exception_chain = _codex_request_failure_details(error)
+    logger.warning(
+        "Codex Responses request failed: "
+        "serialized_request_body_bytes=%s stream_opened=%s "
+        "exception_chain=%s model=%s",
+        request_body_bytes if request_body_bytes is not None else "unknown",
+        str(stream_opened).lower(),
+        exception_chain,
+        getattr(agent, "model", "unknown"),
+    )
+
+
 def _resolve_codex_app_server_home() -> str | None:
     """Resolve Codex state without sharing an OS-user account across profiles."""
     from agent.secret_scope import get_secret, is_multiplex_active
@@ -1032,6 +1085,10 @@ def _consume_codex_event_stream(
     first_delta_fired = False
     active_message_phase: str | None = None
     commentary_text_deltas: list[str] = []
+    # Responses reasoning-summary parts are delimited by summary_index.  Keep
+    # the last index so the chat-facing callback receives the same paragraph
+    # separation as the native Responses adapter.
+    active_summary_index: Any = None
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
@@ -1125,6 +1182,15 @@ def _consume_codex_event_stream(
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
             if reasoning_text and on_reasoning_delta is not None:
+                summary_index = _event_field(event, "summary_index")
+                if (
+                    summary_index is not None
+                    and active_summary_index is not None
+                    and summary_index != active_summary_index
+                ):
+                    reasoning_text = f"\n\n{reasoning_text}"
+                if summary_index is not None:
+                    active_summary_index = summary_index
                 try:
                     on_reasoning_delta(reasoning_text)
                 except Exception:
@@ -1258,7 +1324,13 @@ async def run_codex_stream(
 
     request = dict(api_kwargs)
     request["stream"] = True
-    stream = await active_client.responses.create(**request)
+    try:
+        stream = await active_client.responses.create(**request)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_codex_request_failure(agent, exc, stream_opened=False)
+        raise
 
     if not hasattr(stream, "__aiter__"):
         return stream

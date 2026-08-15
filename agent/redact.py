@@ -11,7 +11,12 @@ import logging
 import os
 import re
 import shlex
+import threading
 from urllib.parse import unquote_plus
+
+from agent.file_safety import (
+    _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,14 +133,19 @@ _PREFIX_PATTERNS = [
     r"glffct-[A-Za-z0-9_\-]{10,}",      # GitLab feature-flags client token
     r"glwt-[A-Za-z0-9_\-]{10,}",        # GitLab workspace token
     r"GR1348941[A-Za-z0-9_\-]{10,}",    # GitLab legacy runner registration token
+    r"pk-lf-[A-Za-z0-9\-]{8,}",         # Langfuse public key
 ]
 
 # ENV assignment patterns: KEY=value where KEY contains a secret-like name.
 # Uppercase keys tolerate spaces around "=" (e.g. ``FOO_SECRET = bar``) because
 # an all-caps key is almost never prose/code.
-_SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
+_SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
 _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
+)
+_ENV_ASSIGN_LOWER_RE = re.compile(
+    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    re.IGNORECASE,
 )
 
 # Lowercase / dotted / hyphenated config keys from config files
@@ -229,8 +239,8 @@ _YAML_ASSIGN_RE = re.compile(
 # match. ALL-CAPS keys keep the legacy embedded matching (``MYTOKEN=…``) — an
 # all-caps key is almost never prose, the same rationale as _ENV_ASSIGN_RE.
 _KEY_KEYWORD_RE = re.compile(
-    r"(?:api|auth|access|refresh|session|secret)[ _.\-]?(?:key|token)"
-    r"|token|secret|passwd|password|credential|auth",
+    r"(?:api|auth|access|refresh|session|secret)[ _.\\-]?(?:key|token)"
+    r"|token|secret|passwd|password|pass|pw|credential|auth|key",
     re.IGNORECASE,
 )
 
@@ -276,7 +286,10 @@ def _key_has_secret_keyword(key: str) -> bool:
     """
     letters = [c for c in key if c.isalpha()]
     if letters and all(c.isupper() for c in letters):
-        return True  # legacy all-caps behavior (MYTOKEN=…)
+        for m in _KEY_KEYWORD_RE.finditer(key):
+            if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
+                return True
+        return False
     for m in _KEY_KEYWORD_RE.finditer(key):
         if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
             return True
@@ -433,9 +446,46 @@ _FORM_BODY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$"
 )
 
+_CONTROL_CHARS_RE = re.compile(
+    r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060\ufeff]"
+)
+_TOKEN_BODY_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-."
+)
+
 # Compile known prefix patterns into one alternation
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
+)
+
+
+def _mask_control_split_tokens(text: str, mask_fn) -> str:
+    """Mask known tokens whose body is split by control characters."""
+    stripped = _CONTROL_CHARS_RE.sub("", text)
+    if stripped == text:
+        return text
+    orig_idx = [i for i, c in enumerate(text) if not _CONTROL_CHARS_RE.match(c)]
+    out = list(text)
+    matches = []
+    for match in _PREFIX_RE.finditer(stripped):
+        body = match.group(1)
+        start_orig = orig_idx[match.start(1)]
+        end_orig = orig_idx[match.end(1) - 1] + 1
+        span = text[start_orig:end_orig]
+        if ("\n" in span or "\r" in span) and _PREFIX_RE.search(span):
+            continue
+        if (
+            all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c) for c in span)
+            and (end_orig >= len(text) or text[end_orig] != "=")
+        ):
+            matches.append((start_orig, end_orig, mask_fn(body)))
+    for start_orig, end_orig, replacement in reversed(matches):
+        out[start_orig:end_orig] = list(replacement)
+    return "".join(out)
+
+
+_DISPLAY_CONTROL_RE = re.compile(
+    r"[\x00-\x1f\x7f\x80-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064]"
 )
 
 
@@ -479,6 +529,9 @@ def mask_secret(
         >>> mask_secret("long-token", head=6, tail=4, floor=18)
         '***'
     """
+    if not value:
+        return empty
+    value = _DISPLAY_CONTROL_RE.sub("", value)
     if not value:
         return empty
     if len(value) < floor:
@@ -718,6 +771,7 @@ def redact_sensitive_text(
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
+        text = _mask_control_split_tokens(text, _prefix_sub)
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
@@ -739,6 +793,8 @@ def redact_sensitive_text(
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+            if "://" not in text:
+                text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
@@ -888,6 +944,29 @@ def redact_sensitive_text(
 # fixtures, ``postgresql://{user}`` f-string templates). See issue #43025.
 _ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
 
+_FILE_READ_COMMANDS = frozenset({
+    "cat", "head", "tail", "type", "bat", "less", "more", "nl",
+    "zcat", "tac", "view", "batcat",
+})
+
+
+def _command_reads_env_file(command: str | None) -> bool:
+    """Return whether a simple file-reader command targets a ``.env`` file."""
+    if not command:
+        return False
+    for segment in re.split(r"[|;&]+", command):
+        tokens = segment.strip().split()
+        if not tokens or tokens[0] not in _FILE_READ_COMMANDS:
+            continue
+        for argument in tokens[1:]:
+            if argument.startswith("-"):
+                continue
+            argument = argument.strip("\"'")
+            basename = argument.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if basename.lower() in _ENV_FILE_BASENAMES:
+                return True
+    return False
+
 
 def is_env_dump_command(command: str | None) -> bool:
     """Return True if ``command`` dumps environment variables to stdout.
@@ -935,7 +1014,10 @@ def redact_terminal_output(
     """
     if not output:
         return output
-    code_file = not is_env_dump_command(command or "")
+    code_file = not (
+        is_env_dump_command(command or "")
+        or _command_reads_env_file(command)
+    )
     return redact_sensitive_text(output, force=force, code_file=code_file)
 
 
@@ -976,6 +1058,139 @@ def _has_known_prefix_substring(text: str) -> bool:
     Used as a cheap pre-check before invoking the expensive ``_PREFIX_RE``.
     """
     return any(p in text for p in _PREFIX_SUBSTRINGS)
+
+
+# Plugin-registered patterns are additive: a plugin can extend redaction but
+# cannot remove or weaken a built-in matcher.  Keeping the registry keyed by
+# source lets the plugin lifecycle drop one owner's patterns on unload without
+# exposing a public removal API.
+_PLUGIN_PREFIX_PATTERNS: dict[str, list[str]] = {}
+_registry_lock = threading.Lock()
+
+
+def _plugin_patterns() -> list[str]:
+    """Return plugin patterns in registration order."""
+    return [
+        pattern
+        for patterns in _PLUGIN_PREFIX_PATTERNS.values()
+        for pattern in patterns
+    ]
+
+
+def _rebuild_prefix_matcher() -> None:
+    """Recompile the prefix matcher after a plugin registration."""
+    global _PREFIX_RE, _PREFIX_SUBSTRINGS
+    combined = _PREFIX_PATTERNS + _plugin_patterns()
+    _PREFIX_RE = re.compile(
+        r"(?<![A-Za-z0-9_-])(" + "|".join(combined) + r")(?![A-Za-z0-9_-])"
+    )
+    _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in combined)
+
+
+def _has_top_level_alternation(pattern: str) -> bool:
+    """Reject alternation that could escape a literal prefix."""
+    depth = 0
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            index += 1
+            while index < len(pattern) and pattern[index] != "]":
+                index += 2 if pattern[index] == "\\" else 1
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "|" and depth == 0:
+            return True
+        index += 1
+    return False
+
+
+def _has_nested_unbounded_repeat(pattern: str) -> bool:
+    """Reject nested unbounded quantifiers that can cause regex DoS."""
+    def follows_unbounded(index: int) -> bool:
+        if index >= len(pattern) or pattern[index] in "*+":
+            return index < len(pattern)
+        if pattern[index] != "{":
+            return False
+        end = pattern.find("}", index)
+        body = pattern[index + 1:end] if end != -1 else ""
+        return body.endswith(",") and body[:-1].isdigit()
+
+    contains_unbounded = [False]
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            index += 1
+            while index < len(pattern) and pattern[index] != "]":
+                index += 2 if pattern[index] == "\\" else 1
+        elif char == "(":
+            contains_unbounded.append(False)
+        elif char == ")":
+            inner = contains_unbounded.pop() if len(contains_unbounded) > 1 else False
+            if inner and follows_unbounded(index + 1):
+                return True
+            contains_unbounded[-1] |= inner
+        elif follows_unbounded(index):
+            contains_unbounded[-1] = True
+            if char == "{":
+                index = pattern.find("}", index)
+        index += 1
+    return False
+
+
+def register_redaction_patterns(
+    patterns, source: str = "plugin"
+) -> int:
+    """Additively register safe credential-token regexes for a plugin."""
+    accepted: list[str] = []
+    for pattern in patterns or []:
+        if not isinstance(pattern, str) or not pattern.strip():
+            logger.warning("%s: skipping empty/non-string redaction pattern", source)
+            continue
+        pattern = pattern.strip()
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            logger.warning("%s: skipping invalid redaction pattern %r (%s)", source, pattern, exc)
+            continue
+        if _has_top_level_alternation(pattern):
+            logger.warning("%s: skipping redaction pattern %r with top-level alternation", source, pattern)
+            continue
+        if _has_nested_unbounded_repeat(pattern):
+            logger.warning("%s: skipping redaction pattern %r with nested unbounded quantifiers", source, pattern)
+            continue
+        if len(_extract_literal_prefix(pattern)) < 2:
+            logger.warning("%s: skipping redaction pattern %r without a literal prefix", source, pattern)
+            continue
+        if (
+            pattern in _PREFIX_PATTERNS
+            or pattern in _plugin_patterns()
+            or pattern in accepted
+        ):
+            continue
+        accepted.append(pattern)
+
+    if accepted:
+        with _registry_lock:
+            _PLUGIN_PREFIX_PATTERNS.setdefault(source, []).extend(accepted)
+            _rebuild_prefix_matcher()
+    return len(accepted)
+
+
+def _reset_plugin_redaction_patterns() -> None:
+    """Clear plugin patterns for lifecycle teardown and tests."""
+    with _registry_lock:
+        _PLUGIN_PREFIX_PATTERNS.clear()
+        _rebuild_prefix_matcher()
 
 
 _HTTP_METHOD_SUBSTRINGS = (

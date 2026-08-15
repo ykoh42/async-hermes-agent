@@ -22,6 +22,7 @@ from collections.abc import Callable
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
 MAX_CHOICES = 4
+RECOMMENDED_LABEL = "(Recommended)"
 
 
 def _flatten_choice(c) -> str:
@@ -55,6 +56,24 @@ def _flatten_choice(c) -> str:
     if isinstance(c, (list, tuple)):
         return " ".join(_flatten_choice(x) for x in c).strip()
     return str(c).strip()
+
+
+def mark_recommended(choices: list[str]) -> list[str]:
+    """Decorate the first of multiple choices for the platform UI."""
+    if len(choices) < 2:
+        return choices
+    first = str(choices[0]).strip()
+    if first != strip_recommended(first):
+        return choices
+    return [f"{first} {RECOMMENDED_LABEL}"] + list(choices[1:])
+
+
+def strip_recommended(text: str) -> str:
+    """Remove the presentation-only recommendation label from an answer."""
+    stripped = str(text).strip()
+    if stripped.casefold().endswith(RECOMMENDED_LABEL.casefold()):
+        return stripped[: -len(RECOMMENDED_LABEL)].strip()
+    return stripped
 
 
 async def _invoke_callback(callback, question, choices, multi_select):
@@ -134,6 +153,10 @@ async def clarify_tool(
             "Clarify requires an async platform callback in async-hermes-agent."
         )
 
+    offered = choices
+    if choices is not None:
+        choices = mark_recommended(choices)
+
     try:
         raw_response = await _invoke_callback(
             callback, question, choices, multi_select
@@ -142,14 +165,14 @@ async def clarify_tool(
         return tool_error(f"Failed to get user input: {exc}")
 
     user_response = (
-        _parse_multi_select_response(raw_response)
+        [strip_recommended(r) for r in _parse_multi_select_response(raw_response)]
         if multi_select and choices is not None
-        else str(raw_response).strip()
+        else strip_recommended(raw_response)
     )
     return json.dumps(
         {
             "question": question,
-            "choices_offered": choices,
+            "choices_offered": offered,
             "user_response": user_response,
         },
         ensure_ascii=False,

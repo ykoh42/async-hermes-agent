@@ -520,6 +520,9 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     ("cache/web", "web_cache"),
     ("cache/delegation", "delegation_cache"),
     ("images", "images"),
+    # Desktop non-image file attachments are staged in the flat top-level
+    # directory so binary uploads remain readable in remote sandboxes.
+    ("attachments", "attachments"),
 ]
 
 
@@ -542,13 +545,21 @@ async def get_cache_directory_mounts(
     mounts: list[dict[str, str]] = []
     for new_subpath, old_name in _CACHE_DIRS:
         host_dir = await get_hermes_dir(new_subpath, old_name)
-        if await aiofiles.os.path.isdir(host_dir):
-            mounts.append(
-                {
-                    "host_path": str(host_dir),
-                    "container_path": f"{container_base.rstrip('/')}/{new_subpath}",
-                }
-            )
+        if not await aiofiles.os.path.isdir(host_dir):
+            # Docker snapshots bind mounts when the container is created. An
+            # attachment/cache directory that appears later would otherwise
+            # remain a dangling path for the lifetime of a persistent
+            # container, so create the empty staging directory now.
+            try:
+                await aiofiles.os.makedirs(host_dir, exist_ok=True)
+            except OSError:
+                continue
+        mounts.append(
+            {
+                "host_path": str(host_dir),
+                "container_path": f"{container_base.rstrip('/')}/{new_subpath}",
+            }
+        )
     _cache_mounts_by_scope[_cache_mount_scope(container_base)] = tuple(
         dict(mount) for mount in mounts
     )

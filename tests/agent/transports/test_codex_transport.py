@@ -252,13 +252,8 @@ class TestCodexBuildKwargs:
         )["extra_headers"]
 
         assert scope["x-test"] == "1"
-        assert len(scope["session_id"]) <= 64
-        assert scope["x-client-request-id"] == scope["session_id"]
-        if length == 64:
-            assert scope["session_id"] == session_id
-        else:
-            assert scope["session_id"].startswith("pck_")
-            assert scope["session_id"] != session_id
+        assert scope["session_id"] == session_id
+        assert len(scope["x-client-request-id"]) <= 64
 
 
 

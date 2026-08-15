@@ -56,6 +56,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "vision_analyze",
     "web_extract",
     "web_search",
+    "image_generate",
 })
 
 # Filesystem tools whose parallel admission is decided by path overlap.

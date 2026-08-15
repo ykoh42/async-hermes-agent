@@ -108,6 +108,13 @@ _MATCHING_PREFIX_STRIP_PROVIDERS: frozenset[str] = frozenset({
     "xai",
 })
 
+# Providers whose API serves ``vendor/model`` ids but whose endpoint can also
+# front arbitrary self-hosted models, so a bare name cannot be prefixed
+# blindly.  Repair only an unambiguous match in the curated catalogue.
+_CATALOGUE_PREFIX_REPAIR_PROVIDERS: frozenset[str] = frozenset({
+    "nvidia",
+})
+
 # Providers whose APIs require lowercase model IDs.  Xiaomi's
 # ``api.xiaomimimo.com`` rejects mixed-case names like ``MiMo-V2.5-Pro``
 # that users might copy from marketing docs — it only accepts
@@ -349,6 +356,45 @@ def _prepend_vendor(model_name: str) -> str:
     return model_name
 
 
+def _repair_prefix_from_catalogue(model_name: str, provider: str) -> str:
+    """Restore a dropped ``vendor/`` prefix from a curated provider entry.
+
+    The NVIDIA endpoint also fronts local NIM containers, so unknown bare
+    names must pass through unchanged rather than being guessed as
+    ``nvidia/<name>``.
+    """
+    if "/" in model_name:
+        return model_name
+    try:
+        from hermes_cli.models import _PROVIDER_MODELS
+    except Exception:
+        return model_name
+
+    catalogue = _PROVIDER_MODELS.get(provider) or []
+    needle = model_name.strip().lower()
+    matches = {
+        entry
+        for entry in catalogue
+        if "/" in entry and entry.split("/", 1)[1].strip().lower() == needle
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    return model_name
+
+
+def suggest_prefixed_model_id(provider: str, model_name: str) -> str | None:
+    """Return an unambiguous curated ``vendor/model`` suggestion, if any."""
+    name = (model_name or "").strip()
+    if not name or "/" in name:
+        return None
+    try:
+        canonical = _normalize_provider_alias(provider)
+    except Exception:
+        return None
+    repaired = _repair_prefix_from_catalogue(name, canonical)
+    return repaired if repaired != name else None
+
+
 # ---------------------------------------------------------------------------
 # Main normalisation entry point
 # ---------------------------------------------------------------------------
@@ -491,6 +537,11 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
             result = result.lower()
         return result
 
+    # Restore a dropped vendor prefix only when the provider catalogue has a
+    # single exact suffix match; local/proxied model names remain untouched.
+    if provider in _CATALOGUE_PREFIX_REPAIR_PROVIDERS:
+        return _repair_prefix_from_catalogue(name, provider)
+
     # --- Authoritative native providers: preserve user-facing slugs as-is ---
     if provider in _AUTHORITATIVE_NATIVE_PROVIDERS:
         return name
@@ -502,4 +553,3 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
 # ---------------------------------------------------------------------------
 # Batch / convenience helpers
 # ---------------------------------------------------------------------------
-

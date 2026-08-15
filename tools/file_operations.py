@@ -25,6 +25,8 @@ Usage:
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
 
+import base64
+import binascii
 import os
 import re
 import difflib
@@ -47,6 +49,39 @@ from agent.file_safety import (
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+_NOT_REGULAR_BYTES_SENTINEL = "__HERMES_NOT_REGULAR_BYTES__"
+
+
+def identify_binary_bytes(sample: bytes) -> str:
+    """Return a stable human-readable type for common binary signatures."""
+    signatures = (
+        (b"\x89PNG\r\n\x1a\n", "PNG image data"),
+        (b"\xff\xd8\xff", "JPEG image data"),
+        (b"%PDF-", "PDF document"),
+        (b"PK\x03\x04", "ZIP archive"),
+        (b"\x1f\x8b", "gzip compressed data"),
+        (b"\x7fELF", "ELF executable"),
+        (b"MZ", "Windows PE executable"),
+        (b"SQLite format 3\x00", "SQLite database"),
+    )
+    for prefix, description in signatures:
+        if sample.startswith(prefix):
+            return description
+    if len(sample) >= 8 and sample[4:8] == b"ftyp":
+        return "ISO media container"
+    return "unknown binary"
+
+
+def describe_binary_file(sample: bytes | None, file_size: int) -> str:
+    """Format a binary refusal with its detected type and byte size."""
+    kind = identify_binary_bytes(sample or b"")
+    if file_size < 1024:
+        rendered = f"{file_size} bytes"
+    elif file_size < 1024 * 1024:
+        rendered = f"{file_size / 1024:.1f} KB"
+    else:
+        rendered = f"{file_size / (1024 * 1024):.1f} MB"
+    return f"{kind}, {rendered}"
 
 
 def _strip_terminal_fence_leaks(text: str) -> str:
@@ -455,8 +490,19 @@ class FileOperations(ABC):
         """
         ...
 
+    async def read_file_bytes(
+        self, path: str, max_bytes: int | None = None
+    ) -> ReadResult:
+        """Read complete binary content as base64 across the backend boundary."""
+        return ReadResult(error="Binary reads are not implemented for this backend")
+
     @abstractmethod
-    async def write_file(self, path: str, content: str) -> WriteResult:
+    async def write_file(
+        self,
+        path: str,
+        content: str,
+        pre_content: str | None = None,
+    ) -> WriteResult:
         """Write content to a file, creating directories as needed."""
         ...
 
@@ -899,6 +945,50 @@ class ShellFileOperations(FileOperations):
 
         return False
 
+    async def _sample_file_bytes(self, path: str, length: int = 1000) -> bytes | None:
+        """Fetch raw sample bytes through the async terminal transport.
+
+        Terminal stdout is decoded with replacement characters, so a byte
+        sample cut in the middle of a UTF-8 code point cannot safely be
+        classified after transport.  Base64 keeps the byte boundary intact;
+        callers fall back to the legacy text heuristic when the backend lacks
+        a usable ``base64`` command.
+        """
+        result = await self._exec(
+            f"head -c {length} {self._escape_shell_arg(path)} 2>/dev/null | base64"
+        )
+        if result.exit_code != 0:
+            return None
+        encoded = "".join(_strip_terminal_fence_leaks(result.stdout).split())
+        if not encoded:
+            return b""
+        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+            return None
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+
+    @staticmethod
+    def _is_likely_binary_bytes(sample: bytes) -> bool:
+        """Classify a byte sample without confusing UTF-8 boundary cuts."""
+        if not sample or b"\x00" in sample:
+            return bool(sample and b"\x00" in sample)
+        try:
+            sample.decode("utf-8")
+            return False
+        except UnicodeDecodeError as exc:
+            # A sample may end inside a multibyte codepoint.  Only that
+            # incomplete suffix is tolerated; invalid bytes in the prefix are
+            # still binary so read/edit/write cannot mojibake them.
+            if exc.start >= len(sample) - 3:
+                try:
+                    sample[: exc.start].decode("utf-8")
+                    return False
+                except UnicodeDecodeError:
+                    pass
+            return True
+
     def _is_image(self, path: str) -> bool:
         """Check if file is an image we can return as base64."""
         ext = os.path.splitext(path)[1].lower()
@@ -1041,6 +1131,7 @@ class ShellFileOperations(FileOperations):
             'rt="$(readlink -f "$t" 2>/dev/null || realpath "$t" 2>/dev/null || true)"; '
             '[ -n "$rt" ] && { t="$rt"; d="$(dirname "$t")"; }; '
             "fi; "
+            'mkdir -p "$d"; '
             'tmp="$(mktemp -p "$d" ' + tmpl + ' 2>/dev/null '
             '|| mktemp "$d/.hermes-tmp.$$.XXXXXX" 2>/dev/null '
             '|| { tmp="$d/.hermes-tmp.$$"; : > "$tmp" && echo "$tmp"; })"; '
@@ -1085,13 +1176,10 @@ class ShellFileOperations(FileOperations):
     async def _file_has_bom(self, path: str, pre_content: str | None = None) -> bool:
         """Whether the file on disk starts with a UTF-8 BOM.
 
-        Uses ``pre_content`` if we already read the file (zero extra exec
-        calls); otherwise issues a tiny ``head -c 3`` to sample just the
-        marker. A missing/empty file returns False (new writes get no BOM
-        unless the caller explicitly includes one).
+        Always probes disk rather than trusting ``pre_content``: the normal
+        read path strips BOMs before returning text to the agent, so using
+        that text would silently lose the marker on a rewrite.
         """
-        if pre_content is not None:
-            return _has_bom(pre_content)
         head_cmd = f"head -c 3 {self._escape_shell_arg(path)} 2>/dev/null"
         head_result = await self._exec(head_cmd)
         if head_result.exit_code != 0 or not head_result.stdout:
@@ -1161,16 +1249,25 @@ class ShellFileOperations(FileOperations):
                     "Use vision_analyze with this file path to inspect the image contents."
                 ),
             )
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = await self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        # Read a sample at the byte layer when the backend supports base64;
+        # this avoids treating a UTF-8 codepoint cut at byte 1000 as binary.
+        sample_bytes = await self._sample_file_bytes(path)
+        if sample_bytes is not None:
+            is_binary = (
+                os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
+                or self._is_likely_binary_bytes(sample_bytes)
+            )
+        else:
+            sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+            sample_result = await self._exec(sample_cmd)
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
 
-        if self._is_likely_binary(path, sample_output):
+        if is_binary:
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
-                error="Binary file - cannot display as text. Use appropriate tools to handle this file type."
+                error=describe_binary_file(sample_bytes, file_size),
             )
 
         # Read with pagination using sed
@@ -1280,12 +1377,22 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = await self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        sample_bytes = await self._sample_file_bytes(path)
+        if sample_bytes is not None:
+            is_binary = (
+                os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
+                or self._is_likely_binary_bytes(sample_bytes)
+            )
+        else:
+            sample_result = await self._exec(
+                f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+            )
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+        if is_binary:
             return ReadResult(
                 is_binary=True, file_size=file_size,
-                error="Binary file — cannot display as text."
+                error=describe_binary_file(sample_bytes, file_size),
             )
         cat_result = await self._exec(f"cat {self._escape_shell_arg(path)}")
         if cat_result.exit_code != 0:
@@ -1299,6 +1406,48 @@ class ShellFileOperations(FileOperations):
         return ReadResult(
             content=raw_content,
             file_size=file_size,
+        )
+
+    async def read_file_bytes(
+        self, path: str, max_bytes: int | None = None
+    ) -> ReadResult:
+        """Read binary-safe bytes from any shell-backed environment."""
+        path = await self._expand_path(path)
+        escaped = self._escape_shell_arg(path)
+        stat_result = await self._exec(
+            f"if [ ! -e {escaped} ]; then exit 1; "
+            f"elif [ ! -f {escaped} ]; then printf '%s' {_NOT_REGULAR_BYTES_SENTINEL!r}; "
+            f"else wc -c < {escaped}; fi"
+        )
+        if stat_result.exit_code != 0:
+            return ReadResult(error=f"File not found: {path}")
+        stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
+        if stat_output.strip() == _NOT_REGULAR_BYTES_SENTINEL:
+            return ReadResult(error=f"Cannot read non-regular file: {path}")
+        try:
+            file_size = int(stat_output.strip())
+        except ValueError:
+            return ReadResult(error=f"Could not determine file size: {path}")
+        if max_bytes is not None and file_size > max_bytes:
+            return ReadResult(
+                file_size=file_size,
+                error=f"File is too large ({file_size:,} bytes, limit is {max_bytes:,})",
+            )
+
+        encoded = await self._exec(
+            f"base64 < {self._escape_shell_arg(path)}"
+        )
+        if encoded.exit_code != 0:
+            return ReadResult(error=f"Failed to read binary file: {encoded.stdout}")
+        compact = "".join(_strip_terminal_fence_leaks(encoded.stdout).split())
+        try:
+            base64.b64decode(compact, validate=True)
+        except (ValueError, binascii.Error):
+            return ReadResult(error=f"Backend returned invalid binary data for: {path}")
+        return ReadResult(
+            base64_content=compact,
+            file_size=file_size,
+            is_binary=True,
         )
 
     async def delete_file(self, path: str) -> WriteResult:
@@ -1382,7 +1531,12 @@ class ShellFileOperations(FileOperations):
     # WRITE Implementation
     # =========================================================================
 
-    async def write_file(self, path: str, content: str) -> WriteResult:
+    async def write_file(
+        self,
+        path: str,
+        content: str,
+        pre_content: str | None = None,
+    ) -> WriteResult:
         """
         Write content to a file, creating parent directories as needed.
 
@@ -1474,9 +1628,8 @@ class ShellFileOperations(FileOperations):
         # the UNION of in-process lint coverage and LSP coverage.  For
         # extensions outside both sets (binaries, opaque formats),
         # skipping the read keeps the hot path fast.
-        pre_content: str | None = None
         want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
-        if want_pre:
+        if want_pre and pre_content is None:
             # Best-effort read; failure (file missing, permission) leaves
             # pre_content as None which makes both downstream consumers
             # degrade gracefully (lint reports all errors; LSP skips the
@@ -1516,15 +1669,10 @@ class ShellFileOperations(FileOperations):
         # rather than an external IDE.
         await self._snapshot_lsp_baseline(path)
 
-        # Create parent directories
+        # Parent creation is folded into _atomic_write so the directory and
+        # atomic replacement share one remote subprocess.
         parent = os.path.dirname(path)
-        dirs_created = False
-
-        if parent:
-            mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
-            mkdir_result = await self._exec(mkdir_cmd)
-            if mkdir_result.exit_code == 0:
-                dirs_created = True
+        dirs_created = bool(parent)
 
         # Write atomically: stream into a temp file in the SAME directory,
         # then ``mv`` it over the target. The rename is atomic on POSIX
@@ -1546,14 +1694,9 @@ class ShellFileOperations(FileOperations):
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
-        # Get bytes written (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = await self._exec(stat_cmd)
-
-        try:
-            bytes_written = int(stat_result.stdout.strip())
-        except ValueError:
-            bytes_written = len(content.encode('utf-8'))
+        # The bytes sent over stdin are the bytes intended on disk; avoid a
+        # redundant remote wc subprocess and its extra shell failure mode.
+        bytes_written = len(content.encode("utf-8", "surrogatepass"))
 
         # Post-write content verification (cheap, one shell call): compare
         # the on-disk sha256 to the intended content's hash. Production
@@ -1694,7 +1837,9 @@ class ShellFileOperations(FileOperations):
             new_content = _normalize_line_endings(new_content, file_ending)
 
         # Write back
-        write_result = await self.write_file(path, new_content)
+        write_result = await self.write_file(
+            path, new_content, pre_content=content
+        )
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
 
@@ -2638,7 +2783,7 @@ class ShellFileOperations(FileOperations):
     async def _search_with_grep(self, pattern: str, path: str, file_glob: str | None,
                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
-        cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
+        cmd_parts = ["grep", "-rnHE"]  # -H forces filenames; -E matches rg regex behavior
 
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.

@@ -494,6 +494,9 @@ class AIAgent:
         reasoning_callback: Callable[..., Any] | None = None,
         clarify_callback: Callable[..., Any] | None = None,
         read_terminal_callback: Callable[..., Any] | None = None,
+        read_preview_callback: Callable[..., Any] | None = None,
+        read_window_below_callback: Callable[..., Any] | None = None,
+        setup_mcp_callback: Callable[..., Any] | None = None,
         step_callback: Callable[..., Any] | None = None,
         stream_delta_callback: Callable[..., Any] | None = None,
         interim_assistant_callback: Callable[..., Any] | None = None,
@@ -520,6 +523,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        skip_background_review: bool = False,
         session_db=None,
         parent_session_id: str | None = None,
         iteration_budget: "IterationBudget" = None,
@@ -578,6 +582,9 @@ class AIAgent:
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
             read_terminal_callback=read_terminal_callback,
+            read_preview_callback=read_preview_callback,
+            read_window_below_callback=read_window_below_callback,
+            setup_mcp_callback=setup_mcp_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -604,6 +611,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            skip_background_review=skip_background_review,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
@@ -1959,6 +1967,7 @@ class AIAgent:
         messages_snapshot: list[dict],
         review_memory: bool = False,
         review_skills: bool = False,
+        focus: str | None = None,
     ) -> None:
         """Schedule the retained review fork as an owned native async task."""
         from agent.background_review import spawn_background_review_thread
@@ -1968,6 +1977,7 @@ class AIAgent:
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            focus=focus,
         )
         review_task = asyncio.create_task(
             target(),
@@ -2855,9 +2865,16 @@ class AIAgent:
         try:
             if hasattr(value, "model_dump"):
                 try:
-                    dumped = value.model_dump(mode="json")
+                    # Suppress pydantic's serializer-mismatch warnings for
+                    # SDK models whose runtime union member is narrower than
+                    # the declared generic field.  The serialized payload is
+                    # still valid; leaking this warning mid-response is not.
+                    dumped = value.model_dump(mode="json", warnings=False)
                 except TypeError:
-                    dumped = value.model_dump()
+                    try:
+                        dumped = value.model_dump(mode="json")
+                    except TypeError:
+                        dumped = value.model_dump()
                 return cls._hook_jsonable(
                     dumped,
                     depth=depth + 1,
@@ -3544,7 +3561,9 @@ class AIAgent:
         return True  # safe default: explainer on
 
     @staticmethod
-    def _format_turn_completion_explanation(turn_exit_reason: str) -> str:
+    def _format_turn_completion_explanation(
+        turn_exit_reason: str, persistence_cause: str | None = None
+    ) -> str:
         """Render a user-facing explanation for an abnormal turn ending.
 
         Maps the internal ``turn_exit_reason`` to a short, actionable
@@ -3633,6 +3652,14 @@ class AIAgent:
                 "let it summarize."
             )
         if reason == "session_persistence_failed":
+            if persistence_cause == "locked":
+                return (
+                    prefix
+                    + "the turn was stopped because session storage was busy "
+                    + "(another Hermes process was writing to the state "
+                    + "database). Your message should already be saved — "
+                    + "please send it again in a moment."
+                )
             return (
                 prefix
                 + "the turn was stopped because session storage could not be "
@@ -4733,6 +4760,11 @@ class AIAgent:
             return False
         if msg.get("tool_calls"):
             return False
+        # Prefill rows are synthetic thinking-only carriers by construction.
+        # Check the marker before content repair/sanitization can make the row
+        # look like an ordinary empty assistant message.
+        if msg.get("_thinking_prefill"):
+            return True
         # Does it have any actual output?
         content = msg.get("content")
         if isinstance(content, str):
@@ -4925,7 +4957,9 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            from agent.auxiliary_client import _AI_GATEWAY_HEADERS
+
+            self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):
@@ -5143,6 +5177,153 @@ class AIAgent:
             "update_primary": False,
         }
         await self._ensure_provider_runtime()
+
+    async def _try_refresh_env_client_credentials(self) -> bool:
+        """Adopt profile ``.env`` credential edits at the turn boundary.
+
+        This is the native-async port of upstream's per-turn refresh.  The
+        only behavioral conversion is that dotenv/profile reads and client
+        replacement are awaited; precedence and pool-rotation safeguards stay
+        in the same method and state fields.
+        """
+        if self.api_mode != "chat_completions":
+            return False
+        if getattr(self, "_fallback_activated", False):
+            return False
+        try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+            from hermes_cli.auth import PROVIDER_REGISTRY
+        except ImportError:
+            return False
+
+        async def _env(key: str) -> str:
+            return str((await get_env_value_prefer_dotenv(key)) or "").strip()
+
+        pconfig = PROVIDER_REGISTRY.get(self.provider)
+        if (
+            pconfig
+            and getattr(pconfig, "auth_type", "") == "api_key"
+            and getattr(pconfig, "api_key_env_vars", ())
+        ):
+            api_key = ""
+            for env_var in pconfig.api_key_env_vars:
+                api_key = await _env(env_var)
+                if api_key:
+                    break
+            if not api_key:
+                return False
+
+            env_url = ""
+            if pconfig.base_url_env_var:
+                env_url = (await _env(pconfig.base_url_env_var)).rstrip("/")
+            default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
+            base_url = env_url or default_base
+            if self.provider == "kimi-coding":
+                from hermes_cli.auth import _resolve_kimi_base_url
+
+                base_url = _resolve_kimi_base_url(
+                    api_key, pconfig.inference_base_url, env_url
+                ).rstrip("/")
+            elif self.provider == "zai":
+                from hermes_cli.auth import _resolve_zai_base_url
+
+                base_url = (
+                    await _resolve_zai_base_url(
+                        api_key, pconfig.inference_base_url, env_url
+                    )
+                ).rstrip("/")
+        elif self.provider == "custom":
+            try:
+                from hermes_cli.runtime_provider import _get_named_custom_provider
+            except ImportError:
+                return False
+            custom_provider = _get_named_custom_provider(
+                getattr(self, "requested_provider", "") or ""
+            )
+            if not custom_provider:
+                return False
+            key_env = str(custom_provider.get("key_env") or "").strip()
+            if not key_env:
+                return False
+            api_key = await _env(key_env)
+            if not api_key:
+                return False
+            default_base = str(custom_provider.get("base_url") or "").strip().rstrip("/")
+            base_url = default_base
+        else:
+            return False
+
+        if not base_url:
+            return False
+
+        resolved = (base_url, api_key)
+        previous = getattr(self, "_env_creds_seen", None)
+        current_base = str(getattr(self, "base_url", "") or "").strip().rstrip("/")
+        if previous is None:
+            adopt = current_base == default_base and not (
+                base_url == current_base and api_key == self.api_key
+            )
+            if (
+                adopt
+                and api_key != self.api_key
+                and getattr(self, "_credential_pool", None) is not None
+                and getattr(self, "_credential_pool_entry_id", None)
+            ):
+                adopt = False
+        else:
+            adopt = (
+                resolved != previous
+                and current_base in {default_base, previous[0]}
+                and not (base_url == current_base and api_key == self.api_key)
+            )
+
+        if not adopt:
+            self._env_creds_seen = resolved
+            return False
+
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
+            base_url
+        )
+        prior_api_key = self.api_key
+        prior_base_url = self.base_url
+        prior_client_kwargs = dict(self._client_kwargs)
+        self.api_key = api_key
+        self.base_url = base_url
+        self._client_kwargs["api_key"] = api_key
+        self._client_kwargs["base_url"] = base_url
+        self._apply_client_headers_for_base_url(base_url)
+        try:
+            rebuilt = await self._replace_primary_openai_client(
+                reason="env_credential_refresh"
+            )
+        except asyncio.CancelledError:
+            self.api_key = prior_api_key
+            self.base_url = prior_base_url
+            self._client_kwargs.clear()
+            self._client_kwargs.update(prior_client_kwargs)
+            raise
+        if not rebuilt:
+            self.api_key = prior_api_key
+            self.base_url = prior_base_url
+            self._client_kwargs.clear()
+            self._client_kwargs.update(prior_client_kwargs)
+            return False
+
+        try:
+            from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+
+            sync_credential_pool_entry_id(self)
+        except Exception:
+            logger.debug("sync_credential_pool_entry_id after env refresh failed", exc_info=True)
+        self._env_creds_seen = resolved
+        logger.info(
+            "Applied updated .env credentials for %s: endpoint %s",
+            self.provider,
+            self.base_url,
+        )
+        return True
 
     async def _try_refresh_codex_client_credentials(
         self,
@@ -6244,7 +6425,7 @@ class AIAgent:
         review: response-loss blocker)
         """
         cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(assistant_msg, dict):
+        if not isinstance(assistant_msg, dict):
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: list[str] = []
@@ -6272,14 +6453,26 @@ class AIAgent:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
-            cb(visible, already_streamed=already_streamed)
-            if undelivered_parts:
-                for part in undelivered_parts:
-                    self._record_delivered_interim_text(part)
-            else:
-                self._record_delivered_interim_text(visible)
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_interim_message",
+                **self._stream_hook_base_payload(),
+                text=visible,
+                already_streamed=already_streamed,
+            )
         except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+            logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
+        if cb is not None:
+            try:
+                cb(visible, already_streamed=already_streamed)
+                if undelivered_parts:
+                    for part in undelivered_parts:
+                        self._record_delivered_interim_text(part)
+                else:
+                    self._record_delivered_interim_text(visible)
+            except Exception:
+                logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the native-async single-writer guard fields (#65991)."""
@@ -6349,6 +6542,46 @@ class AIAgent:
                 where, dropped,
             )
 
+    def _stream_hook_base_payload(self) -> dict[str, Any]:
+        return {
+            "turn_id": getattr(self, "_current_turn_id", "") or "",
+            "iteration": int(getattr(self, "_api_call_count", 0) or 0),
+            "session_id": self.session_id or "",
+            "model": self.model or "",
+            "provider": self.provider or "",
+            "surface": self.platform or "cli",
+        }
+
+    def _emit_stream_start(self) -> None:
+        try:
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_stream_start", **self._stream_hook_base_payload()
+            )
+        except Exception:
+            logger.debug("on_stream_start plugin hook enqueue failed", exc_info=True)
+
+    def _emit_stream_end(
+        self,
+        *,
+        final_text: str,
+        finished: bool,
+        error: str | None,
+    ) -> None:
+        try:
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_stream_end",
+                **self._stream_hook_base_payload(),
+                final_text=final_text,
+                finished=finished,
+                error=error,
+            )
+        except Exception:
+            logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
         if self._stream_writer_superseded():
@@ -6402,6 +6635,17 @@ class AIAgent:
                 delivered = True
             except Exception:
                 pass
+        try:
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_stream_delta",
+                **self._stream_hook_base_payload(),
+                delta=text,
+                kind="text",
+            )
+        except Exception:
+            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
         if delivered:
             self._record_streamed_assistant_text(text)
 
@@ -6416,6 +6660,24 @@ class AIAgent:
                 cb(text)
             except Exception:
                 pass
+        try:
+            from agent.plugin_stream_hooks import (
+                enqueue_plugin_stream_hook,
+                stream_reasoning_deltas_enabled,
+            )
+
+            if stream_reasoning_deltas_enabled():
+                enqueue_plugin_stream_hook(
+                    "on_stream_delta",
+                    **self._stream_hook_base_payload(),
+                    delta=text,
+                    kind="reasoning",
+                )
+        except Exception:
+            logger.debug(
+                "reasoning on_stream_delta plugin hook enqueue failed",
+                exc_info=True,
+            )
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -6434,6 +6696,13 @@ class AIAgent:
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
+        try:
+            from agent.plugin_stream_hooks import has_stream_observer_hooks
+
+            if has_stream_observer_hooks():
+                return True
+        except Exception:
+            logger.debug("plugin stream hook consumer check failed", exc_info=True)
         return (
             self.stream_delta_callback is not None
             or getattr(self, "_stream_callback", None) is not None
@@ -7146,6 +7415,29 @@ class AIAgent:
             return False
 
         model = (self.model or "").lower()
+        # Prefer the native OpenRouter catalog when available.  It is more
+        # precise than a vendor-prefix allowlist (which inevitably goes stale),
+        # while the static list below remains the deterministic offline
+        # fallback when the catalog is unavailable or the model is unlisted.
+        capabilities = None
+        # MiniMax's OpenRouter route has an explicit upstream contract here:
+        # do not send the generic ``reasoning`` body even if a future catalog
+        # entry advertises a similarly named capability.
+        if not model.startswith("minimax/"):
+            try:
+                from hermes_cli.models import openrouter_model_reasoning_capabilities
+
+                capabilities = await openrouter_model_reasoning_capabilities(
+                    self.model,
+                    allow_fetch=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                capabilities = None
+        if capabilities is not None:
+            return bool(capabilities.get("supports_reasoning"))
+
         reasoning_model_prefixes = (
             "deepseek/",
             "anthropic/",

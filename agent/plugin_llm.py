@@ -175,6 +175,7 @@ class _TrustPolicy:
     allow_any_model: bool = False  # True when allowed_models == ["*"]
     allow_agent_id_override: bool = False
     allow_profile_override: bool = False
+    allow_task_override: bool = False
 
 
 def _normalize_ref(raw: str) -> str:
@@ -245,6 +246,7 @@ async def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
         allow_any_model=allow_any_model,
         allow_agent_id_override=bool(llm_cfg.get("allow_agent_id_override", False)),
         allow_profile_override=bool(llm_cfg.get("allow_profile_override", False)),
+        allow_task_override=bool(llm_cfg.get("allow_task_override", False)),
     )
 
 
@@ -329,6 +331,86 @@ def _check_overrides(
         final_profile = requested_profile.strip()
 
     return final_provider, final_model, requested_agent_id, final_profile
+
+
+def _builtin_auxiliary_task_keys() -> frozenset[str]:
+    """Return retained built-in auxiliary task keys from data-only defaults."""
+    try:
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        auxiliary = DEFAULT_CONFIG.get("auxiliary", {})
+        if isinstance(auxiliary, dict):
+            return frozenset(
+                key for key, value in auxiliary.items() if isinstance(value, dict)
+            )
+    except Exception:  # pragma: no cover - defensive import boundary
+        pass
+    return frozenset()
+
+
+def _resolve_task_ownership(plugin_id: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Return plugin-owned and built-in auxiliary task keys.
+
+    The upstream CLI stores built-ins in ``hermes_cli.main``. That module is
+    intentionally not shipped by this library fork, so the retained source of
+    truth is the data-only ``DEFAULT_CONFIG.auxiliary`` mapping. Plugin-owned
+    keys still come from the live plugin registry.
+    """
+    owned: set[str] = set()
+    builtin: set[str] = set()
+    try:
+        from hermes_cli.plugins import get_plugin_auxiliary_tasks
+
+        for entry in get_plugin_auxiliary_tasks():
+            if entry.get("plugin") == plugin_id:
+                key = entry.get("key")
+                if isinstance(key, str) and key:
+                    owned.add(key)
+    except Exception:  # pragma: no cover - registry unavailable
+        pass
+    builtin = set(_builtin_auxiliary_task_keys())
+    return frozenset(owned), frozenset(builtin)
+
+
+def _check_task(
+    policy: _TrustPolicy,
+    *,
+    plugin_id: str,
+    requested_task: str | None,
+) -> str | None:
+    """Validate a plugin auxiliary-task route without silent fallback."""
+    if not requested_task:
+        return None
+    task = requested_task.strip()
+    if not task or task.lower() == "auto":
+        return None
+
+    owned, builtin = _resolve_task_ownership(plugin_id)
+    if task in owned:
+        return task
+    if task in builtin:
+        if policy.allow_task_override:
+            return task
+        logger.warning(
+            "plugin_llm task routing denied: plugin %r requested built-in "
+            "auxiliary task %r without allow_task_override",
+            plugin_id,
+            task,
+        )
+        raise PluginLlmTrustError(
+            f"Plugin {plugin_id!r} cannot route through built-in auxiliary task "
+            f"{task!r} without allow_task_override."
+        )
+    logger.warning(
+        "plugin_llm task routing denied: plugin %r requested unowned auxiliary "
+        "task %r",
+        plugin_id,
+        task,
+    )
+    raise PluginLlmTrustError(
+        f"Plugin {plugin_id!r} cannot route through auxiliary task {task!r}; "
+        "the plugin must register that task itself."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +629,7 @@ async def _resolve_attribution(
     provider_override: str | None,
     model_override: str | None,
     response: Any,
+    route_info: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Decide what to record as ``result.provider`` / ``result.model``.
 
@@ -568,7 +651,13 @@ async def _resolve_attribution(
     4. If everything above is empty, fall back to ``"auto"`` /
        ``"default"`` so the result object has non-empty strings.
     """
-    if provider_override:
+    route_info = route_info or {}
+    route_provider = route_info.get("provider")
+    route_model = route_info.get("model")
+
+    if route_provider:
+        provider = route_provider
+    elif provider_override:
         provider = provider_override
     else:
         try:
@@ -580,6 +669,8 @@ async def _resolve_attribution(
     response_model = getattr(response, "model", None)
     if isinstance(response_model, str) and response_model.strip():
         model = response_model.strip()
+    elif route_model:
+        model = route_model
     elif model_override:
         model = model_override
     else:
@@ -632,6 +723,7 @@ class PluginLlm:
         agent_id: str | None = None,
         profile: str | None = None,
         purpose: str | None = None,
+        task: str | None = None,
     ) -> PluginLlmCompleteResult:
         """Run a host-owned chat completion against the user's active model.
 
@@ -645,6 +737,9 @@ class PluginLlm:
         if not inspect.iscoroutinefunction(self._policy_loader):
             raise TypeError("Plugin LLM policy loaders must be async")
         policy = await self._policy_loader(self._plugin_id)
+        eff_task = _check_task(
+            policy, plugin_id=self._plugin_id, requested_task=task
+        )
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
@@ -660,6 +755,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            task=eff_task,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -673,6 +769,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                "task": eff_task or "",
             },
         )
         logger.info(
@@ -700,6 +797,7 @@ class PluginLlm:
         agent_id: str | None = None,
         profile: str | None = None,
         purpose: str | None = None,
+        task: str | None = None,
     ) -> PluginLlmStructuredResult:
         """Run a bounded host-owned structured completion.
 
@@ -721,6 +819,9 @@ class PluginLlm:
         if not inspect.iscoroutinefunction(self._policy_loader):
             raise TypeError("Plugin LLM policy loaders must be async")
         policy = await self._policy_loader(self._plugin_id)
+        eff_task = _check_task(
+            policy, plugin_id=self._plugin_id, requested_task=task
+        )
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
@@ -746,6 +847,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            task=eff_task,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -765,6 +867,7 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "task": eff_task or "",
             },
         )
         logger.info(
@@ -810,6 +913,7 @@ class PluginLlm:
         max_tokens: int | None,
         timeout: float | None,
         extra_body: dict[str, Any] | None = None,
+        task: str | None = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
             return await self._async_caller(
@@ -821,13 +925,15 @@ class PluginLlm:
                 max_tokens=max_tokens,
                 timeout=timeout,
                 extra_body=extra_body,
+                task=task,
             )
         from agent.auxiliary_client import call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
+        route_info: dict[str, str] = {}
         response = await call_llm(
-            task=None,
+            task=task,
             provider=provider_override,
             model=model_override,
             messages=messages,
@@ -835,11 +941,13 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            route_info=route_info,
         )
         provider, model = await _resolve_attribution(
             provider_override=provider_override,
             model_override=model_override,
             response=response,
+            route_info=route_info,
         )
         return provider, model, response
 

@@ -104,3 +104,18 @@ class TestUnifiedDispatch:
         props = VIDEO_GENERATE_SCHEMA["parameters"]["properties"]
         assert "operation" not in props
         assert "video_url" not in props
+
+    def test_upscale_is_an_optional_provider_capability(self):
+        from tools.video_generation_tool import VIDEO_GENERATE_SCHEMA
+
+        prop = VIDEO_GENERATE_SCHEMA["parameters"]["properties"]["upscale"]
+        assert prop["type"] == "boolean"
+        assert "upscaler" in prop["description"]
+
+    @pytest.mark.asyncio
+    async def test_upscale_is_forwarded_without_becoming_required(self):
+        provider = _RecordingProvider()
+        video_gen_registry.register_provider(provider)
+        result = await self._run({"prompt": "a dog", "upscale": True})
+        assert result["success"] is True
+        assert provider.last_kwargs["upscale"] is True

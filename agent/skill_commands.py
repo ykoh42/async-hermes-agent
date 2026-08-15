@@ -13,6 +13,7 @@ from typing import Any
 
 import aiofiles.os
 
+from agent.prompt_cache_boundary import register_stable_prefix
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,13 @@ SKILL_SCAFFOLD_SQL_LIKE = _SKILL_INVOCATION_PREFIX + "%"
 # Joins head and tail excerpts before ``describe_skill_invocation`` parses
 # them.  Never include text from the far side of this marker in a preview.
 SKILL_EXCERPT_JOINT = "\x1e"
+
+
+def append_user_instruction(parts: list, instruction: str) -> str:
+    """Append the volatile instruction and return the stable scaffold prefix."""
+    stable_prefix = "\n".join(parts) + "\n" + _SINGLE_SKILL_INSTRUCTION
+    parts.append(f"{_SINGLE_SKILL_INSTRUCTION}{instruction}")
+    return stable_prefix
 
 
 def extract_user_instruction_from_skill_message(content: Any) -> str | None:
@@ -327,17 +335,20 @@ async def _build_skill_message(
             'file_path="<path>"), or run scripts directly by absolute path '
             f"(e.g. `node {skill_dir}/scripts/foo.js`)."
         )
+    stable_prefix = None
     if user_instruction:
-        parts.extend(
-            [
-                "",
-                "The user has provided the following instruction alongside "
-                f"the skill invocation: {user_instruction}",
-            ]
-        )
+        parts.append("")
+        stable_prefix = append_user_instruction(parts, user_instruction)
     if runtime_note:
         parts.extend(["", f"[Runtime note: {runtime_note}]"])
-    return "\n".join(parts)
+    message = "\n".join(parts)
+    if (
+        stable_prefix is not None
+        and message.startswith(stable_prefix)
+        and len(message) > len(stable_prefix)
+    ):
+        register_stable_prefix(stable_prefix)
+    return message
 
 
 async def scan_skill_commands() -> dict[str, dict[str, Any]]:

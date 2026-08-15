@@ -35,6 +35,7 @@ import aiofiles.os
 # user/plugin discovery stays lazy and awaited, and cold tool discovery does
 # not call a blocking cwd helper from the event-loop thread.
 import httpx as _httpx_bootstrap  # noqa: F401
+from tools import self_repo_guard as _SelfRepoGuardBootstrap  # noqa: F401
 from contextvars import ContextVar
 from typing import Any
 
@@ -1065,6 +1066,7 @@ async def handle_function_call(
         approval_tokens = set_current_observability_context(
             turn_id=turn_id or "",
             tool_call_id=tool_call_id or "",
+            session_id=session_id or "",
         )
     except Exception:
         logger.debug("approval correlation setup failed", exc_info=True)

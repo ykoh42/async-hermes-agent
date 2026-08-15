@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # insertion order, which doubles as the default apply order.
 _SOURCES: dict[str, SecretSource] = {}
 _PLUGIN_SOURCES: dict[object, dict[str, SecretSource]] = {}
+_BUILTIN_SOURCE_NAMES: set[str] = set()
 _BUILTINS_LOADED = False
 
 
@@ -68,11 +69,11 @@ def _plugin_scope(
     return scope
 
 
-def _source_snapshot() -> dict[str, SecretSource]:
+def _source_snapshot(scope: str | None = None) -> dict[str, SecretSource]:
     sources = dict(_SOURCES)
-    scope = _plugin_scope()
-    if scope is not None:
-        sources.update(_PLUGIN_SOURCES.get(scope, {}))
+    active_scope = scope if scope is not None else _plugin_scope()
+    if active_scope is not None:
+        sources.update(_PLUGIN_SOURCES.get(active_scope, {}))
     return sources
 
 
@@ -122,7 +123,13 @@ class ApplyReport:
 # ---------------------------------------------------------------------------
 
 
-def register_source(source: SecretSource, *, replace: bool = False) -> bool:
+def register_source(
+    source: SecretSource,
+    *,
+    replace: bool = False,
+    builtin: bool = False,
+    scope: str | None = None,
+) -> bool:
     """Register a secret source.  Returns True on success.
 
     Rejections are logged, never raised — a bad plugin must not take
@@ -163,11 +170,23 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
             getattr(source, "shape", None),
         )
         return False
-    scope = _plugin_scope(
-        registration=True,
-        module_name=type(source).__module__,
+    registration_scope = (
+        None
+        if builtin
+        else (
+            scope
+            if scope is not None
+            else _plugin_scope(
+                registration=True,
+                module_name=type(source).__module__,
+            )
+        )
     )
-    target = _PLUGIN_SOURCES.setdefault(scope, {}) if scope is not None else _SOURCES
+    target = (
+        _PLUGIN_SOURCES.setdefault(registration_scope, {})
+        if registration_scope is not None
+        else _SOURCES
+    )
     effective = dict(_SOURCES)
     effective.update(target)
     if name in effective and not replace:
@@ -188,17 +207,63 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
                 )
                 return False
     target[name] = source
+    if builtin and registration_scope is None:
+        _BUILTIN_SOURCE_NAMES.add(name)
     return True
 
 
-def get_source(name: str) -> SecretSource | None:
+def get_source(name: str, *, scope: str | None = None) -> SecretSource | None:
     _ensure_builtin_sources()
-    return _source_snapshot().get(name)
+    return _source_snapshot(scope).get(name)
 
 
-def list_sources() -> list[SecretSource]:
+def list_sources(*, scope: str | None = None) -> list[SecretSource]:
     _ensure_builtin_sources()
-    return list(_source_snapshot().values())
+    return list(_source_snapshot(scope).values())
+
+
+def list_plugin_sources() -> list[SecretSource]:
+    """Return global and active-profile sources registered by plugins."""
+    _ensure_builtin_sources()
+    active_scope = _plugin_scope()
+    sources = {
+        name: source
+        for name, source in _SOURCES.items()
+        if name not in _BUILTIN_SOURCE_NAMES
+    }
+    if active_scope is not None:
+        sources.update(_PLUGIN_SOURCES.get(active_scope, {}))
+    return list(sources.values())
+
+
+def snapshot_registration(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> SecretSource | None:
+    _ensure_builtin_sources()
+    target = _SOURCES if scope is None else _PLUGIN_SOURCES.get(scope, {})
+    return target.get(name)
+
+
+def restore_registration(
+    name: str,
+    current: SecretSource,
+    previous: SecretSource | None,
+    *,
+    scope: str | None = None,
+) -> bool:
+    _ensure_builtin_sources()
+    target = _SOURCES if scope is None else _PLUGIN_SOURCES.setdefault(scope, {})
+    if target.get(name) is not current:
+        return False
+    if previous is None:
+        target.pop(name, None)
+    else:
+        target[name] = previous
+    if scope is not None and not target:
+        _PLUGIN_SOURCES.pop(scope, None)
+    return True
 
 
 def _ensure_builtin_sources() -> None:
@@ -214,7 +279,7 @@ def _ensure_builtin_sources() -> None:
     try:
         from agent.secret_sources.bitwarden import BitwardenSource
 
-        register_source(BitwardenSource())
+        register_source(BitwardenSource(), builtin=True)
     except Exception:  # noqa: BLE001 — never block startup
         logger.warning(
             "Failed to register bundled Bitwarden secret source", exc_info=True
@@ -222,7 +287,7 @@ def _ensure_builtin_sources() -> None:
     try:
         from agent.secret_sources.onepassword import OnePasswordSource
 
-        register_source(OnePasswordSource())
+        register_source(OnePasswordSource(), builtin=True)
     except Exception:  # noqa: BLE001 — never block startup
         logger.warning(
             "Failed to register bundled 1Password secret source", exc_info=True
@@ -230,7 +295,7 @@ def _ensure_builtin_sources() -> None:
     try:
         from agent.secret_sources.command import CommandSource
 
-        register_source(CommandSource())
+        register_source(CommandSource(), builtin=True)
     except Exception:  # noqa: BLE001 — never block startup
         logger.warning(
             "Failed to register bundled command secret source", exc_info=True
@@ -241,6 +306,7 @@ def _reset_registry_for_tests() -> None:
     global _BUILTINS_LOADED
     _SOURCES.clear()
     _PLUGIN_SOURCES.clear()
+    _BUILTIN_SOURCE_NAMES.clear()
     _BUILTINS_LOADED = False
 
 

@@ -455,6 +455,77 @@ async def test_prefetch_is_one_turn_delayed_and_keeps_upstream_format(provider):
         "Do not call tools to look up information that is already present here."
         "\n\n- Memory 1\n- Memory 2"
     )
+
+
+async def test_recall_sync_uses_current_query_and_skips_background_queue(
+    tmp_path,
+    monkeypatch,
+):
+    provider = await _make_candidate(
+        tmp_path,
+        monkeypatch,
+        recall_sync=True,
+    )
+    try:
+        assert provider._recall_sync is True
+        await provider.queue_prefetch("queued query")
+        assert provider._prefetch_task is None
+        context = await provider.prefetch("current query")
+        assert "- Memory 1" in context
+        assert provider._client.recall_calls[-1]["query"] == "current query"
+        assert provider._client.recall_calls[-1]["types"] == ["observation"]
+    finally:
+        await provider.shutdown()
+
+
+async def test_recall_status_reports_count_and_clears_after_empty_turn(
+    provider,
+):
+    await provider.queue_prefetch("first query")
+    assert "- Memory 1" in await provider.prefetch("next query")
+    status = provider.recall_status()
+    assert status is not None
+    assert (status.provider_label, status.count, status.glyph) == (
+        "Hindsight",
+        2,
+        "👁️",
+    )
+
+    async def empty_recall(**kwargs):
+        return SimpleNamespace(results=[])
+
+    provider._client.arecall = empty_recall
+    await provider.queue_prefetch("empty query")
+    assert await provider.prefetch("following query") == ""
+    assert provider.recall_status() is None
+
+
+async def test_retain_indicator_emits_only_when_a_retain_is_dispatched(
+    tmp_path,
+    monkeypatch,
+):
+    await _write_config(tmp_path)
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home",
+        lambda: tmp_path,
+    )
+    statuses: list[str] = []
+    provider = HindsightMemoryProvider()
+    await provider.initialize(
+        "indicator-session",
+        hermes_home=str(tmp_path),
+        status_callback=statuses.append,
+    )
+    provider._client = FakeClient()
+    provider._resolve_retain_target = AsyncMock(
+        return_value=(provider._document_id, None),
+    )
+    try:
+        await provider.sync_turn("hello", "answer")
+        await provider._retain_queue.join()
+        assert statuses == ["👁️ Hindsight — saving to memory…"]
+    finally:
+        await provider.shutdown()
     assert await provider.prefetch("consumed") == ""
 
 

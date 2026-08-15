@@ -362,6 +362,11 @@ PROVIDER_TO_MODELS_DEV: dict[str, str] = {
     "xai-oauth": "xai",
     "xiaomi": "xiaomi",
     "nvidia": "nvidia",
+    # Meta Model API (Muse Spark family, api.meta.ai). models.dev keys these
+    # under the "meta" provider id; Hermes' provider is "meta-ai" (and the
+    # api.meta.ai host reverse-maps to "meta-ai"), so keep both aliases.
+    "meta-ai": "meta",
+    "meta": "meta",
     "groq": "groq",
     "mistral": "mistral",
     "togetherai": "togetherai",
@@ -583,18 +588,26 @@ async def lookup_models_dev_context(provider: str, model: str) -> int | None:
     Returns the context window in tokens, or None if not found.
     Handles case-insensitive matching and filters out context=0 entries.
     """
+    explicit = await _explicit_model_override(provider, model)
+    explicit_context = _override_int(explicit, "context_window") if explicit else None
+    if explicit_context is not None:
+        return explicit_context
+
     mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
     if not mdev_provider_id:
-        return None
+        default = await _default_model_override(provider)
+        return _override_int(default, "context_window") if default else None
 
     data = await fetch_models_dev()
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
-        return None
+        default = await _default_model_override(provider)
+        return _override_int(default, "context_window") if default else None
 
     models = provider_data.get("models", {})
     if not isinstance(models, dict):
-        return None
+        default = await _default_model_override(provider)
+        return _override_int(default, "context_window") if default else None
 
     # Exact match
     entry = models.get(model)
@@ -633,6 +646,11 @@ async def lookup_models_dev_context(provider: str, model: str) -> int | None:
                 if ctx:
                     return ctx
 
+    default = await _default_model_override(provider)
+    default_context = _override_int(default, "context_window") if default else None
+    if default_context is not None:
+        return default_context
+
     return None
 
 
@@ -669,6 +687,169 @@ class ModelCapabilities:
     model_family: str = ""
 
 
+_OVERRIDE_WARNED_KEYS: set[tuple[str, str]] = set()
+
+
+async def _load_model_overrides() -> dict[str, Any]:
+    """Load the active profile's canonical ``model_overrides`` section.
+
+    The configuration reader already owns its profile-aware mtime cache, so
+    this layer deliberately does not add a second process-global snapshot.
+    That keeps two active HERMES_HOME profiles from sharing metadata by
+    accident while preserving the existing async config boundary.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        config = await load_config_readonly()
+        raw = cfg_get(config, "model_overrides", default={})
+        return raw if isinstance(raw, dict) else {}
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return {}
+
+
+def _models_dev_to_hermes_ids(provider_id: str) -> list[str]:
+    return [
+        hermes_id
+        for hermes_id, mapped_id in PROVIDER_TO_MODELS_DEV.items()
+        if mapped_id == provider_id
+    ]
+
+
+async def _provider_override_section(provider: str) -> dict[str, Any] | None:
+    overrides = await _load_model_overrides()
+    provider_key = (provider or "").strip()
+    if not provider_key:
+        return None
+
+    candidates = [provider_key]
+    mapped = PROVIDER_TO_MODELS_DEV.get(provider_key)
+    if mapped and mapped not in candidates:
+        candidates.append(mapped)
+    for hermes_id in _models_dev_to_hermes_ids(provider_key):
+        if hermes_id not in candidates:
+            candidates.append(hermes_id)
+    for key in candidates:
+        section = overrides.get(key)
+        if isinstance(section, dict):
+            return section
+    return None
+
+
+async def _explicit_model_override(
+    provider: str, model: str
+) -> dict[str, Any] | None:
+    section = await _provider_override_section(provider)
+    model_key = (model or "").strip()
+    if section is None or not model_key:
+        return None
+    exact = section.get(model_key)
+    if isinstance(exact, dict):
+        return exact
+    lowered = model_key.lower()
+    for key, value in section.items():
+        if key != "_default" and str(key).lower() == lowered and isinstance(value, dict):
+            return value
+    return None
+
+
+async def _default_model_override(provider: str) -> dict[str, Any] | None:
+    section = await _provider_override_section(provider)
+    if section is not None:
+        value = section.get("_default")
+        if isinstance(value, dict):
+            return value
+    overrides = await _load_model_overrides()
+    value = overrides.get("_default")
+    return value if isinstance(value, dict) else None
+
+
+async def _override_for(
+    provider: str, model: str, *, catalog_hit: bool
+) -> dict[str, Any] | None:
+    explicit = await _explicit_model_override(provider, model)
+    if explicit is not None:
+        return explicit
+    if catalog_hit:
+        return None
+    return await _default_model_override(provider)
+
+
+def _override_int(override: dict[str, Any] | None, key: str) -> int | None:
+    if not isinstance(override, dict) or key not in override:
+        return None
+    raw = override.get(key)
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    warn_key = (key, repr(raw))
+    if warn_key not in _OVERRIDE_WARNED_KEYS:
+        _OVERRIDE_WARNED_KEYS.add(warn_key)
+        logger.warning(
+            "model_overrides: ignoring invalid %s value %r "
+            "(expected a positive integer)",
+            key,
+            raw,
+        )
+    return None
+
+
+def _override_to_catalog_shape(
+    override: dict[str, Any],
+) -> tuple[dict[str, Any], bool | None]:
+    patch: dict[str, Any] = {}
+    limit: dict[str, Any] = {}
+    context = _override_int(override, "context_window")
+    output = _override_int(override, "max_output_tokens")
+    if context is not None:
+        limit["context"] = context
+    if output is not None:
+        limit["output"] = output
+    if limit:
+        patch["limit"] = limit
+    if "supports_tools" in override:
+        patch["tool_call"] = bool(override["supports_tools"])
+    if "supports_reasoning" in override:
+        patch["reasoning"] = bool(override["supports_reasoning"])
+    vision = bool(override["supports_vision"]) if "supports_vision" in override else None
+    if vision is not None:
+        patch["attachment"] = vision
+    if "model_family" in override:
+        patch["family"] = str(override["model_family"] or "")
+    return patch, vision
+
+
+def _merge_catalog_entry_with_override(
+    raw: dict[str, Any], override: dict[str, Any]
+) -> dict[str, Any]:
+    shaped, vision = _override_to_catalog_shape(override)
+    merged = dict(raw)
+    limit_patch = shaped.pop("limit", None)
+    if isinstance(limit_patch, dict):
+        base_limit = raw.get("limit")
+        base_limit = dict(base_limit) if isinstance(base_limit, dict) else {}
+        base_limit.update(limit_patch)
+        merged["limit"] = base_limit
+    if vision is not None:
+        modalities = raw.get("modalities")
+        modalities = dict(modalities) if isinstance(modalities, dict) else {}
+        inputs = modalities.get("input")
+        inputs = list(inputs) if isinstance(inputs, list) else []
+        if vision and "image" not in inputs:
+            inputs.append("image")
+        if not vision:
+            inputs = [item for item in inputs if item != "image"]
+        modalities["input"] = inputs
+        merged["modalities"] = modalities
+    merged.update(shaped)
+    return merged
+
+
 async def _get_provider_models(provider: str) -> dict[str, Any] | None:
     """Resolve a Hermes provider ID to its models dict from models.dev.
 
@@ -691,7 +872,7 @@ async def _get_provider_models(provider: str) -> dict[str, Any] | None:
 
 
 def _find_model_entry(models: dict[str, Any], model: str) -> dict[str, Any] | None:
-    """Find a model entry by exact match, then case-insensitive fallback."""
+    """Find a model entry by exact, case-insensitive, or cloud-suffix match."""
     # Exact match
     entry = models.get(model)
     if isinstance(entry, dict):
@@ -702,6 +883,15 @@ def _find_model_entry(models: dict[str, Any], model: str) -> dict[str, Any] | No
     for mid, mdata in models.items():
         if mid.lower() == model_lower and isinstance(mdata, dict):
             return mdata
+
+    for suffix in (":cloud", "-cloud"):
+        entry = models.get(model + suffix)
+        if isinstance(entry, dict):
+            return entry
+        suffix_lower = model_lower + suffix
+        for mid, mdata in models.items():
+            if mid.lower() == suffix_lower and isinstance(mdata, dict):
+                return mdata
 
     return None
 
@@ -827,38 +1017,64 @@ async def get_model_capabilities(
     model: str,
 ) -> ModelCapabilities | None:
     """Async counterpart of :func:`get_model_capabilities`."""
-    mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
-    if not mdev_provider_id:
-        return None
-    data = await fetch_models_dev()
-    provider_data = data.get(mdev_provider_id)
-    if not isinstance(provider_data, dict):
-        return None
-    models = provider_data.get("models", {})
-    if not isinstance(models, dict):
-        return None
-    entry = _find_model_entry(models, model)
-    if entry is None:
+    models = await _get_provider_models(provider)
+    entry = _find_model_entry(models, model) if models is not None else None
+    override = await _override_for(provider, model, catalog_hit=entry is not None)
+    if entry is None and override is None:
         return None
 
-    input_mods = entry.get("modalities", {})
-    input_mods = input_mods.get("input") if isinstance(input_mods, dict) else None
-    supports_vision = (
-        "image" in input_mods
-        if isinstance(input_mods, list)
-        else bool(entry.get("attachment", False))
-    )
-    limit = entry.get("limit", {})
-    limit = limit if isinstance(limit, dict) else {}
-    context = limit.get("context")
-    output = limit.get("output")
+    if entry is None:
+        supports_tools = True
+        supports_vision = False
+        supports_reasoning = False
+        context_window = 200000
+        max_output_tokens = 8192
+        model_family = ""
+    else:
+        input_mods = entry.get("modalities", {})
+        input_mods = input_mods.get("input") if isinstance(input_mods, dict) else None
+        supports_vision = (
+            "image" in input_mods
+            if isinstance(input_mods, list)
+            else bool(entry.get("attachment", False))
+        )
+        supports_tools = bool(entry.get("tool_call", False))
+        supports_reasoning = bool(entry.get("reasoning", False))
+        limit = entry.get("limit", {})
+        limit = limit if isinstance(limit, dict) else {}
+        context = limit.get("context")
+        output = limit.get("output")
+        context_window = (
+            int(context) if isinstance(context, (int, float)) and context > 0 else 200000
+        )
+        max_output_tokens = (
+            int(output) if isinstance(output, (int, float)) and output > 0 else 8192
+        )
+        model_family = entry.get("family", "") or ""
+
+    if override is not None:
+        if "supports_tools" in override:
+            supports_tools = bool(override["supports_tools"])
+        if "supports_vision" in override:
+            supports_vision = bool(override["supports_vision"])
+        if "supports_reasoning" in override:
+            supports_reasoning = bool(override["supports_reasoning"])
+        context_override = _override_int(override, "context_window")
+        if context_override is not None:
+            context_window = context_override
+        output_override = _override_int(override, "max_output_tokens")
+        if output_override is not None:
+            max_output_tokens = output_override
+        if "model_family" in override:
+            model_family = str(override["model_family"] or "")
+
     return ModelCapabilities(
-        supports_tools=bool(entry.get("tool_call", False)),
+        supports_tools=supports_tools,
         supports_vision=supports_vision,
-        supports_reasoning=bool(entry.get("reasoning", False)),
-        context_window=int(context) if isinstance(context, (int, float)) and context > 0 else 200000,
-        max_output_tokens=int(output) if isinstance(output, (int, float)) and output > 0 else 8192,
-        model_family=entry.get("family", "") or "",
+        supports_reasoning=supports_reasoning,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
+        model_family=model_family,
     )
 
 
@@ -1064,21 +1280,42 @@ async def get_model_info(
     data = await fetch_models_dev()
     pdata = data.get(mdev_id)
     if not isinstance(pdata, dict):
-        return None
+        override = await _override_for(provider_id, model_id, catalog_hit=False)
+        if override is None:
+            return None
+        shaped, _ = _override_to_catalog_shape(override)
+        shaped["name"] = model_id
+        return _parse_model_info(model_id, shaped, mdev_id)
 
     models = pdata.get("models", {})
     if not isinstance(models, dict):
-        return None
+        override = await _override_for(provider_id, model_id, catalog_hit=False)
+        if override is None:
+            return None
+        shaped, _ = _override_to_catalog_shape(override)
+        shaped["name"] = model_id
+        return _parse_model_info(model_id, shaped, mdev_id)
 
     # Exact match
     raw = models.get(model_id)
     if isinstance(raw, dict):
+        override = await _override_for(provider_id, model_id, catalog_hit=True)
+        if override is not None:
+            raw = _merge_catalog_entry_with_override(raw, override)
         return _parse_model_info(model_id, raw, mdev_id)
 
     # Case-insensitive fallback
     model_lower = model_id.lower()
     for mid, mdata in models.items():
         if mid.lower() == model_lower and isinstance(mdata, dict):
+            override = await _override_for(provider_id, mid, catalog_hit=True)
+            if override is not None:
+                mdata = _merge_catalog_entry_with_override(mdata, override)
             return _parse_model_info(mid, mdata, mdev_id)
 
-    return None
+    override = await _override_for(provider_id, model_id, catalog_hit=False)
+    if override is None:
+        return None
+    shaped, _ = _override_to_catalog_shape(override)
+    shaped["name"] = model_id
+    return _parse_model_info(model_id, shaped, mdev_id)

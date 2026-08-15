@@ -25,6 +25,69 @@ import pytest
 class TestResolveAutoMainFirst:
     """_resolve_auto() must prefer main provider + main model for every user."""
 
+    @pytest.mark.asyncio
+    async def test_title_generation_auto_honors_main_model_by_default(self):
+        """The default title route must not replace the selected main model."""
+        main_model = "deepseek-v4-flash-free"
+        mock_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_aux_model_for_provider",
+            return_value="gemini-3-flash",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            new_callable=AsyncMock,
+            return_value=(mock_client, main_model),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = await _resolve_auto(
+                main_runtime={
+                    "provider": "opencode-zen",
+                    "model": main_model,
+                },
+                task="title_generation",
+            )
+
+        assert client is mock_client
+        assert model == main_model
+        assert mock_resolve.call_args.args[:2] == ("opencode-zen", main_model)
+
+    @pytest.mark.asyncio
+    async def test_title_generation_can_opt_into_provider_fast_model(self):
+        """The provider fast tier remains available as an explicit opt-in."""
+        fast_model = "gemini-3-flash"
+        mock_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"prefer_fast_model": True},
+        ), patch(
+            "agent.auxiliary_client._get_aux_model_for_provider",
+            return_value=fast_model,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            new_callable=AsyncMock,
+            return_value=(mock_client, fast_model),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = await _resolve_auto(
+                main_runtime={
+                    "provider": "opencode-zen",
+                    "model": "deepseek-v4-flash-free",
+                },
+                task="title_generation",
+            )
+
+        assert client is mock_client
+        assert model == fast_model
+        assert mock_resolve.call_args.args[:2] == ("opencode-zen", fast_model)
+
 
     @pytest.mark.asyncio
     async def test_moa_main_resolves_aux_to_aggregator(self, monkeypatch, tmp_path):

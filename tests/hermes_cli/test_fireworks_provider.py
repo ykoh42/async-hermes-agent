@@ -105,6 +105,14 @@ class TestFireworksAuxiliary:
         assert "X-Title" not in headers
         assert kwargs["base_url"] == "https://api.fireworks.ai/inference/v1"
 
+    @pytest.mark.asyncio
+    async def test_client_sends_hermes_user_agent(self, monkeypatch):
+        """The profile User-Agent reaches OpenAI client construction."""
+        monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
+        _client, _model, kwargs = await self._resolve("fireworks")
+        headers = kwargs.get("default_headers", {})
+        assert headers["User-Agent"].startswith("HermesAgent/")
+
 
 class TestFireworksModelMetadata:
     def test_url_infers_fireworks(self):

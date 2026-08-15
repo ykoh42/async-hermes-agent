@@ -387,6 +387,40 @@ async def test_sensitive_paths_and_config_are_blocked(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ssh_config_write_uses_native_approval_gate(tmp_path, monkeypatch):
+    from tools.file_tools import write_file_tool
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / ".ssh" / "config"
+    approval = AsyncMock(return_value={"approved": True, "message": None})
+    monkeypatch.setattr("tools.approval.request_tool_approval", approval)
+
+    result = json.loads(await write_file_tool(str(target), "Host example\n"))
+
+    assert result["bytes_written"] > 0
+    assert target.read_text() == "Host example\n"
+    approval.assert_awaited_once()
+    assert approval.await_args.kwargs["rule_key"] == "ssh_config_write"
+
+
+@pytest.mark.asyncio
+async def test_ssh_config_write_fails_closed_without_approval(tmp_path, monkeypatch):
+    from tools.file_tools import write_file_tool
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / ".ssh" / "config"
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        AsyncMock(return_value={"approved": False, "message": "BLOCKED"}),
+    )
+
+    result = json.loads(await write_file_tool(str(target), "Host denied\n"))
+
+    assert result["error"] == "BLOCKED"
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
 async def test_search_uses_native_subprocess_and_paginates(tmp_path):
     from tools.file_tools import search_tool
 

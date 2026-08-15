@@ -68,7 +68,10 @@ def test_public_session_interface_is_async():
         "resolve_resume_session_id",
         "restore_rewound",
         "set_session_title",
+        "set_auto_title",
         "set_auto_title_if_empty",
+        "get_session_title_source",
+        "set_session_title_source",
         "set_session_archived",
         "set_session_pinned",
         "close",
@@ -90,6 +93,16 @@ async def test_session_compatibility_primitives_preserve_upstream_contract(db):
         "session-alpha"
     )
     assert (await db.get_session("session-alpha"))["source"] == "library"
+
+    await db.create_session(
+        "session-with-origin",
+        source="library",
+        display_name="Origin display",
+        origin_json='{"kind":"test"}',
+    )
+    origin = await db.get_session("session-with-origin")
+    assert origin["display_name"] == "Origin display"
+    assert origin["origin_json"] == '{"kind":"test"}'
 
     first = await db.append_message(
         "session-alpha", role="user", content="first"
@@ -417,6 +430,33 @@ async def test_session_title_uniqueness_and_auto_title_are_atomic(db):
 
 
 @pytest.mark.asyncio
+async def test_session_title_provenance_matches_upstream_authority_order(db):
+    await db.create_session("derived", source="library")
+    assert await db.set_auto_title(
+        "derived", "Derived", source=SessionDB.TITLE_SOURCE_DERIVED
+    ) is True
+    assert await db.get_session_title_source("derived") == "derived"
+    assert await db.set_auto_title(
+        "derived", "Model", source=SessionDB.TITLE_SOURCE_LLM
+    ) is True
+    assert await db.get_session_title("derived") == "Model"
+    assert await db.set_auto_title(
+        "derived", "Older", source=SessionDB.TITLE_SOURCE_DERIVED
+    ) is False
+
+    assert await db.set_session_title("derived", "Manual") is True
+    assert await db.get_session_title_source("derived") == "user"
+    assert await db.set_auto_title(
+        "derived", "Ignored", source=SessionDB.TITLE_SOURCE_LLM
+    ) is False
+
+    assert await db.set_session_title_source(
+        "derived", SessionDB.TITLE_SOURCE_DERIVED
+    ) is True
+    assert await db.get_session_title_source("derived") == "derived"
+
+
+@pytest.mark.asyncio
 async def test_compression_tip_can_reclaim_hidden_ancestor_title(db):
     await db.create_session("root", source="library")
     await db.set_session_title("root", "fingerprint-scanner")
@@ -550,6 +590,63 @@ async def test_resume_resolution_keeps_message_bearing_parent(db):
     )
 
     assert await db.resolve_resume_session_id("root") == "root"
+
+
+@pytest.mark.asyncio
+async def test_reset_children_remain_listable_when_children_are_excluded(db):
+    await db.create_session(
+        "parent", source="library", session_key="conversation-key"
+    )
+    await db.end_session("parent", "session_reset")
+    await db.create_session(
+        "reset-child",
+        source="library",
+        session_key="conversation-key",
+        parent_session_id="parent",
+    )
+
+    visible = await db.list_sessions_rich(
+        source="library", include_children=False, project_compression_tips=False
+    )
+    assert {row["id"] for row in visible} == {"parent", "reset-child"}
+
+    assert await db.session_count(source="library", exclude_children=True) == 2
+
+
+@pytest.mark.asyncio
+async def test_reopen_stamps_markerless_reset_children_before_clearing_boundary(db):
+    await db.create_session(
+        "parent", source="library", session_key="conversation-key"
+    )
+    await db.end_session("parent", "session_switch")
+    await db.create_session(
+        "reset-child",
+        source="library",
+        session_key="conversation-key",
+        parent_session_id="parent",
+    )
+
+    await db.reopen_session("parent")
+
+    child = await db.get_session("reset-child")
+    assert json.loads(child["model_config"])["_reset_from"] == "parent"
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_follow_legacy_reset_child(db):
+    await db.create_session(
+        "parent", source="library", session_key="conversation-key"
+    )
+    await db.end_session("parent", "session_switch")
+    await db.create_session(
+        "reset-child",
+        source="library",
+        session_key="conversation-key",
+        parent_session_id="parent",
+    )
+    await db.append_message("reset-child", role="user", content="new branch")
+
+    assert await db.resolve_resume_session_id("parent") == "parent"
 
 
 @pytest.mark.asyncio
@@ -1230,6 +1327,19 @@ async def test_logical_size_optimize_and_vacuum_use_native_async_sqlite(db):
     assert present[0] >= 1
     assert await db.optimize_fts() == present[0]
     assert await db.vacuum() == present[0]
+
+
+@pytest.mark.asyncio
+async def test_wal_size_limit_is_bounded_when_wal_is_available(db):
+    """Native WAL setup must not retain unlimited checkpoint slack."""
+    connection = await db._get_connection()
+    mode = (await (await connection.execute("PRAGMA journal_mode")).fetchone())[0]
+    if str(mode).lower() != "wal":
+        pytest.skip("WAL unavailable on this SQLite/filesystem")
+    limit = (
+        await (await connection.execute("PRAGMA journal_size_limit")).fetchone()
+    )[0]
+    assert int(limit) > 0
 
 
 @pytest.mark.asyncio

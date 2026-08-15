@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import _sanitize_surrogates
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -497,6 +498,12 @@ async def finalize_turn(
 
     _response_transformed = False
 
+    # Model SDK content can contain lone UTF-16 surrogates even when the
+    # persisted history copy has already been sanitized.  Scrub at the final
+    # delivery boundary so every retained caller receives encodable text.
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
@@ -676,6 +683,7 @@ async def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
         try:

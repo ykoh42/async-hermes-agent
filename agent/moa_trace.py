@@ -97,6 +97,15 @@ def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
     }
 
 
+def slot_metrics(acct: Any, label: str, output: Any = None) -> dict[str, Any]:
+    """Render compact per-reference accounting for observability hooks."""
+    trace = _slot_trace(acct, label)
+    trace.pop("input_messages", None)
+    if output is not None:
+        trace["output"] = output
+    return trace
+
+
 async def save_moa_turn(
     *,
     session_id: str | None,

@@ -1417,6 +1417,78 @@ async def _resolve_client_cert(server_name: str, config: dict):
     return cert_path
 
 
+async def _resolve_identity_header(server_name: str, config: dict):
+    """Resolve optional per-server identity header configuration.
+
+    ``value_from: profile`` is resolved at the awaited connection boundary so
+    profile selection never performs synchronous I/O or captures another
+    agent's active profile. Invalid configuration is intentionally ignored
+    after a warning, matching the upstream transport contract.
+    """
+    raw = config.get("identity_header")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "MCP server '%s': identity_header must be a mapping with "
+            "'name' and 'value'/'value_from' keys (got %s) — ignoring",
+            server_name,
+            type(raw).__name__,
+        )
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        logger.warning(
+            "MCP server '%s': identity_header requires a non-empty "
+            "'name' — ignoring",
+            server_name,
+        )
+        return None
+    value_from = str(raw.get("value_from") or "static").strip().lower()
+    if value_from == "static":
+        value = raw.get("value")
+        if not isinstance(value, str) or not value.strip():
+            logger.warning(
+                "MCP server '%s': identity_header with value_from: static "
+                "requires a non-empty string 'value' — ignoring",
+                server_name,
+            )
+            return None
+        return (name.strip(), value)
+    if value_from == "profile":
+        from hermes_cli.profiles import get_active_profile_name
+
+        value = get_active_profile_name()
+        if inspect.isawaitable(value):
+            value = await value
+        return (name.strip(), str(value))
+    logger.warning(
+        "MCP server '%s': identity_header value_from must be 'static' or "
+        "'profile' (got %r) — ignoring",
+        server_name,
+        value_from,
+    )
+    return None
+
+
+async def _apply_identity_header(server_name: str, config: dict, headers: dict) -> dict:
+    """Merge identity header into ``headers`` without overriding explicit data."""
+    resolved = await _resolve_identity_header(server_name, config)
+    if resolved is None:
+        return headers
+    name, value = resolved
+    if any(key.lower() == name.lower() for key in headers):
+        logger.debug(
+            "MCP server '%s': identity_header '%s' already set via explicit "
+            "headers config — keeping the explicit value",
+            server_name,
+            name,
+        )
+        return headers
+    headers[name] = value
+    return headers
+
+
 def _format_connect_error(exc: BaseException) -> str:
     """Render nested MCP connection errors into an actionable short message."""
 
@@ -2621,6 +2693,12 @@ class MCPServerTask:
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
+        if config.get("identity_header") is not None:
+            logger.warning(
+                "MCP server '%s': identity_header is only supported on "
+                "HTTP/SSE transports — ignored for stdio servers",
+                self.name,
+            )
         if not _MCP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
@@ -3025,6 +3103,7 @@ class MCPServerTask:
 
         url = config["url"]
         headers = dict(config.get("headers") or {})
+        headers = await _apply_identity_header(self.name, config, headers)
         # Some MCP servers require MCP-Protocol-Version on the initial
         # initialize request and reject session-less POSTs otherwise.
         # Seed it as a client-level default, but treat user overrides as
@@ -3934,6 +4013,113 @@ _server_error_counts: MutableMapping[str, int] = _ScopedDict()
 _server_breaker_opened_at: MutableMapping[str, float] = _ScopedDict()
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
+
+# Optional operator-controlled trust gating for retained MCP servers.  These
+# are profile-scoped just like the transport registry: two agents may use the
+# same server name with different trust policy on one event loop.
+_server_trust_levels: MutableMapping[str, str] = _ScopedDict()
+_tool_read_only_hints: MutableMapping[str, dict[str, bool]] = _ScopedDict()
+_TRUST_FULL = "full"
+_TRUST_UNTRUSTED = "untrusted"
+
+
+def _normalize_server_trust(value: Any) -> str:
+    """Normalize ``trust`` to the two supported tiers, failing closed."""
+    if value is None:
+        return _TRUST_FULL
+    text = str(value).strip().lower()
+    if text == _TRUST_FULL:
+        return _TRUST_FULL
+    if text == _TRUST_UNTRUSTED:
+        return _TRUST_UNTRUSTED
+    logger.warning(
+        "MCP trust: unrecognized trust value %r — treating as 'untrusted' "
+        "(valid values: full, untrusted)",
+        value,
+    )
+    return _TRUST_UNTRUSTED
+
+
+def _annotation_read_only_hint(mcp_tool: Any) -> bool:
+    """Return true only for an exact boolean ``readOnlyHint=True``."""
+    annotations = getattr(mcp_tool, "annotations", None)
+    if annotations is None:
+        return False
+    if isinstance(annotations, dict):
+        hint = annotations.get("readOnlyHint")
+    else:
+        hint = getattr(annotations, "readOnlyHint", None)
+    return hint is True
+
+
+def _record_tool_trust_metadata(
+    server_name: str, config: dict, tools: list[Any]
+) -> None:
+    """Capture operator trust and discovery annotations for call-time gating."""
+    with _lock:
+        _server_trust_levels[server_name] = _normalize_server_trust(
+            (config or {}).get("trust")
+        )
+        hints = _tool_read_only_hints.setdefault(server_name, {})
+        for mcp_tool in tools:
+            name = getattr(mcp_tool, "name", None)
+            if name:
+                hints[name] = _annotation_read_only_hint(mcp_tool)
+
+
+async def _trust_gate_check(server_name: str, tool_name: str) -> str | None:
+    """Approve write-capable tools on explicitly untrusted MCP servers."""
+    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    if trust != _TRUST_UNTRUSTED:
+        return None
+    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+        return None
+
+    try:
+        from tools.approval import request_elicitation_consent
+
+        answer = request_elicitation_consent(
+            (
+                f"MCP tool '{tool_name}' on UNTRUSTED server '{server_name}' "
+                "wants to run. This tool is write-capable (no "
+                "readOnlyHint=true annotation) and may modify external state."
+            ),
+            (
+                f"Server '{server_name}' is configured 'trust: untrusted'. "
+                f"Approve to run '{tool_name}' once, or deny to block it."
+            ),
+            surface=f"mcp-trust/{server_name}",
+        )
+        if inspect.isawaitable(answer):
+            answer = await answer
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "MCP trust gate: approval check failed for %s.%s: %s",
+            server_name,
+            tool_name,
+            exc,
+            exc_info=True,
+        )
+        return tool_error(
+            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            "was blocked: the approval system was unavailable (fail-closed)."
+        )
+
+    if str(answer).strip().lower() == "accept":
+        return None
+    logger.info(
+        "MCP trust gate: user %s '%s' on untrusted server '%s'",
+        "cancelled" if str(answer).strip().lower() == "cancel" else "denied",
+        tool_name,
+        server_name,
+    )
+    return tool_error(
+        "The user did not approve running write-capable MCP tool "
+        f"'{tool_name}' on untrusted server '{server_name}'. The command "
+        "was NOT run. Do not retry without explicit user direction."
+    )
 
 
 def _bump_server_error(server_name: str) -> None:
@@ -5044,6 +5230,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "check the MCP server."
                 )
 
+        trust_error = await _trust_gate_check(server_name, tool_name)
+        if trust_error is not None:
+            return trust_error
+
         server = await _get_connected_server_for_call(server_name)
         if not server:
             _bump_server_error(server_name)
@@ -5525,6 +5715,12 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
         return strip_nullable_unions(node, keep_nullable_hint=True)
 
+    def _collapse_const_unions(node):
+        """Collapse same-typed const unions to portable property enums."""
+        from tools.schema_sanitizer import collapse_const_unions
+
+        return collapse_const_unions(node)
+
     def _repair_object_shape(node):
         """Recursively repair object-shaped nodes: fill type, prune required."""
         if isinstance(node, list):
@@ -5565,6 +5761,7 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
     normalized = _rewrite_local_refs(schema)
     normalized = _strip_nullable_union(normalized)
+    normalized = _collapse_const_unions(normalized)
     normalized = _repair_object_shape(normalized)
 
     # Ensure top-level is a well-formed object schema
@@ -5933,6 +6130,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> li
     check_fn = _make_check_fn(name)
     candidates: list[dict] = []
 
+    _record_tool_trust_metadata(name, config, list(server._tools))
+
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
             logger.debug(
@@ -6112,6 +6311,21 @@ def _register_from_cache(name: str, config: dict, entry: dict) -> list[str]:
         return True
 
     check_fn = _make_check_fn(name)
+    cached_tool_metadata = [
+        SimpleNamespace(
+            name=raw.get("name"),
+            annotations=(
+                raw.get("annotations")
+                if isinstance(raw.get("annotations"), dict)
+                else None
+            ),
+        )
+        for raw in tools_from_cache_entry(entry)
+        if isinstance(raw, dict) and raw.get("name")
+    ]
+    # Older cache entries lack annotations; the trust gate treats those as
+    # write-capable, which is the safe behavior for an untrusted server.
+    _record_tool_trust_metadata(name, config, cached_tool_metadata)
     for raw in tools_from_cache_entry(entry):
         if not isinstance(raw, dict) or not raw.get("name"):
             continue
@@ -6202,6 +6416,9 @@ async def _write_server_schema_cache(
                 "inputSchema": (
                     tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
                 ),
+                "annotations": {
+                    "readOnlyHint": _annotation_read_only_hint(tool),
+                },
             }
             for tool in server._tools
         ]

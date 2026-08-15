@@ -23,6 +23,7 @@ update when it's noticed.
 import json
 import logging
 import datetime
+import inspect
 import uuid
 from typing import Any
 
@@ -133,7 +134,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "num_inference_steps", "seed",
             "output_format", "enable_safety_checker",
         },
-        "upscale": False,
+        "upscale": True,
         # Image-to-image / editing: FLUX.2 [klein] 9B edit endpoint takes
         # `image_urls` (list). Natural-language edits, multi-ref.
         "edit_endpoint": "fal-ai/flux-2/klein/9b/edit",
@@ -201,7 +202,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "seed", "output_format", "enable_safety_checker",
             "enable_prompt_expansion",
         },
-        "upscale": False,
+        "upscale": True,
     },
     "fal-ai/nano-banana-pro": {
         "display": "Nano Banana Pro (Gemini 3 Pro Image)",
@@ -227,7 +228,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "safety_tolerance", "seed", "sync_mode", "resolution",
             "enable_web_search", "limit_generations",
         },
-        "upscale": False,
+        "upscale": True,
         # Nano Banana Pro edit (Gemini 3 Pro Image): natural-language edits
         # with up to 2 reference images via `image_urls`.
         "edit_endpoint": "fal-ai/nano-banana-pro/edit",
@@ -237,6 +238,40 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "resolution", "enable_web_search", "limit_generations",
         },
         "max_reference_images": 2,
+    },
+    "fal-ai/nano-banana-2": {
+        "display": "Nano Banana 2 (Gemini 3.1 Flash Image)",
+        "speed": "~3s",
+        "strengths": "Fast reasoning, multilingual text, infographics",
+        "price": "Lower-cost Flash tier",
+        "size_style": "aspect_ratio",
+        "sizes": {
+            "landscape": "16:9",
+            "square": "1:1",
+            "portrait": "9:16",
+        },
+        "defaults": {
+            "num_images": 1,
+            "output_format": "png",
+            "safety_tolerance": "4",
+            "resolution": "1K",
+            "limit_generations": True,
+        },
+        "supports": {
+            "prompt", "aspect_ratio", "num_images", "output_format",
+            "safety_tolerance", "seed", "sync_mode", "system_prompt",
+            "resolution", "enable_web_search", "limit_generations",
+            "thinking_level",
+        },
+        "upscale": True,
+        "edit_endpoint": "fal-ai/nano-banana-2/edit",
+        "edit_supports": {
+            "prompt", "image_urls", "aspect_ratio", "num_images",
+            "output_format", "safety_tolerance", "seed", "sync_mode",
+            "system_prompt", "resolution", "enable_web_search",
+            "limit_generations", "thinking_level",
+        },
+        "max_reference_images": 14,
     },
     "fal-ai/gpt-image-1.5": {
         "display": "GPT Image 1.5",
@@ -260,7 +295,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "quality", "num_images", "output_format",
             "background", "sync_mode",
         },
-        "upscale": False,
+        "upscale": True,
         # Edit endpoint: high-fidelity edits preserving composition/lighting.
         "edit_endpoint": "fal-ai/gpt-image-1.5/edit",
         "edit_supports": {
@@ -299,7 +334,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             # openai_api_key (BYOK) intentionally omitted — all users go
             # through the shared FAL billing path.
         },
-        "upscale": False,
+        "upscale": True,
         # GPT Image 2 edit endpoint lives under the OpenAI namespace on FAL
         # (NOT fal-ai/). Takes `image_urls` (list) + optional mask. We don't
         # send `image_size` on edit so the model auto-infers from input.
@@ -330,7 +365,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "rendering_speed", "expand_prompt",
             "style", "seed",
         },
-        "upscale": False,
+        "upscale": True,
         # Ideogram V3 edit endpoint takes `image_urls` (list).
         "edit_endpoint": "fal-ai/ideogram/v3/edit",
         "edit_supports": {
@@ -358,7 +393,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "enable_safety_checker",
             "colors", "background_color",
         },
-        "upscale": False,
+        "upscale": True,
     },
     "fal-ai/qwen-image": {
         "display": "Qwen Image",
@@ -382,7 +417,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "num_inference_steps", "guidance_scale",
             "num_images", "output_format", "acceleration", "seed", "sync_mode",
         },
-        "upscale": False,
+        "upscale": True,
         # Qwen edit uses the Qwen Image 2.0 Pro editing endpoint, which takes
         # `image_urls` (list) + natural-language edit instructions.
         "edit_endpoint": "fal-ai/qwen-image-2/pro/edit",
@@ -412,7 +447,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "aspect_ratio", "creativity", "seed",
             "image_style_references",
         },
-        "upscale": False,
+        "upscale": True,
     },
     "fal-ai/krea/v2/large/text-to-image": {
         "display": "Krea 2 Large",
@@ -433,6 +468,199 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "image_style_references",
         },
         "upscale": False,
+    },
+    "bytedance/seedream/v5/pro/text-to-image": {
+        "display": "Seedream 5.0 Pro",
+        "speed": "~10s",
+        "strengths": "ByteDance flagship, dense layouts, native text in 14 languages",
+        "price": "$0.0675/image (≤1536²)",
+        "size_style": "image_size_preset",
+        "sizes": {
+            "landscape": {"width": 2048, "height": 1152},
+            "square": {"width": 1536, "height": 1536},
+            "portrait": {"width": 1152, "height": 2048},
+        },
+        "defaults": {
+            "num_images": 1,
+            "output_format": "png",
+            "enable_safety_checker": False,
+        },
+        "supports": {
+            "prompt", "image_size", "num_images", "output_format",
+            "sync_mode", "enable_safety_checker",
+        },
+        "upscale": False,
+        "edit_endpoint": "bytedance/seedream/v5/pro/edit",
+        "edit_supports": {
+            "prompt", "image_urls", "image_size", "num_images",
+            "output_format", "sync_mode", "enable_safety_checker",
+        },
+        "max_reference_images": 10,
+    },
+    "bytedance/seedream/v5/lite/text-to-image": {
+        "display": "Seedream 5.0 Lite",
+        "speed": "~5s",
+        "strengths": "Fast/cheap Seedream tier, high-res output",
+        "price": "$0.035/image",
+        "size_style": "image_size_preset",
+        "sizes": {
+            "landscape": "landscape_16_9",
+            "square": "square_hd",
+            "portrait": "portrait_16_9",
+        },
+        "defaults": {
+            "num_images": 1,
+            "enable_safety_checker": False,
+        },
+        "supports": {
+            "prompt", "image_size", "num_images", "max_images",
+            "sync_mode", "enable_safety_checker",
+        },
+        "upscale": False,
+    },
+    "ideogram/v4/instant": {
+        "display": "Ideogram V4 (Instant)",
+        "speed": "<1s",
+        "strengths": "Latest Ideogram typography, posters/logos, instant",
+        "price": "$0.0075/MP",
+        "size_style": "image_size_preset",
+        "sizes": {
+            "landscape": "landscape_16_9",
+            "square": "square_hd",
+            "portrait": "portrait_16_9",
+        },
+        "defaults": {
+            "expansion_model": "Medium",
+            "output_format": "png",
+            "enable_safety_checker": False,
+        },
+        "supports": {
+            "prompt", "image_size", "expansion_model", "num_images",
+            "seed", "sync_mode", "enable_safety_checker", "output_format",
+        },
+        "upscale": True,
+    },
+    "ideogram/v4/fast": {
+        "display": "Ideogram V4 (Fast)",
+        "speed": "~1s",
+        "strengths": "Ideogram V4 quality tiers via rendering_speed",
+        "price": "$0.005-0.018/MP",
+        "size_style": "image_size_preset",
+        "sizes": {
+            "landscape": "landscape_16_9",
+            "square": "square_hd",
+            "portrait": "portrait_16_9",
+        },
+        "defaults": {
+            "expansion_model": "Medium",
+            "rendering_speed": "BALANCED",
+        },
+        "supports": {
+            "prompt", "image_size", "expansion_model", "rendering_speed",
+            "num_images", "seed", "sync_mode",
+        },
+        "upscale": True,
+    },
+    "alibaba/qwen-image-3/text-to-image": {
+        "display": "Qwen Image 3",
+        "speed": "~8s",
+        "strengths": "Complex CN/EN text rendering, prompt-guided resolution",
+        "price": "$0.04 (1K) / $0.075 (2K) per image",
+        "size_style": "image_size_preset",
+        "sizes": {
+            "landscape": "landscape_16_9",
+            "square": "square_hd",
+            "portrait": "portrait_16_9",
+        },
+        "defaults": {
+            "num_images": 1,
+            "output_format": "png",
+            "enable_prompt_expansion": False,
+            "enable_safety_checker": False,
+        },
+        "supports": {
+            "prompt", "negative_prompt", "image_size", "num_images",
+            "seed", "sync_mode", "output_format", "enable_prompt_expansion",
+            "enable_safety_checker",
+        },
+        "upscale": True,
+        "edit_endpoint": "alibaba/qwen-image-3/edit",
+        "edit_supports": {
+            "prompt", "image_urls", "negative_prompt", "num_images",
+            "seed", "sync_mode", "output_format", "enable_prompt_expansion",
+            "enable_safety_checker",
+        },
+        "max_reference_images": 3,
+    },
+    "microsoft/mai-image-2.5-pro": {
+        "display": "MAI Image 2.5 Pro",
+        "speed": "~10s",
+        "strengths": "Microsoft flagship, hero imagery, precise typography",
+        "price": "~$0.17/image",
+        "size_style": "aspect_ratio",
+        "sizes": {
+            "landscape": "16:9",
+            "square": "1:1",
+            "portrait": "9:16",
+        },
+        "defaults": {
+            "num_images": 1,
+            "output_format": "png",
+        },
+        "supports": {
+            "prompt", "aspect_ratio", "num_images", "output_format",
+            "sync_mode",
+        },
+        "upscale": True,
+    },
+    "google/nano-banana-2-lite": {
+        "display": "Nano Banana 2 Lite",
+        "speed": "<2s",
+        "strengths": "Gemini image family, sub-2s, 14 aspect ratios incl. extreme",
+        "price": "~$0.04/image (1K fixed)",
+        "size_style": "aspect_ratio",
+        "sizes": {
+            "landscape": "16:9",
+            "square": "1:1",
+            "portrait": "9:16",
+        },
+        "defaults": {
+            "num_images": 1,
+            "output_format": "png",
+            "safety_tolerance": "5",
+        },
+        "supports": {
+            "prompt", "aspect_ratio", "num_images", "seed", "output_format",
+            "safety_tolerance", "sync_mode", "system_prompt",
+            "limit_generations", "thinking_level",
+        },
+        "upscale": True,
+        "edit_endpoint": "google/nano-banana-2-lite/edit",
+        "edit_supports": {
+            "prompt", "image_urls", "aspect_ratio", "num_images", "seed",
+            "output_format", "safety_tolerance", "sync_mode", "system_prompt",
+        },
+        "max_reference_images": 4,
+    },
+    "fal-ai/recraft/v4.1/text-to-image": {
+        "display": "Recraft V4.1",
+        "speed": "~8s",
+        "strengths": "Design-first raster, brand systems, editorial",
+        "price": "$0.035/image",
+        "size_style": "image_size_preset",
+        "sizes": {
+            "landscape": "landscape_16_9",
+            "square": "square_hd",
+            "portrait": "portrait_16_9",
+        },
+        "defaults": {
+            "enable_safety_checker": False,
+        },
+        "supports": {
+            "prompt", "image_size", "enable_safety_checker",
+            "colors", "background_color",
+        },
+        "upscale": True,
     },
 }
 
@@ -745,6 +973,7 @@ async def image_generate_tool(
     seed: int | None = None,
     image_url: str | None = None,
     reference_image_urls: list | None = None,
+    upscale: bool | None = None,
 ) -> str:
     """Generate an image from a text prompt, or edit a source image, via FAL.
 
@@ -786,6 +1015,7 @@ async def image_generate_tool(
             "num_images": num_images,
             "output_format": output_format,
             "seed": seed,
+            "upscale": upscale,
             "modality": modality,
             "source_images": len(source_images),
         },
@@ -871,9 +1101,14 @@ async def image_generate_tool(
         if not images:
             raise ValueError("No images were generated")
 
-        # Edit endpoints already return the final composition; the Clarity
-        # upscaler is a text-to-image quality pass, so skip it for edits.
-        should_upscale = bool(meta.get("upscale", False)) and not use_edit
+        # An explicit request wins over the per-model default, including for
+        # edits.  When omitted, preserve the catalog default and avoid
+        # changing edit composition by silently applying a text-to-image
+        # upscaler.
+        if upscale is not None:
+            should_upscale = bool(upscale)
+        else:
+            should_upscale = bool(meta.get("upscale", False)) and not use_edit
 
         formatted_images = []
         for img in images:
@@ -912,6 +1147,9 @@ async def image_generate_tool(
             "success": True,
             "image": formatted_images[0]["url"] if formatted_images else None,
             "modality": modality,
+            "upscaled": bool(
+                formatted_images and formatted_images[0].get("upscaled")
+            ),
         }
 
         debug_call_data["success"] = True
@@ -1078,6 +1316,17 @@ IMAGE_GENERATE_SCHEMA = {
                     "capped per-model; the description above indicates the max."
                 ),
             },
+            "upscale": {
+                "type": "boolean",
+                "description": (
+                    "Optional override for the high-resolution pass. Models "
+                    "with sub-2MP native output upscale automatically (~2x, "
+                    "extra cost/latency); pass false for a faster/cheaper "
+                    "draft at native resolution, or true to force the pass "
+                    "on native hi-res models and image edits. Omit to keep "
+                    "the per-model default."
+                ),
+            },
         },
         "required": ["prompt"],
     },
@@ -1130,6 +1379,7 @@ async def _dispatch_to_plugin_provider(
     aspect_ratio: str,
     image_url: str | None = None,
     reference_image_urls: list | None = None,
+    upscale: bool | None = None,
 ):
     """Route the call to a plugin-registered provider when one is selected.
 
@@ -1200,6 +1450,8 @@ async def _dispatch_to_plugin_provider(
             norm_refs = normalize_reference_images(reference_image_urls)
         if norm_refs:
             kwargs["reference_image_urls"] = norm_refs
+        if upscale is not None:
+            kwargs["upscale"] = bool(upscale)
         result = await provider.generate(**kwargs)
     except TypeError as exc:
         # A provider whose generate() signature predates image_url support
@@ -1270,6 +1522,7 @@ async def _maybe_route_managed_krea(
     aspect_ratio: str,
     image_url: str | None = None,
     reference_image_urls: list | None = None,
+    upscale: bool | None = None,
 ) -> str | None:
     """Route a native ``krea-2-*`` model to the managed Krea gateway, in managed mode.
 
@@ -1328,6 +1581,8 @@ async def _maybe_route_managed_krea(
             norm_refs = normalize_reference_images(reference_image_urls)
         if norm_refs:
             kwargs["reference_image_urls"] = norm_refs
+        if upscale is not None:
+            kwargs["upscale"] = bool(upscale)
         result = await provider.generate(**kwargs)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Managed Krea routing failed: %s", exc)
@@ -1347,6 +1602,167 @@ async def _maybe_route_managed_krea(
     return json.dumps(result)
 
 
+async def _confine_source_images(
+    image_url: str | None,
+    reference_image_urls: list | tuple | None,
+    task_id: str | None,
+    *,
+    permitted: tuple[str, ...] = ("image",),
+) -> tuple[str | None, list | None, str | None]:
+    """Resolve path-like media through the shared native async source boundary.
+
+    HTTP and data URLs are already self-contained and pass through unchanged.
+    On a non-local terminal backend, filesystem paths are read through
+    ``tools.image_source`` and converted to data URLs before any provider
+    dispatch. This keeps image/video generation aligned with the vision source
+    resolver and prevents a provider from reading a host path directly.
+    """
+    backend = str(get_secret("TERMINAL_ENV", "local") or "local").strip().lower()
+    if backend in {"", "local"}:
+        return image_url, reference_image_urls, None
+
+    from tools.image_source import (
+        ImageResolutionError,
+        resolve_local_source_to_data_url,
+    )
+
+    async def _resolve(value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            return value
+        candidate = value.strip()
+        if candidate.startswith(("http://", "https://", "data:")):
+            return value
+        return await resolve_local_source_to_data_url(
+            candidate,
+            task_id,
+            permitted=permitted,
+        )
+
+    try:
+        if isinstance(image_url, str) and image_url.strip():
+            image_url = await _resolve(image_url)
+        if isinstance(reference_image_urls, (list, tuple)):
+            reference_image_urls = [
+                await _resolve(ref) if isinstance(ref, str) else ref
+                for ref in reference_image_urls
+            ]
+    except ImageResolutionError as exc:
+        return image_url, reference_image_urls, json.dumps({
+            "success": False,
+            "image": None,
+            "error": f"Could not read source image: {exc}",
+            "error_type": type(exc).__name__,
+        })
+    return image_url, reference_image_urls, None
+
+
+def _looks_like_absolute_file_path(value: str) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    lower = value.lower()
+    if lower.startswith(("http://", "https://", "data:")):
+        return False
+    if value.startswith("/"):
+        return True
+    return len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}
+
+
+def _active_terminal_env(task_id: str | None):
+    try:
+        from tools.terminal_tool import get_active_env
+
+        return get_active_env(task_id or "default")
+    except Exception as exc:  # noqa: BLE001 - artifact hints must not break generation
+        logger.debug("Could not inspect active terminal environment: %s", exc)
+        return None
+
+
+def _agent_cache_base_for_env(env: Any) -> str | None:
+    if env is not None:
+        explicit = getattr(env, "agent_visible_cache_base", None)
+        if callable(explicit):
+            try:
+                value = explicit()
+                if value:
+                    return str(value).rstrip("/")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("active env agent_visible_cache_base failed: %s", exc)
+
+        remote_home = getattr(env, "_remote_home", None)
+        if remote_home:
+            return f"{str(remote_home).rstrip('/')}/.hermes"
+
+        if env.__class__.__name__ in {
+            "DockerEnvironment", "SingularityEnvironment", "ModalEnvironment",
+        }:
+            return "/root/.hermes"
+
+    backend = str(get_secret("TERMINAL_ENV", "local") or "local").strip().lower()
+    if backend in {"docker", "singularity", "modal"}:
+        return "/root/.hermes"
+    if backend == "ssh":
+        return "~/.hermes"
+    return None
+
+
+async def _agent_visible_cache_path(host_path: str, env: Any) -> str | None:
+    if not _looks_like_absolute_file_path(host_path):
+        return None
+    cache_base = _agent_cache_base_for_env(env)
+    if not cache_base:
+        return None
+    try:
+        from tools.credential_files import (
+            get_cache_directory_mounts,
+            map_cache_path_to_container,
+        )
+
+        await get_cache_directory_mounts(container_base=cache_base)
+        return map_cache_path_to_container(host_path, container_base=cache_base)
+    except Exception as exc:  # noqa: BLE001 - artifact hints are best-effort
+        logger.debug("Could not translate image cache path for backend: %s", exc)
+        return None
+
+
+async def _force_artifact_sync(env: Any) -> None:
+    sync_manager = getattr(env, "_sync_manager", None)
+    if sync_manager is None:
+        return
+    try:
+        result = sync_manager.sync(force=True)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 - generation itself already succeeded
+        logger.warning("Could not force-sync generated image artifact: %s", exc)
+
+
+async def _postprocess_image_generate_result(
+    raw: str,
+    task_id: str | None = None,
+) -> str:
+    """Annotate successful local image results with a remote-visible path."""
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return raw
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return raw
+
+    image = payload.get("image")
+    if not isinstance(image, str) or not _looks_like_absolute_file_path(image):
+        return raw
+
+    env = _active_terminal_env(task_id)
+    agent_path = await _agent_visible_cache_path(image, env)
+    if not agent_path or agent_path == image:
+        return raw
+
+    await _force_artifact_sync(env)
+    payload.setdefault("host_image", image)
+    payload.setdefault("agent_visible_image", agent_path)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 async def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
@@ -1355,15 +1771,28 @@ async def _handle_image_generate(args, **kw):
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
     image_url = args.get("image_url")
     reference_image_urls = args.get("reference_image_urls")
+    upscale = args.get("upscale")
+    if not isinstance(upscale, bool):
+        upscale = None
+    image_url, reference_image_urls, confinement_error = await _confine_source_images(
+        image_url,
+        reference_image_urls,
+        kw.get("task_id"),
+    )
+    if confinement_error is not None:
+        return confinement_error
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
     dispatched = await _dispatch_to_plugin_provider(
         prompt, aspect_ratio,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
+        upscale=upscale,
     )
     if dispatched is not None:
-        return dispatched
+        return await _postprocess_image_generate_result(
+            dispatched, task_id=kw.get("task_id")
+        )
 
     # Managed-mode Krea routing: when no explicit plugin provider is configured
     # but the selected model is a native ``krea-2-*`` id, a portal user routes to
@@ -1374,16 +1803,21 @@ async def _handle_image_generate(args, **kw):
         prompt, aspect_ratio,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
+        upscale=upscale,
     )
     if krea_routed is not None:
-        return krea_routed
+        return await _postprocess_image_generate_result(
+            krea_routed, task_id=kw.get("task_id")
+        )
 
-    return await image_generate_tool(
+    raw = await image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
+        upscale=upscale,
     )
+    return await _postprocess_image_generate_result(raw, task_id=kw.get("task_id"))
 
 
 # ---------------------------------------------------------------------------

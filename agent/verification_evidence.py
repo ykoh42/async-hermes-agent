@@ -496,6 +496,44 @@ async def record_terminal_result(
     if evidence is None:
         return None
 
+    return await _insert_evidence(evidence)
+
+
+async def record_verify_run(
+    *,
+    root: str | Path,
+    session_id: str | None = None,
+    ok: bool,
+    command: str = "hermes verify",
+    scope: str = "full",
+    output: str = "",
+) -> dict[str, Any]:
+    """Record a completed ``hermes verify`` run as verification evidence."""
+    try:
+        from agent.coding_context import project_facts_for
+
+        facts = await project_facts_for(root)
+    except Exception:
+        facts = None
+
+    resolved = await _resolved_path(root)
+    evidence = VerificationEvidence(
+        command=command,
+        canonical_command="hermes verify",
+        kind="verify",
+        scope=scope if scope in {"full", "targeted"} else "full",
+        status="passed" if ok else "failed",
+        exit_code=0 if ok else 1,
+        cwd=str(resolved),
+        root=str((facts or {}).get("root") or resolved),
+        session_id=str(session_id or "default"),
+        output_summary=_summarize_output(output),
+    )
+    return await _insert_evidence(evidence)
+
+
+async def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
+    """Insert one evidence row and repoint the workspace state."""
     created_at = _utc_now()
     async with _transaction() as conn:
         cur = await conn.execute(

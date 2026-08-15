@@ -100,9 +100,12 @@ DEFAULT_CONFIG = {
         # approve. Clean the diff before you commit and push." Cache-safe:
         # takes effect next session. Empty by default.
         "coding_instructions": "",
-        # Verification closure for code edits. Programmatic callers default to
-        # enabled; set false to disable the bounded evidence follow-up.
-        "verify_on_stop": "auto",
+        # Verification closure for code edits. Default is False (opt-in): the
+        # v31/v32 migrations already switched existing installs off because
+        # the verification narrative proved more noise than signal. Set true
+        # to force it on everywhere, or "auto" for legacy surface-aware
+        # behavior.
+        "verify_on_stop": False,
         "verify_guidance": True,
         "max_verify_nudges": 3,
         # How user-attached images are presented to the main model on each turn.
@@ -728,6 +731,7 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "provider": "auto",
             "model": "",
+            "prefer_fast_model": False,
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -1157,6 +1161,11 @@ DEFAULT_CONFIG = {
         "providers": {},
     },
 
+    # Per-model metadata overrides. Explicit provider/model entries patch
+    # catalog metadata; ``_default`` entries only fill gaps for models the
+    # catalog does not know.
+    "model_overrides": {},
+
     # Network settings — workarounds for connectivity issues.
     "network": {
         # Force IPv4 connections.  On servers with broken or unreachable IPv6,
@@ -1213,6 +1222,10 @@ DEFAULT_CONFIG = {
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
+        # Safety bounds for materializing large transcripts. Set either to 0
+        # to disable its guard; export limits apply per session segment.
+        "max_resume_messages": 20000,
+        "max_export_messages": 20000,
         # Search-index (FTS) storage optimization — the compact v23 layout
         # that drops duplicate content copies and stops trigram-indexing tool
         # output (typically reclaims ~60%+ of state.db on heavy users). It is

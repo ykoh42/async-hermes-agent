@@ -2,7 +2,7 @@
 
 Native-async, library-focused distribution of
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), based
-on upstream tag `v2026.8.3` (Python package version `0.20.0`).
+on upstream tag `v2026.8.13` (Python package version `0.20.1`).
 
 This repository keeps the Hermes agent loop, model providers, tool execution,
 MCP, skills, persistent memory and sessions, trajectory generation, runner, and
@@ -54,24 +54,23 @@ instances can run concurrently.
 Python 3.11 through 3.13 is supported.
 
 ```bash
-uv pip install "async-hermes-agent==0.20.0.5"
+uv pip install "async-hermes-agent==0.20.1.1"
 ```
 
 Versioned packages are published to PyPI through GitHub OIDC Trusted
 Publishing. The same verified wheel, source distribution, and checksums are
 attached to the corresponding GitHub Release.
 
-The package version has four numeric segments: `0.20.0.5` means upstream
-Python version `0.20.0` plus async-distribution revision `5`. Fork-only releases
+The package version has four numeric segments: `0.20.1.1` means upstream
+Python version `0.20.1` plus async-distribution revision `1`. Fork-only releases
 increment the fourth segment. When a new upstream version is ported, the first
 three segments change to match it and the async revision restarts at `1`.
 
-The earlier `0.20.4` GitHub release used the old independent version scheme and
-sorts after `0.20.0.5` under Python version ordering. If it was installed from
-that Git tag, migrate explicitly once:
+The earlier `0.20.4` GitHub release used the old independent version scheme.
+If it was installed from that Git tag, migrate explicitly once:
 
 ```bash
-uv pip install --reinstall "async-hermes-agent==0.20.0.5"
+uv pip install --reinstall "async-hermes-agent==0.20.1.1"
 ```
 
 For development:
@@ -105,12 +104,12 @@ runtime.
 The Honcho extra pins the native-async SDK version validated by this package.
 Select `memory.provider: honcho` in `config.yaml`; connection, identity,
 cadence, and session settings are documented in the
-[Honcho provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/plugins/memory/honcho/README.md).
+[Honcho provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.1/plugins/memory/honcho/README.md).
 
 OpenViking uses the core native-async HTTP transport and needs no Python
 extra. Server setup, provider configuration, async lifecycle, recall, and tool
 behavior are documented in the
-[OpenViking provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/plugins/memory/openviking/README.md).
+[OpenViking provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.1/plugins/memory/openviking/README.md).
 
 ## Sessions
 
@@ -303,9 +302,9 @@ uv build
 
 ## Contributing and security
 
-Read [CONTRIBUTING.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/CONTRIBUTING.md)
+Read [CONTRIBUTING.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.1/CONTRIBUTING.md)
 before submitting changes and
-[SECURITY.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/SECURITY.md)
+[SECURITY.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.1/SECURITY.md)
 for private vulnerability reporting.
 
 ## Upstream relationship
@@ -316,4 +315,4 @@ that these changes are drop-in mergeable to the synchronous upstream product.
 
 Hermes Agent is built by [Nous Research](https://nousresearch.com). This
 distribution retains the upstream MIT license; see
-[LICENSE](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.0.5/LICENSE).
+[LICENSE](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.1/LICENSE).

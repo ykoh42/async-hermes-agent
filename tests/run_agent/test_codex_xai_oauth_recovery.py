@@ -517,9 +517,11 @@ async def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
             status_code,
             error_context=None,
             api_key_hint=None,
+            failure_reason=None,
         ):
             assert status_code == 403
             assert api_key_hint == "test-key"
+            assert failure_reason == "billing"
             assert error_context == {
                 "reason": "personal-team-blocked:spending-limit",
                 "message": (

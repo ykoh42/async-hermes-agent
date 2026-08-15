@@ -339,6 +339,19 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "no endpoints found that support tool use",
 ]
 
+
+def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
+    """Return whether a bare model id is known only as ``vendor/id``."""
+    name = (model or "").strip()
+    if not name or "/" in name:
+        return False
+    try:
+        from hermes_cli.model_normalize import suggest_prefixed_model_id
+
+        return bool(suggest_prefixed_model_id((provider or "").strip(), name))
+    except Exception:
+        return False
+
 # Malformed-message-array 400s.  Deterministic request-shape rejections that
 # describe the *transcript* being invalid, not a parameter.  The canonical
 # case: a stream dies mid-response and Hermes persists a content-less
@@ -688,6 +701,35 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # Plugin transforms are consulted before the built-in rules, matching
+    # upstream's first-valid-wins hook.  The helper is deliberately
+    # synchronous and discovery-free here: native async plugin discovery is
+    # performed at awaited lifecycle boundaries, while this classifier also
+    # serves pure CPU-only recovery paths.
+    try:
+        from hermes_cli.plugins import get_plugin_error_classification
+
+        plugin_classification = get_plugin_error_classification(
+            provider=provider,
+            model=model,
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            error_message=error_msg,
+            error_body=body,
+            error=error,
+            approx_tokens=approx_tokens,
+            context_length=context_length,
+            num_messages=num_messages,
+        )
+    except Exception as exc:
+        logger.debug("Plugin error classification unavailable: %s", exc)
+        plugin_classification = None
+    if plugin_classification is not None:
+        plugin_reason = plugin_classification.pop("reason", None)
+        if isinstance(plugin_reason, FailoverReason):
+            return _result(plugin_reason, **plugin_classification)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
@@ -1056,6 +1098,14 @@ def _classify_by_status(
                 should_fallback=False,
             )
         if any(p in error_msg for p in _MODEL_NOT_FOUND_PATTERNS):
+            return result_fn(
+                FailoverReason.model_not_found,
+                retryable=False,
+                should_fallback=True,
+            )
+        # A bare id that the curated catalogue only knows in prefixed form is
+        # deterministic model-id failure, not a transient endpoint problem.
+        if _model_id_missing_known_prefix(model, provider):
             return result_fn(
                 FailoverReason.model_not_found,
                 retryable=False,

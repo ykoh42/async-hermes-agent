@@ -77,7 +77,7 @@ def get_conversation_context() -> str | None:
 
 
 def _hermes_version() -> str:
-    """Return the current PEP 440 package version, e.g. ``"0.20.0.5"``.
+    """Return the current PEP 440 package version, e.g. ``"0.20.1.1"``.
 
     Falls back to ``"unknown"`` if ``hermes_cli`` cannot be imported (should
     never happen in a real install — guarded for defensive testing).

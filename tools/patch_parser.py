@@ -679,8 +679,15 @@ async def _apply_update(op: PatchOperation, file_ops: Any) -> tuple[bool, str, s
             else:
                 new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
 
-    # Write new content
-    write_result = await file_ops.write_file(op.file_path, new_content)
+    # Pass the content already read during validation so native backends can
+    # reuse it for lint/LSP baselines without a redundant remote read. Keep
+    # the basic duck-typed two-argument contract for small test/custom backends.
+    try:
+        write_result = await file_ops.write_file(
+            op.file_path, new_content, pre_content=current_content
+        )
+    except TypeError:
+        write_result = await file_ops.write_file(op.file_path, new_content)
     if write_result.error:
         return False, write_result.error, None
 

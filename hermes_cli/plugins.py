@@ -41,6 +41,7 @@ import importlib.metadata
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -48,7 +49,7 @@ import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import aiofiles
 import aiofiles.os
@@ -213,6 +214,16 @@ VALID_HOOKS: set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Pure provider-error classification transform.  Unlike the awaited
+    # lifecycle hooks, this hook is consumed by the synchronous classifier;
+    # only already-loaded synchronous callbacks are eligible there.
+    "transform_api_error_classification",
+    # Fire-and-forget stream observers.  These are queued by
+    # agent.plugin_stream_hooks and cannot transform model output.
+    "on_stream_start",
+    "on_stream_delta",
+    "on_stream_end",
+    "on_interim_message",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -370,6 +381,76 @@ async def _get_enabled_plugins(config: dict | None = None) -> set | None:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+
+# System-prompt sections are intentionally bounded and rendered only once for
+# a new session.  The complete prompt is persisted by the async state layer;
+# resumed agents reconstruct the section bytes from that stored prompt rather
+# than invoking plugin code again.
+SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
+DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS = 4_000
+MAX_SYSTEM_PROMPT_SECTION_CHARS = 4_000
+MAX_SYSTEM_PROMPT_SECTIONS = 32
+MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS = 8_000
+_SYSTEM_PROMPT_SECTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_SYSTEM_PROMPT_SECTION_HEADING_PREFIX = "## Plugin Context: "
+PLUGIN_SECTIONS_START = "<!-- hermes-plugin-sections:start -->"
+PLUGIN_SECTIONS_END = "<!-- hermes-plugin-sections:end -->"
+
+
+def is_valid_system_prompt_section_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_SYSTEM_PROMPT_SECTION_ID_RE.fullmatch(value))
+
+
+@dataclass(frozen=True)
+class PluginSystemPromptSection:
+    id: str
+    content: str | Callable[[dict[str, Any]], str]
+    position: str
+    max_chars: int
+    plugin: str
+
+
+@dataclass(frozen=True)
+class RenderedPluginSystemPromptSection:
+    id: str
+    content: str
+    position: str
+    plugin: str
+
+
+def format_system_prompt_section(section_id: str, content: str) -> str:
+    return (
+        f"{_SYSTEM_PROMPT_SECTION_HEADING_PREFIX}{section_id}\n"
+        f"<!-- hermes-plugin-section-chars:{len(content)} -->\n\n"
+        f"{content}"
+    )
+
+
+def format_system_prompt_sections(sections: list[RenderedPluginSystemPromptSection]) -> str:
+    if not sections:
+        return ""
+    blocks = [format_system_prompt_section(item.id, item.content) for item in sections]
+    return f"{PLUGIN_SECTIONS_START}\n" + "\n\n".join(blocks) + f"\n{PLUGIN_SECTIONS_END}"
+
+
+@dataclass
+class PluginRegistration:
+    """Small disposable handle for a plugin-owned registration."""
+
+    kind: str
+    key: str
+    release: Callable[[], None]
+    _disposed: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def active(self) -> bool:
+        return not self._disposed
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        self._disposed = True
+        self.release()
 
 
 @dataclass
@@ -1000,6 +1081,57 @@ class PluginContext:
             display_name,
         )
 
+    def register_system_prompt_section(
+        self,
+        id: str,
+        content: str | Callable[[dict[str, Any]], str],
+        *,
+        position: str = "after_memory",
+        max_chars: int = DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS,
+    ) -> PluginRegistration:
+        """Register bounded prompt context frozen into new session prompts."""
+        if not is_valid_system_prompt_section_id(id):
+            raise ValueError(
+                "system prompt section id must be 1-128 lowercase characters "
+                "using letters, numbers, '.', '_', or '-'"
+            )
+        if not isinstance(content, str) and not callable(content):
+            raise TypeError("system prompt section content must be a string or callable")
+        if position not in SYSTEM_PROMPT_SECTION_POSITIONS:
+            raise ValueError(
+                "system prompt section position must be one of: "
+                + ", ".join(sorted(SYSTEM_PROMPT_SECTION_POSITIONS))
+            )
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or not 0 < max_chars <= MAX_SYSTEM_PROMPT_SECTION_CHARS
+        ):
+            raise ValueError(
+                "system prompt section max_chars must be between 1 and "
+                f"{MAX_SYSTEM_PROMPT_SECTION_CHARS}"
+            )
+        existing = self._manager._system_prompt_sections.get(id)
+        if existing is not None:
+            raise ValueError(
+                f"system prompt section {id!r} is already registered by "
+                f"plugin {existing.plugin!r}"
+            )
+        section = PluginSystemPromptSection(
+            id=id,
+            content=content,
+            position=position,
+            max_chars=max_chars,
+            plugin=self.manifest.key or self.manifest.name,
+        )
+        self._manager._system_prompt_sections[id] = section
+
+        def release() -> None:
+            if self._manager._system_prompt_sections.get(id) is section:
+                self._manager._system_prompt_sections.pop(id, None)
+
+        return PluginRegistration("system_prompt_section", id, release)
+
     def register_hook(self, hook_name: str, callback: Callable) -> None:
         """Register a lifecycle hook callback.
 
@@ -1045,7 +1177,8 @@ class PluginContext:
         name: str,
         path: Path,
         description: str = "",
-    ) -> None:
+        frontmatter: Mapping[str, Any] | None = None,
+    ) -> PluginRegistration:
         """Register a read-only skill provided by this plugin.
 
         The skill becomes resolvable as ``'<plugin_name>:<name>'`` via
@@ -1081,11 +1214,19 @@ class PluginContext:
             "plugin": self.manifest.name,
             "bare_name": name,
             "description": description,
+            "frontmatter": dict(frontmatter or {}),
         }
+        current = self._manager._plugin_skills[qualified]
+
+        def _release() -> None:
+            if self._manager._plugin_skills.get(qualified) is current:
+                self._manager._plugin_skills.pop(qualified, None)
+
         logger.debug(
             "Plugin %s registered skill: %s",
             self.manifest.name, qualified,
         )
+        return PluginRegistration("skill", qualified, _release)
 
 
 # ---------------------------------------------------------------------------
@@ -1095,8 +1236,14 @@ class PluginContext:
 class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
-    def __init__(self) -> None:
+    def __init__(self, scope_key: str | None = None) -> None:
         self._registry_scope = self
+        # Retain the upstream constructor's explicit scope marker.  The
+        # native-async profile manager still uses the manager object itself as
+        # the registry namespace, while callers that construct a manager for a
+        # known profile can inspect the immutable key without changing that
+        # lifecycle behavior.
+        self.scope_key = scope_key
         self._loop_finalizer: weakref.finalize | None = None
         _PLUGIN_MANAGER_INSTANCES.add(self)
         self._module_namespace = _NS_PARENT
@@ -1108,6 +1255,7 @@ class PluginManager:
         self._plugin_tool_names: set[str] = set()
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: dict[str, dict] = {}  # Slash commands registered by plugins
+        self._system_prompt_sections: dict[str, PluginSystemPromptSection] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
@@ -1151,6 +1299,7 @@ class PluginManager:
         self._middleware.clear()
         self._plugin_tool_names.clear()
         self._plugin_commands.clear()
+        self._system_prompt_sections.clear()
         self._plugin_skills.clear()
         self._aux_tasks.clear()
         self._context_engine = None
@@ -1688,7 +1837,12 @@ class PluginManager:
             _PLUGIN_REGISTRATION_TARGET.reset(registration_token)
         self._plugins[manifest.key or manifest.name] = loaded
 
-    async def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
+    async def _load_directory_module(
+        self,
+        manifest: PluginManifest,
+        *,
+        module_name: str | None = None,
+    ) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
 
         The module slug is derived from ``manifest.key`` so category-namespaced
@@ -1711,7 +1865,7 @@ class PluginManager:
 
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{self._module_namespace}.{slug}"
+        module_name = module_name or f"{self._module_namespace}.{slug}"
         self._owned_module_names.add(module_name)
         source_alias = None
         if manifest.source == "bundled":
@@ -1877,6 +2031,49 @@ class PluginManager:
                     exc,
                 )
         return results
+
+    def render_system_prompt_sections(
+        self, session_info: dict[str, Any]
+    ) -> list[RenderedPluginSystemPromptSection]:
+        """Render registered sections deterministically and fail open."""
+        frozen_info = types.MappingProxyType(dict(session_info))
+        rendered: list[RenderedPluginSystemPromptSection] = []
+        total_chars = len(PLUGIN_SECTIONS_START) + len(PLUGIN_SECTIONS_END) + 2
+        for section_id in sorted(self._system_prompt_sections):
+            section = self._system_prompt_sections[section_id]
+            if len(rendered) >= MAX_SYSTEM_PROMPT_SECTIONS:
+                logger.warning("Plugin system prompt section count budget exceeded; skipping %s", section.id)
+                continue
+            try:
+                value = section.content(frozen_info) if callable(section.content) else section.content
+            except Exception as exc:
+                logger.warning("Plugin system prompt section %s raised and was skipped: %s", section.id, exc)
+                continue
+            if not isinstance(value, str):
+                logger.warning("Plugin system prompt section %s returned non-string; skipped", section.id)
+                continue
+            text = value.strip()
+            if not text or PLUGIN_SECTIONS_START in text or PLUGIN_SECTIONS_END in text:
+                continue
+            if len(text) > section.max_chars:
+                logger.warning("Plugin system prompt section %s exceeded max_chars; skipped", section.id)
+                continue
+            rendered_chars = len(format_system_prompt_section(section.id, text))
+            if rendered:
+                rendered_chars += 2
+            if total_chars + rendered_chars > MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS:
+                logger.warning("Plugin system prompt aggregate budget exceeded; skipping %s", section.id)
+                continue
+            rendered.append(
+                RenderedPluginSystemPromptSection(
+                    id=section.id,
+                    content=text,
+                    position=section.position,
+                    plugin=section.plugin,
+                )
+            )
+            total_chars += rendered_chars
+        return rendered
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
@@ -2065,6 +2262,156 @@ def has_middleware(kind: str) -> bool:
 def has_hook(hook_name: str) -> bool:
     """Return True when a loaded plugin handles a hook."""
     return get_plugin_manager().has_hook(hook_name)
+
+
+def render_system_prompt_sections(
+    session_info: dict[str, Any],
+) -> list[RenderedPluginSystemPromptSection]:
+    """Render sections from the already-loaded active plugin manager.
+
+    Discovery remains an awaited operation.  Prompt construction is a pure
+    in-memory render and therefore does not introduce a synchronous I/O
+    compatibility bridge.
+    """
+    return get_plugin_manager().render_system_prompt_sections(session_info)
+
+
+def iter_hook_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
+    """Return currently loaded callbacks for a fire-and-forget observer.
+
+    Discovery remains an awaited operation owned by the normal plugin manager;
+    this synchronous read is deliberately limited to the already-loaded hook
+    table so token-path dispatch never performs I/O or imports.
+    """
+    callbacks = getattr(get_plugin_manager(), "_hooks", {}).get(hook_name, ())
+    return tuple(callbacks)
+
+
+def get_plugin_error_classification(
+    *,
+    provider: str = "",
+    model: str = "",
+    status_code: int | None = None,
+    error_type: str = "",
+    error_code: str = "",
+    error_message: str = "",
+    error_body: dict[str, Any] | None = None,
+    error: BaseException | None = None,
+    approx_tokens: int = 0,
+    context_length: int = 0,
+    num_messages: int = 0,
+) -> dict[str, Any] | None:
+    """Return the first valid synchronous API-error transform.
+
+    ``classify_api_error`` is intentionally a pure synchronous operation:
+    it is also used by compression and stream-recovery helpers that do not
+    perform I/O.  The native-async plugin lifecycle therefore cannot be
+    awaited from this boundary without violating the no-thread/no-nested-
+    loop contract.  Discovery remains owned by the awaited plugin boundary;
+    this helper only inspects callbacks already loaded in the active manager.
+    Async callbacks are skipped (the normal lifecycle dispatcher will reject
+    synchronous/async contract mismatches separately).
+
+    The payload and sanitized first-valid result match upstream's
+    ``transform_api_error_classification`` contract.
+    """
+    from agent.error_classifier import FailoverReason
+
+    callbacks = iter_hook_callbacks("transform_api_error_classification")
+    payload: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "status_code": status_code,
+        "error_type": error_type,
+        "error_code": error_code,
+        "error_message": error_message,
+        "error_body": error_body if isinstance(error_body, dict) else {},
+        "error": error,
+        "approx_tokens": approx_tokens,
+        "context_length": context_length,
+        "num_messages": num_messages,
+    }
+    winner: dict[str, Any] | None = None
+    skipped_valid = 0
+    for callback in callbacks:
+        if inspect.iscoroutinefunction(callback):
+            logger.debug(
+                "Skipping async API-error transform callback %s in sync classifier",
+                getattr(callback, "__name__", repr(callback)),
+            )
+            continue
+        try:
+            try:
+                parameters = inspect.signature(callback).parameters
+            except (TypeError, ValueError):
+                parameters = None
+            if parameters is None or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                result = callback(**payload)
+            else:
+                accepted = {
+                    name: value
+                    for name, value in payload.items()
+                    if name in parameters
+                    and parameters[name].kind
+                    in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                }
+                result = callback(**accepted)
+            if inspect.isawaitable(result):
+                logger.debug(
+                    "Skipping awaitable API-error transform callback %s in sync classifier",
+                    getattr(callback, "__name__", repr(callback)),
+                )
+                continue
+        except Exception as exc:
+            logger.warning(
+                "API-error transform callback %s raised: %s",
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+            continue
+        if not isinstance(result, dict):
+            continue
+        reason_raw = result.get("reason")
+        if isinstance(reason_raw, FailoverReason):
+            reason = reason_raw
+        elif isinstance(reason_raw, str):
+            try:
+                reason = FailoverReason(reason_raw.strip().lower())
+            except ValueError:
+                continue
+        else:
+            continue
+        if winner is not None:
+            skipped_valid += 1
+            continue
+        winner = {"reason": reason}
+        for key in (
+            "retryable",
+            "should_compress",
+            "should_rotate_credential",
+            "should_fallback",
+        ):
+            if key in result:
+                winner[key] = bool(result[key])
+        message = result.get("message")
+        if isinstance(message, str) and message.strip():
+            winner["message"] = message.strip()[:500]
+        error_context = result.get("error_context")
+        if isinstance(error_context, dict):
+            winner["error_context"] = error_context
+    if winner is not None and skipped_valid:
+        logger.warning(
+            "transform_api_error_classification: skipped %d valid "
+            "classification(s) after the first result in registration order won",
+            skipped_valid,
+        )
+    return winner
 
 
 _thread_tool_whitelist: contextvars.ContextVar[

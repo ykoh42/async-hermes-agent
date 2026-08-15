@@ -302,6 +302,78 @@ def strip_nullable_unions(
     return stripped
 
 
+_CONST_PRIMITIVE_TYPES: dict[type, str] = {
+    bool: "boolean",
+    int: "integer",
+    float: "number",
+    str: "string",
+}
+
+
+def _const_branch_type(branch: Any) -> str | None:
+    """Return the JSON-Schema primitive type of a pure ``const`` branch."""
+    if not isinstance(branch, dict) or "const" not in branch:
+        return None
+    extra = set(branch) - {"const", "type", "title", "description"}
+    if extra:
+        return None
+    value = branch["const"]
+    # bool is a subclass of int; check by exact type so True/False never
+    # collapse into an integer enum.
+    for py_type, json_type in _CONST_PRIMITIVE_TYPES.items():
+        if type(value) is py_type:
+            declared = branch.get("type")
+            if declared is not None and declared != json_type:
+                return None
+            return json_type
+    return None
+
+
+def collapse_const_unions(schema: Any) -> Any:
+    """Collapse same-typed ``const`` unions to provider-safe ``enum`` schemas.
+
+    MCP servers commonly encode a closed value set as ``anyOf``/``oneOf``
+    branches containing only ``const`` values.  Several tool-call backends
+    reject that form even though the equivalent ``enum`` is portable.  The
+    transformation is conservative, recursive, deterministic, and never
+    mutates its input.  A single null branch is retained as ``nullable``.
+    """
+    if isinstance(schema, list):
+        return [collapse_const_unions(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    out = {key: collapse_const_unions(value) for key, value in schema.items()}
+    for key in ("anyOf", "oneOf"):
+        variants = out.get(key)
+        if not isinstance(variants, list) or not variants:
+            continue
+        null_branches = [
+            item
+            for item in variants
+            if isinstance(item, dict)
+            and item.get("type") == "null"
+            and "const" not in item
+        ]
+        const_branches = [item for item in variants if item not in null_branches]
+        if len(null_branches) > 1 or not const_branches:
+            continue
+        branch_types = {_const_branch_type(item) for item in const_branches}
+        if len(branch_types) != 1 or None in branch_types:
+            continue
+        replacement: dict[str, Any] = {
+            "type": branch_types.pop(),
+            "enum": [item["const"] for item in const_branches],
+        }
+        if null_branches:
+            replacement["nullable"] = True
+        for meta_key in ("title", "description", "default", "examples"):
+            if meta_key in out and meta_key not in replacement:
+                replacement[meta_key] = out[meta_key]
+        return replacement
+    return out
+
+
 def _sanitize_node(node: Any, path: str) -> Any:
     """Recursively sanitize a JSON-Schema fragment.
 

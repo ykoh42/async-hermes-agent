@@ -105,16 +105,29 @@ class TestMandatoryKeysSurviveWhitelist:
 
 class TestFalRouting:
     def _patch_submit(self, monkeypatch, image_tool, capture: dict):
-        async def fake_submit(endpoint, arguments):
-            capture["endpoint"] = endpoint
-            capture["arguments"] = arguments
+        def fake_submit(endpoint, arguments):
+            if endpoint != image_tool.UPSCALER_MODEL:
+                capture["endpoint"] = endpoint
+                capture["arguments"] = arguments
+            if endpoint == image_tool.UPSCALER_MODEL:
+                return {
+                    "image": {
+                        "url": "https://out/upscaled.png",
+                        "width": 2,
+                        "height": 2,
+                    }
+                }
             return {
                 "images": [
                     {"url": "https://out/img.png", "width": 1, "height": 1}
                 ]
             }
 
-        monkeypatch.setattr(image_tool, "_submit_fal_request", fake_submit)
+        monkeypatch.setattr(
+            image_tool,
+            "_submit_fal_request",
+            AsyncMock(side_effect=fake_submit),
+        )
         monkeypatch.setattr(
             image_tool, "fal_key_is_configured", AsyncMock(return_value=True)
         )
@@ -136,6 +149,62 @@ class TestFalRouting:
 
 
     @pytest.mark.asyncio
+    async def test_explicit_upscale_false_disables_catalog_default(
+        self, cfg_home, monkeypatch
+    ):
+        import tools.image_generation_tool as image_tool
+
+        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/flux-2-pro"}})
+        capture: dict = {}
+        self._patch_submit(monkeypatch, image_tool, capture)
+        monkeypatch.setattr(
+            image_tool, "_upscale_image", AsyncMock(return_value=None)
+        )
+
+        raw = await image_tool.image_generate_tool(
+            prompt="a cat", aspect_ratio="square", upscale=False
+        )
+        out = json.loads(raw)
+        assert out["success"] is True
+        assert out["upscaled"] is False
+        image_tool._upscale_image.assert_not_awaited()
+
+
+    @pytest.mark.asyncio
+    async def test_explicit_upscale_true_runs_for_native_hires_model(
+        self, cfg_home, monkeypatch
+    ):
+        import tools.image_generation_tool as image_tool
+
+        _write_cfg(
+            cfg_home,
+            {"image_gen": {"model": "bytedance/seedream/v5/lite/text-to-image"}},
+        )
+        capture: dict = {}
+        self._patch_submit(monkeypatch, image_tool, capture)
+        monkeypatch.setattr(
+            image_tool,
+            "_upscale_image",
+            AsyncMock(return_value={
+                "url": "https://out/upscaled.png",
+                "width": 2,
+                "height": 2,
+                "upscaled": True,
+                "upscale_factor": 2,
+            }),
+        )
+
+        raw = await image_tool.image_generate_tool(
+            prompt="a cat", aspect_ratio="square", upscale=True
+        )
+        out = json.loads(raw)
+        assert out["success"] is True
+        assert out["image"] == "https://out/upscaled.png"
+        assert out["upscaled"] is True
+        image_tool._upscale_image.assert_awaited_once()
+
+
+    @pytest.mark.asyncio
     async def test_edit_skips_upscaler(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool
 
@@ -144,11 +213,11 @@ class TestFalRouting:
         capture: dict = {}
         self._patch_submit(monkeypatch, image_tool, capture)
         upscale_called = {"hit": False}
-        async def fake_upscale(*args, **kwargs):
-            upscale_called["hit"] = True
-            return None
-
-        monkeypatch.setattr(image_tool, "_upscale_image", fake_upscale)
+        monkeypatch.setattr(
+            image_tool,
+            "_upscale_image",
+            AsyncMock(side_effect=lambda *args, **kwargs: upscale_called.__setitem__("hit", True)),
+        )
 
         raw = await image_tool.image_generate_tool(
             prompt="tweak", image_url="https://in/src.png",

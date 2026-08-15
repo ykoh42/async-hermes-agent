@@ -160,6 +160,17 @@ async def test_fal_text_only_routes_to_text_endpoint(matrix_env, family_id):
     home, fal_calls, _ = matrix_env
     from plugins.video_gen.fal import FAL_FAMILIES
 
+    if not FAL_FAMILIES[family_id].get("text_endpoint"):
+        result = await _invoke_tool(
+            home,
+            {"video_gen": {"provider": "fal", "model": family_id}},
+            {"prompt": "a dog running"},
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "modality_unsupported"
+        assert fal_calls == []
+        return
+
     result = await _invoke_tool(
         home,
         {"video_gen": {"provider": "fal", "model": family_id}},

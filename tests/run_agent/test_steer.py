@@ -260,9 +260,12 @@ class TestActiveTurnRedirectCheckpoint:
         # Nothing was on screen, so the row exists only for the model: hidden
         # from every transcript surface, scaffolding replayed via the sidecar.
         assert checkpoint_row["display_kind"] == "hidden"
+        assert "api_content" not in checkpoint_row
         assert (
-            checkpoint_row["api_content"]
-            == "[This response was interrupted by a user correction.]"
+            messages[-1]["api_content"]
+            == "[Context from the interrupted assistant response]\n"
+            "[This response was interrupted by a user correction.]\n\n"
+            "New direction."
         )
         assert messages[-1]["content"] == "New direction."
 
@@ -434,6 +437,18 @@ class TestSteerMarkerContract:
         emitted = format_steer_marker("hi")
         assert STEER_MARKER_OPEN in emitted and STEER_MARKER_CLOSE in emitted
         assert STEER_MARKER_OPEN in STEER_CHANNEL_NOTE and STEER_MARKER_CLOSE in STEER_CHANNEL_NOTE
+
+    def test_system_prompt_scopes_freshness_to_unanswered_marker(self):
+        from agent.prompt_builder import STEER_CHANNEL_NOTE
+
+        assert "latest tool-result batch" in STEER_CHANNEL_NOTE
+        assert "no later assistant message follows it" in STEER_CHANNEL_NOTE
+        assert "do not treat it as a new message" in STEER_CHANNEL_NOTE
+        assert "repeat completed work" in STEER_CHANNEL_NOTE
+
+        emitted = format_steer_marker("deploy once")
+        assert "delivered once at this position" in emitted
+        assert "not a new delivery when replayed" in emitted
 
     def test_marker_no_longer_uses_the_distrusted_label(self):
         """Regression: the bare 'User guidance:' line read as tool content and

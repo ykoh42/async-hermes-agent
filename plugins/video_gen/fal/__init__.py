@@ -7,17 +7,25 @@ called without ``image_url``, and to its image-to-video endpoint when
 ``image_url`` is provided. The agent never sees the routing — it just
 calls ``video_generate(prompt=..., image_url=...)``.
 
-Model families (each with t2v + i2v endpoints):
+Model families (most expose both t2v + i2v; gemini-omni-flash is image-to-video only):
 
   Cheap tier:
-    ltx-2.3       fal-ai/ltx-2.3-22b/text-to-video               /  fal-ai/ltx-2.3-22b/image-to-video
-    pixverse-v6   fal-ai/pixverse/v6/text-to-video               /  fal-ai/pixverse/v6/image-to-video
+    ltx-2.3            fal-ai/ltx-2.3-22b/text-to-video           /  fal-ai/ltx-2.3-22b/image-to-video
+    pixverse-v6        fal-ai/pixverse/v6/text-to-video           /  fal-ai/pixverse/v6/image-to-video
+    seedance-2.0-mini  bytedance/seedance-2.0/mini/text-to-video  /  bytedance/seedance-2.0/mini/image-to-video
 
   Premium tier:
-    veo3.1        fal-ai/veo3.1                                  /  fal-ai/veo3.1/image-to-video
-    seedance-2.0  bytedance/seedance-2.0/text-to-video           /  bytedance/seedance-2.0/image-to-video
-    kling-v3-4k   fal-ai/kling-video/v3/4k/text-to-video         /  fal-ai/kling-video/v3/4k/image-to-video
-    happy-horse   alibaba/happy-horse/text-to-video              /  alibaba/happy-horse/image-to-video
+    veo3.1             fal-ai/veo3.1                              /  fal-ai/veo3.1/image-to-video
+    seedance-2.0       bytedance/seedance-2.0/text-to-video       /  bytedance/seedance-2.0/image-to-video
+    seedance-2.5       bytedance/seedance-2.5/text-to-video       /  bytedance/seedance-2.5/image-to-video
+    minimax-h3         minimax/h3/text-to-video                   /  minimax/h3/image-to-video
+    flux-3             blackforestlabs/flux-3/text-to-video       /  blackforestlabs/flux-3/image-to-video
+    grok-imagine-1.5   xai/grok-imagine-video/v1.5/text-to-video  /  xai/grok-imagine-video/v1.5/image-to-video
+    kling-v3-4k        fal-ai/kling-video/v3/4k/text-to-video     /  fal-ai/kling-video/v3/4k/image-to-video
+    happy-horse        alibaba/happy-horse/text-to-video          /  alibaba/happy-horse/image-to-video
+
+  Image-to-video only (no text_endpoint):
+    gemini-omni-flash  google/gemini-omni-flash/image-to-video
 
 Selection precedence for the active family:
     1. ``model=`` arg from the tool call
@@ -26,8 +34,8 @@ Selection precedence for the active family:
     4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs)
     5. ``DEFAULT_MODEL``
 
-Authentication uses ``FAL_KEY`` or the Nous-managed FAL gateway. Output is an
-HTTPS URL from FAL's CDN.
+Authentication via ``FAL_KEY`` or the managed Nous gateway. Output is an
+HTTPS URL from FAL's CDN; the gateway downloads and delivers it.
 """
 
 from __future__ import annotations
@@ -62,6 +70,10 @@ logger = logging.getLogger(__name__)
 #                    (heuristic: 2-element with gap > 1 is a range)
 #   audio          : True if generate_audio is supported
 #   negative       : True if negative_prompt is supported
+#   seed           : False when the endpoint declares no `seed` field
+#                    (absent = True, so existing families keep sending it)
+#   duration_int   : True when FAL types duration as an integer rather than
+#                    the usual queue-API string
 
 FAL_FAMILIES: dict[str, dict[str, Any]] = {
     # ─── Cheap / fast tier ─────────────────────────────────────────────
@@ -95,6 +107,21 @@ FAL_FAMILIES: dict[str, dict[str, Any]] = {
         "audio": True,
         "negative": True,
     },
+    "seedance-2.0-mini": {
+        "display": "Seedance 2.0 Mini",
+        "speed": "~30-90s",
+        "price": "cheap",
+        "strengths": "ByteDance. Faster/cheaper Seedance tier, audio + lip-sync, 4-15s.",
+        "tier": "cheap",
+        "text_endpoint": "bytedance/seedance-2.0/mini/text-to-video",
+        "image_endpoint": "bytedance/seedance-2.0/mini/image-to-video",
+        "aspect_ratios": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("480p", "720p"),
+        "durations": (4, 15),
+        "audio": True,
+        "negative": False,
+        "seed": False,
+    },
     # ─── Expensive / premium tier ──────────────────────────────────────
     "veo3.1": {
         "display": "Veo 3.1",
@@ -126,6 +153,94 @@ FAL_FAMILIES: dict[str, dict[str, Any]] = {
         "durations": (4, 15),
         "audio": True,
         "negative": False,
+        # FAL input schema has no `seed` (only returned on output).
+        "seed": False,
+    },
+    "seedance-2.5": {
+        "display": "Seedance 2.5",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "ByteDance flagship. Native 30s single-pass, audio in the same latent space, lip-sync.",
+        "tier": "premium",
+        "text_endpoint": "bytedance/seedance-2.5/text-to-video",
+        "image_endpoint": "bytedance/seedance-2.5/image-to-video",
+        "image_drop_keys": ("aspect_ratio",),
+        "aspect_ratios": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("480p", "720p"),
+        "durations": (4, 30),
+        "audio": True,
+        "negative": False,
+        "seed": False,
+    },
+    "minimax-h3": {
+        "display": "MiniMax H3",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "MiniMax frontier. Native 2K (up to 4K), 5-15s, seven aspect ratios.",
+        "tier": "premium",
+        "text_endpoint": "minimax/h3/text-to-video",
+        "image_endpoint": "minimax/h3/image-to-video",
+        "duration_int": True,
+        "image_drop_keys": ("aspect_ratio",),
+        "aspect_ratios": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("768P", "2K", "4K"),
+        "resolution_aliases": {
+            "480p": "768P", "540p": "768P", "720p": "768P", "768p": "768P",
+            "1080p": "2K", "2k": "2K", "4k": "4K", "2160p": "4K",
+        },
+        "durations": (5, 15),
+        "audio": False,
+        "negative": False,
+        "seed": False,
+    },
+    "flux-3": {
+        "display": "FLUX 3 (via FAL)",
+        "speed": "~60-120s",
+        "price": "premium",
+        "strengths": "Black Forest Labs frontier video. Native audio, 5-20s, 8 aspect ratios.",
+        "tier": "premium",
+        "text_endpoint": "blackforestlabs/flux-3/text-to-video",
+        "image_endpoint": "blackforestlabs/flux-3/image-to-video",
+        "duration_int": True,
+        "aspect_ratios": ("21:9", "2:1", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("720p", "1080p"),
+        "durations": (5, 20),
+        "audio": True,
+        "negative": False,
+        "seed": False,
+    },
+    "grok-imagine-1.5": {
+        "display": "Grok Imagine 1.5 (via FAL)",
+        "speed": "~30-90s",
+        "price": "premium",
+        "strengths": "xAI. Fast stylized video with audio, 1-15s, cheap per second.",
+        "tier": "premium",
+        "text_endpoint": "xai/grok-imagine-video/v1.5/text-to-video",
+        "image_endpoint": "xai/grok-imagine-video/v1.5/image-to-video",
+        "duration_int": True,
+        "image_drop_keys": ("aspect_ratio",),
+        "aspect_ratios": ("16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16"),
+        "resolutions": ("480p", "720p", "1080p"),
+        "durations": (1, 15),
+        "audio": False,
+        "negative": False,
+        "seed": False,
+    },
+    "gemini-omni-flash": {
+        "display": "Gemini Omni Flash (via FAL)",
+        "speed": "~60-120s",
+        "price": "premium",
+        "strengths": "Google. Image-to-video with audio, physics-grounded motion, 3-10s.",
+        "tier": "premium",
+        "text_endpoint": None,
+        "image_endpoint": "google/gemini-omni-flash/image-to-video",
+        "duration_int": True,
+        "aspect_ratios": ("16:9", "9:16"),
+        "resolutions": None,
+        "durations": (3, 10),
+        "audio": False,
+        "negative": False,
+        "seed": False,
     },
     "kling-v3-4k": {
         "display": "Kling v3 4K",
@@ -210,6 +325,48 @@ async def _load_video_gen_section() -> dict[str, Any]:
         return {}
 
 
+_ENDPOINT_MODALITY_LEAVES = frozenset({"text-to-video", "image-to-video"})
+
+
+def _normalize_family_key(candidate: str) -> str | None:
+    """Extract a known family from a bare id or a full FAL endpoint path."""
+    value = candidate.strip()
+    if not value:
+        return None
+    if value in FAL_FAMILIES:
+        return value
+
+    # Exact endpoint match is unambiguous and must win over segment matching.
+    for family_id, meta in FAL_FAMILIES.items():
+        if value in (meta.get("text_endpoint"), meta.get("image_endpoint")):
+            return family_id
+
+    # A configured endpoint stem such as ``minimax/h3`` or
+    # ``bytedance/seedance-2.0/mini`` is accepted only when the following
+    # segment is a declared modality leaf.
+    stem_hits: list[tuple[int, str]] = []
+    for family_id, meta in FAL_FAMILIES.items():
+        for endpoint in (meta.get("text_endpoint"), meta.get("image_endpoint")):
+            if not isinstance(endpoint, str) or not endpoint.startswith(value + "/"):
+                continue
+            next_segment = endpoint[len(value) + 1 :].split("/", 1)[0]
+            if next_segment in _ENDPOINT_MODALITY_LEAVES:
+                stem_hits.append((len(value), family_id))
+                break
+    if stem_hits:
+        return max(stem_hits)[1]
+
+    # Finally match the longest known family id appearing as a path segment.
+    best_family: str | None = None
+    best_length = -1
+    parts = set(value.split("/"))
+    for family_id in FAL_FAMILIES:
+        if family_id in parts and len(family_id) > best_length:
+            best_family = family_id
+            best_length = len(family_id)
+    return best_family
+
+
 async def _resolve_family(explicit: str | None) -> tuple[str, dict[str, Any]]:
     """Decide which FAL family to use. Returns ``(family_id, meta)``."""
     candidates: list[str | None] = []
@@ -225,9 +382,10 @@ async def _resolve_family(explicit: str | None) -> tuple[str, dict[str, Any]]:
         candidates.append(top)
 
     for c in candidates:
-        if isinstance(c, str) and c.strip() and c.strip() in FAL_FAMILIES:
-            fid = c.strip()
-            return fid, FAL_FAMILIES[fid]
+        if isinstance(c, str) and c.strip():
+            family_id = _normalize_family_key(c)
+            if family_id:
+                return family_id, FAL_FAMILIES[family_id]
 
     return DEFAULT_MODEL, FAL_FAMILIES[DEFAULT_MODEL]
 
@@ -260,7 +418,9 @@ def _build_payload(
         # declare an override.
         key = family.get("image_param_key") or "image_url"
         payload[key] = image_url
-    if seed is not None:
+    # Newer FAL schemas do not accept a seed input. Existing families omit the
+    # flag and therefore retain the historical default of sending it.
+    if seed is not None and family.get("seed", True):
         payload["seed"] = seed
 
     if family.get("aspect_ratios"):
@@ -269,22 +429,31 @@ def _build_payload(
         # otherwise let the endpoint auto-crop / use its default
 
     if family.get("resolutions"):
-        if resolution in family["resolutions"]:
-            payload["resolution"] = resolution
+        aliases = family.get("resolution_aliases") or {}
+        resolved_resolution = aliases.get((resolution or "").lower(), resolution)
+        if resolved_resolution in family["resolutions"]:
+            payload["resolution"] = resolved_resolution
         # else: let the endpoint default
 
     clamped = _clamp_duration(family, duration)
     if clamped is not None and family.get("durations"):
-        # FAL exposes duration as a string in the queue API ("8" not 8).
-        # Some families (e.g. veo3.1) require a unit suffix ("4s" not "4").
-        suffix = family.get("duration_suffix", "")
-        payload["duration"] = f"{clamped}{suffix}"
+        if family.get("duration_int"):
+            payload["duration"] = clamped
+        else:
+            # FAL exposes duration as a string in the queue API ("8" not 8).
+            # Some families (e.g. veo3.1) require a unit suffix ("4s").
+            suffix = family.get("duration_suffix", "")
+            payload["duration"] = f"{clamped}{suffix}"
 
     if family.get("audio") and audio is not None:
         payload["generate_audio"] = bool(audio)
 
     if family.get("negative") and negative_prompt:
         payload["negative_prompt"] = negative_prompt
+
+    if image_url:
+        for key in family.get("image_drop_keys", ()):
+            payload.pop(key, None)
 
     return payload
 
@@ -337,7 +506,12 @@ def _get_managed_fal_video_client(managed_gateway):
     )
 
 
-async def _submit_fal_video_request(endpoint: str, arguments: dict[str, Any]):
+async def _submit_fal_video_request(
+    endpoint: str,
+    arguments: dict[str, Any],
+    *,
+    return_request_id: bool = False,
+):
     """Submit through direct FAL or the managed queue.
 
     Returns the completed queue result without blocking the event loop.
@@ -359,7 +533,10 @@ async def _submit_fal_video_request(endpoint: str, arguments: dict[str, Any]):
                 arguments=arguments,
                 headers=request_headers,
             )
-            return await handle.get()
+            result = await handle.get()
+            if return_request_id:
+                return result, getattr(handle, "request_id", None)
+            return result
         finally:
             await _close_fal_client(client)
 
@@ -384,7 +561,10 @@ async def _submit_fal_video_request(endpoint: str, arguments: dict[str, Any]):
                     f"config.yaml."
                 ) from exc
             raise
-        return await handle.get()
+        result = await handle.get()
+        if return_request_id:
+            return result, getattr(handle, "request_id", None)
+        return result
     finally:
         await managed_client.close()
 
@@ -396,6 +576,45 @@ async def _check_fal_video_available() -> bool:
     if await fal_key_is_configured():
         return True
     return await _resolve_managed_fal_video_gateway() is not None
+
+
+# ---------------------------------------------------------------------------
+# Upscaler (SeedVR2 — video upscale pass)
+# ---------------------------------------------------------------------------
+
+UPSCALER_ENDPOINT = "fal-ai/seedvr/upscale/video"
+UPSCALER_FACTOR = 2
+
+
+async def _upscale_video(
+    video_url: str,
+    source_request_id: str | None = None,
+) -> str | None:
+    """Best-effort SeedVR2 upscale, preserving a successful native result."""
+    try:
+        arguments: dict[str, Any] = {
+            "video_url": video_url,
+            "upscale_mode": "factor",
+            "upscale_factor": UPSCALER_FACTOR,
+        }
+        if await _resolve_managed_fal_video_gateway() is not None:
+            if not source_request_id:
+                raise RuntimeError(
+                    "Managed SeedVR upscale requires the source FAL request id"
+                )
+            arguments["source_request_id"] = source_request_id
+        result = await _submit_fal_video_request(UPSCALER_ENDPOINT, arguments)
+    except Exception as exc:  # noqa: BLE001 - upscale is best effort
+        logger.warning("Video upscale failed: %s", exc)
+        return None
+
+    video = result.get("video") if isinstance(result, dict) else None
+    if isinstance(video, dict) and video.get("url"):
+        return video["url"]
+    if isinstance(video, str) and video:
+        return video
+    logger.warning("Video upscaler returned no URL")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +660,13 @@ class FALVideoGenProvider(VideoGenProvider):
                 "tier": meta.get("tier", "premium"),
                 "modalities": modalities,
             })
+            durations = meta.get("durations")
+            if durations:
+                if _is_duration_range(durations):
+                    out[-1]["min_duration"], out[-1]["max_duration"] = durations
+                else:
+                    out[-1]["min_duration"] = min(durations)
+                    out[-1]["max_duration"] = max(durations)
         return out
 
     async def default_model(self) -> str | None:
@@ -450,7 +676,7 @@ class FALVideoGenProvider(VideoGenProvider):
         return {
             "name": "FAL",
             "badge": "paid",
-            "tag": "LTX, Pixverse, Veo 3.1, Seedance 2.0, Kling 4K, Happy Horse — text-to-video & image-to-video",
+            "tag": "LTX, Pixverse, Seedance 2.0/2.5/Mini, Veo 3.1, MiniMax H3, FLUX 3, Kling 4K, Happy Horse, Grok Imagine, Gemini Omni — text-to-video & image-to-video",
             "env_vars": [
                 {
                     "key": "FAL_KEY",
@@ -461,12 +687,24 @@ class FALVideoGenProvider(VideoGenProvider):
         }
 
     def capabilities(self) -> dict[str, Any]:
+        max_duration = 1
+        min_duration: int | None = None
+        for meta in FAL_FAMILIES.values():
+            durations = meta.get("durations")
+            if not durations:
+                continue
+            if _is_duration_range(durations):
+                low, high = durations
+            else:
+                low, high = min(durations), max(durations)
+            max_duration = max(max_duration, high)
+            min_duration = low if min_duration is None else min(min_duration, low)
         return {
             "modalities": ["text", "image"],
             "aspect_ratios": ["16:9", "9:16", "1:1"],
             "resolutions": ["360p", "540p", "720p", "1080p"],
-            "max_duration": 15,
-            "min_duration": 1,
+            "max_duration": max_duration,
+            "min_duration": min_duration if min_duration is not None else 1,
             "supports_audio": True,
             "supports_negative_prompt": True,
             "max_reference_images": 0,
@@ -485,6 +723,7 @@ class FALVideoGenProvider(VideoGenProvider):
         negative_prompt: str | None = None,
         audio: bool | None = None,
         seed: int | None = None,
+        upscale: bool | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         if not await _check_fal_video_available():
@@ -559,7 +798,24 @@ class FALVideoGenProvider(VideoGenProvider):
         )
 
         try:
-            result = await _submit_fal_video_request(endpoint, payload)
+            # Preserve the upstream request-id handoff needed by managed
+            # SeedVR2 while keeping the ordinary two-argument private helper
+            # contract unchanged for callers/tests that do not upscale.
+            if upscale:
+                submitted = await _submit_fal_video_request(
+                    endpoint,
+                    payload,
+                    return_request_id=True,
+                )
+                if isinstance(submitted, tuple) and len(submitted) == 2:
+                    result, source_request_id = submitted
+                else:
+                    # Keep monkeypatched/private callers that return the
+                    # ordinary result shape compatible with the opt-in path.
+                    result, source_request_id = submitted, None
+            else:
+                result = await _submit_fal_video_request(endpoint, payload)
+                source_request_id = None
         except Exception as exc:
             logger.warning(
                 "FAL video gen failed (family=%s, endpoint=%s): %s",
@@ -586,7 +842,16 @@ class FALVideoGenProvider(VideoGenProvider):
                 provider="fal", model=family_id, prompt=prompt,
             )
 
-        extra: dict[str, Any] = {"endpoint": endpoint}
+        upscaled = False
+        if upscale:
+            upscaled_url = await _upscale_video(url, source_request_id)
+            if upscaled_url:
+                url = upscaled_url
+                upscaled = True
+
+        extra: dict[str, Any] = {"endpoint": endpoint, "upscaled": upscaled}
+        if upscaled:
+            extra["upscale_factor"] = UPSCALER_FACTOR
         if isinstance(video, dict):
             if video.get("file_size"):
                 extra["file_size"] = video["file_size"]

@@ -678,6 +678,32 @@ async def _run_review(
     review_agent = None
     review_messages: list[dict] = []
 
+    def _unregister_review_agent(agent_ref: Any) -> None:
+        """Clear the fork from both parent tracking slots, idempotently."""
+        if agent_ref is None:
+            return
+        review_lock = getattr(agent, "_background_review_lock", None)
+        if review_lock is not None:
+            with review_lock:
+                if getattr(agent, "_background_review_agent", None) is agent_ref:
+                    agent._background_review_agent = None
+        elif getattr(agent, "_background_review_agent", None) is agent_ref:
+            agent._background_review_agent = None
+
+        children = getattr(agent, "_active_children", None)
+        if children is None:
+            return
+        children_lock = getattr(agent, "_active_children_lock", None)
+        try:
+            if children_lock is not None:
+                with children_lock:
+                    if agent_ref in children:
+                        children.remove(agent_ref)
+            elif agent_ref in children:
+                children.remove(agent_ref)
+        except (AttributeError, ValueError):
+            pass
+
     async def _close_review_agent() -> None:
         nonlocal review_agent
         if review_agent is None:
@@ -808,6 +834,24 @@ async def _run_review(
         review_agent._end_session_on_close = False
         review_agent.compression_enabled = False
 
+        # Register while the fork's model call is in flight. A new live turn
+        # can then interrupt this review before it races the same session and
+        # credential runtime; cleanup removes both references on every path.
+        review_lock = getattr(agent, "_background_review_lock", None)
+        if review_lock is not None:
+            with review_lock:
+                agent._background_review_agent = review_agent
+        else:
+            agent._background_review_agent = review_agent
+        children = getattr(agent, "_active_children", None)
+        if children is not None:
+            children_lock = getattr(agent, "_active_children_lock", None)
+            if children_lock is not None:
+                with children_lock:
+                    children.append(review_agent)
+            else:
+                children.append(review_agent)
+
         from hermes_cli.plugins import (
             clear_thread_tool_whitelist,
             set_thread_tool_whitelist,
@@ -857,6 +901,7 @@ async def _run_review(
             )
         finally:
             clear_thread_tool_whitelist()
+            _unregister_review_agent(review_agent)
 
         review_messages = list(
             getattr(review_agent, "_session_messages", [])
@@ -899,6 +944,7 @@ async def _run_review(
         )
         agent._emit_auxiliary_failure("background review", exc)
     finally:
+        _unregister_review_agent(review_agent)
         if review_agent is not None:
             await _close_review_agent()
         set_approval_callback(prior_approval_callback)
@@ -909,6 +955,7 @@ def spawn_background_review_thread(
     messages_snapshot: list[dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    focus: str | None = None,
 ):
     """Build the native async review target and prompt.
 
@@ -932,6 +979,15 @@ def spawn_background_review_thread(
             agent,
             "_SKILL_REVIEW_PROMPT",
             _SKILL_REVIEW_PROMPT,
+        )
+
+    focus = (focus or "").strip()
+    if focus:
+        prompt = (
+            f"{prompt}\n\n"
+            "The user explicitly requested this review with the following "
+            "focus — prioritize it over the general instructions above:\n"
+            f"{focus}"
         )
 
     # Freeze the exact schema at scheduling time. The parent may begin another

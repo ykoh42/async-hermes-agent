@@ -415,7 +415,7 @@ class TestBackgroundReviewOwnership:
 
         assert result["success"] is False
         assert "not curator-managed" in result["error"]
-        assert "no usage record" in result["error"]
+        assert "created_by=None" in result["error"]
         assert "original procedure" in (
             tmp_path / "test-skill" / "SKILL.md"
         ).read_text(encoding="utf-8")

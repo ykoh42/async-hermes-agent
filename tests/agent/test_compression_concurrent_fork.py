@@ -382,13 +382,29 @@ async def test_task_cancellation_during_post_lease_read_releases_lock(
     await db.create_session(session_id, source="library")
     agent = _build_agent_with_db(db, session_id)
     entered = asyncio.Event()
+    lease_acquired = asyncio.Event()
     release_started = asyncio.Event()
     allow_release = asyncio.Event()
+    original_get_session = db.get_session
+    original_try_acquire = db.try_acquire_compression_lock
     original_release = db.release_compression_lock
 
     async def blocked_get_session(_session_id):
+        session = await original_get_session(_session_id)
+        # Persisted guard hydration reads the session before the lease is
+        # acquired.  Only block the ownership lookup that follows the lease;
+        # otherwise the test cancels before the cleanup path is entered.
+        if not lease_acquired.is_set():
+            return session
         entered.set()
         await asyncio.Event().wait()
+        return session
+
+    async def tracked_try_acquire(*args, **kwargs):
+        acquired = await original_try_acquire(*args, **kwargs)
+        if acquired:
+            lease_acquired.set()
+        return acquired
 
     async def controlled_release(lock_session_id, holder):
         release_started.set()
@@ -396,6 +412,7 @@ async def test_task_cancellation_during_post_lease_read_releases_lock(
         return await original_release(lock_session_id, holder)
 
     db.get_session = blocked_get_session
+    db.try_acquire_compression_lock = tracked_try_acquire
     db.release_compression_lock = controlled_release
     running = asyncio.create_task(
         agent._compress_context(

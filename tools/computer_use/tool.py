@@ -1076,8 +1076,9 @@ def _action_payload(res: ActionResult) -> dict[str, Any]:
         payload["verified"] = res.verified
     if res.effect is not None:
         payload["effect"] = res.effect
-    if res.escalation is not None:
-        payload["escalation"] = res.escalation
+    escalation = _enrich_escalation(res)
+    if escalation is not None:
+        payload["escalation"] = escalation
     if res.path is not None:
         payload["path"] = res.path
     if res.degraded is not None:
@@ -1096,6 +1097,42 @@ def _text_response(res: ActionResult) -> str:
     return json.dumps(_action_payload(res))
 
 
+# Window classes of browsers whose page content the typed cua_browser_* route
+# can drive with trusted input and zero focus steal.  When background text
+# delivery is refused for one of these surfaces, offer the typed route before
+# suggesting a foreground escalation.
+_TYPED_BROWSER_WINDOW_CLASSES = {
+    "chrome_widgetwin_1",
+    "mozillawindowclass",
+}
+
+
+def _enrich_escalation(res: ActionResult) -> dict[str, Any] | None:
+    """Add a typed-browser alternative without changing the driver verdict."""
+    escalation = res.escalation
+    if not isinstance(escalation, dict):
+        return escalation
+    if escalation.get("recommended") != "foreground":
+        return escalation
+    meta = res.meta or {}
+    target_class = str(meta.get("target_class") or "").lower()
+    if target_class not in _TYPED_BROWSER_WINDOW_CLASSES:
+        return escalation
+    if meta.get("event_kind") not in {"text_input", "key_press"}:
+        return escalation
+    enriched = dict(escalation)
+    enriched["alternative"] = "page"
+    enriched["alternative_hint"] = (
+        "target is a browser window: if the input goes into PAGE content "
+        "(not browser chrome or a native dialog), the typed cua_browser_* "
+        "route can deliver it without a window flash — bind with "
+        "cua_browser_state (exact pid/window_id), then cua_browser_type. "
+        "Use foreground only for chrome/native surfaces or if typed binding "
+        "is unavailable."
+    )
+    return enriched
+
+
 # Default cap for the AX `elements` array returned by capture. Dense UIs
 # (Electron apps, Obsidian, JetBrains IDEs) can publish 500+ AX nodes, which
 # can exhaust session context after a single capture. The model-facing
@@ -1106,6 +1143,12 @@ _DEFAULT_MAX_ELEMENTS = 100
 # reintroduce the original unbounded behavior.
 _MAX_ALLOWED_MAX_ELEMENTS = 1000
 _MIN_PROVIDER_IMAGE_DIMENSION = 8
+
+# Accessibility labels can contain entire message bodies/document text. Keep
+# the model-facing element payload bounded while preserving the full tree in a
+# recoverable spill file when detail is dropped.
+_MAX_ELEMENT_LABEL_CHARS = 120
+_MAX_SPILL_FILES = 20
 
 
 def _image_dimensions_from_b64(image_b64: str) -> tuple[int, int] | None:
@@ -1191,6 +1234,22 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
     image_dimensions = _image_dimensions_from_b64(cap.png_b64 or "") if cap.png_b64 else None
     response_width = image_dimensions[0] if image_dimensions else cap.width
     response_height = image_dimensions[1] if image_dimensions else cap.height
+    bounds_note = _bounds_space_note(visible_elements, response_width, response_height)
+    bounds_scale = _bounds_scale(visible_elements, response_width, response_height)
+    if bounds_note and bounds_scale:
+        bounds_note += (
+            f"; estimated scale ~{bounds_scale}x (screenshot position x "
+            f"{bounds_scale} ≈ native coordinate)"
+        )
+    elements_file: str | None = None
+    if _capture_lost_detail(cap, visible_elements, truncated_elements):
+        try:
+            candidate = _spill_elements_to_file(cap)
+            elements_file = (
+                await candidate if inspect.isawaitable(candidate) else candidate
+            )
+        except Exception as exc:  # pragma: no cover - spill is best effort
+            logger.debug("computer_use: element spill failed: %s", exc)
     image_too_small = bool(
         image_dimensions
         and (
@@ -1210,6 +1269,14 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
         + (f" window={cap.window_title!r}" if cap.window_title else ""),
         f"{total_elements} interactable element(s):",
     ]
+    if bounds_note:
+        summary_lines.append(f"  ({bounds_note})")
+    if elements_file:
+        summary_lines.append(
+            f"  (full element tree with untruncated labels saved to "
+            f"{elements_file} — read_file/search_files it if you need "
+            "dropped label text or elements beyond the cap)"
+        )
     if element_index:
         summary_lines.extend(element_index)
     # Multimodal and AX paths both reference `summary`; build it once up-front
@@ -1233,7 +1300,13 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
         # main models tripped HTTP 404 / 400 at the provider boundary even
         # when auxiliary.vision was explicitly configured to handle this.
         if await _should_route_through_aux_vision():
-            routed = await _route_capture_through_aux_vision(cap, summary)
+            routed = await _route_capture_through_aux_vision(
+                cap,
+                summary,
+                visible_elements=visible_elements,
+                truncated_elements=truncated_elements,
+                elements_file=elements_file,
+            )
             if routed is not None:
                 return routed
             # Aux routing was requested but failed (vision node down, aux call
@@ -1266,6 +1339,10 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
             }
             if truncated_elements:
                 payload["truncated_elements"] = truncated_elements
+            if elements_file:
+                payload["elements_file"] = elements_file
+            if bounds_scale:
+                payload["bounds_scale"] = bounds_scale
             return json.dumps(payload)
 
         # Prefer the explicit MIME type cua-driver attaches to its image
@@ -1289,7 +1366,9 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
             ],
             "text_summary": summary,
             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,
-                     "elements": total_elements, "png_bytes": cap.png_bytes_len},
+                     "elements": total_elements, "png_bytes": cap.png_bytes_len,
+                     **({"elements_file": elements_file} if elements_file else {}),
+                     **({"bounds_scale": bounds_scale} if bounds_scale else {})},
         }
     # AX-only (or image-missing fallback): text path actually carries the
     # `elements` array, so the truncation note applies here.
@@ -1311,6 +1390,10 @@ async def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX
     }
     if truncated_elements:
         payload["truncated_elements"] = truncated_elements
+    if elements_file:
+        payload["elements_file"] = elements_file
+    if bounds_scale:
+        payload["bounds_scale"] = bounds_scale
     return json.dumps(payload)
 
 
@@ -1325,25 +1408,44 @@ _MAX_VISION_DIM = 1456
 
 
 def _shrink_capture_for_vision(raw: bytes, ext: str,
-                               max_dim: int = _MAX_VISION_DIM) -> bytes:
+                               max_dim: int = _MAX_VISION_DIM,
+                               ) -> tuple[bytes, str | None]:
     """Downscale encoded image bytes so the longest side is <= max_dim.
 
-    Returns the original bytes unchanged when the image already fits or when
-    Pillow is unavailable/fails — no worse than the pre-shrink behavior.
+    Returns ``(bytes, scale_note)``. The note lets the vision model map
+    coordinates reported in the resized image back to the real screenshot.
     """
     try:
         from io import BytesIO
         from PIL import Image
         img = Image.open(BytesIO(raw))
         if max(img.size) <= max_dim:
-            return raw
+            return raw, None
+        original_width, original_height = img.size
         img.thumbnail((max_dim, max_dim))
+        new_width, new_height = img.size
         out = BytesIO()
         img.save(out, format="JPEG" if ext == ".jpg" else "PNG")
-        return out.getvalue()
+        fx = original_width / new_width if new_width else 1.0
+        fy = original_height / new_height if new_height else 1.0
+        if f"{fx:.2f}" == f"{fy:.2f}":
+            factor_clause = (
+                f"multiply any coordinates you report by {fx:.2f} "
+                "to map back to the real screen."
+            )
+        else:
+            factor_clause = (
+                f"multiply any x coordinates you report by {fx:.2f} and "
+                f"any y coordinates by {fy:.2f} to map back to the real screen."
+            )
+        return (
+            out.getvalue(),
+            f"Screenshot downscaled from {original_width}x{original_height} to "
+            f"{new_width}x{new_height} for vision; {factor_clause}",
+        )
     except Exception as exc:
         logger.debug("computer_use: vision downscale skipped: %s", exc)
-        return raw
+        return raw, None
 
 async def _should_route_through_aux_vision() -> bool:
     """Return True when ``_capture_response`` should hand the PNG to aux vision.
@@ -1376,7 +1478,10 @@ async def _should_route_through_aux_vision() -> bool:
         return cached
     try:
         cfg = await load_config_readonly()
-        decision = bool(should_route_capture_to_aux_vision(provider, model, cfg))
+        decision = should_route_capture_to_aux_vision(provider, model, cfg)
+        if inspect.isawaitable(decision):
+            decision = await decision
+        decision = bool(decision)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: aux-vision routing decision failed: %s", exc)
         return False
@@ -1401,6 +1506,10 @@ async def _capture_after_mode() -> str:
 async def _route_capture_through_aux_vision(
     cap: CaptureResult,
     summary: str,
+    *,
+    visible_elements: list[UIElement] | None = None,
+    truncated_elements: int = 0,
+    elements_file: str | None = None,
 ) -> str | None:
     """Pre-analyse the captured PNG via ``vision_analyze`` and return a text result.
 
@@ -1446,7 +1555,7 @@ async def _route_capture_through_aux_vision(
         cache_dir = await get_hermes_dir("cache/vision", "temp_vision_images")
         await aiofiles.os.makedirs(cache_dir, exist_ok=True)
         temp_image_path = cache_dir / f"computer_use_{_uuid.uuid4().hex}{ext}"
-        raw = _shrink_capture_for_vision(raw, ext)
+        raw, scale_note = _shrink_capture_for_vision(raw, ext)
         async with aiofiles.open(temp_image_path, "wb") as stream:
             await stream.write(raw)
 
@@ -1459,6 +1568,8 @@ async def _route_capture_through_aux_vision(
             "actually visible.\n\n"
             f"AX/SOM index for cross-reference:\n{summary}"
         )
+        if scale_note:
+            prompt += f"\n\nNote: {scale_note}"
 
         result_json = await vision_analyze_tool(str(temp_image_path), prompt)
     except Exception as exc:
@@ -1487,17 +1598,24 @@ async def _route_capture_through_aux_vision(
     if not analysis_text:
         return None
 
-    return json.dumps({
+    elements_out = cap.elements if visible_elements is None else visible_elements
+    payload: dict[str, Any] = {
         "mode": cap.mode,
         "width": cap.width,
         "height": cap.height,
         "app": cap.app,
         "window_title": cap.window_title,
-        "elements": [_element_to_dict(e) for e in cap.elements],
+        "elements": [_element_to_dict(e) for e in elements_out],
+        "total_elements": len(cap.elements),
         "summary": summary,
         "vision_analysis": analysis_text,
         "vision_analysis_routed_via": "auxiliary.vision",
-    })
+    }
+    if truncated_elements:
+        payload["truncated_elements"] = truncated_elements
+    if elements_file:
+        payload["elements_file"] = elements_file
+    return json.dumps(payload)
 
 
 async def _maybe_follow_capture(
@@ -1556,14 +1674,149 @@ def _format_elements(elements: list[UIElement], max_lines: int = 40) -> list[str
     return out
 
 
+async def _spill_elements_to_file(cap: CaptureResult) -> str | None:
+    """Write the complete element tree to a bounded, recoverable cache file.
+
+    The model-facing response caps labels and element count to protect the
+    tool-result budget.  This best-effort native-async spill gives callers an
+    escape hatch through ``read_file``/``search_files`` without making capture
+    fail when the cache is unavailable.
+    """
+    try:
+        import uuid
+
+        from hermes_constants import get_hermes_dir
+        from tools.spill_safety import _write_text_exclusive_async
+
+        cache_dir = await get_hermes_dir(
+            "cache/computer_use", "computer_use_cache"
+        )
+        await aiofiles.os.makedirs(cache_dir, exist_ok=True)
+
+        try:
+            names = await aiofiles.os.listdir(cache_dir)
+            candidates: list[tuple[float, Any]] = []
+            for name in names:
+                if not name.startswith("elements_") or not name.endswith(".json"):
+                    continue
+                path = cache_dir / name
+                try:
+                    stat_result = await aiofiles.os.stat(path)
+                except OSError:
+                    continue
+                candidates.append((stat_result.st_mtime, path))
+            candidates.sort(key=lambda item: item[0])
+            for _, stale in candidates[: max(0, len(candidates) - (_MAX_SPILL_FILES - 1))]:
+                try:
+                    await aiofiles.os.unlink(stale)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        path = cache_dir / f"elements_{uuid.uuid4().hex}.json"
+        payload = {
+            "app": cap.app,
+            "window_title": cap.window_title,
+            "total_elements": len(cap.elements),
+            "elements": [
+                {
+                    "index": e.index,
+                    "role": e.role,
+                    "label": e.label,
+                    "bounds": list(e.bounds),
+                    "app": e.app,
+                }
+                for e in cap.elements
+            ],
+        }
+        await _write_text_exclusive_async(
+            path,
+            json.dumps(payload, ensure_ascii=False, indent=1),
+            private=True,
+        )
+        return str(path)
+    except Exception as exc:  # pragma: no cover - enhancement is best effort
+        logger.debug("computer_use: element spill failed: %s", exc)
+        return None
+
+
+def _capture_lost_detail(
+    cap: CaptureResult,
+    visible_elements: list[UIElement],
+    truncated_elements: int,
+) -> bool:
+    """Return true when the in-context response drops recoverable detail."""
+    if truncated_elements:
+        return True
+    return any(
+        len(e.label) > _MAX_ELEMENT_LABEL_CHARS for e in visible_elements
+    )
+
+
+def _bounds_scale(
+    elements: list[UIElement], image_width: int, image_height: int,
+) -> float | None:
+    """Estimate native-bounds to screenshot-pixel scale, if spaces diverge."""
+    if not elements or image_width <= 0 or image_height <= 0:
+        return None
+    max_x = 0
+    max_y = 0
+    for e in elements:
+        try:
+            x, y, width, height = e.bounds
+        except (TypeError, ValueError):
+            continue
+        max_x = max(max_x, int(x) + int(width))
+        max_y = max(max_y, int(y) + int(height))
+    if max_x <= image_width * 1.05 and max_y <= image_height * 1.05:
+        return None
+    return round(max(max_x / image_width, max_y / image_height), 2)
+
+
+def _bounds_space_note(
+    elements: list[UIElement], image_width: int, image_height: int,
+) -> str | None:
+    """Describe native coordinate bounds when they exceed screenshot space."""
+    if not elements or image_width <= 0 or image_height <= 0:
+        return None
+    max_x = 0
+    max_y = 0
+    for e in elements:
+        try:
+            x, y, width, height = e.bounds
+        except (TypeError, ValueError):
+            continue
+        max_x = max(max_x, int(x) + int(width))
+        max_y = max(max_y, int(y) + int(height))
+    if max_x <= 0 and max_y <= 0:
+        return None
+    if max_x <= image_width * 1.05 and max_y <= image_height * 1.05:
+        return None
+    return (
+        "element bounds are in native desktop coordinates (extend to "
+        f"~{max_x}x{max_y}), NOT screenshot pixels ({image_width}x"
+        f"{image_height}). coordinate= clicks expect the native space — "
+        "derive click points from element bounds, or scale screenshot "
+        "positions up accordingly"
+    )
+
+
 def _element_to_dict(e: UIElement) -> dict[str, Any]:
-    return {
+    label = e.label
+    truncated = len(label) > _MAX_ELEMENT_LABEL_CHARS
+    if truncated:
+        label = label[:_MAX_ELEMENT_LABEL_CHARS]
+    out: dict[str, Any] = {
         "index": e.index,
         "role": e.role,
-        "label": e.label,
+        "label": label,
         "bounds": list(e.bounds),
         "app": e.app,
     }
+    if truncated:
+        out["label_truncated"] = True
+    return out
 
 
 # ---------------------------------------------------------------------------

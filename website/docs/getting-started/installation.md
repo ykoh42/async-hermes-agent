@@ -20,32 +20,31 @@ application supplies its own service or UI boundary.
 Install the exact reviewed package version from PyPI:
 
 ```bash
-uv pip install "async-hermes-agent==0.20.0.5"
+uv pip install "async-hermes-agent==0.20.1.1"
 ```
 
 The release workflow publishes through OIDC Trusted Publishing. The same
 verified wheel, source distribution, and `SHA256SUMS` file are attached to the
-[`v0.20.0.5` GitHub Release](https://github.com/ykoh42/async-hermes-agent/releases/tag/v0.20.0.5).
+[`v0.20.1.1` GitHub Release](https://github.com/ykoh42/async-hermes-agent/releases/tag/v0.20.1.1).
 To install the reviewed source snapshot instead, pin the immutable tag:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.0.5"
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.1.1"
 ```
 
 ## Version policy
 
 The four numeric segments keep the fork tied to its upstream baseline.
-`0.20.0.5` means upstream Python package version `0.20.0` (tag `v2026.8.3`)
-plus async-distribution revision `5`. Fork-only releases increment the final
+`0.20.1.1` means upstream Python package version `0.20.1` (tag `v2026.8.13`)
+ plus async-distribution revision `1`. Fork-only releases increment the final
 segment; a completed upstream port changes the first three segments and resets
 the final segment to `1`.
 
 The earlier `0.20.4` GitHub release used an independent scheme. Python version
-ordering considers it newer than `0.20.0.5`, so an installation made from that
-tag needs this one-time explicit migration:
+tag should be explicitly reinstalled at the new upstream-aligned version:
 
 ```bash
-uv pip install --reinstall "async-hermes-agent==0.20.0.5"
+uv pip install --reinstall "async-hermes-agent==0.20.1.1"
 ```
 
 ## 2. Or install from a checkout

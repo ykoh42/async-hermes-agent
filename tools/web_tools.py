@@ -62,7 +62,12 @@ from plugins.web.parallel.provider import (  # noqa: F401 — backward-compat na
 )
 
 from tools.debug_helpers import DebugSession
-from tools.url_safety import is_safe_url, normalize_url_for_request, sensitive_query_param_name
+from tools.url_safety import (
+    async_is_safe_url,
+    is_safe_url,
+    normalize_url_for_request,
+    sensitive_query_param_name,
+)
 import sys
 
 logger = logging.getLogger(__name__)

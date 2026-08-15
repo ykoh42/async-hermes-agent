@@ -1,6 +1,7 @@
 """Contracts retained from the v2026.8.3 file-operations implementation."""
 
 import asyncio
+import base64
 import inspect
 import json
 import os
@@ -68,6 +69,7 @@ def test_upstream_file_operations_surface_is_native_async():
     method_names = {
         "read_file",
         "read_file_raw",
+        "read_file_bytes",
         "write_file",
         "patch_replace",
         "patch_v4a",
@@ -83,6 +85,11 @@ def test_upstream_file_operations_surface_is_native_async():
                 cls.__name__,
                 method_name,
             )
+
+    assert str(inspect.signature(ShellFileOperations.read_file_bytes)) == (
+        "(self, path: str, max_bytes: int | None = None) -> "
+        "tools.file_operations.ReadResult"
+    )
 
     assert str(inspect.signature(ShellFileOperations.read_file)) == (
         "(self, path: str, offset: int = 1, limit: int = 2000) -> "
@@ -122,6 +129,28 @@ async def test_shell_file_operations_real_native_async_workflow(tmp_path):
         delete = await ops.delete_file("notes.txt")
         assert delete.error is None
         assert not (tmp_path / "notes.txt").exists()
+    finally:
+        await env.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_shell_file_operations_reads_backend_bytes_with_limit(tmp_path):
+    from tools.environments.local import LocalEnvironment
+
+    payload = b"\x00\xffremote-bytes"
+    (tmp_path / "payload.bin").write_bytes(payload)
+    env = LocalEnvironment(cwd=str(tmp_path))
+    ops = ShellFileOperations(env)
+    try:
+        result = await ops.read_file_bytes("payload.bin")
+        assert result.error is None
+        assert result.is_binary is True
+        assert result.file_size == len(payload)
+        assert base64.b64decode(result.base64_content, validate=True) == payload
+
+        limited = await ops.read_file_bytes("payload.bin", max_bytes=len(payload) - 1)
+        assert limited.base64_content is None
+        assert "too large" in limited.error
     finally:
         await env.cleanup()
 

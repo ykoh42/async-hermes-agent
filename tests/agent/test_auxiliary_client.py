@@ -4013,6 +4013,75 @@ class TestCodexAdapterPromptCacheKey:
         assert "prompt_cache_retention" not in captured
 
 
+class TestCodexAuxiliaryAdapterCacheScope:
+    """Auxiliary prompt-cache buckets are isolated by logical session."""
+
+    @staticmethod
+    def _build_adapter():
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        message_item = SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="ok")],
+        )
+
+        class FakeStream:
+            def __aiter__(self):
+                async def events():
+                    yield SimpleNamespace(type="response.output_item.done", item=message_item)
+                    yield SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(status="completed", id="r1", usage=None),
+                    )
+
+                return events()
+
+            async def aclose(self):
+                return None
+
+        captured = {}
+
+        async def create(**kwargs):
+            captured.update(kwargs)
+            return FakeStream()
+
+        client = SimpleNamespace(
+            base_url="https://chatgpt.com/backend-api/codex",
+            responses=SimpleNamespace(create=create),
+        )
+        return _CodexCompletionsAdapter(client, "gpt-5.5"), captured
+
+    async def _capture_key(self, session_id):
+        import agent.auxiliary_client as aux
+
+        adapter, captured = self._build_adapter()
+        token = aux.set_runtime_main("openai", "gpt-5.5", session_id=session_id)
+        try:
+            await adapter.create(
+                messages=[
+                    {"role": "system", "content": "You are a summarizer."},
+                    {"role": "user", "content": "Summarize this turn."},
+                ]
+            )
+        finally:
+            aux.reset_runtime_main(token)
+        return captured["prompt_cache_key"]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_sessions_get_distinct_keys(self):
+        assert await self._capture_key("session-A") != await self._capture_key("session-B")
+
+    @pytest.mark.asyncio
+    async def test_cron_refires_share_one_logical_key(self):
+        first = await self._capture_key("cron_job42_20260801_090000")
+        second = await self._capture_key("cron_job42_20260802_090000")
+        other = await self._capture_key("cron_job99_20260801_090000")
+        assert first == second
+        assert first != other
+
+
 class TestCodexAdapterGithubResponsesMessageIdDrop:
     """_CodexCompletionsAdapter must drop codex_message_items ``id`` when
     talking to Copilot (githubcopilot.com), independent of the main

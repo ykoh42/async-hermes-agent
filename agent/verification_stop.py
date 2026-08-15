@@ -75,14 +75,28 @@ def _filter_verifiable_paths(paths: Iterable[str]) -> list[str]:
     return [p for p in paths if p and not _is_non_code_path(p)]
 
 
+def _session_is_messaging_surface() -> bool:
+    """Return whether this turn is delivered over a human messaging channel."""
+    try:
+        from gateway.session_context import session_is_messaging_surface
+
+        return session_is_messaging_surface()
+    except Exception:
+        # If the gateway context is unavailable, this is a local/programmatic
+        # call rather than a messaging surface.
+        return False
+
+
 async def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
     Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
-    explicit ``agent.verify_on_stop`` config value. The config default is
-    ``"auto"`` (see ``DEFAULT_CONFIG``) — surface-aware: ON for interactive
-    programmatic callers. An explicit bool forces the behavior in either
-    direction. A missing or unrecognized value falls back to ``"auto"``.
+    explicit ``agent.verify_on_stop`` config value. The default is ``False``
+    (opt-in — see ``DEFAULT_CONFIG``): existing migrations already turn the
+    behavior off, so fresh installs match. An explicit bool forces the
+    behavior in either direction, and the ``"auto"`` sentinel opts into the
+    legacy surface-aware behavior. Missing or unrecognized values fall back
+    to OFF.
     """
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
@@ -105,8 +119,8 @@ async def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
         if token in {"0", "false", "no", "off"}:
             return False
         if token == "auto":
-            return True
-    return True
+            return not _session_is_messaging_surface()
+    return False
 
 
 async def _candidate_cwds(paths: Iterable[str]) -> list[Path]:

@@ -346,3 +346,77 @@ def test_dependent_schemas_still_recursively_sanitized():
     assert dep_schemas["owner"] == {"type": "object", "properties": {}}, (
         f"dependentSchemas['owner'] was not fully sanitized: {dep_schemas['owner']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# collapse_const_unions — upstream v2026.8.13 schema normalization
+# ---------------------------------------------------------------------------
+
+from tools.schema_sanitizer import collapse_const_unions
+
+
+def test_pure_const_union_collapses_to_enum():
+    schema = {"anyOf": [{"const": "red"}, {"const": "green"}]}
+    assert collapse_const_unions(schema) == {
+        "type": "string", "enum": ["red", "green"]
+    }
+
+
+def test_non_uniform_const_union_is_unchanged():
+    schema = {"anyOf": [{"const": "a"}, {"const": 1}]}
+    assert collapse_const_unions(copy.deepcopy(schema)) == schema
+
+
+def test_bool_const_is_not_integer():
+    mixed = {"anyOf": [{"const": True}, {"const": 1}]}
+    assert collapse_const_unions(copy.deepcopy(mixed)) == mixed
+    assert collapse_const_unions({"anyOf": [{"const": True}, {"const": False}]}) == {
+        "type": "boolean", "enum": [True, False]
+    }
+
+
+def test_const_union_nested_metadata_and_nullable_branch():
+    schema = {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "description": "Pick one",
+                "default": "fast",
+                "anyOf": [
+                    {"const": "fast"},
+                    {"const": "slow"},
+                    {"type": "null"},
+                ],
+            }
+        },
+    }
+    out = collapse_const_unions(schema)
+    assert out["properties"]["mode"] == {
+        "description": "Pick one",
+        "default": "fast",
+        "type": "string",
+        "enum": ["fast", "slow"],
+        "nullable": True,
+    }
+
+
+def test_mcp_schema_normalization_collapses_const_union():
+    from tools.mcp_tool import _normalize_mcp_input_schema
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "color": {"anyOf": [{"const": "red"}, {"const": "green"}]}
+        },
+    }
+    out = _normalize_mcp_input_schema(schema)
+    assert out["properties"]["color"] == {
+        "type": "string", "enum": ["red", "green"]
+    }
+
+
+def test_const_union_does_not_mutate_input():
+    schema = {"anyOf": [{"const": "x"}, {"const": "y"}]}
+    snapshot = copy.deepcopy(schema)
+    collapse_const_unions(schema)
+    assert schema == snapshot

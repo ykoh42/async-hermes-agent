@@ -17,10 +17,14 @@ from __future__ import annotations
 from agent.turn_context import (
     _compression_made_progress,
     _compression_warrants_another_preflight_pass,
+    compression_made_progress,
 )
 
 
 class TestCompressionMadeProgress:
+    def test_public_upstream_name_matches_private_runtime_name(self):
+        assert compression_made_progress is _compression_made_progress
+
     def test_rows_reduced_counts_as_progress(self):
         """Removing message rows is the obvious progress signal."""
         assert _compression_made_progress(
@@ -67,4 +71,3 @@ class TestCompressionWarrantsAnotherPreflightPass:
             new_tokens=345_000,
             threshold_tokens=272_000,
         ) is False
-

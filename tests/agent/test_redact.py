@@ -4,7 +4,14 @@ import logging
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    _reset_plugin_redaction_patterns,
+    mask_secret,
+    redact_cdp_url,
+    redact_sensitive_text,
+    register_redaction_patterns,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -112,6 +119,84 @@ class TestEnvAssignments:
         assert result.startswith("export ")
         assert "SECRET_TOKEN=" in result
         assert "mypassword" not in result
+
+
+class TestBareSecretEnvSuffixes:
+    """Bare *_KEY / *_PASS / *_PW env suffixes mask, incl. lowercase."""
+
+    def test_upper_suffix_keys_mask(self):
+        for text in (
+            "FAL_KEY=sk-abc123def456",
+            "OPENAI_KEY=sk-abc123def456",
+            "MYSQL_PASS=ghi789",
+            "DB_PW=jkl012",
+        ):
+            result = redact_sensitive_text(text, force=True)
+            assert "=" in result and result.split("=", 1)[1] != text.split("=", 1)[1]
+
+    def test_lowercase_env_name_masks(self):
+        result = redact_sensitive_text(
+            "openai_key=xyzzyplugh1234567890abcd", force=True
+        )
+        assert "xyzzyplugh1234567890abcd" not in result
+
+    def test_prose_words_with_keyword_unchanged(self):
+        for text in ("KEYBOARD=notsecret", "PASSAGE=notsecret"):
+            assert redact_sensitive_text(text, force=True) == text
+
+    def test_form_body_not_swallowed(self):
+        text = "password=mysecret&username=bob&token=opaqueValue"
+        result = redact_sensitive_text(text, force=True)
+        assert "mysecret" not in result
+        assert "opaqueValue" not in result
+        assert "username=bob" in result
+
+
+class TestControlCharSplitTokens:
+    """Tokens split by control/zero-width chars must still mask."""
+
+    def _assert_split_masked(self, text, token):
+        result = redact_sensitive_text(text, force=True)
+        longest = max(token[10:], token[:10], key=len)
+        assert longest not in result
+
+    def test_newline_split_token_masks(self):
+        token = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+        self._assert_split_masked(f"{token[:10]}\n{token[10:]}", token)
+
+    def test_esc_split_token_masks(self):
+        token = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+        self._assert_split_masked(f"{token[:10]}\x1b{token[10:]}", token)
+
+    def test_zero_width_split_token_masks(self):
+        token = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+        self._assert_split_masked(f"{token[:10]}\u200b{token[10:]}", token)
+
+    def test_complete_token_does_not_swallow_next_line(self):
+        token = "ghp_" + "F" * 29
+        text = f"text: Token: {token}\nbutton [ref=e3]: Copy\n"
+        result = redact_sensitive_text(text, force=True)
+        assert "F" * 20 not in result
+        assert "button" in result
+        assert "ref=e3" in result
+
+    def test_selfmatching_head_esc_split_tail_masked(self):
+        head = "sk-" + "a" * 15
+        tail = "b" * 25
+        result = redact_sensitive_text(head + "\x1b" + tail, force=True)
+        assert tail not in result
+        assert "a" * 12 not in result
+
+    def test_env_dump_lines_not_joined(self):
+        env_dump = (
+            "HOME=/home/user\n"
+            "ELEVENLABS_API_KEY=sk_abc123def456ghi789jkl\n"
+            "EXA_API_KEY=exa_XY789abcdef01234\n"
+            "SHELL=/bin/bash\n"
+        )
+        result = redact_sensitive_text(env_dump, force=True)
+        assert "SHELL=/bin/bash" in result
+        assert "HOME=/home/user" in result
 
 
 class TestEnvLookupPreserved:
@@ -757,6 +842,21 @@ class TestFireworksToken:
         assert short in result
 
 
+def test_plugin_redaction_patterns_are_additive_and_validated():
+    _reset_plugin_redaction_patterns()
+    try:
+        assert register_redaction_patterns(
+            [r"nvapi-[A-Za-z0-9_-]{20,}"], source="plugin:test"
+        ) == 1
+        token = "nvapi-" + "A" * 24
+        assert token not in redact_sensitive_text(f"error {token}", force=True)
+        assert register_redaction_patterns(
+            [r"nvapi-[A-Za-z0-9_-]{20,}", r".*", r"a|.*", r"(a+)+"]
+        ) == 0
+    finally:
+        _reset_plugin_redaction_patterns()
+
+
 
 class TestRedactCdpUrl:
     """redact_cdp_url() is the single chokepoint for CDP endpoint log redaction.
@@ -830,3 +930,15 @@ class TestKeywordWordBoundary:
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
 
+
+class TestMaskSecretControlStripping:
+    """Control bytes must not leak into visible masked output."""
+
+    def test_newline_stripped_from_mask(self):
+        assert mask_secret("ab\ncd0123456789zzzz") == "abcd...zzzz"
+
+    def test_c1_control_stripped_from_mask(self):
+        assert mask_secret("abcd0123456789zz\x85q") == "abcd...9zzq"
+
+    def test_printable_mask_unchanged(self):
+        assert mask_secret("abcdef0123456789zzzz") == "abcd...zzzz"

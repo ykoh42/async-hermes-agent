@@ -24,6 +24,39 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.conversation_loop import _get_continuation_prompt
 
 
+def _finalize_chat_stream_for_test(*, arguments: str, finish_reason=None):
+    from agent.chat_completion_helpers import _finalize_chat_stream
+
+    return _finalize_chat_stream(SimpleNamespace(
+        finish_reason=finish_reason,
+        content_parts=[],
+        reasoning_parts=[],
+        tool_calls_acc={0: {
+            "id": "call_x",
+            "name": "write_file",
+            "arguments": [arguments],
+        }},
+        resp_model="test/model",
+        usage=None,
+    ))
+
+
+def test_clean_stream_end_before_tool_arguments_is_partial_stub():
+    response = _finalize_chat_stream_for_test(arguments="")
+
+    assert response.id == PARTIAL_STREAM_STUB_ID
+    assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
+    assert response.choices[0].message.tool_calls is None
+    assert response._dropped_tool_names == ["write_file"]
+
+
+def test_empty_tool_arguments_are_valid_when_stream_finished():
+    response = _finalize_chat_stream_for_test(arguments="", finish_reason="tool_calls")
+
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert response.choices[0].message.tool_calls[0].function.arguments == ""
+
+
 # ── Length-continuation prompt branching ──────────────────────────────────
 
 class TestLengthContinuationPromptBranching:

@@ -606,7 +606,11 @@ class TestSubagentCostRollup(unittest.IsolatedAsyncioTestCase):
             ]
             result = json.loads(
                 await delegate_task(
-                    tasks=[{"goal": "A"}, {"goal": "B"}, {"goal": "C"}],
+                    tasks=[
+                        {"goal": "Analyze task A"},
+                        {"goal": "Analyze task B"},
+                        {"goal": "Analyze task C"},
+                    ],
                     parent_agent=parent,
                 )
             )
@@ -1097,6 +1101,61 @@ class TestDelegateHeartbeat(unittest.IsolatedAsyncioTestCase):
             f"got {len(touch_calls)} touches",
         )
 
+    async def test_heartbeat_does_not_trip_idle_stale_while_waiting_on_model(self):
+        """A slow model wait remains live while its activity clock advances."""
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        touch_calls = []
+        kept_going = asyncio.Event()
+
+        def record(desc):
+            touch_calls.append(desc)
+            if len(touch_calls) > 2:
+                kept_going.set()
+
+        parent._touch_activity = record
+
+        child = _make_child_mock()
+        activity = {"ts": 1000.0}
+
+        def summary():
+            activity["ts"] += 1.0
+            return {
+                "current_tool": None,
+                "api_call_count": 1,
+                "max_iterations": 50,
+                "last_activity_desc": "waiting for non-streaming API response",
+                "last_activity_ts": activity["ts"],
+            }
+
+        child.get_activity_summary.side_effect = summary
+
+        async def slow_run(**kwargs):
+            async with asyncio.timeout(5):
+                await kept_going.wait()
+            return {"final_response": "done", "completed": True, "api_calls": 1}
+
+        child.run_conversation.side_effect = slow_run
+
+        with (
+            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01),
+            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
+            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
+        ):
+            await _run_single_child(
+                task_index=0,
+                goal="Test slow model wait",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertGreater(
+            len(touch_calls),
+            2,
+            f"Heartbeat stopped too early while waiting on the model: {touch_calls}",
+        )
+
 
 class TestDelegationReasoningEffort(unittest.IsolatedAsyncioTestCase):
     """Tests for delegation.reasoning_effort config override."""
@@ -1470,7 +1529,10 @@ class TestOrchestratorEndToEnd(unittest.IsolatedAsyncioTestCase):
                 ):
                     # Re-entrant: orchestrator spawns two leaves
                     await delegate_task(
-                        tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
+                        tasks=[
+                            {"goal": "Analyze leaf A"},
+                            {"goal": "Analyze leaf B"},
+                        ],
                         parent_agent=m,
                     )
                     return {

@@ -41,7 +41,7 @@ Install the verified PyPI distribution and pin the package version in
 production:
 
 ```bash
-uv pip install "async-hermes-agent==0.20.0.5"
+uv pip install "async-hermes-agent==0.20.1.1"
 ```
 
 The same verified distributions and checksums are attached to the GitHub

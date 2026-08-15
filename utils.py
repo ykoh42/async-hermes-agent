@@ -142,6 +142,8 @@ def atomic_write_text(
     *,
     encoding: str = "utf-8",
     tmp_prefix: str = ".tmp_",
+    preserve_mode: bool = False,
+    create_mode: int | None = None,
 ) -> None:
     """Write *content* to *path* via temp file + fsync + atomic rename.
 
@@ -151,18 +153,36 @@ def atomic_write_text(
 
     Used by the memory store, skill manager, and agent importer so that
     every destructive file rewrite in the codebase shares one implementation.
+
+    Args:
+        preserve_mode: When true, preserve an existing target's permission
+            bits and (on POSIX) owner across the atomic replacement.
+        create_mode: Permission bits for a new target.  This is ignored for
+            an existing target and, without ``preserve_mode``, does not alter
+            the historical 0600 default for existing rewrites.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    original_mode = _preserve_file_mode(path) if preserve_mode else None
+    original_owner = _preserve_file_owner(path) if preserve_mode else None
+    effective_mode = original_mode
+    if effective_mode is None and create_mode is not None and not path.exists():
+        effective_mode = create_mode
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp"
     )
     try:
         with os.fdopen(fd, "w", encoding=encoding) as handle:
+            if effective_mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), effective_mode)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        atomic_replace(tmp_path, path)
+        real_path = atomic_replace(tmp_path, path)
+        if preserve_mode:
+            _restore_file_owner(Path(real_path), original_owner)
+        if effective_mode is not None and not hasattr(os, "fchmod"):
+            _restore_file_mode(Path(real_path), effective_mode)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -307,6 +327,7 @@ def atomic_yaml_write(
     default_flow_style: bool = False,
     sort_keys: bool = False,
     extra_content: str | None = None,
+    create_mode: int | None = None,
 ) -> None:
     """Write YAML data to a file atomically.
 
@@ -321,12 +342,16 @@ def atomic_yaml_write(
         sort_keys: Whether to sort dict keys (default False).
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
+        create_mode: Permission bits to apply when the target does not yet
+            exist. Existing targets keep their current mode.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     original_mode = _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
+    if original_mode is None and create_mode is not None and not path.exists():
+        original_mode = create_mode
 
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
@@ -335,6 +360,8 @@ def atomic_yaml_write(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if original_mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), original_mode)
             # allow_unicode=True writes emoji/kaomoji (e.g. personalities, skin
             # cursors) as real UTF-8 instead of fragile escape sequences. Without
             # it, PyYAML emits astral-plane chars as `\UXXXXXXXX` (8-digit) escapes

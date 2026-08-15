@@ -50,6 +50,13 @@ class TestMinimaxM3StaleCacheGuard:
         assert not _model_name_suggests_minimax_m3("MiniMax-M2.7")
         assert not _model_name_suggests_minimax_m3("MiniMax-M2.5")
 
+    async def test_stale_32k_guard_includes_minimax_m2(self):
+        from agent.model_metadata import _model_name_suggests_stale_32k_underreport
+
+        assert _model_name_suggests_stale_32k_underreport("MiniMax-M2.7")
+        assert _model_name_suggests_stale_32k_underreport("MiniMaxAI/MiniMax-M2.5")
+        assert not _model_name_suggests_stale_32k_underreport("openai/gpt-5.6")
+
 
 
     async def test_m2_cache_not_clobbered(self, tmp_path, monkeypatch):
@@ -65,6 +72,22 @@ class TestMinimaxM3StaleCacheGuard:
                 slug, base_url=base, api_key="", provider="minimax-cn"
             )
             assert ctx == 204_800, f"{slug} should stay 204800, got {ctx}"
+
+    async def test_stale_m2_32k_cache_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+
+        importlib.reload(mm)
+        base = "https://api.minimaxi.com/anthropic"
+        await mm.save_context_length("MiniMax-M2.7", base, 32768)
+        ctx = await mm.get_model_context_length(
+            "MiniMax-M2.7",
+            base_url=base,
+            api_key="",
+            provider="minimax-cn",
+        )
+        assert ctx == 204_800
 
 
 

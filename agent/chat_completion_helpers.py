@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
 from agent.secret_scope import UnscopedSecretError, get_secret
 from agent.turn_context import substitute_api_content
@@ -706,6 +707,13 @@ def _finalize_chat_stream(accumulator: Any) -> Any:
                         arguments = repaired
                     else:
                         has_truncated_tool_args = True
+            elif accumulator.finish_reason is None:
+                # A clean SSE close can arrive after the tool name but before
+                # the first arguments delta.  Do not let the dispatch boundary
+                # coerce the empty string to ``{}`` and execute a tool that was
+                # never fully emitted; route it through the same partial-stream
+                # continuation path as truncated JSON arguments.
+                has_truncated_tool_args = True
             tool_calls.append(
                 SimpleNamespace(
                     id=entry["id"],
@@ -935,6 +943,46 @@ async def interruptible_streaming_api_call(
     timeout = await _derive_stream_stale_timeout(agent, api_kwargs)
     loop = asyncio.get_running_loop()
     max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+    stream_hook_finished = False
+
+    def _stream_final_text(response: Any) -> str:
+        """Extract final text for the observer contract without changing wire data."""
+        try:
+            choices = getattr(response, "choices", None)
+            choice = choices[0] if isinstance(choices, (list, tuple)) and choices else None
+            content = getattr(getattr(choice, "message", None), "content", None)
+            if isinstance(content, str):
+                return content
+        except Exception:
+            pass
+        content = getattr(response, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(getattr(part, "text", ""))
+                for part in content
+                if isinstance(getattr(part, "text", None), str)
+            )
+        return ""
+
+    def _emit_stream_start_once() -> None:
+        emit = getattr(agent, "_emit_stream_start", None)
+        if callable(emit):
+            emit()
+
+    def _emit_stream_end_once(
+        *, final_text: str = "", finished: bool = False, error: str | None = None
+    ) -> None:
+        nonlocal stream_hook_finished
+        if stream_hook_finished:
+            return
+        stream_hook_finished = True
+        emit = getattr(agent, "_emit_stream_end", None)
+        if callable(emit):
+            emit(final_text=final_text, finished=finished, error=error)
+
+    _emit_stream_start_once()
 
     for stream_attempt in range(max_stream_retries + 1):
         if getattr(agent, "_interrupt_requested", False):
@@ -1015,9 +1063,11 @@ async def interruptible_streaming_api_call(
             finally:
                 heartbeat_stop.set()
                 await _finish_stream_heartbeat(heartbeat_task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            _emit_stream_end_once(error=str(exc) or type(exc).__name__)
             raise
-        except InterruptedError:
+        except InterruptedError as exc:
+            _emit_stream_end_once(error=str(exc))
             raise
         except Exception as caught:
             if getattr(agent, "_interrupt_requested", False):
@@ -1169,6 +1219,10 @@ async def interruptible_streaming_api_call(
                 )
                 if partial is not None:
                     _reset_stale_streak(agent)
+                    _emit_stream_end_once(
+                        final_text=_stream_final_text(partial),
+                        error=str(error),
+                    )
                     return partial
 
             if transient and stream_attempt < max_stream_retries:
@@ -1248,13 +1302,40 @@ async def interruptible_streaming_api_call(
                             "in config.yaml\n"
                         )
                 logger.exception("Streaming failed before delivery: %s", error)
+            _emit_stream_end_once(error=str(error))
             raise error
 
         if getattr(agent, "_interrupt_requested", False):
-            raise InterruptedError(
+            error = InterruptedError(
                 "Agent interrupted during streaming API call (post-worker)"
             )
+            _emit_stream_end_once(error=str(error))
+            raise error
+
+        # Anthropic's SDK can return a non-empty ``tool_use`` snapshot when an
+        # SSE stream closes between ``content_block_start`` and the first
+        # input delta.  A completed tool call always has a stop reason; without
+        # this guard the partial snapshot would execute with empty input.  Keep
+        # the check at the native async retry boundary so it covers both the
+        # raw SDK response and any provider adapter that materializes the same
+        # message shape.
+        if getattr(agent, "api_mode", None) == "anthropic_messages":
+            response_stop_reason = getattr(response, "stop_reason", None)
+            if response_stop_reason is None:
+                response_content = getattr(response, "content", None) or []
+                if any(
+                    getattr(block, "type", None) == "tool_use"
+                    for block in response_content
+                ):
+                    from agent.errors import EmptyStreamError
+
+                    raise EmptyStreamError(
+                        "Stream ended with no stop_reason while a tool_use "
+                        "block was still incomplete; treating as a "
+                        "mid-tool-call stream drop (#80498)."
+                    )
         _reset_stale_streak(agent)
+        _emit_stream_end_once(final_text=_stream_final_text(response), finished=True)
         return response
 
     raise AssertionError("unreachable stream retry state")
@@ -1463,6 +1544,17 @@ async def build_api_kwargs(
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = await agent._prepare_messages_for_non_vision_model(api_messages)
 
+        # Native server-side compaction is opt-in and self-gated to direct
+        # OpenAI/Codex routes and eligible model families.
+        from agent.native_compaction import native_compaction_context_management
+
+        _context_management = native_compaction_context_management(
+            agent,
+            is_codex_backend=is_codex_backend,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+        )
+
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
         # Most commonly hit when MCP-derived tools carry JSON Schema validation
@@ -1495,6 +1587,21 @@ async def build_api_kwargs(
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        web_search_provider = None
+        if is_xai_responses and tools_for_api:
+            try:
+                from agent.web_search_registry import get_active_search_provider
+
+                active_search_provider = await get_active_search_provider()
+                web_search_provider = getattr(active_search_provider, "name", None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The transport's synchronous boundary defaults to xAI native
+                # search when resolution is unavailable, matching upstream's
+                # fail-closed behavior.
+                web_search_provider = None
+
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
@@ -1512,6 +1619,8 @@ async def build_api_kwargs(
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            context_management=_context_management,
+            web_search_provider=web_search_provider,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -2053,6 +2162,22 @@ async def try_activate_fallback(agent, reason: FailoverReason | None = None) -> 
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
+        # Resolve the fallback wire mode from the original entry before the
+        # native runtime normalizes ``/anthropic`` to ``/v1``. An explicit
+        # value, including ``chat_completions``, is authoritative and must
+        # not be re-detected after client construction.
+        fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
+        if fb_api_mode_explicit:
+            fb_api_mode_hint = str(fb.get("api_mode")).strip()
+        elif fb_provider == "anthropic":
+            fb_api_mode_hint = "anthropic_messages"
+        elif fb_base_url_hint and (
+            fb_base_url_hint.rstrip("/").lower().endswith("/anthropic")
+            or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
+        ):
+            fb_api_mode_hint = "anthropic_messages"
+        else:
+            fb_api_mode_hint = None
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2070,6 +2195,7 @@ async def try_activate_fallback(agent, reason: FailoverReason | None = None) -> 
             "model": fb_model,
             "api_key": fb_api_key_hint,
             "base_url": fb_base_url_hint,
+            "api_mode": fb_api_mode_hint,
             # A fallback must not overwrite the next-turn primary snapshot.
             "update_primary": False,
         }
@@ -2081,7 +2207,9 @@ async def try_activate_fallback(agent, reason: FailoverReason | None = None) -> 
         # Preserve the existing transport-mode exceptions after native
         # credential resolution. These branches are pure URL/model policy.
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if fb_api_mode_explicit:
+            fb_api_mode = str(fb.get("api_mode")).strip()
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.

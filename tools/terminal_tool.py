@@ -42,6 +42,8 @@ from tools import ansi_strip as _ansi_strip_bootstrap  # noqa: F401
 from tools import file_tools as _file_tools_bootstrap  # noqa: F401
 from tools import interrupt as _interrupt_bootstrap
 from tools import process_registry as _process_registry_bootstrap  # noqa: F401
+from tools import shell_heredoc as _shell_heredoc_bootstrap  # noqa: F401
+from tools import self_repo_guard as _self_repo_guard_bootstrap  # noqa: F401
 from tools import tool_output_limits as _tool_output_limits_bootstrap  # noqa: F401
 from tools.environments.local import (
     LocalEnvironment,
@@ -54,13 +56,20 @@ from tools.environments.local import (
     build_subprocess_env,
     _set_sudo_password_callback as set_sudo_password_callback,
 )
-from tools.environments.base import BaseEnvironment
+from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
 from tools.environments import file_sync as _file_sync_bootstrap  # noqa: F401
 from tools.environments.singularity import SingularityEnvironment
 from tools.approval import check_all_command_guards
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_terminal_error_text(value: Any) -> str:
+    """Force-redact exception text before returning a terminal error envelope."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text("" if value is None else str(value), force=True)
 
 _TerminalScopeKey = tuple[asyncio.AbstractEventLoop | object, str]
 _TERMINAL_NO_LOOP = object()
@@ -125,6 +134,7 @@ async def _activate_terminal_scope() -> _TerminalScopeKey:
             _last_activity,
             _task_env_overrides,
             _session_cwds,
+            _container_aliases,
         ):
             migrate = getattr(scoped, "migrate", None)
             if callable(migrate):
@@ -233,6 +243,8 @@ _cleanup_lifetimes: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 _task_env_overrides: MutableMapping[str, dict[str, Any]] = _ScopedTerminalDict()
 _session_cwds: MutableMapping[str, str] = _ScopedTerminalDict()
+_container_aliases: MutableMapping[str, str] = _ScopedTerminalDict()
+_container_alias_lock = threading.RLock()
 _CONTAINER_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
 )
@@ -248,6 +260,7 @@ def _prune_closed_terminal_loops() -> None:
         _last_activity,
         _task_env_overrides,
         _session_cwds,
+        _container_aliases,
     ):
         prune = getattr(scoped, "prune_closed_loops", None)
         if callable(prune):
@@ -381,6 +394,14 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
 
 
 def _strip_quotes(command: str) -> str:
+    try:
+        from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+        command = strip_inert_heredoc_bodies(command)
+    except Exception:
+        # The quote scanner remains the conservative fallback if the optional
+        # heredoc helper cannot be imported during process bootstrap.
+        pass
     result = re.sub(r"'[^']*'", "''", command)
     result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
     return re.sub(r"`[^`]*`", "``", result)
@@ -870,7 +891,13 @@ async def _get_modal_backend_state(modal_mode: object | None) -> dict[str, Any]:
 
 
 def _resolve_container_task_id(task_id: str | None) -> str:
-    """Map a tool-call task id to its shared or isolated sandbox key."""
+    """Map a task id to its shared or per-session sandbox key.
+
+    Backend/image overrides remain the explicit isolation signal used by the
+    existing rollout API.  Docker with ``container_persistent=false`` also
+    gets upstream's retained per-session isolation; subagent aliases resolve
+    back to their parent's container without changing their task identity.
+    """
     isolation_keys = frozenset(
         {
             "docker_image",
@@ -884,7 +911,41 @@ def _resolve_container_task_id(task_id: str | None) -> str:
         overrides = _task_env_overrides[task_id]
         if set(overrides) & isolation_keys:
             return task_id
+    if task_id and _docker_session_isolation_enabled():
+        return _resolve_container_alias(task_id)
     return "default"
+
+
+def _docker_session_isolation_enabled() -> bool:
+    """Whether non-persistent Docker sessions get distinct containers."""
+    from agent.secret_scope import get_secret
+
+    env_type = get_secret("TERMINAL_ENV", "local")
+    persistent = get_secret("TERMINAL_CONTAINER_PERSISTENT", "true")
+    return str(env_type or "local").lower() == "docker" and str(
+        persistent or "true"
+    ).lower() not in {"true", "1", "yes"}
+
+
+def register_container_alias(
+    child_task_id: str, parent_task_id: str | None
+) -> None:
+    """Make a delegated child resolve to its parent's sandbox."""
+    if not child_task_id:
+        return
+    with _container_alias_lock:
+        _container_aliases[child_task_id] = str(parent_task_id or "default")
+
+
+def _resolve_container_alias(task_id: str) -> str:
+    """Follow child→parent aliases without looping on malformed input."""
+    seen: set[str] = set()
+    key = task_id
+    with _container_alias_lock:
+        while key in _container_aliases and key not in seen:
+            seen.add(key)
+            key = _container_aliases[key]
+    return key
 
 
 def _get_approval_callback() -> Callable[..., Any] | None:
@@ -1029,6 +1090,8 @@ def clear_task_env_overrides(task_id: str) -> None:
     key = str(task_id or "default")
     _task_env_overrides.pop(key, None)
     clear_session_cwd(key)
+    with _container_alias_lock:
+        _container_aliases.pop(key, None)
 
 
 def get_session_cwd(session_key: str | None) -> str | None:
@@ -1054,6 +1117,36 @@ def clear_session_cwd(session_key: str) -> None:
         _session_cwds.pop(session_key, None)
 
 
+def _resolve_task_host_cwd(
+    config: dict[str, Any], task_id: str | None
+) -> str | None:
+    """Resolve the host path allowed for a Docker ``/workspace`` mount.
+
+    In per-session Docker mode a process-global ``TERMINAL_CWD``/config path
+    is not a valid mount source for a fresh session.  Only a cwd explicitly
+    attached to that session is accepted; the legacy shared-container path is
+    preserved for the default task and persistent containers.
+    """
+    if config.get("env_type") != "docker":
+        return None
+    if not config.get("docker_mount_cwd_to_workspace"):
+        return None
+    if not _docker_session_isolation_enabled():
+        return config.get("host_cwd")
+    if _resolve_container_task_id(task_id) == "default":
+        return config.get("host_cwd")
+    overrides = resolve_task_overrides(task_id)
+    if overrides.get("cwd_source") == "process":
+        return None
+    candidate = overrides.get("cwd")
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    candidate = os.path.abspath(os.path.expanduser(candidate))
+    if not os.path.isdir(candidate) or candidate.startswith(("/workspace", "/root")):
+        return None
+    return candidate
+
+
 def _create_environment(
     env_type: str,
     image: str,
@@ -1077,7 +1170,16 @@ def _create_environment(
     if env_type == "docker":
         from tools.environments.docker import DockerEnvironment
 
-        return DockerEnvironment(
+        session_scoped = (
+            _docker_session_isolation_enabled()
+            and task_id != "default"
+            and not (
+                task_id
+                and set(resolve_task_overrides(task_id))
+                & {"docker_image", "modal_image", "singularity_image", "daytona_image", "env_type"}
+            )
+        )
+        docker_env = DockerEnvironment(
             image=image,
             cwd=cwd,
             timeout=timeout,
@@ -1096,11 +1198,19 @@ def _create_environment(
             run_as_host_user=container.get("docker_run_as_host_user", False),
             network=container.get("docker_network", True),
             extra_args=container.get("docker_extra_args", []),
-            persist_across_processes=container.get(
-                "docker_persist_across_processes", True
+            persist_across_processes=(
+                False
+                if session_scoped
+                else container.get("docker_persist_across_processes", True)
             ),
             shm_size=container.get("docker_shm_size", "1g"),
         )
+        if session_scoped:
+            try:
+                docker_env._session_scoped = True
+            except AttributeError:
+                pass
+        return docker_env
     if env_type == "singularity":
         return SingularityEnvironment(
             image=image,
@@ -1202,11 +1312,39 @@ def get_active_env(task_id: str):
         return _active_environments.get(key)
 
 
+async def ensure_task_env(task_id: str | None = None):
+    """Lazily create the selected sandbox for a task when it is non-local.
+
+    Image and media tools may need a remote sandbox before the first terminal
+    command.  Local paths intentionally remain host-side, so the local
+    backend is a no-op.  Bring-up is best-effort: a failed native backend
+    leaves the caller's existing fail-closed path intact.
+    """
+    config = await _get_env_config()
+    if str(config.get("env_type") or "local") == "local":
+        return None
+    try:
+        return await _get_or_create_environment(task_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - best-effort lazy bring-up
+        effective_task_id = _resolve_container_task_id(task_id)
+        logger.warning(
+            "Lazy terminal environment init failed for task %s: %s",
+            effective_task_id[:8],
+            exc,
+        )
+        return None
+
+
 def is_persistent_env(task_id: str) -> bool:
     env = get_active_env(task_id)
     if env is None:
         return False
-    return bool(getattr(env, "_persistent", False))
+    return bool(
+        getattr(env, "_persistent", False)
+        or getattr(env, "_session_scoped", False)
+    )
 
 
 def _get_creation_lock(task_id: str) -> asyncio.Lock:
@@ -1270,7 +1408,7 @@ async def _get_or_create_environment(
             container_config=config,
             local_config=config,
             task_id=raw_key,
-            host_cwd=config.get("host_cwd"),
+            host_cwd=_resolve_task_host_cwd(config, task_id),
         )
         await env._ensure_initialized()
         with _env_lock:
@@ -1500,6 +1638,32 @@ async def cleanup_all_environments() -> int:  # noqa: ASYNC124 - lifecycle API
     return cleaned
 
 
+def _resolve_command_cwd(
+    *,
+    workdir: str | None,
+    default_cwd: str,
+    session_key: str | None = None,
+    env_type: str | None = None,
+) -> str:
+    """Resolve one command's cwd with container-host path protection."""
+    if workdir:
+        return workdir
+    recorded = get_session_cwd(session_key)
+    if (
+        recorded
+        and env_type in _CONTAINER_BACKENDS
+        and _is_unusable_container_cwd(recorded)
+    ):
+        logger.info(
+            "Ignoring recorded session cwd %r for %s backend; using %r",
+            recorded,
+            env_type,
+            default_cwd,
+        )
+        return default_cwd
+    return recorded or default_cwd
+
+
 
 
 async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
@@ -1566,7 +1730,7 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
                 {
                     "output": "",
                     "exit_code": -1,
-                    "error": (
+                    "error": _redact_terminal_error_text(
                         "Terminal tool disabled: environment creation failed "
                         f"({exc})"
                     ),
@@ -1578,12 +1742,32 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
-        cwd = str(
-            workdir
-            or get_session_cwd(session_key)
-            or get_session_cwd(task_id)
-            or env.cwd
+        cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=str(env.cwd),
+            session_key=session_key or task_id,
+            env_type=env_type,
         )
+        # A local command that rewrites the checkout backing this interpreter
+        # can mix module versions in the running process.  This guard is
+        # deliberately non-bypassable and does not apply to remote sandboxes.
+        if env_type == "local":
+            from tools.self_repo_guard import detect_self_repo_git_mutation
+
+            self_repo_hit, self_repo_message = detect_self_repo_git_mutation(
+                command,
+                cwd,
+            )
+            if self_repo_hit:
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 1,
+                        "error": self_repo_message,
+                        "status": "blocked",
+                    },
+                    ensure_ascii=False,
+                )
         if env_type == "local" and not workdir and not await _cwd_usable(cwd):
             recovered = await _resolve_safe_cwd(cwd)
             logger.warning(
@@ -1745,7 +1929,9 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
                     {
                         "output": "",
                         "exit_code": -1,
-                        "error": f"Failed to start background process: {exc}",
+                        "error": _redact_terminal_error_text(
+                            f"Failed to start background process: {exc}"
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -1806,7 +1992,7 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
                         {
                             "output": "",
                             "exit_code": -1,
-                            "error": (
+                            "error": _redact_terminal_error_text(
                                 "Command execution failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
@@ -1933,6 +2119,36 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
         return json.dumps(payload, ensure_ascii=False)
     except asyncio.CancelledError:
         raise
+    except EnvironmentConnectionError as exc:
+        degraded_mode = os.getenv("TERMINAL_DEGRADED_MODE", "warn").strip().lower()
+        if degraded_mode == "fail":
+            import traceback
+
+            traceback_text = traceback.format_exc()
+            logger.error("terminal_tool exception:\n%s", traceback_text)
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": _redact_terminal_error_text(
+                        f"Failed to execute command: {exc}"
+                    ),
+                    "traceback": _redact_terminal_error_text(traceback_text),
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "status": "degraded",
+                "reason": exc.reason,
+                "retry_hint": exc.retry_hint,
+                "error": f"Terminal backend degraded: {exc.reason}",
+            },
+            ensure_ascii=False,
+        )
     except Exception as exc:
         import traceback
 
@@ -1942,8 +2158,10 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
             {
                 "output": "",
                 "exit_code": -1,
-                "error": f"Failed to execute command: {exc}",
-                "traceback": traceback_text,
+                "error": _redact_terminal_error_text(
+                    f"Failed to execute command: {exc}"
+                ),
+                "traceback": _redact_terminal_error_text(traceback_text),
                 "status": "error",
             },
             ensure_ascii=False,
@@ -2032,15 +2250,16 @@ async def _prepare_terminal_output(
             ) as handle:
                 raw_spill = await handle.read()
             sanitized_spill = redact_terminal_output(strip_ansi(raw_spill), command)
-            async with aiofiles.open(
+            from tools.spill_safety import _write_text_exclusive_async
+
+            await _write_text_exclusive_async(
                 spill_path,
-                "w",
+                sanitized_spill,
+                private=True,
+                overwrite=True,
                 encoding="utf-8",
                 errors="replace",
-            ) as handle:
-                await handle.write(sanitized_spill)
-                await handle.flush()
-                await aiofiles.os.wrap(os.fsync)(handle.fileno())
+            )
             await aiofiles.os.wrap(os.chmod)(spill_path, 0o600)
             total = raw_total_chars if raw_total_chars is not None else len(raw_spill)
             metadata = {

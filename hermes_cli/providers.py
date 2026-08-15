@@ -205,6 +205,12 @@ HERMES_OVERLAYS: dict[str, HermesOverlay] = {
         extra_env_vars=("FIREWORKS_API_KEY",),
         base_url_override="https://api.fireworks.ai/inference/v1",
     ),
+    "actual": HermesOverlay(
+        transport="codex_responses",
+        extra_env_vars=("ACTUAL_API_KEY", "ACTUAL_BASE_URL"),
+        base_url_override="https://api.actual.inc/v1",
+        base_url_env_var="ACTUAL_BASE_URL",
+    ),
     "upstage": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("UPSTAGE_API_KEY",),
@@ -376,6 +382,11 @@ ALIASES: dict[str, str] = {
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
 
+    # Actual Computer
+    "actual-computer": "actual",
+    "actualcomputer": "actual",
+    "aci": "actual",
+
     # fireworks
     "fireworks-ai": "fireworks",
     "fw": "fireworks",
@@ -407,6 +418,7 @@ _LABEL_OVERRIDES: dict[str, str] = {
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
+    "actual": "Actual Computer",
     "upstage": "Upstage Solar",
     "tencent-tokenhub": "Tencent TokenHub",
     "lmstudio": "LM Studio",

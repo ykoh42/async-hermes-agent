@@ -16,6 +16,7 @@ import aiosqlite
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_STALE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
@@ -23,6 +24,7 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
 )
@@ -315,6 +317,106 @@ class SessionSchemaMixin:
                 return False
             raise
 
+    async def _recover_stale_fts(self, cursor: Any, *, legacy: bool) -> bool:
+        """Atomically rebuild stale FTS indexes and restore their triggers."""
+        try:
+            trigram_status = await self._fts_table_probe(
+                cursor, "messages_fts_trigram"
+            )
+        except sqlite3.DatabaseError:
+            # A corrupt virtual table may fail even a LIMIT 0 probe. Include
+            # it in the drop-and-recreate recovery in that case.
+            trigram_status = True
+        include_trigram = trigram_status is True
+
+        drop_sql = "".join(
+            f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS
+        )
+        drop_sql += "".join(
+            f"DROP TRIGGER IF EXISTS {trigger};"
+            for trigger in _FTS_CJK_TRIGGERS
+        )
+        if include_trigram:
+            drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
+        drop_sql += (
+            "DROP VIEW IF EXISTS messages_fts_trigram_src;"
+            "DROP TABLE IF EXISTS messages_fts;"
+        )
+
+        if legacy:
+            schema_sql = LEGACY_FTS_SQL
+            if include_trigram:
+                schema_sql += LEGACY_FTS_TRIGRAM_SQL
+            rebuild_sql = schema_sql + """
+                INSERT INTO messages_fts(rowid, content)
+                SELECT id,
+                       COALESCE(content, '') || ' ' ||
+                       COALESCE(tool_name, '') || ' ' ||
+                       COALESCE(tool_calls, '')
+                FROM messages;
+            """
+            if include_trigram:
+                rebuild_sql += """
+                    DELETE FROM messages_fts_trigram;
+                    INSERT INTO messages_fts_trigram(rowid, content)
+                    SELECT id,
+                           COALESCE(content, '') || ' ' ||
+                           COALESCE(tool_name, '') || ' ' ||
+                           COALESCE(tool_calls, '')
+                    FROM messages;
+                """
+        else:
+            schema_sql = FTS_SQL
+            if include_trigram:
+                schema_sql += FTS_TRIGRAM_SQL
+            rebuild_sql = schema_sql + (
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+            )
+            if include_trigram:
+                rebuild_sql += (
+                    "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                    "VALUES('rebuild');"
+                )
+            rebuild_sql += (
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_rebuild_high_water', 'fts_rebuild_progress');"
+            )
+
+        recovery_sql = (
+            "BEGIN IMMEDIATE;"
+            + drop_sql
+            + rebuild_sql
+            + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
+            + "COMMIT;"
+        )
+        try:
+            await cursor.executescript(recovery_sql)
+        except sqlite3.DatabaseError as exc:
+            try:
+                await cursor.rollback()
+            except sqlite3.Error:
+                pass
+            try:
+                await self._drop_all_fts_triggers(cursor)  # type: ignore[attr-defined]
+                await cursor.commit()
+            except sqlite3.Error:
+                pass
+            logger.error(
+                "Automatic rebuild of stale FTS indexes failed (%s); "
+                "canonical writes remain enabled with FTS detached.",
+                exc,
+            )
+            return False
+
+        self._fts_stale = False
+        self._fts_enabled = True
+        self._trigram_available = include_trigram
+        logger.warning(
+            "Rebuilt stale state.db FTS indexes from canonical messages and "
+            "restored async sync triggers."
+        )
+        return True
+
     @staticmethod
     async def _parse_schema_columns(
         schema_sql: str,
@@ -522,6 +624,16 @@ class SessionSchemaMixin:
 
         fts5_available = await self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
+        async with cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+            (FTS_STALE_KEY,),
+        ) as stale_cursor:
+            self._fts_stale = await stale_cursor.fetchone() is not None
+        if self._fts_stale:
+            # A prior process detached FTS after corruption. Never recreate
+            # triggers opportunistically; only a complete rebuild may clear
+            # the durable marker and restore sync.
+            await self._drop_all_fts_triggers(cursor)  # type: ignore[attr-defined]
         if not fts5_available:
             await self._drop_fts_triggers(cursor)  # type: ignore[unresolved-attribute]
 
@@ -731,7 +843,19 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError:
             pass
 
-        if fts5_available:
+        if fts5_available and self._fts_stale:
+            legacy_fts = await self._db_has_legacy_inline_fts(  # type: ignore[unresolved-attribute]
+                cursor
+            )
+            if await self._recover_stale_fts(cursor, legacy=legacy_fts):
+                await self._ensure_fts_cjk_schema(  # type: ignore[unresolved-attribute]
+                    cursor
+                )
+            else:
+                self._fts_enabled = False
+                self._trigram_available = False
+                self._fts_cjk_available = False
+        elif fts5_available:
             if await self._db_has_legacy_inline_fts(  # type: ignore[unresolved-attribute]
                 cursor
             ):

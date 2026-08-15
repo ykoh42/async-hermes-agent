@@ -87,6 +87,7 @@ def _quiet_compressor() -> MagicMock:
     compressor.should_compress_info.return_value = (False, None)
     compressor.should_defer_preflight_to_real_usage.return_value = True
     compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor._commit_proactive_prune = AsyncMock(return_value=True)
     return compressor
 
 
@@ -108,6 +109,7 @@ def agent():
     a.client = MagicMock()
     a.client.chat.completions.create = AsyncMock()
     a._deferred_provider_runtime = None
+    a._context_engine_started = True
     a.tools = _make_tool_defs("web_search")
     a.valid_tool_names = {"web_search"}
     a._tool_snapshot_initialized = True

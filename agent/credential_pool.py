@@ -96,6 +96,11 @@ SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_LEAST_USED,
 }
 
+
+async def get_env_prefer_dotenv(key: str) -> str:
+    """Return a credential with the user's dotenv value taking precedence."""
+    return (await get_env_value_prefer_dotenv(key) or "").strip()
+
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
 # 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
@@ -103,6 +108,8 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60  # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60  # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60  # 1 hour
+EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60  # 1 minute
+FAILURE_REASON_BILLING = "billing"
 
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
@@ -139,6 +146,7 @@ _EXTRA_KEYS = frozenset({
     "tls",
     "secret_source",
     "secret_fingerprint",
+    "failure_reason",
 })
 
 
@@ -284,13 +292,26 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
-def _exhausted_ttl(error_code: int | None) -> int:
-    """Return cooldown seconds based on the HTTP status that caused exhaustion."""
+def _exhausted_ttl(
+    error_code: int | None,
+    *,
+    sole_credential: bool = False,
+    failure_reason: str | None = None,
+) -> int:
+    """Return the cooldown for an exhausted credential.
+
+    A sole credential should retry transient throttles promptly because there
+    is no fallback to rotate to.  Billing failures remain fully benched even
+    when their provider reports them as a 403; the classifier's reason is
+    persisted in ``extra`` so a reload preserves that distinction.
+    """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
-    if error_code == 429:
-        return EXHAUSTED_TTL_429_SECONDS
-    return EXHAUSTED_TTL_DEFAULT_SECONDS
+    base = EXHAUSTED_TTL_429_SECONDS if error_code == 429 else EXHAUSTED_TTL_DEFAULT_SECONDS
+    is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
+    if sole_credential and not is_billing:
+        return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
+    return base
 
 
 def _parse_absolute_timestamp(value: Any) -> float | None:
@@ -379,14 +400,22 @@ def _normalize_error_context(error_context: dict[str, Any] | None) -> dict[str, 
     return normalized
 
 
-def _exhausted_until(entry: PooledCredential) -> float | None:
+def _exhausted_until(
+    entry: PooledCredential,
+    *,
+    sole_credential: bool = False,
+) -> float | None:
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(getattr(entry, "last_error_reset_at", None))
     if reset_at is not None:
         return reset_at
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+        return entry.last_status_at + _exhausted_ttl(
+            entry.last_error_code,
+            sole_credential=sole_credential,
+            failure_reason=getattr(entry, "failure_reason", None),
+        )
     return None
 
 
@@ -698,6 +727,8 @@ class CredentialPool:
         entry: PooledCredential,
         status_code: int | None,
         error_context: dict[str, Any] | None = None,
+        *,
+        failure_reason: str | None = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
@@ -711,6 +742,11 @@ class CredentialPool:
             terminal_status = STATUS_DEAD
         else:
             terminal_status = STATUS_EXHAUSTED
+        updated_extra = dict(entry.extra)
+        if failure_reason:
+            updated_extra["failure_reason"] = failure_reason
+        else:
+            updated_extra.pop("failure_reason", None)
         updated = replace(
             entry,
             last_status=terminal_status,
@@ -719,6 +755,7 @@ class CredentialPool:
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
             last_error_reset_at=normalized_error.get("reset_at"),
+            extra=updated_extra,
         )
         self._replace_entry(entry, updated)
         return updated
@@ -944,6 +981,7 @@ class CredentialPool:
         *,
         clear_expired: bool = False,
         allow_refresh: bool = True,
+        lock_held: bool = False,
     ) -> list[PooledCredential]:
         """Return entries usable without invoking a synchronous refresher.
 
@@ -957,6 +995,9 @@ class CredentialPool:
         changed = False
         entries_to_prune: list[str] = []
         available: list[PooledCredential] = []
+        sole_credential = sum(
+            1 for candidate in self._entries if candidate.last_status != STATUS_DEAD
+        ) <= 1
         for entry in list(self._entries):
             # Reference-only API-key rows are hydrated by the legacy CLI
             # loader.  They must never be selected by the async turn with an
@@ -971,7 +1012,10 @@ class CredentialPool:
                         changed = True
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
-                exhausted_until = _exhausted_until(entry)
+                exhausted_until = _exhausted_until(
+                    entry,
+                    sole_credential=sole_credential,
+                )
                 if exhausted_until is not None and now < exhausted_until:
                     continue
                 if clear_expired:
@@ -996,7 +1040,11 @@ class CredentialPool:
             if entry.auth_type == AUTH_TYPE_OAUTH and self._entry_needs_refresh(entry):
                 if not allow_refresh:
                     continue
-                refreshed = await self._refresh_entry(entry, force=False)
+                refreshed = await self._refresh_entry(
+                    entry,
+                    force=False,
+                    lock_held=lock_held,
+                )
                 if refreshed is None:
                     continue
                 entry = refreshed
@@ -1016,6 +1064,7 @@ class CredentialPool:
         available = await self._available_entries(
             clear_expired=True,
             allow_refresh=allow_refresh,
+            lock_held=True,
         )
         if not available:
             self._current_id = None
@@ -1100,26 +1149,47 @@ class CredentialPool:
         """Return the current or next usable credential without selecting it."""
         async with self._lock:
             return self._current_unlocked() or next(
-                iter(await self._available_entries(allow_refresh=False)),
+                iter(
+                    await self._available_entries(
+                        allow_refresh=False,
+                        lock_held=True,
+                    )
+                ),
                 None,
             )
 
     async def has_available(self) -> bool:
         """Check pool availability without a synchronous token refresh."""
         async with self._lock:
-            return bool(await self._available_entries(allow_refresh=False))
+            return bool(
+                await self._available_entries(
+                    allow_refresh=False,
+                    lock_held=True,
+                )
+            )
 
     async def next_available_at(self) -> float | None:
         """Return the earliest known epoch when an exhausted entry recovers."""
         async with self._lock:
-            available = await self._available_entries(allow_refresh=False)
+            available = await self._available_entries(
+                allow_refresh=False,
+                lock_held=True,
+            )
             if available:
                 return None
+            sole_credential = sum(
+                1 for entry in self._entries if entry.last_status != STATUS_DEAD
+            ) <= 1
             candidates = [
                 exhausted_until
                 for entry in self._entries
                 if entry.last_status == STATUS_EXHAUSTED
-                and (exhausted_until := _exhausted_until(entry)) is not None
+                and (
+                    exhausted_until := _exhausted_until(
+                        entry,
+                        sole_credential=sole_credential,
+                    )
+                ) is not None
             ]
             return min(candidates) if candidates else None
 
@@ -1130,6 +1200,7 @@ class CredentialPool:
         error_context: dict[str, Any] | None = None,
         api_key_hint: str | None = None,
         credential_id: str | None = None,
+        failure_reason: str | None = None,
     ) -> PooledCredential | None:
         """Async-agent implementation of the existing rotate-after-failure rule.
 
@@ -1149,6 +1220,24 @@ class CredentialPool:
                     ),
                     None,
                 )
+                # A per-turn environment refresh can leave the caller's
+                # entry id stale while the request still carries the key
+                # that actually failed.  When both identities disagree,
+                # attribute the failure to the key-matched entry rather than
+                # quarantining a healthy fallback (#79156).
+                if (
+                    entry is not None
+                    and api_key_hint
+                    and entry.runtime_api_key != api_key_hint
+                ):
+                    entry = next(
+                        (
+                            candidate
+                            for candidate in self._entries
+                            if candidate.runtime_api_key == api_key_hint
+                        ),
+                        None,
+                    )
             if entry is None and api_key_hint:
                 entry = next(
                     (
@@ -1160,7 +1249,9 @@ class CredentialPool:
                 )
             if entry is None and identity_supplied:
                 self._unmatched_rotation_streak += 1
-                available_count = len(await self._available_entries())
+                available_count = len(
+                    await self._available_entries(lock_held=True)
+                )
                 if self._unmatched_rotation_streak > max(available_count, 1):
                     logger.warning(
                         "credential pool: failed credential identity matched no %s entry "
@@ -1174,7 +1265,9 @@ class CredentialPool:
                     return None
                 self._current_id = None
                 next_entry = await self._select_unlocked()
-                if next_entry is not None and len(await self._available_entries()) == 1:
+                if next_entry is not None and len(
+                    await self._available_entries(lock_held=True)
+                ) == 1:
                     self._unmatched_rotation_streak = 0
                     self._current_id = None
                     return None
@@ -1186,7 +1279,12 @@ class CredentialPool:
             if entry is None:
                 return None
             label = entry.label or entry.id[:8]
-            self._mark_exhausted(entry, status_code, error_context)
+            self._mark_exhausted(
+                entry,
+                status_code,
+                error_context,
+                failure_reason=failure_reason,
+            )
             failed_runtime_key = entry.runtime_api_key
             if identity_supplied and failed_runtime_key:
                 for sibling in list(self._entries):
@@ -1194,7 +1292,12 @@ class CredentialPool:
                         sibling.id != entry.id
                         and sibling.runtime_api_key == failed_runtime_key
                     ):
-                        self._mark_exhausted(sibling, status_code, error_context)
+                        self._mark_exhausted(
+                            sibling,
+                            status_code,
+                            error_context,
+                            failure_reason=failure_reason,
+                        )
             await self._persist()
             updated_entry = next(
                 (candidate for candidate in self._entries if candidate.id == entry.id),
@@ -1249,13 +1352,51 @@ class CredentialPool:
             entry = entry or self._current_unlocked()
             if entry is None or entry.auth_type != AUTH_TYPE_OAUTH:
                 return None
-            return await self._refresh_entry(entry, force=True)
+            return await self._refresh_entry(
+                entry,
+                force=True,
+                lock_held=True,
+            )
+
+    def _quarantine_entries(self, sources: set[str]) -> list[str]:
+        """Remove terminal singleton entries from the in-memory pool.
+
+        The caller supplies the async-lock ownership state through
+        :meth:`_quarantine_entries_async`; keeping this tiny mutation
+        synchronous avoids holding an asyncio lock across auth-store I/O.
+        """
+        removed_ids = [
+            candidate.id
+            for candidate in self._entries
+            if candidate.source in sources
+        ]
+        self._entries = [
+            candidate
+            for candidate in self._entries
+            if candidate.source not in sources
+        ]
+        if self._current_id in removed_ids:
+            self._current_id = None
+        return removed_ids
+
+    async def _quarantine_entries_async(
+        self,
+        sources: set[str],
+        *,
+        lock_held: bool,
+    ) -> list[str]:
+        """Atomically quarantine entries on both native refresh call paths."""
+        if lock_held:
+            return self._quarantine_entries(sources)
+        async with self._lock:
+            return self._quarantine_entries(sources)
 
     async def _refresh_entry(
         self,
         entry: PooledCredential,
         *,
         force: bool,
+        lock_held: bool = False,
     ) -> PooledCredential | None:
         """Refresh an OAuth entry through its native provider transport."""
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
@@ -1585,18 +1726,10 @@ class CredentialPool:
                                         state,
                                         set_active=False,
                                     )
-                        removed_ids = [
-                            candidate.id
-                            for candidate in self._entries
-                            if candidate.source == "device_code"
-                        ]
-                        self._entries = [
-                            candidate
-                            for candidate in self._entries
-                            if candidate.source != "device_code"
-                        ]
-                        if self._current_id in removed_ids:
-                            self._current_id = None
+                        removed_ids = await self._quarantine_entries_async(
+                            {"device_code"},
+                            lock_held=lock_held,
+                        )
                         auth_mod._merge_credential_pool_entries(
                             auth_store,
                             self.provider,
@@ -1680,18 +1813,10 @@ class CredentialPool:
                                 state,
                                 set_active=False,
                             )
-                        removed_ids = [
-                            candidate.id
-                            for candidate in self._entries
-                            if candidate.source == "device_code"
-                        ]
-                        self._entries = [
-                            candidate
-                            for candidate in self._entries
-                            if candidate.source != "device_code"
-                        ]
-                        if self._current_id in removed_ids:
-                            self._current_id = None
+                        removed_ids = await self._quarantine_entries_async(
+                            {"device_code"},
+                            lock_held=lock_held,
+                        )
                         auth_mod._merge_credential_pool_entries(
                             auth_store,
                             self.provider,
@@ -1726,7 +1851,10 @@ class CredentialPool:
                 self._current_id = credential_id
                 return credential_id
 
-            available = await self._available_entries(clear_expired=True)
+            available = await self._available_entries(
+                clear_expired=True,
+                lock_held=True,
+            )
             if not available:
                 return None
 
@@ -1761,7 +1889,11 @@ class CredentialPool:
             entry = self._current_unlocked()
             if entry is None:
                 return None
-            refreshed = await self._refresh_entry(entry, force=True)
+            refreshed = await self._refresh_entry(
+                entry,
+                force=True,
+                lock_held=True,
+            )
             if refreshed is not None:
                 self._current_id = refreshed.id
             return refreshed
@@ -1870,6 +2002,11 @@ def _upsert_entry(
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
+    token_changed = (
+        "access_token" in payload
+        and payload["access_token"] is not None
+        and payload["access_token"] != existing.access_token
+    )
     for key, value in payload.items():
         if key in {"id", "priority"} or value is None:
             continue
@@ -1881,6 +2018,15 @@ def _upsert_entry(
         elif key in _EXTRA_KEYS:
             if existing.extra.get(key) != value:
                 extra_updates[key] = value
+    if token_changed and existing.last_status is not None:
+        field_updates.update(
+            last_status=None,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
     if field_updates or extra_updates:
         if extra_updates:
             field_updates["extra"] = {**existing.extra, **extra_updates}
@@ -2276,7 +2422,7 @@ async def _seed_from_env(
     # processes (Codex CLI, test scripts, etc.) should not override deliberate
     # changes to the .env file.
     async def _get_env_prefer_dotenv(key: str) -> str:
-        return (await get_env_value_prefer_dotenv(key) or "").strip()
+        return await get_env_prefer_dotenv(key)
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it

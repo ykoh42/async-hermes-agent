@@ -40,11 +40,11 @@ async def test_concurrent_profiles_isolate_vision_and_video_model_overrides(
     monkeypatch.setenv("AUXILIARY_VIDEO_MODEL", "process-video")
     set_multiplex_active(True)
 
-    async def echo_vision(_url, _prompt, model, task_id=None):
+    async def echo_vision(_url, _prompt, model, task_id=None, region=None):
         await asyncio.sleep(0)
         return (model, task_id)
 
-    async def echo_video(_url, _prompt, model):
+    async def echo_video(_url, _prompt, model, task_id=None):
         await asyncio.sleep(0)
         return model
 

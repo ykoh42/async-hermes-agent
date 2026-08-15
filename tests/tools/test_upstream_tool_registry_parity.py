@@ -104,11 +104,11 @@ def test_public_coroutine_signatures_preserve_upstream_args_and_defaults():
             [
                 "action", "name", "content", "category", "file_path",
                 "file_content", "old_string", "new_string", "replace_all",
-                "absorbed_into",
+                "absorbed_into", "task_id", "session_id",
             ],
             [
                 inspect.Parameter.empty, inspect.Parameter.empty, None, None,
-                None, None, None, None, False, None,
+                None, None, None, None, False, None, None, None,
             ],
         ),
         terminal_tool.terminal_tool: (
@@ -346,6 +346,8 @@ async def test_named_handlers_preserve_upstream_lambda_forwarding(monkeypatch):
         new_string=None,
         replace_all=False,
         absorbed_into=None,
+        task_id=None,
+        session_id=None,
     )
 
     assert await tts_tool._handle_text_to_speech(

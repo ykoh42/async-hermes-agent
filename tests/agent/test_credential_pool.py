@@ -142,6 +142,56 @@ async def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, m
     assert statuses["cred-model-config"] == STATUS_EXHAUSTED
 
 
+async def test_stale_credential_id_prefers_api_key_hint(tmp_path, monkeypatch):
+    """A disagreeing id/key pair must quarantine the key that ran."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        AsyncMock(return_value=None),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-primary",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-api-primary",
+                    },
+                    {
+                        "id": "cred-backup",
+                        "label": "backup",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-ant-api-backup",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    pool = await load_pool("anthropic")
+    next_entry = await pool.mark_exhausted_and_rotate(
+        status_code=429,
+        api_key_hint="sk-ant-api-primary",
+        credential_id="cred-backup",
+    )
+
+    statuses = {entry.id: entry.last_status for entry in pool.entries()}
+    assert statuses["cred-primary"] == STATUS_EXHAUSTED
+    assert statuses["cred-backup"] != STATUS_EXHAUSTED
+    assert next_entry is not None
+    assert next_entry.id == "cred-backup"
+
+
 async def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, monkeypatch):
     """An api_key_hint matching no entry must not quarantine a healthy key.
 

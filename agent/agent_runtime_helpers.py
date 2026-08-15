@@ -38,6 +38,7 @@ from typing import Any
 import aiofiles
 import aiofiles.os
 
+from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -355,10 +356,11 @@ def sanitize_tool_call_arguments(
                 # itself becomes an orphan (#58168).
                 tool_call_id = _ra().AIAgent._get_tool_call_id_static(tool_call) or None
                 function_name = function.get("name", "?")
-                preview = arguments[:80]
+                preview = arguments[:_FULL_ARGS_LOG_BOUND]
                 log.warning(
                     "Corrupted tool_call arguments repaired before request "
-                    "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
+                    "(session=%s, message_index=%s, tool_call_id=%s, function=%s, "
+                    "original_arguments=%r)",
                     session_id or "-",
                     message_index,
                     tool_call_id or "-",
@@ -1035,6 +1037,8 @@ async def recover_with_credential_pool(
         }
         if _credential_id:
             kwargs["credential_id"] = _credential_id
+        if effective_reason is not None:
+            kwargs["failure_reason"] = effective_reason.value
         return await pool.mark_exhausted_and_rotate(**kwargs)
 
     effective_reason = classified_reason
@@ -1973,16 +1977,33 @@ def cache_ttl_means_disabled(ttl: Any) -> bool:
     return str(ttl).lower() in ("off", "false", "disabled", "no", "none")
 
 
+VALID_CACHE_TTLS = ("5m", "1h")
+
+
+async def _raw_cache_ttl_from_config() -> Any:
+    """Read the raw prompt-cache tier from the async config snapshot."""
+    from hermes_cli.config import load_config_readonly
+
+    prompt_cache = (await load_config_readonly()).get("prompt_caching", {}) or {}
+    return prompt_cache.get("cache_ttl", "5m")
+
+
 async def prompt_caching_disabled_from_config() -> bool:
     """Read the async config snapshot and return its prompt-cache disable flag."""
     try:
-        from hermes_cli.config import load_config_readonly
-
-        prompt_cache = (await load_config_readonly()).get("prompt_caching", {}) or {}
-        ttl = prompt_cache.get("cache_ttl", "5m")
+        ttl = await _raw_cache_ttl_from_config()
     except Exception:
         return False
     return cache_ttl_means_disabled(ttl)
+
+
+async def configured_cache_ttl() -> str | None:
+    """Return the configured supported cache tier, or ``None``."""
+    try:
+        ttl = await _raw_cache_ttl_from_config()
+    except Exception:
+        return None
+    return ttl if ttl in VALID_CACHE_TTLS else None
 
 
 async def blank_cache_policy_stub(cache_disabled: bool | None = None):
@@ -2009,10 +2030,13 @@ async def plan_cache_sections_for_destination(
     api_mode: str,
     model: str,
     cache_disabled: bool | None = None,
+    cache_ttl: str | None = None,
+    static_system_prefix: str | None = None,
 ) -> tuple[list, list | None]:
     """Build request-local cache sections for an explicitly named route."""
     from agent.prompt_caching import (
         build_prompt_cache_plan,
+        effective_cache_ttl,
         strip_anthropic_cache_control,
         strip_anthropic_tool_cache_control,
     )
@@ -2034,7 +2058,15 @@ async def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages,
         tools,
+        cache_ttl=effective_cache_ttl(
+            cache_ttl,
+            provider=provider,
+            model=model,
+        ),
         native_anthropic=native_layout,
+        static_system_prefix=(
+            static_system_prefix if isinstance(static_system_prefix, str) else None
+        ),
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
             stub,
             provider=provider,
@@ -2153,6 +2185,33 @@ def anthropic_prompt_cache_policy(
         and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
     )
 
+    if is_anthropic_wire:
+        try:
+            from hermes_cli.config import get_custom_provider_model_capability
+
+            explicit_capability = get_custom_provider_model_capability(
+                model=eff_model,
+                base_url=eff_base_url,
+                capability="prompt_caching",
+                custom_providers=getattr(agent, "_custom_providers", None),
+            )
+        except Exception:
+            explicit_capability = None
+        if explicit_capability is not None:
+            return bool(explicit_capability), bool(explicit_capability)
+
+    is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
+    is_minimax_host = (
+        base_url_host_matches(eff_base_url, "api.minimax.io")
+        or base_url_host_matches(eff_base_url, "api.minimaxi.com")
+    )
+    is_minimax_route = is_minimax_provider or is_minimax_host
+    if is_anthropic_wire and is_minimax_route:
+        from agent.model_metadata import _model_name_suggests_minimax_m3
+
+        if _model_name_suggests_minimax_m3(eff_model):
+            return False, False
+
     if is_native_anthropic:
         return True, True
     # Envelope layout is an OpenAI-wire construct. Portal Claude on the native
@@ -2187,24 +2246,18 @@ def anthropic_prompt_cache_policy(
     # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
     # same cost reduction as Claude traffic.
     # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-    if is_anthropic_wire:
-        is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-        is_minimax_host = (
-            base_url_host_matches(eff_base_url, "api.minimax.io")
-            or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-        )
-        if is_minimax_provider or is_minimax_host:
-            return True, True
+    if is_anthropic_wire and is_minimax_route:
+        return True, True
 
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
     # transport that accepts Anthropic-style cache_control markers and
     # rewards them with real cache hits.  Without this branch
     # qwen3.6-plus on opencode-go reports 0% cached tokens and burns
     # through the subscription on every turn.
-    model_is_qwen = "qwen" in model_lower
-    provider_is_alibaba_family = provider_lower in {
-        "opencode", "opencode-zen", "opencode-go", "alibaba",
-    }
+    from agent.prompt_caching import ALIBABA_FAMILY_PROVIDERS, is_qwen_model
+
+    model_is_qwen = is_qwen_model(model_lower)
+    provider_is_alibaba_family = provider_lower in ALIBABA_FAMILY_PROVIDERS
     if provider_is_alibaba_family and model_is_qwen:
         # Envelope layout (native_anthropic=False): markers on inner
         # content parts, not top-level tool messages.  Matches
@@ -2522,6 +2575,12 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
 
     switch_config = await load_config_readonly()
     custom_providers = get_compatible_custom_providers(switch_config)
+    # Keep the live custom-provider snapshot in sync with the configuration
+    # used for this switch.  The deferred runtime and prompt-cache policy
+    # both consult this attribute; retaining the init-time snapshot would
+    # ignore provider capability changes made during a session.
+    previous_custom_providers = getattr(agent, "_custom_providers", None)
+    agent._custom_providers = custom_providers
     if not effective_base_url and new_provider.startswith("custom:"):
         from hermes_cli.providers import resolve_custom_provider
 
@@ -2562,6 +2621,7 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         "_client_kwargs",
         "_deferred_provider_runtime",
         "_config_context_length",
+        "_custom_providers",
         "_anthropic_api_key",
         "_anthropic_base_url",
         "_anthropic_client",
@@ -2579,6 +2639,7 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         for name in rollback_attributes
     }
     rollback_state["_config_context_length"] = previous_context_length
+    rollback_state["_custom_providers"] = previous_custom_providers
     agent._deferred_provider_runtime = {
         "provider": new_provider,
         "model": new_model,
@@ -2692,6 +2753,11 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+        clear_prune_rearm = getattr(
+            compressor, "clear_durable_proactive_prune_rearm", None
+        )
+        if callable(clear_prune_rearm):
+            await clear_prune_rearm()
 
     agent._cached_system_prompt = None
     from agent.chat_completion_helpers import _reset_stale_streak

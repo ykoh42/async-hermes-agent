@@ -487,10 +487,10 @@ class TestMicroCompaction:
         cc = _compressor()
         messages = _conversation(exchanges=10)
 
-        for _ in range(4):
+        for _ in range(6):
             messages = await cc._micro_compact(messages)
 
-        assert cc._micro_compact_passes == 4
+        assert cc._micro_compact_passes == 6
         assert cc._micro_compact_tokens_saved_total > 0
 
     async def test_defrag_triggers_once_the_rolling_summary_grows(self):

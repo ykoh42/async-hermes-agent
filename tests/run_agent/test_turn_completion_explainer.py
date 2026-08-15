@@ -92,6 +92,13 @@ def test_explanation_for_max_iterations_reached_prefix_match():
     assert "iteration" in out.lower()
 
 
+def test_explanation_distinguishes_locked_session_storage():
+    out = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "locked"
+    )
+    assert "storage was busy" in out
+
+
 
 
 
@@ -176,4 +183,3 @@ async def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
-

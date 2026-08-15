@@ -176,3 +176,11 @@ class TestDefaultConfigShape:
         assert "model" in web
         assert web["provider"] == "auto"
         assert web["model"] == ""
+
+    def test_title_generation_fast_model_is_explicit_opt_in(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        title = DEFAULT_CONFIG["auxiliary"]["title_generation"]
+        assert title["provider"] == "auto"
+        assert title["model"] == ""
+        assert title["prefer_fast_model"] is False

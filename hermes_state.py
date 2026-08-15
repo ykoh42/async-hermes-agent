@@ -36,6 +36,7 @@ from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
+    FTS_STALE_KEY,
     FTS_CJK_TABLE_SQL,
     FTS_CJK_TRIGGER_SQL,
     FTS_SQL,
@@ -49,8 +50,12 @@ from hermes_state_common import (
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
+    _RESET_END_REASONS,
+    _RESET_END_REASONS_SQL,
+    _legacy_reset_child_sql,
     _session_runtime_config_value,
     _shape_preview,
+    escape_like as _escape_like,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
 )
@@ -59,6 +64,70 @@ from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 
 logger = logging.getLogger(__name__)
+
+MAX_SAFE_RESUME_MESSAGES = 20_000
+MAX_SAFE_EXPORT_MESSAGES = 20_000
+
+
+async def _configured_transcript_limit(key: str, fallback: int) -> int:
+    """Resolve a transcript safety limit without synchronous config I/O."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        sessions_cfg = (await load_config_readonly()).get("sessions") or {}
+        value = sessions_cfg.get(key)
+        if value is None:
+            return fallback
+        limit = int(value)
+        return limit if limit >= 0 else fallback
+    except Exception:
+        return fallback
+
+
+async def resolved_max_resume_messages() -> int:
+    """Return the configured interactive-resume transcript limit."""
+    return await _configured_transcript_limit(
+        "max_resume_messages", MAX_SAFE_RESUME_MESSAGES
+    )
+
+
+async def resolved_max_export_messages() -> int:
+    """Return the configured in-memory-export transcript limit."""
+    return await _configured_transcript_limit(
+        "max_export_messages", MAX_SAFE_EXPORT_MESSAGES
+    )
+
+
+class SessionResumeTooLargeError(ValueError):
+    def __init__(
+        self,
+        message_count: int,
+        limit: int = MAX_SAFE_RESUME_MESSAGES,
+        scope: str = "across its lineage",
+    ) -> None:
+        self.message_count = message_count
+        self.limit = limit
+        super().__init__(
+            f"session has at least {message_count} active messages {scope}; "
+            f"safe resume limit is {limit}. Export the session instead, or set "
+            "sessions.max_resume_messages: 0 in config.yaml to disable the guard."
+        )
+
+
+class SessionExportTooLargeError(ValueError):
+    def __init__(
+        self,
+        session_id: str,
+        message_count: int,
+        limit: int = MAX_SAFE_EXPORT_MESSAGES,
+    ) -> None:
+        self.session_id = session_id
+        self.message_count = message_count
+        self.limit = limit
+        super().__init__(
+            f"session '{session_id}' has at least {message_count} active messages; "
+            f"safe in-memory export limit is {limit}"
+        )
 T = TypeVar("T")
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 _chmod = aiofiles.os.wrap(os.chmod)
@@ -88,6 +157,11 @@ _WAL_INCOMPAT_MARKERS = (
     "not authorized",
     "disk i/o error",
 )
+
+# Keep the session WAL from retaining the largest-ever transaction forever.
+# SQLite's default journal_size_limit is unlimited; apply the same bounded
+# 64 MiB policy as upstream at every native WAL-open boundary.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
 
 _last_init_error: str | None = None
 _wal_fallback_warned_paths: set[str] = set()
@@ -124,19 +198,24 @@ def format_session_db_unavailable(
 
 async def _on_disk_journal_mode(conn) -> str | None:
     """Read the effective journal mode without changing it."""
-    try:
-        row = await (await conn.execute("PRAGMA journal_mode")).fetchone()
-    except sqlite3.OperationalError:
-        return None
-    if row is None or row[0] is None:
-        return None
-    mode = row[0]
-    if isinstance(mode, bytes):
+    for attempt in range(4):
         try:
-            mode = mode.decode("ascii")
-        except UnicodeDecodeError:
+            row = await (await conn.execute("PRAGMA journal_mode")).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "disk i/o error" not in str(exc).lower() or attempt == 3:
+                return None
+            await asyncio.sleep(0.05)
+            continue
+        if row is None or row[0] is None:
             return None
-    return str(mode).strip().lower()
+        mode = row[0]
+        if isinstance(mode, bytes):
+            try:
+                mode = mode.decode("ascii")
+            except UnicodeDecodeError:
+                return None
+        return str(mode).strip().lower()
+    return None
 
 
 async def _apply_macos_checkpoint_barrier(conn) -> None:
@@ -147,6 +226,14 @@ async def _apply_macos_checkpoint_barrier(conn) -> None:
         await conn.execute("PRAGMA checkpoint_fullfsync=1")
     except sqlite3.OperationalError:
         pass
+
+
+async def _apply_wal_size_limit(conn) -> None:
+    """Best-effort bound for WAL slack after checkpoints and VACUUM."""
+    try:
+        await conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
+    except sqlite3.OperationalError as exc:
+        logger.debug("journal_size_limit not applied: %s", exc)
 
 
 async def _enforce_macos_synchronous_full(conn) -> None:
@@ -256,6 +343,7 @@ async def _apply_delete_for_wal_reset_bug(
     current = await _on_disk_journal_mode(conn) or ""
     if current == "wal":
         _log_wal_reset_bug_once(db_label, kept_wal=True)
+        await _apply_wal_size_limit(conn)
         await _apply_macos_checkpoint_barrier(conn)
         await _enforce_macos_synchronous_full(conn)
         return "wal"
@@ -296,6 +384,7 @@ async def apply_wal_with_fallback(
 
     current = await _on_disk_journal_mode(conn)
     if current == "wal":
+        await _apply_wal_size_limit(conn)
         await _apply_macos_checkpoint_barrier(conn)
         await _enforce_macos_synchronous_full(conn)
         return "wal"
@@ -318,6 +407,7 @@ async def apply_wal_with_fallback(
         ).fetchone()
         mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
         if mode == "wal":
+            await _apply_wal_size_limit(conn)
             await _apply_macos_checkpoint_barrier(conn)
             await _enforce_macos_synchronous_full(conn)
             return "wal"
@@ -354,6 +444,7 @@ async def apply_wal_with_fallback(
                 else ""
             )
             if mode == "wal":
+                await _apply_wal_size_limit(conn)
                 await _apply_macos_checkpoint_barrier(conn)
                 await _enforce_macos_synchronous_full(conn)
                 return "wal"
@@ -409,6 +500,13 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     """Return whether SQLite reported malformed schema or database bytes."""
     return isinstance(exc, sqlite3.DatabaseError) and any(
         marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS
+    )
+
+
+def _is_not_a_database_error(exc: BaseException) -> bool:
+    """Return whether SQLite reported a broken connection to a valid file."""
+    return isinstance(exc, sqlite3.DatabaseError) and (
+        "file is not a database" in str(exc).lower()
     )
 
 
@@ -956,6 +1054,31 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in text.lower() for marker in _DISK_FULL_MARKERS)
 
 
+PERSISTENCE_ERROR_CAUSES = ("locked", "disk", "unknown")
+
+
+def classify_persistence_error(exc_or_str: BaseException | str | None) -> str:
+    """Classify a session write failure for user-facing retry guidance."""
+    if exc_or_str is None:
+        return "unknown"
+    if isinstance(exc_or_str, CompressionSessionBusyError):
+        return "locked"
+    text = str(exc_or_str).lower()
+    if any(
+        marker in text
+        for marker in ("locked", "busy", "being compressed", "compression lease")
+    ):
+        return "locked"
+    if (
+        is_disk_full_error(exc_or_str)
+        or "disk" in text
+        or "readonly" in text
+        or "read-only" in text
+    ):
+        return "disk"
+    return "unknown"
+
+
 async def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     """Return true only when a structured local compression owner is gone."""
     match = _COMPRESSION_LOCK_HOLDER_PID_RE.search(holder or "")
@@ -1043,11 +1166,11 @@ async def _delete_delegate_children(connection, parent_ids: list[str]) -> list[s
 
 def _cwd_prefix_clause(cwd_prefix: str) -> tuple[str, list[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
-    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [
-        prefix,
-        f"{prefix}/%",
-        f"{prefix}\\%",
-    ]
+    escaped = _escape_like(prefix)
+    return (
+        "(s.cwd = ? OR s.cwd LIKE ? ESCAPE '\\' OR s.cwd LIKE ? ESCAPE '\\')",
+        [prefix, f"{escaped}/%", f"{escaped}\\\\%"],
+    )
 
 
 def _workspace_key_clause(key: str) -> tuple[str, list[str]]:
@@ -1111,6 +1234,35 @@ def _strip_background_review_harness(
                 continue
         result.append(message)
     return result
+
+
+_STALE_TOOL_CALL_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
+
+
+def _is_stale_tool_call_marker_message(message: dict[str, Any]) -> bool:
+    """Return whether an old assistant tool turn contains only a marker."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return False
+    if not message.get("tool_calls") or not isinstance(message.get("content"), str):
+        return False
+    return bool(_STALE_TOOL_CALL_MARKER_RE.fullmatch(message["content"].strip()))
+
+
+def _strip_stale_tool_call_markers(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Clear bare protocol markers persisted by pre-fix tool-call turns."""
+    repaired = 0
+    for message in messages:
+        if _is_stale_tool_call_marker_message(message):
+            message["content"] = ""
+            repaired += 1
+    if repaired:
+        logger.info(
+            "Cleared %d stale tool-call marker message(s) while restoring session",
+            repaired,
+        )
+    return messages
 
 
 class CompressionSessionClosedError(RuntimeError):
@@ -1274,6 +1426,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 return content
         return content
+
+    @staticmethod
+    def _reasoning_json_text(value: Any) -> str | None:
+        """Serialize reasoning fields without encoding an existing TEXT row twice.
+
+        Session exports and ``get_messages()`` expose these columns as their
+        stored JSON text.  Reusing such a row through ``replace_messages`` or
+        ``append_message`` must preserve that text byte-for-byte; live provider
+        responses still pass Python lists/dicts and are encoded normally.
+        """
+        if not value:
+            return None
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
 
 
     @staticmethod
@@ -1448,6 +1615,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # assistant reply immediately following it, so a polluted session
         # resumes clean even if stray rows exist.
         messages = _strip_background_review_harness(messages)
+        # Defense in depth for sessions written before the stale-marker fix:
+        # preserve the tool call/result pairing but do not replay a bare
+        # protocol marker as if it were a model answer.
+        messages = _strip_stale_tool_call_markers(messages)
         if repair_alternation and messages:
             # Lazy import: hermes_state already depends on agent.* (see
             # sanitize_context above), but keep this optional path from
@@ -1494,10 +1665,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._schema_ready = False
         self._wal_active = False
         self._write_count = 0
+        self._notadb_reconnect_attempted = False
         self._fts_usermerge_floor_applied = False
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._fts_enabled = False
+        self._fts_stale = False
         self._trigram_available = False
         self._fts_cjk_loaded = False
         self._fts_cjk_available = False
@@ -1621,7 +1794,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         finally:
                             self._initializing_connection = None
                     else:
-                        self._fts_enabled = (
+                        stale_cursor = await connection.execute(
+                            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                            (FTS_STALE_KEY,),
+                        )
+                        try:
+                            self._fts_stale = (
+                                await stale_cursor.fetchone() is not None
+                            )
+                        finally:
+                            await stale_cursor.close()
+                        self._fts_enabled = not self._fts_stale and (
                             await self._fts_table_probe(
                                 connection,
                                 "messages_fts",
@@ -1761,6 +1944,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if connection is not None:
                     await _close_owned_connection(connection)
                 raise
+
+    async def _reconnect_after_notadb(self) -> bool:
+        """Reopen a broken write connection once, then let the write retry."""
+        if self.read_only or self._notadb_reconnect_attempted:
+            return False
+        self._notadb_reconnect_attempted = True
+        logger.warning(
+            "state.db connection reported 'file is not a database'; "
+            "reopening the connection once before retrying the write"
+        )
+        try:
+            async with self._get_connect_lock():
+                connection = self._connection
+                self._connection = None
+                tracking_key = self._connection_tracking_key
+                self._connection_tracking_key = None
+                self._schema_ready = False
+                if connection is not None:
+                    await _close_owned_connection(connection)
+                if tracking_key is not None:
+                    remaining = _live_connection_counts.get(tracking_key, 1) - 1
+                    if remaining > 0:
+                        _live_connection_counts[tracking_key] = remaining
+                    else:
+                        _live_connection_counts.pop(tracking_key, None)
+            await self._get_connection(patience_s=self._WRITE_PATIENCE_S)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("state.db connection reopen failed: %s", exc)
+            return False
 
     @asynccontextmanager
     async def _read_ctx(self):
@@ -1918,6 +2133,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError:
                 pass
 
+    async def _drop_all_fts_triggers(self, connection) -> None:
+        """Detach every retained FTS trigger, including the optional CJK set."""
+        await self._drop_fts_triggers(connection)
+        for trigger in _FTS_CJK_TRIGGERS:
+            try:
+                await connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         if self._trigram_unavailable_warned:
             return
@@ -2039,13 +2263,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 raise
             except sqlite3.DatabaseError as exc:
+                if _is_not_a_database_error(exc):
+                    if await self._reconnect_after_notadb():  # noqa: ASYNC120 - reconnect owns cleanup and re-raises cancellation
+                        continue
+                    raise
                 if _is_no_more_rows(exc) and await self._sleep_before_write_retry(  # noqa: ASYNC120
                     deadline,
                     patience_s,
                 ):
                     continue
                 if not await self._try_runtime_fts_rebuild(exc):  # noqa: ASYNC120
-                    raise
+                    if not await self._enter_fts_fail_open(exc):  # noqa: ASYNC120
+                        raise
+                    continue
             except sqlite3.Error as exc:
                 if _is_no_more_rows(exc) and await self._sleep_before_write_retry(  # noqa: ASYNC120
                     deadline,
@@ -2150,6 +2380,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cwd: str | None = None,
         profile_name: str | None = None,
         git_repo_root: str | None = None,
+        origin_json: str | None = None,
+        display_name: str | None = None,
     ) -> None:
         """Insert or enrich one session row through the async writer."""
         async def _create(connection):
@@ -2161,12 +2393,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
                    parent_session_id, cwd,
-                   profile_name, git_repo_root, started_at
+                   profile_name, git_repo_root, origin_json, display_name,
+                   started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
-                       model_config = COALESCE(sessions.model_config, excluded.model_config),
+                       model_config = CASE
+                           WHEN excluded.model_config IS NOT NULL
+                                AND json_type(
+                                    sessions.model_config, '$._reset_from'
+                                ) IS NOT NULL
+                                AND json_remove(
+                                    sessions.model_config, '$._reset_from'
+                                ) = '{}'
+                           THEN json_set(
+                               excluded.model_config,
+                               '$._reset_from',
+                               json_extract(
+                                   sessions.model_config, '$._reset_from'
+                               )
+                           )
+                           ELSE COALESCE(
+                               sessions.model_config, excluded.model_config
+                           )
+                       END,
                        system_prompt_hash = COALESCE(
                            sessions.system_prompt_hash,
                            excluded.system_prompt_hash
@@ -2184,7 +2435,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
-                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
+                       origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
+                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
                 (
                     session_id,
                     source,
@@ -2200,6 +2453,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cwd,
                     profile_name,
                     git_repo_root,
+                    origin_json,
+                    display_name,
                     time.time(),
                 ),
             )
@@ -2290,6 +2545,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cwd: str,
         git_branch: str | None = None,
         git_repo_root: str | None = None,
+        replace_git_meta: bool = False,
     ) -> None:
         """Persist workspace identity without blocking the event loop."""
         if not session_id or not cwd:
@@ -2299,12 +2555,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         parameters: list[Any] = [cwd]
         branch = (git_branch or "").strip()
         repo_root = (git_repo_root or "").strip()
-        if branch:
+        if branch or replace_git_meta:
             assignments.append("git_branch = ?")
-            parameters.append(branch)
-        if repo_root:
+            parameters.append(branch or None)
+        if repo_root or replace_git_meta:
             assignments.append("git_repo_root = ?")
-            parameters.append(repo_root)
+            parameters.append(repo_root or None)
         parameters.append(session_id)
 
         async def _update(connection):
@@ -2341,11 +2597,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> int:
         """Append one transcript row using the same wire serialization as SessionDB."""
         display_metadata_json = self._encode_display_metadata(display_metadata)
-        reasoning_details_json = json.dumps(reasoning_details) if reasoning_details else None
-        codex_items_json = json.dumps(codex_reasoning_items) if codex_reasoning_items else None
-        codex_message_items_json = (
-            json.dumps(codex_message_items) if codex_message_items else None
-        )
+        reasoning_details_json = self._reasoning_json_text(reasoning_details)
+        codex_items_json = self._reasoning_json_text(codex_reasoning_items)
+        codex_message_items_json = self._reasoning_json_text(codex_message_items)
         if isinstance(tool_calls, str):
             try:
                 tool_calls = json.loads(tool_calls)
@@ -2468,9 +2722,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(message.get("reasoning_content"))
                     if role == "assistant"
                     else None,
-                    json.dumps(reasoning_details) if reasoning_details else None,
-                    json.dumps(codex_reasoning_items) if codex_reasoning_items else None,
-                    json.dumps(codex_message_items) if codex_message_items else None,
+                    self._reasoning_json_text(reasoning_details),
+                    self._reasoning_json_text(codex_reasoning_items),
+                    self._reasoning_json_text(codex_message_items),
                     message.get("platform_message_id") or message.get("message_id"),
                     1 if message.get("observed") else 0,
                     1,
@@ -2544,8 +2798,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         messages: list[dict[str, Any]],
         active_only: bool = False,
+        archive_dropped: bool = False,
     ) -> None:
-        """Atomically replace all or only active transcript rows."""
+        """Atomically replace transcript rows, optionally retaining drops.
+
+        ``archive_dropped=True`` soft-archives the active rows being replaced
+        instead of deleting them. Already archived compaction rows are never
+        touched; the replacement rows are inserted as the new active view.
+        """
         active_clause = " AND active = 1" if active_only else ""
 
         async def _replace(connection):
@@ -2561,10 +2821,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
-            await connection.execute(
-                f"DELETE FROM messages WHERE session_id = ?{active_clause}",
-                (session_id,),
-            )
+            if archive_dropped:
+                await connection.execute(
+                    "UPDATE messages SET active = 0 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+            else:
+                await connection.execute(
+                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
+                    (session_id,),
+                )
             await connection.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 "
                 "WHERE id = ?",
@@ -2611,8 +2878,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         await self._execute_write(_end)
 
     async def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed."""
+        """Clear ended_at/end_reason so a session can be resumed.
+
+        Before clearing a reset boundary, stabilize markerless legacy reset
+        children that still depend on the parent's mutable end_reason.
+        """
         async def _reopen(connection):
+            placeholders = ",".join("?" for _ in _RESET_END_REASONS)
+            await connection.execute(
+                "UPDATE sessions AS child SET model_config = json_set("
+                "COALESCE(child.model_config, '{}'), '$._reset_from', "
+                "child.parent_session_id) "
+                "WHERE child.parent_session_id = ? "
+                "AND json_extract(COALESCE(child.model_config, '{}'), "
+                "                 '$._reset_from') IS NULL "
+                f"AND {_legacy_reset_child_sql('child', placeholders)}",
+                (session_id, *_RESET_END_REASONS),
+            )
             await connection.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
@@ -2809,9 +3091,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         compacted_messages: list[dict[str, Any]],
+        model_config_patch: dict[str, Any] | None = None,
     ) -> int:
-        """Atomically archive live rows and insert the compacted transcript."""
+        """Atomically archive live rows and insert the compacted transcript.
+
+        ``model_config_patch`` is committed in the same transaction as the
+        active-message rewrite. ``None`` values remove keys, matching the
+        upstream JSON-patch contract used by compression runway state.
+        """
         async def _archive(connection):
+            patched_model_config: str | None = None
+            if model_config_patch is not None:
+                row = await (
+                    await connection.execute(
+                        "SELECT model_config FROM sessions WHERE id = ?",
+                        (session_id,),
+                    )
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(f"Session not found: {session_id}")
+                raw = row["model_config"]
+                config: dict[str, Any] = {}
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        parsed = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        config = parsed
+                elif isinstance(raw, dict):
+                    config = dict(raw)
+                for key, value in model_config_patch.items():
+                    if value is None:
+                        config.pop(key, None)
+                    else:
+                        config[key] = value
+                patched_model_config = json.dumps(config)
+
             await connection.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
@@ -2887,13 +3203,91 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     len(tool_calls) if isinstance(tool_calls, list) else int(tool_calls is not None)
                 )
                 now_ts = max(now_ts + 1e-6, timestamp + 1e-6)
-            await connection.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (len(compacted_messages), tool_calls_total, session_id),
-            )
+            if model_config_patch is None:
+                await connection.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                    "WHERE id = ?",
+                    (len(compacted_messages), tool_calls_total, session_id),
+                )
+            else:
+                await connection.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "model_config = ? WHERE id = ?",
+                    (
+                        len(compacted_messages),
+                        tool_calls_total,
+                        patched_model_config,
+                        session_id,
+                    ),
+                )
             return len(compacted_messages)
 
         return await self._execute_write(_archive)
+
+    async def patch_session_model_config(
+        self,
+        session_id: str,
+        patch: dict[str, Any],
+    ) -> None:
+        """Merge a small JSON patch into session model metadata atomically."""
+        if not session_id or not isinstance(patch, dict):
+            return
+
+        async def _patch(connection):
+            row = await (
+                await connection.execute(
+                    "SELECT model_config FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            if row is None:
+                return
+            raw = row["model_config"]
+            config: dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    config = parsed
+            elif isinstance(raw, dict):
+                config = dict(raw)
+            for key, value in patch.items():
+                if value is None:
+                    config.pop(key, None)
+                else:
+                    config[key] = value
+            await connection.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config), session_id),
+            )
+
+        await self._execute_write(_patch)
+
+    async def get_session_model_config_value(
+        self,
+        session_id: str,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        """Read one tolerant JSON model-config value from a session row."""
+        if not session_id:
+            return default
+        session = await self.get_session(session_id)
+        if not session:
+            return default
+        raw = session.get("model_config")
+        if isinstance(raw, dict):
+            return raw.get(key, default)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return default
+            if isinstance(parsed, dict):
+                return parsed.get(key, default)
+        return default
 
     async def update_system_prompt(
         self, session_id: str, system_prompt: str | None
@@ -3597,11 +3991,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         exact = await self.get_session(session_id_or_prefix)
         if exact:
             return exact["id"]
-        escaped = (
-            session_id_or_prefix.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = _escape_like(session_id_or_prefix)
         connection = await self._get_connection()
         rows = await (
             await connection.execute(
@@ -3895,8 +4285,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.source = ?")
             params.append(source)
         if title_like:
-            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ?")
-            params.append(f"%{title_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(title_like.lower())}%")
         if end_reason:
             clauses.append("s.end_reason = ?")
             params.append(end_reason)
@@ -3911,8 +4301,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.message_count <= ?")
             params.append(max_messages)
         if model_like:
-            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ?")
-            params.append(f"%{model_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(model_like.lower())}%")
         if provider:
             clauses.append("LOWER(COALESCE(s.billing_provider, '')) = ?")
             params.append(provider.lower())
@@ -3926,8 +4316,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.chat_type = ?")
             params.append(chat_type)
         if branch_like:
-            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ?")
-            params.append(f"%{branch_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(branch_like.lower())}%")
         if min_tokens is not None:
             clauses.append(
                 "(COALESCE(s.input_tokens, 0) + "
@@ -4188,20 +4578,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        latest: bool = False,
+        after_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Load a session's messages through the native async connection."""
+        """Load a session's messages through the native async connection.
+
+        ``latest=True`` measures ``offset`` back from the newest row while
+        returning the selected page in chronological order.
+        """
+        if after_id is not None and (latest or offset):
+            raise ValueError("after_id is incompatible with latest/offset paging")
         active_clause = "" if include_inactive else " AND active = 1"
+        keyset_clause = " AND id > ?" if after_id is not None else ""
         query = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause} ORDER BY id"
+            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
         )
         params: list[Any] = [session_id]
+        if after_id is not None:
+            params.append(after_id)
         if limit is not None or offset:
             query += " LIMIT ? OFFSET ?"
             params.extend([-1 if limit is None else limit, offset])
         async with self._read_ctx() as connection:
             cursor = await connection.execute(query, params)
             rows = await cursor.fetchall()
+        if latest:
+            rows.reverse()
         return [self._decode_message_row(row) for row in rows]
 
     async def message_count(self, session_id: str | None = None) -> int:
@@ -4447,7 +4850,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def resolve_session_by_title(self, title: str) -> str | None:
         """Resolve an exact or numbered continuation title asynchronously."""
         exact = await self.get_session_by_title(title)
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(title)
         async with self._read_ctx() as connection:
             rows = await (
                 await connection.execute(
@@ -4520,6 +4923,67 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.error("In-place FTS rebuild failed: %s", rebuild_exc)
             return False
         return rebuilt > 0
+
+    async def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
+        """Detach corrupt FTS indexes so canonical writes can continue.
+
+        The marker and trigger removal are committed atomically.  Once the
+        triggers are gone, new canonical rows are intentionally allowed to
+        create an index gap of unknown extent; a later writable open rebuilds
+        every derived index before reinstalling any trigger.
+        """
+        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+            return False
+        try:
+            async with self._get_write_lock():
+                connection = await self._get_connection()
+                cursor = await connection.execute("BEGIN IMMEDIATE")
+                await cursor.close()
+                try:
+                    marker = await connection.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (FTS_STALE_KEY,),
+                    )
+                    await marker.close()
+                    placeholders = ",".join("?" for _ in _FTS_CJK_TRIGGERS)
+                    async with connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({placeholders}) LIMIT 1",
+                        _FTS_CJK_TRIGGERS,
+                    ) as trigger_cursor:
+                        cjk_present = await trigger_cursor.fetchone()
+                    if cjk_present:
+                        cjk_marker = await connection.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                        await cjk_marker.close()
+                    await self._drop_all_fts_triggers(connection)
+                    await connection.commit()
+                except BaseException:
+                    await _finish_connection_rollback(connection)
+                    raise
+        except sqlite3.Error as detach_exc:
+            logger.error(
+                "Could not detach corrupt FTS indexes; canonical write still "
+                "cannot proceed: %s",
+                detach_exc,
+            )
+            return False
+
+        self._fts_stale = True
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_cjk_available = False
+        logger.error(
+            "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
+            "retrying the canonical write. Search temporarily uses LIKE until "
+            "a later SessionDB open rebuilds the indexes.",
+            exc,
+        )
+        return True
 
 
     async def search_sessions(
@@ -4833,9 +5297,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "WHERE parent_session_id = ? "
                         "  AND json_extract(COALESCE(model_config, '{}'), "
                         "'$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), "
-                        "'$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
+                    "  AND json_extract(COALESCE(model_config, '{}'), "
+                    "'$._delegate_from') IS NULL "
+                    "  AND json_extract(COALESCE(model_config, '{}'), "
+                    "'$._reset_from') IS NULL "
+                    f"  AND NOT {_legacy_reset_child_sql('sessions', _RESET_END_REASONS_SQL)} "
+                    "  AND COALESCE(source, '') != 'tool' "
                         "ORDER BY started_at DESC, id DESC LIMIT 1",
                         (current,),
                     )
@@ -4856,7 +5323,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return best if best is not None else session_id
 
+    def _is_explicit_fork_child_row(self, session: dict[str, Any]) -> bool:
+        if session.get("source") == "tool":
+            return True
+        raw = session.get("model_config")
+        if not raw:
+            return False
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(cfg, dict) and (
+            cfg.get("_branched_from") is not None
+            or cfg.get("_delegate_from") is not None
+        )
+
     def _is_branch_child_row(self, session: dict[str, Any]) -> bool:
+        """Compatibility predicate for callers that only need branch rows."""
         raw = session.get("model_config")
         if not raw:
             return False
@@ -4870,7 +5353,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self, child: dict[str, Any]
     ) -> bool:
         parent_id = child.get("parent_session_id")
-        if not parent_id or self._is_branch_child_row(child):
+        if not parent_id or self._is_explicit_fork_child_row(child):
             return False
         parent = await self.get_session(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
@@ -4878,7 +5361,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def get_compression_lineage(self, session_id: str) -> list[str]:
         """Return compression ancestors through tip in chronological order."""
         session = await self.get_session(session_id)
-        if not session or self._is_branch_child_row(session):
+        if not session or self._is_explicit_fork_child_row(session):
             return [session_id] if session else []
 
         root = session
@@ -4908,7 +5391,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             next_child = None
             for row in rows:
                 candidate = dict(row)
-                if not self._is_branch_child_row(candidate):
+                if not self._is_explicit_fork_child_row(candidate):
                     next_child = candidate
                     break
             if not next_child or next_child["id"] in seen:
@@ -5000,12 +5483,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             filter_clauses: list[str] = []
 
             def _like_pattern(needle: str) -> str:
-                escaped = (
-                    needle.replace("\\", "\\\\")
-                    .replace("%", "\\%")
-                    .replace("_", "\\_")
-                )
-                return f"%{escaped}%"
+                return f"%{_escape_like(needle)}%"
 
             if id_needle:
                 filter_clauses.append(
@@ -5188,6 +5666,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 merged["_lineage_root_id"] = session["id"]
                 projected.append(merged)
             sessions = projected
+
+        for session in sessions:
+            session["unread"] = self.session_unread(session)
 
         return sessions
 
@@ -5438,6 +5919,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         halves the resume's DB work versus two separate calls, with byte-identical
         output (see test_get_resume_conversations_matches_separate_reads).
         """
+        await self.assert_resume_safe(session_id)
         session_ids = await self._session_lineage_root_to_tip(session_id)
         async with self._read_ctx() as connection:
             placeholders = ",".join("?" for _ in session_ids)
@@ -5473,6 +5955,82 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_row_ids=True,
         )
         return model_history, display_history
+
+    async def get_resume_message_count(self, session_id: str) -> int:
+        """Count active rows that a full resume would materialize."""
+        session_ids = await self._session_lineage_root_to_tip(session_id)
+        placeholders = ",".join("?" for _ in session_ids)
+        async with self._read_ctx() as connection:
+            cursor = await connection.execute(
+                f"SELECT COUNT(*) FROM messages "
+                f"WHERE session_id IN ({placeholders}) AND active = 1",
+                tuple(session_ids),
+            )
+            row = await cursor.fetchone()
+        return int(row[0] if row else 0)
+
+    async def assert_resume_safe(
+        self,
+        session_id: str,
+        max_messages: int | None = None,
+    ) -> int:
+        """Return resume row count or reject an oversized transcript.
+
+        ``None`` resolves ``sessions.max_resume_messages``. A configured zero
+        disables the guard while preserving the exact count return value.
+        """
+        if max_messages is None:
+            max_messages = await resolved_max_resume_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        if max_messages == 0:
+            return await self.get_resume_message_count(session_id)
+
+        session_ids = await self._session_lineage_root_to_tip(session_id)
+        placeholders = ",".join("?" for _ in session_ids)
+        async with self._read_ctx() as connection:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) FROM ("
+                f"SELECT 1 FROM messages WHERE session_id IN ({placeholders}) "
+                "AND active = 1 LIMIT ?"
+                ")",
+                (*session_ids, max_messages + 1),
+            )
+            row = await cursor.fetchone()
+        message_count = int(row[0] if row else 0)
+        if message_count > max_messages:
+            raise SessionResumeTooLargeError(message_count, max_messages)
+        return message_count
+
+    async def assert_export_safe(
+        self,
+        session_id: str,
+        max_messages: int | None = None,
+    ) -> int:
+        """Return active row count or reject an oversized export segment."""
+        if max_messages is None:
+            max_messages = await resolved_max_export_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        async with self._read_ctx() as connection:
+            if max_messages == 0:
+                cursor = await connection.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+            else:
+                cursor = await connection.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT 1 FROM messages WHERE session_id = ? AND active = 1 LIMIT ?"
+                    ")",
+                    (session_id, max_messages + 1),
+                )
+            row = await cursor.fetchone()
+        message_count = int(row[0] if row else 0)
+        if max_messages and message_count > max_messages:
+            raise SessionExportTooLargeError(session_id, message_count, max_messages)
+        return message_count
 
     async def get_ancestor_display_prefix(
         self, session_id: str
@@ -5586,6 +6144,73 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
+    async def reopen_orphaned_compression_session(self, session_id: str) -> bool:
+        """Reopen a compression parent only when no continuation was published.
+
+        Older interrupted handoffs could close the parent before publishing a
+        child.  Recovery is conservative: any direct non-branch/non-delegate
+        child or live compression lease keeps the parent closed.  The expired
+        lease reclaim and parent reopen occur in one async write transaction so
+        a refresh cannot race the recovery decision.
+        """
+        if not session_id:
+            return False
+
+        async def _reopen(connection):
+            parent = await (
+                await connection.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is None
+                or parent["end_reason"] != "compression"
+            ):
+                return False
+            child = await (
+                await connection.execute(
+                    """SELECT 1 FROM sessions
+                       WHERE parent_session_id = ?
+                         AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
+                         AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
+                         AND COALESCE(source, '') != 'tool'
+                       LIMIT 1""",
+                    (session_id,),
+                )
+            ).fetchone()
+            if child is not None:
+                return False
+            now = time.time()
+            lock_row = await (
+                await connection.execute(
+                    "SELECT holder, expires_at FROM compression_locks "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            if lock_row is not None:
+                expires_at = lock_row["expires_at"]
+                if expires_at is None or float(expires_at) >= now:
+                    return False
+                deleted = await connection.execute(
+                    "DELETE FROM compression_locks "
+                    "WHERE session_id = ? AND holder = ? AND expires_at = ?",
+                    (session_id, lock_row["holder"], expires_at),
+                )
+                if deleted.rowcount != 1:
+                    return False
+            updated = await connection.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ? AND ended_at IS NOT NULL "
+                "AND end_reason = 'compression'",
+                (session_id,),
+            )
+            return updated.rowcount == 1
+
+        return bool(await self._execute_write(_reopen))
+
     async def get_session_title(self, session_id: str) -> str | None:
         """Read a title without using the synchronous connection."""
         connection = await self._get_connection()
@@ -5596,11 +6221,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchone()
         return row["title"] if row is not None else None
 
+    async def get_session_title_source(self, session_id: str) -> str | None:
+        """Read title provenance, or ``None`` when the session is untitled."""
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        if row is None or row["title"] is None:
+            return None
+        return row["title_source"]
+
     async def get_next_title_in_lineage(self, base_title: str) -> str:
         """Return the next generated continuation title."""
         match = re.match(r"^(.*?) #(\d+)$", base_title)
         base = match.group(1) if match else base_title
-        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(base)
         connection = await self._get_connection()
         rows = await (
             await connection.execute(
@@ -5619,6 +6257,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return f"{base} #{max(suffixes, default=1) + 1}"
 
     MAX_TITLE_LENGTH = 100
+
+    # Title provenance, lowest to highest authority.  Automatic titles may
+    # replace only a title of strictly lower authority; an explicit user title
+    # is never overwritten by a later model-generated title.
+    TITLE_SOURCE_DERIVED = "derived"
+    TITLE_SOURCE_LLM = "llm"
+    TITLE_SOURCE_USER = "user"
+    _TITLE_SOURCE_RANK = {
+        TITLE_SOURCE_DERIVED: 0,
+        TITLE_SOURCE_LLM: 1,
+        TITLE_SOURCE_USER: 2,
+    }
+
+    @classmethod
+    def _title_rank(cls, source: str | None) -> int:
+        # Rows written before the provenance column existed are treated as
+        # user-owned unless they are still untitled.  This conservative
+        # default prevents an automatic title from clobbering legacy data.
+        if source is None:
+            return cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_USER]
+        return cls._TITLE_SOURCE_RANK.get(str(source), 0)
 
     @staticmethod
     def sanitize_title(title: str | None) -> str | None:
@@ -5699,19 +6358,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         title: str,
         *,
-        only_if_empty: bool,
+        source: str,
     ) -> bool:
         title = self.sanitize_title(title)
+        is_user = source == self.TITLE_SOURCE_USER
+        new_rank = self._title_rank(source) if not is_user else None
 
         async def _do(conn):
-            if only_if_empty:
-                current = await (
-                    await conn.execute(
-                        "SELECT title FROM sessions WHERE id = ?",
-                        (session_id,),
-                    )
-                ).fetchone()
-                if current is None or current["title"] is not None:
+            current = await (
+                await conn.execute(
+                    "SELECT title, title_source FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            if current is None:
+                return 0
+            if not is_user and current["title"] is not None:
+                if self._title_rank(current["title_source"]) >= new_rank:
                     return 0
 
             if title:
@@ -5737,10 +6400,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             f"{conflict_id}"
                         )
 
-            predicate = " AND title IS NULL" if only_if_empty else ""
             cursor = await conn.execute(
-                f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
-                (title, session_id),
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND title IS ? AND title_source IS ?",
+                (
+                    title,
+                    source if title else None,
+                    session_id,
+                    current["title"],
+                    current["title_source"],
+                ),
             )
             return cursor.rowcount
 
@@ -5750,16 +6419,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     async def set_session_title(self, session_id: str, title: str) -> bool:
         """Set or update a session's title."""
         return await self._set_session_title(
-            session_id, title, only_if_empty=False
+            session_id, title, source=self.TITLE_SOURCE_USER
+        )
+
+    async def set_auto_title(
+        self, session_id: str, title: str, *, source: str
+    ) -> bool:
+        """Set an automatically generated title with explicit provenance."""
+        if source not in (
+            self.TITLE_SOURCE_DERIVED,
+            self.TITLE_SOURCE_LLM,
+        ):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        return await self._set_session_title(
+            session_id, title, source=source
         )
 
     async def set_auto_title_if_empty(
         self, session_id: str, title: str
     ) -> bool:
         """Set an auto-generated title only when the current title is null."""
-        return await self._set_session_title(
-            session_id, title, only_if_empty=True
+        return await self.set_auto_title(
+            session_id, title, source=self.TITLE_SOURCE_LLM
         )
+
+    async def set_session_title_source(
+        self, session_id: str, source: str
+    ) -> bool:
+        """Change title provenance without changing its text."""
+        if source not in self._TITLE_SOURCE_RANK:
+            raise ValueError(f"invalid title source: {source!r}")
+
+        async def _do(conn):
+            cursor = await conn.execute(
+                "UPDATE sessions SET title_source = ? "
+                "WHERE id = ? AND title IS NOT NULL",
+                (source, session_id),
+            )
+            return cursor.rowcount
+
+        return bool(await self._execute_write(_do))
 
     async def set_session_archived(
         self, session_id: str, archived: bool
@@ -5863,6 +6562,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         rowcount = await self._execute_write(_do)
         return rowcount > 0
+
+    async def set_session_read(self, session_id: str, read: bool = True) -> bool:
+        """Mark a session read/unread across its compression lineage.
+
+        ``None`` means the session has never been tracked and is treated as
+        read. A timestamp is a read watermark; ``0.0`` explicitly marks the
+        conversation unread so later activity remains visible to callers.
+        """
+        async def _do(conn):
+            cursor = await conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET last_read_at = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, time.time() if read else 0.0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = (
+                    await (await conn.execute("SELECT changes()")).fetchone()
+                )[0]
+            return rowcount
+
+        return bool(await self._execute_write(_do))
+
+    @staticmethod
+    def session_unread(session_row: dict[str, Any]) -> bool:
+        """Derive unread state from a session's read watermark and activity."""
+        last_read = session_row.get("last_read_at")
+        if last_read is None:
+            return False
+        last_active = session_row.get("last_active") or session_row.get("started_at")
+        return float(last_active or 0) > float(last_read)
 
     async def publish_compression_child(
         self,
@@ -6070,6 +6827,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             vacuum_cursor = await connection.execute("VACUUM")
             await vacuum_cursor.close()
+            try:
+                checkpoint = await connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                )
+                try:
+                    await checkpoint.fetchall()
+                finally:
+                    await checkpoint.close()
+            except Exception as exc:
+                logger.debug(
+                    "WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc
+                )
         return optimized
 
     async def maybe_auto_prune_and_vacuum(

@@ -37,6 +37,26 @@ _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
+
+
+class EnvironmentConnectionError(RuntimeError):
+    """Infrastructure failure of a terminal backend.
+
+    Backends raise this when the service or connection itself is unavailable,
+    as distinct from a command that merely exits non-zero.  The terminal tool
+    turns it into a structured degraded result (or a redacted error when the
+    configured degraded mode is ``fail``).
+    """
+
+    def __init__(self, reason: str, *, retry_hint: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_hint = retry_hint or (
+            "This is an infrastructure failure, not a command failure. "
+            "Verify the backend is reachable (network, service running, "
+            "credentials), then retry the same command — recovery is "
+            "automatic once the backend is back."
+        )
 _activity_callback: contextvars.ContextVar[Callable[[str], None] | None] = (
     contextvars.ContextVar("environment_activity_callback", default=None)
 )

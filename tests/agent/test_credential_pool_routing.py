@@ -157,7 +157,12 @@ class TestPoolRotationCycle:
         )
         assert recovered is True
         assert has_retried is False  # reset after rotation
-        pool.mark_exhausted_and_rotate.assert_awaited_once_with(status_code=429, error_context=None, api_key_hint="test-api-key")
+        pool.mark_exhausted_and_rotate.assert_awaited_once_with(
+            status_code=429,
+            error_context=None,
+            api_key_hint="test-api-key",
+            failure_reason="rate_limit",
+        )
         agent._swap_credential.assert_awaited_once_with(entries[1])
 
     @pytest.mark.asyncio
@@ -185,7 +190,12 @@ class TestPoolRotationCycle:
         )
         assert recovered is True
         assert has_retried is False
-        pool.mark_exhausted_and_rotate.assert_awaited_once_with(status_code=402, error_context=None, api_key_hint="test-api-key")
+        pool.mark_exhausted_and_rotate.assert_awaited_once_with(
+            status_code=402,
+            error_context=None,
+            api_key_hint="test-api-key",
+            failure_reason="billing",
+        )
 
 
     @pytest.mark.asyncio
@@ -223,7 +233,10 @@ class TestPoolRotationCycle:
         )
         assert recovered is True
         pool.mark_exhausted_and_rotate.assert_awaited_once_with(
-            status_code=402, error_context=None, api_key_hint="pool-current-key"
+            status_code=402,
+            error_context=None,
+            api_key_hint="pool-current-key",
+            failure_reason="billing",
         )
 
 

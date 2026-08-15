@@ -104,12 +104,14 @@ class TestUpdateFromResponse:
 
 class TestPreflightDeferral:
 
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
+    def test_projects_real_usage_when_rough_growth_is_large(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 50_000
         compressor.last_rough_tokens_when_real_prompt_fit = 90_000
 
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
+        # Upstream now projects the synchronized real/rough pair instead of
+        # applying a fixed 5% rough-growth allowance.
+        assert compressor.should_defer_preflight_to_real_usage(100_000) is True
 
 
     def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
@@ -2179,6 +2181,7 @@ class TestSanitizerStripsOrphanedToolCalls:
                 ],
             },
             {"role": "tool", "tool_call_id": "tc_valid", "content": "file content"},
+            {"role": "assistant", "content": "done"},
         ]
 
         sanitized = compressor._sanitize_tool_pairs(msgs)

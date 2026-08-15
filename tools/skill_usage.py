@@ -117,6 +117,8 @@ def _empty_record() -> dict[str, Any]:
         "last_used_at": None,
         "last_viewed_at": None,
         "patch_count": 0,
+        "patch_generation": 0,
+        "last_reused_patch_generation": 0,
         "last_patched_at": None,
         "created_at": _now_iso(),
         "state": STATE_ACTIVE,
@@ -291,27 +293,77 @@ async def get_record(skill_name: str) -> dict[str, Any]:
 
 async def _mutate(
     skill_name: str,
-    mutator: Callable[[dict[str, Any]], None],
+    mutator: Callable[[dict[str, Any]], Any],
     *,
     require_curation_eligible: bool = False,
-) -> None:
+) -> Any:
     if not skill_name:
-        return
+        return None
     try:
         if require_curation_eligible and not await is_curation_eligible(skill_name):
-            return
+            return None
         async with _usage_file_lock():
             data = await load_usage()
             record = data.get(skill_name)
             if not isinstance(record, dict):
                 record = _empty_record()
-            mutator(record)
+            result = mutator(record)
             data[skill_name] = record
             await save_usage(data)
+            return result
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.debug("skill usage mutation failed for %s", skill_name, exc_info=True)
+        return None
+
+
+def _non_negative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _emit_skill_lifecycle(
+    skill_name: str,
+    action: str,
+    *,
+    record: dict[str, Any] | None = None,
+    task_id: str | None = None,
+    session_id: str | None = None,
+    use_count: int | None = None,
+    reused: bool | None = None,
+    reuse_after_patch: bool | None = None,
+) -> None:
+    """Emit retained skill lifecycle facts through the native hook boundary."""
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if not has_hook("on_skill_lifecycle"):
+            return
+        await invoke_hook(
+            "on_skill_lifecycle",
+            action=action,
+            skill_name=skill_name,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            use_count=use_count,
+            reused=reused,
+            reuse_after_patch=reuse_after_patch,
+            provenance=await telemetry_provenance(skill_name, record),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug(
+            "skill_usage lifecycle hook failed for %s/%s",
+            skill_name,
+            action,
+            exc_info=True,
+        )
 
 
 async def bump_view(skill_name: str) -> None:
@@ -322,20 +374,72 @@ async def bump_view(skill_name: str) -> None:
     await _mutate(skill_name, apply)
 
 
-async def bump_use(skill_name: str) -> None:
-    def apply(record: dict[str, Any]) -> None:
-        record["use_count"] = int(record.get("use_count") or 0) + 1
+async def bump_use(
+    skill_name: str,
+    *,
+    task_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    def apply(record: dict[str, Any]) -> dict[str, Any]:
+        previous_use_count = _non_negative_int(record.get("use_count"))
+        patch_generation = _non_negative_int(record.get("patch_generation"))
+        last_reused_generation = min(
+            _non_negative_int(record.get("last_reused_patch_generation")),
+            patch_generation,
+        )
+        reused = previous_use_count > 0
+        reuse_after_patch = reused and patch_generation > last_reused_generation
+        record["use_count"] = previous_use_count + 1
         record["last_used_at"] = _now_iso()
+        record["patch_generation"] = patch_generation
+        record["last_reused_patch_generation"] = (
+            patch_generation if reuse_after_patch else last_reused_generation
+        )
+        return {
+            "created_by": record.get("created_by"),
+            "use_count": record["use_count"],
+            "reused": reused,
+            "reuse_after_patch": reuse_after_patch,
+        }
 
-    await _mutate(skill_name, apply)
+    facts = await _mutate(skill_name, apply)
+    if isinstance(facts, dict):
+        await _emit_skill_lifecycle(
+            skill_name,
+            "loaded",
+            record=facts,
+            task_id=task_id,
+            session_id=session_id,
+            use_count=facts["use_count"],
+            reused=facts["reused"],
+            reuse_after_patch=facts["reuse_after_patch"],
+        )
 
 
-async def bump_patch(skill_name: str) -> None:
-    def apply(record: dict[str, Any]) -> None:
-        record["patch_count"] = int(record.get("patch_count") or 0) + 1
+async def bump_patch(
+    skill_name: str,
+    *,
+    action: str = "patch",
+    task_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    def apply(record: dict[str, Any]) -> dict[str, Any]:
+        record["patch_count"] = _non_negative_int(record.get("patch_count")) + 1
+        record["patch_generation"] = _non_negative_int(
+            record.get("patch_generation")
+        ) + 1
         record["last_patched_at"] = _now_iso()
+        return {"created_by": record.get("created_by")}
 
-    await _mutate(skill_name, apply)
+    facts = await _mutate(skill_name, apply)
+    if isinstance(facts, dict):
+        await _emit_skill_lifecycle(
+            skill_name,
+            "patched" if action == "patch" else "edited",
+            record=facts,
+            task_id=task_id,
+            session_id=session_id,
+        )
 
 
 async def mark_agent_created(skill_name: str) -> None:
@@ -344,6 +448,51 @@ async def mark_agent_created(skill_name: str) -> None:
         lambda record: record.__setitem__("created_by", "agent"),
         require_curation_eligible=True,
     )
+
+
+async def record_created(
+    skill_name: str,
+    *,
+    agent_created: bool,
+    task_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Record creation provenance while retaining the async sidecar format."""
+
+    def apply(record: dict[str, Any]) -> dict[str, Any]:
+        record.clear()
+        record.update(_empty_record())
+        if agent_created:
+            record["created_by"] = "agent"
+        return {"created_by": record.get("created_by")}
+
+    facts = await _mutate(
+        skill_name,
+        apply,
+        require_curation_eligible=False,
+    )
+    if isinstance(facts, dict):
+        await _emit_skill_lifecycle(
+            skill_name,
+            "created",
+            record=facts,
+            task_id=task_id,
+            session_id=session_id,
+        )
+
+
+async def record_installed(skill_name: str) -> None:
+    """Record a successful Skills Hub install without exposing its name."""
+
+    def apply(record: dict[str, Any]) -> dict[str, Any]:
+        record["created_by"] = "installed"
+        record["state"] = STATE_ACTIVE
+        record["archived_at"] = None
+        return {"created_by": record["created_by"]}
+
+    facts = await _mutate(skill_name, apply)
+    if isinstance(facts, dict):
+        await _emit_skill_lifecycle(skill_name, "installed", record=facts)
 
 
 async def set_pinned(skill_name: str, pinned: bool) -> None:
@@ -1101,6 +1250,34 @@ async def provenance(skill_name: str) -> str:
     if await is_bundled(skill_name):
         return "bundled"
     return "agent"
+
+
+async def telemetry_provenance(
+    skill_name: str,
+    record: dict[str, Any] | None = None,
+) -> str:
+    """Return bounded provenance for shared skill lifecycle metrics."""
+    if await is_hub_installed(skill_name) or await is_bundled(skill_name):
+        return "installed"
+    if ":" in skill_name:
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            if get_plugin_manager().find_plugin_skill(skill_name) is not None:
+                return "installed"
+        except Exception:
+            pass
+    if isinstance(record, dict):
+        created_by = record.get("created_by")
+        if created_by == "installed":
+            return "installed"
+        if created_by == "agent":
+            return "agent_created"
+    if await _find_external_skill_dir(skill_name) is not None:
+        return "external"
+    if await _find_skill_dir(skill_name) is not None or isinstance(record, dict):
+        return "local"
+    return "unknown"
 
 
 async def curated_report() -> list[dict[str, Any]]:

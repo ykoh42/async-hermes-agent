@@ -31,6 +31,7 @@ Or via $HERMES_HOME/hindsight/config.json (profile-scoped), falling back to
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import errno
 import hashlib
 import json
@@ -49,7 +50,7 @@ import aiofiles
 import aiofiles.os
 import aiofiles.tempfile
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, RecallStatus
 from agent.secret_scope import get_secret, is_multiplex_active
 from agent.ssl_verify import _create_httpx_client
 from hermes_cli.async_source_loader import _load_source_package, _locate_source_module
@@ -60,12 +61,21 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class _RecallResult:
+    """Formatted recall text and its discrete memory count."""
+
+    text: str
+    count: int
+
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+_HINDSIGHT_GLYPH = "👁️"
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -109,8 +119,30 @@ def _parse_int_setting(value: Any, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
+        logger.warning(
+            "Invalid integer Hindsight setting %r; using default %s",
+            value,
+            default,
+        )
         return default
+
+
+def _local_runtime_hint(reason: str | None) -> str:
+    """Return actionable install guidance for a missing embedded runtime."""
+    text = (reason or "").lower()
+    if "no module named" in text and (
+        "hindsight'" in text
+        or 'hindsight"' in text
+        or "hindsight_embed" in text
+    ):
+        return (
+            f" Install the embedded runtime with: uv pip install --python "
+            f"{sys.executable} hindsight-all — or run 'hermes memory setup'. "
+            "(local_embedded needs the 'hindsight-all' package, which provides "
+            "the top-level 'hindsight' module; 'hindsight-client' alone only "
+            "covers cloud / local_external.)"
+        )
+    return ""
 
 
 # Env var the embedded daemon manager reads (at import time, as a module-level
@@ -980,6 +1012,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._config = None
+        self._unavailable_reason = ""
         self._api_key = None
         self._api_url = _DEFAULT_API_URL
         self._bank_id = "hermes"
@@ -1006,9 +1039,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        self._prefetch_count = 0
         self._prefetch_lock = asyncio.Lock()
         self._prefetch_task: asyncio.Task[None] | None = None
         self._prefetch_tasks: set[asyncio.Task[None]] = set()
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+        self._recall_indicator = True
+        self._retain_indicator = True
+        self._status_callback = None
         # Retains stay ordered exactly as upstream, but the writer is an owned
         # event-loop task consuming an asyncio.Queue instead of a worker thread.
         self._retain_queue: asyncio.Queue = asyncio.Queue()
@@ -1066,6 +1105,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
+        self._recall_sync = False
         self._recall_max_tokens = 4096
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
@@ -1091,9 +1131,13 @@ class HindsightMemoryProvider(MemoryProvider):
     async def is_available(self) -> bool:
         try:
             cfg = await _load_config()
+            self._config = cfg
+            self._unavailable_reason = ""
             mode = cfg.get("mode", "cloud")
             if mode in {"local", "local_embedded"}:
-                available, _ = await _check_local_runtime()
+                available, reason = await _check_local_runtime()
+                if not available:
+                    self._unavailable_reason = _local_runtime_hint(reason)
                 return available
             if mode == "local_external":
                 return True
@@ -1106,8 +1150,15 @@ class HindsightMemoryProvider(MemoryProvider):
                 cfg.get("api_url") or get_secret("HINDSIGHT_API_URL", "")
             )
             return has_key or has_url
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._unavailable_reason = _local_runtime_hint(str(exc))
             return False
+
+    def unavailable_reason(self) -> str:
+        """Return actionable guidance captured by the async availability probe."""
+        return self._unavailable_reason.strip()
 
     async def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/hindsight/config.json."""
@@ -1157,6 +1208,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
+            {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory", "default": True},
+            {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is dispatched to memory", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1560,6 +1614,8 @@ class HindsightMemoryProvider(MemoryProvider):
     async def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
+        status_callback = kwargs.get("status_callback")
+        self._status_callback = status_callback if callable(status_callback) else None
 
         # Each process lifecycle gets its own document_id. Reusing session_id
         # alone caused overwrites on /resume — the reloaded session starts
@@ -1675,6 +1731,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
+        self._recall_sync = bool(self._config.get("recall_sync", False))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
@@ -1688,6 +1745,8 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
+        self._recall_indicator = bool(self._config.get("recall_indicator", True))
+        self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
@@ -1751,17 +1810,60 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
-    async def prefetch(self, query: str, *, session_id: str = "") -> str:
-        task = self._prefetch_task
-        if task is not None and not task.done():
-            logger.debug("Prefetch: waiting for background task to complete")
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
-            except TimeoutError:
-                pass
-        async with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
+    def _recall_disabled(self) -> bool:
+        """Return whether auto-recall is disabled for the current provider."""
+        if self._memory_mode == "tools":
+            logger.debug("Prefetch: skipped (tools-only mode)")
+            return True
+        if not self._auto_recall:
+            logger.debug("Prefetch: skipped (auto_recall disabled)")
+            return True
+        if self._shutting_down.is_set():
+            logger.debug("Prefetch: skipped (shutting down)")
+            return True
+        return False
+
+    async def _do_recall(self, query: str) -> _RecallResult:
+        """Run one native-async recall/reflect and retain its result count."""
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[: self._recall_max_input_chars]
+        try:
+            if self._prefetch_method == "reflect":
+                response = await self._run_hindsight_operation(
+                    lambda client: client.areflect(
+                        bank_id=self._bank_id,
+                        query=query,
+                        budget=self._budget,
+                    )
+                )
+                return _RecallResult(response.text or "", 0)
+
+            recall_kwargs: dict[str, Any] = {
+                "bank_id": self._bank_id,
+                "query": query,
+                "budget": self._budget,
+                "max_tokens": self._recall_max_tokens,
+            }
+            if self._recall_tags:
+                recall_kwargs["tags"] = self._recall_tags
+                recall_kwargs["tags_match"] = self._recall_tags_match
+            if self._recall_types:
+                recall_kwargs["types"] = self._recall_types
+            response = await self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs)
+            )
+            results = response.results or []
+            text = "\n".join(
+                f"- {result.text}" for result in results if result.text
+            )
+            return _RecallResult(text, len(results))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Hindsight recall failed: %s", exc, exc_info=True)
+            return _RecallResult("", 0)
+
+    def _format_recall(self, result: str) -> str:
         if not result:
             logger.debug("Prefetch: no results available")
             return ""
@@ -1773,20 +1875,54 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _record_recall_indicator(self, *, returned: bool, count: int) -> None:
+        self._last_recall_returned = returned
+        self._last_recall_count = count if returned else 0
+
+    async def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if self._recall_sync:
+            if self._recall_disabled():
+                self._record_recall_indicator(returned=False, count=0)
+                return ""
+            recalled = await self._do_recall(query)
+            self._record_recall_indicator(
+                returned=bool(recalled.text),
+                count=recalled.count,
+            )
+            return self._format_recall(recalled.text)
+
+        task = self._prefetch_task
+        if task is not None and not task.done():
+            logger.debug("Prefetch: waiting for background task to complete")
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+            except TimeoutError:
+                pass
+        async with self._prefetch_lock:
+            result = self._prefetch_result
+            count = self._prefetch_count
+            self._prefetch_result = ""
+            self._prefetch_count = 0
+        self._record_recall_indicator(returned=bool(result), count=count)
+        return self._format_recall(result)
+
+    def recall_status(self) -> RecallStatus | None:
+        """Describe what the most recent prefetch injected for the UI."""
+        if not self._recall_indicator or not self._last_recall_returned:
+            return None
+        return RecallStatus(
+            provider_label="Hindsight",
+            count=self._last_recall_count,
+            glyph=_HINDSIGHT_GLYPH,
+        )
+
     async def queue_prefetch(
         self,
         query: str,
         *,
         session_id: str = "",
     ) -> None:
-        if self._memory_mode == "tools":
-            logger.debug("Prefetch: skipped (tools-only mode)")
-            return
-        if not self._auto_recall:
-            logger.debug("Prefetch: skipped (auto_recall disabled)")
-            return
-        if self._shutting_down.is_set():
-            logger.debug("Prefetch: skipped (shutting down)")
+        if self._recall_sync or self._recall_disabled():
             return
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
@@ -1796,70 +1932,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 await self._wait_for_retains_drained(
                     self._prefetch_retain_drain_timeout
                 )
-            try:
-                if self._prefetch_method == "reflect":
-                    logger.debug(
-                        "Prefetch: calling reflect (bank=%s, query_len=%d)",
-                        self._bank_id,
-                        len(query),
-                    )
-                    response = await self._run_hindsight_operation(
-                        lambda client: client.areflect(
-                            bank_id=self._bank_id,
-                            query=query,
-                            budget=self._budget,
-                        )
-                    )
-                    text = response.text or ""
-                else:
-                    recall_kwargs: dict[str, Any] = {
-                        "bank_id": self._bank_id,
-                        "query": query,
-                        "budget": self._budget,
-                        "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug(
-                        "Prefetch: calling recall "
-                        "(bank=%s, query_len=%d, budget=%s)",
-                        self._bank_id,
-                        len(query),
-                        self._budget,
-                    )
-                    response = await self._run_hindsight_operation(
-                        lambda client: client.arecall(**recall_kwargs)
-                    )
-                    num_results = (
-                        len(response.results) if response.results else 0
-                    )
-                    logger.debug(
-                        "Prefetch: recall returned %d results",
-                        num_results,
-                    )
-                    text = (
-                        "\n".join(
-                            f"- {result.text}"
-                            for result in response.results
-                            if result.text
-                        )
-                        if response.results
-                        else ""
-                    )
-                if text:
-                    async with self._prefetch_lock:
-                        self._prefetch_result = text
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.debug(
-                    "Hindsight prefetch failed: %s",
-                    exc,
-                    exc_info=True,
-                )
+            recalled = await self._do_recall(query)
+            async with self._prefetch_lock:
+                self._prefetch_result = recalled.text
+                self._prefetch_count = recalled.count
 
         task = asyncio.create_task(
             run_prefetch(),
@@ -2038,11 +2114,23 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Hindsight retain succeeded")
 
         self._ensure_writer()
+        self._emit_saving_indicator()
         self._retain_queue.put_nowait(_do_retain)
         # Advance the append watermark only after the delta is queued, so a
         # later retain doesn't re-ship turns we've already handed to the writer.
         if update_mode == "append":
             self._last_retained_turn_count = len(self._session_turns)
+
+    def _emit_saving_indicator(self) -> None:
+        """Emit the model-independent retain status, when configured."""
+        if not self._retain_indicator or self._status_callback is None:
+            return
+        try:
+            self._status_callback(
+                f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…"
+            )
+        except Exception:
+            logger.debug("Retain indicator emit failed", exc_info=True)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         if self._memory_mode == "context":

@@ -542,10 +542,17 @@ class ToolRegistry:
                 return True
         return False
 
-    def get_entry(self, name: str) -> ToolEntry | None:
+    def get_entry(
+        self,
+        name: str,
+        *,
+        scope: str | None = None,
+    ) -> ToolEntry | None:
         """Return a registered tool entry by name, or None."""
         with self._lock:
-            plugin_scope = _active_plugin_registry_scope()
+            plugin_scope = (
+                scope if scope is not None else _active_plugin_registry_scope()
+            )
             if plugin_scope is not None:
                 plugin = self._plugin_tools.get(plugin_scope, {}).get(name)
                 if plugin is not None:
@@ -553,9 +560,11 @@ class ToolRegistry:
             builtin = self._tools.get(name)
             if builtin is not None:
                 return builtin
-            scope = _active_mcp_registry_scope()
-            if scope is not None:
-                entry = self._mcp_tools.get(scope, {}).get(name)
+            mcp_scope = (
+                scope if scope is not None else _active_mcp_registry_scope()
+            )
+            if mcp_scope is not None:
+                entry = self._mcp_tools.get(mcp_scope, {}).get(name)
                 if entry is not None:
                     return entry
             return None
@@ -640,12 +649,22 @@ class ToolRegistry:
     # Registration
     # ------------------------------------------------------------------
 
-    def register_plugin_override_policy(self, module_namespace: str, allowed: bool) -> None:
+    def register_plugin_override_policy(
+        self,
+        module_namespace: str,
+        allowed: bool,
+        *,
+        scope: str | None = None,
+    ) -> None:
         """Bind a plugin module namespace to its operator opt-in for built-in
         override. Called once per plugin at load time. Later delayed
         ``register()`` calls remain gated until the owning manager is cleaned
         up, after which registrations from the retired module fail closed.
         """
+        # The active plugin manager already binds the namespace to its profile
+        # scope.  Keep that ownership map as the source of truth while
+        # accepting upstream's explicit scope argument for compatibility.
+        del scope
         with self._lock:
             self._plugin_override_policy[module_namespace] = bool(allowed)
 
@@ -748,6 +767,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable | None = None,
         override: bool = False,
+        scope: str | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -764,7 +784,7 @@ class ToolRegistry:
 
         with self._lock:
             mcp_scope = (
-                _active_mcp_registry_scope()
+                (scope if scope is not None else _active_mcp_registry_scope())
                 if toolset.startswith("mcp-")
                 else None
             )
@@ -775,7 +795,11 @@ class ToolRegistry:
                     "active plugin manager"
                 )
             plugin_scope = (
-                _active_plugin_registry_scope(registration=True)
+                (
+                    scope
+                    if scope is not None
+                    else _active_plugin_registry_scope(registration=True)
+                )
                 if mcp_scope is None
                 else None
             )
@@ -1067,7 +1091,14 @@ class ToolRegistry:
             result_type=result_type,
         )
 
-    async def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
+    async def dispatch(
+        self,
+        name: str,
+        args: dict,
+        *,
+        scope: str | None = None,
+        **kwargs,
+    ) -> str | dict:
         """Execute a tool handler by name.
 
         * Every active handler is awaited directly.
@@ -1076,7 +1107,7 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
-        entry = self.get_entry(name)
+        entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:

@@ -17,11 +17,15 @@ def _reset_registry():
 
 
 class _FakeCodexProvider(ImageGenProvider):
+    def __init__(self):
+        self.received: dict = {}
+
     @property
     def name(self) -> str:
         return "codex"
 
     async def generate(self, prompt, aspect_ratio="landscape", **kwargs):
+        self.received = {"prompt": prompt, "aspect_ratio": aspect_ratio, **kwargs}
         return {
             "success": True,
             "image": "/tmp/codex-test.png",
@@ -72,6 +76,36 @@ class TestPluginDispatch:
         assert payload["provider"] == "codex"
         assert payload["image"] == "/tmp/codex-test.png"
         assert payload["aspect_ratio"] == "square"
+
+
+    @pytest.mark.asyncio
+    async def test_dispatch_forwards_explicit_upscale(self, monkeypatch):
+        from tools import image_generation_tool
+        from agent import image_gen_registry as registry_module
+        from hermes_cli import plugins as plugins_module
+
+        provider = _FakeCodexProvider()
+        monkeypatch.setattr(
+            image_generation_tool,
+            "_read_configured_image_provider",
+            AsyncMock(return_value="codex"),
+        )
+        monkeypatch.setattr(
+            image_generation_tool,
+            "_read_configured_image_model",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            plugins_module, "_ensure_plugins_discovered", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            registry_module, "get_provider", lambda name: provider if name == "codex" else None
+        )
+
+        await image_generation_tool._dispatch_to_plugin_provider(
+            "draw cat", "square", upscale=True
+        )
+        assert provider.received["upscale"] is True
 
 
     @pytest.mark.asyncio

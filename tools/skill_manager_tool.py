@@ -681,6 +681,32 @@ def _add_description_prompt_preview(result: dict[str, Any], content: str) -> Non
         )
 
 
+def _attach_lint_findings(result: dict[str, Any], content: str) -> None:
+    """Attach advisory authoring findings without synchronous file I/O.
+
+    The retained manager already has the complete SKILL.md content in memory;
+    use the linter's pure content path here so creating a skill never introduces
+    a blocking disk read into the native-async mutation boundary.  On-disk
+    linter checks remain available through ``python -m tools.skill_linter``.
+    """
+    try:
+        from tools.skill_linter import lint_content
+
+        findings = lint_content(content)
+    except Exception:
+        return
+    if not findings:
+        return
+    result["lint_warnings"] = [
+        {"severity": finding.severity, "rule": finding.rule, "message": finding.message}
+        for finding in findings
+    ]
+    result["lint_hint"] = (
+        "These advisory skill-authoring findings are not blockers; fix them "
+        "with skill_manage(action='patch') when appropriate."
+    )
+
+
 async def _create_skill(
     name: str,
     content: str,
@@ -739,6 +765,7 @@ async def _create_skill(
     if category:
         result["category"] = category
     _add_description_prompt_preview(result, content)
+    _attach_lint_findings(result, content)
     return result
 
 
@@ -1097,6 +1124,8 @@ async def skill_manage(
     new_string: str | None = None,
     replace_all: bool = False,
     absorbed_into: str | None = None,
+    task_id: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Manage user skills and return the upstream JSON result shape."""
     preflight = await _background_review_preflight(action, name)
@@ -1182,9 +1211,26 @@ async def skill_manage(
 
                 if action == "create":
                     if is_background_review():
-                        await skill_usage.mark_agent_created(name)
+                        await skill_usage.record_created(
+                            name,
+                            agent_created=True,
+                            task_id=task_id,
+                            session_id=session_id,
+                        )
+                    else:
+                        await skill_usage.record_created(
+                            name,
+                            agent_created=False,
+                            task_id=task_id,
+                            session_id=session_id,
+                        )
                 elif action in {"patch", "edit", "write_file", "remove_file"}:
-                    await skill_usage.bump_patch(name)
+                    await skill_usage.bump_patch(
+                        name,
+                        action=action,
+                        task_id=task_id,
+                        session_id=session_id,
+                    )
                 elif action == "delete" and not result.get("_archived"):
                     await skill_usage.forget(name)
             except asyncio.CancelledError:
@@ -1343,6 +1389,8 @@ async def _handle_skill_manage(args, **kw):
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
+        task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
     )
 
 

@@ -47,6 +47,7 @@ one extra LLM call and yields a usable description.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -104,7 +105,7 @@ def _lookup_user_declared_supports_vision(
         return None
 
 
-def _lookup_supports_vision(
+async def _lookup_supports_vision(
     provider: str,
     model: str,
     cfg: dict[str, Any] | None = None,
@@ -118,7 +119,10 @@ def _lookup_supports_vision(
         _lookup_image_supports = None
     if _lookup_image_supports is not None:
         try:
-            return _lookup_image_supports(provider, model, cfg)
+            result = _lookup_image_supports(provider, model, cfg)
+            if inspect.isawaitable(result):
+                return await result
+            return result
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
                 "computer_use vision_routing: image-routing caps lookup failed "
@@ -128,7 +132,7 @@ def _lookup_supports_vision(
             return None
     try:
         from agent.models_dev import get_model_capabilities
-        caps = get_model_capabilities(provider, model)
+        caps = await get_model_capabilities(provider, model)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug(
             "computer_use vision_routing: caps lookup failed for %s:%s — %s",
@@ -161,7 +165,7 @@ def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> bool 
     return bool(_supports_media_in_tool_results(provider, model))
 
 
-def should_route_capture_to_aux_vision(
+async def should_route_capture_to_aux_vision(
     provider: str,
     model: str,
     cfg: dict[str, Any] | None,
@@ -194,6 +198,8 @@ def should_route_capture_to_aux_vision(
         return True
 
     supports_vision = _lookup_supports_vision(provider, model, cfg)
+    if inspect.isawaitable(supports_vision):
+        supports_vision = await supports_vision
     if supports_vision is True:
         return False
     return True

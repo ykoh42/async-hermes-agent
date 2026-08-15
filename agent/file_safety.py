@@ -71,7 +71,6 @@ async def build_write_denied_paths(home: str) -> set[str]:
         os.path.join(home, ".ssh", "authorized_keys"),
         os.path.join(home, ".ssh", "id_rsa"),
         os.path.join(home, ".ssh", "id_ed25519"),
-        os.path.join(home, ".ssh", "config"),
         os.path.join(home, ".netrc"),
         os.path.join(home, ".pgpass"),
         os.path.join(home, ".npmrc"),
@@ -110,6 +109,11 @@ async def build_write_denied_prefixes(home: str) -> list[str]:
     return [await _canonical(path) + os.sep for path in paths]
 
 
+async def build_write_approval_paths(home: str) -> set[str]:
+    """Return non-credential paths that require an interactive write approval."""
+    return {await _canonical(os.path.join(home, ".ssh", "config"))}
+
+
 async def get_safe_write_roots() -> set[str]:
     """Return resolved ``HERMES_WRITE_SAFE_ROOT`` paths."""
     roots = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
@@ -129,6 +133,12 @@ async def get_safe_write_roots() -> set[str]:
 async def _classify_write_denial(path: str) -> str | bool | None:
     home = await _canonical(os.path.expanduser("~"))
     resolved = await _canonical(path)
+
+    # ``~/.ssh/config`` is routine to edit but can contain ProxyCommand or
+    # Match exec directives.  It is allowed past the denylist only so the
+    # model-facing file tool can request the native async approval gate.
+    if resolved in await build_write_approval_paths(home):
+        return None
 
     if resolved in await build_write_denied_paths(home):
         return "credential"
@@ -171,6 +181,13 @@ async def get_write_denied_error(path: str, *, verb: str = "Write") -> str | Non
             f"({roots}). Unset the variable or add this path's directory prefix."
         )
     return f"{verb} denied: '{path}' is a protected system/credential file."
+
+
+async def is_write_approval_required(path: str) -> bool:
+    """Return whether a path needs human approval before a model write."""
+    home = await _canonical(os.path.expanduser("~"))
+    resolved = await _canonical(path)
+    return resolved in await build_write_approval_paths(home)
 
 
 async def get_read_block_error(path: str) -> str | None:

@@ -27,6 +27,10 @@ _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
 
 
+class HonchoAuthError(RuntimeError):
+    """Raised when Honcho rejects credentials after the async retry boundary."""
+
+
 @dataclass
 class HonchoSession:
     """
@@ -627,6 +631,7 @@ class HonchoSessionManager:
         reasoning_level: str | None = None,
         peer: str = "user",
         apply_injection_cap: bool = True,
+        raise_errors: bool = False,
     ) -> str:
         """
         Query Honcho's dialectic endpoint about a peer.
@@ -694,6 +699,8 @@ class HonchoSessionManager:
             return result
         except Exception as e:
             logger.warning("Honcho dialectic query failed: %s", e)
+            if raise_errors:
+                raise
             return ""
 
     async def prefetch_context(self, session_key: str, user_message: str | None = None) -> None:

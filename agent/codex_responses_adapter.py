@@ -690,7 +690,12 @@ def _chat_messages_to_responses_input(
                 "output": output_value,
             })
 
-    return items
+    # A native compaction checkpoint makes everything before it invisible to
+    # the Responses server. Keep the same boundary pruning as upstream while
+    # leaving ordinary histories byte-for-byte unchanged.
+    from agent.native_compaction import prune_pre_checkpoint_items
+
+    return prune_pre_checkpoint_items(items)
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +825,17 @@ def _preflight_codex_input_items(
                 else:
                     reasoning_item["summary"] = []
                 normalized.append(reasoning_item)
+            continue
+
+        if item_type == "compaction":
+            # Replayed native server-side compaction checkpoint.  The
+            # encrypted blob is opaque and issuer-bound; only forward the
+            # field defined by the Responses API.
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                normalized.append(
+                    {"type": "compaction", "encrypted_content": encrypted}
+                )
             continue
 
         if item_type == "message":
@@ -1030,7 +1046,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key",
-        "prompt_cache_retention", "service_tier",
+        "prompt_cache_retention", "service_tier", "context_management",
         "extra_headers", "extra_body", "timeout",
     }
     normalized: dict[str, Any] = {
@@ -1078,6 +1094,10 @@ def _preflight_codex_api_kwargs(
         val = api_kwargs.get(passthrough_key)
         if val is not None:
             normalized[passthrough_key] = val
+
+    context_management = api_kwargs.get("context_management")
+    if isinstance(context_management, list) and context_management:
+        normalized["context_management"] = context_management
 
     extra_headers = api_kwargs.get("extra_headers")
     if extra_headers is not None:
@@ -1416,6 +1436,20 @@ def _normalize_codex_response(
                             raw_summary.append({"type": "summary_text", "text": text})
                     raw_item["summary"] = raw_summary
                 reasoning_items_raw.append(raw_item)
+        elif item_type == "compaction":
+            # Native server-side compaction checkpoint. Store it in the
+            # existing reasoning sidecar so persistence and replay need no
+            # additional state shape.
+            encrypted = getattr(item, "encrypted_content", None)
+            if isinstance(encrypted, str) and encrypted:
+                raw_item = {"type": "compaction", "encrypted_content": encrypted}
+                if issuer_kind:
+                    raw_item["_issuer_kind"] = issuer_kind
+                reasoning_items_raw.append(raw_item)
+                logger.info(
+                    "Native Responses compaction item captured (%d chars encrypted).",
+                    len(encrypted),
+                )
         elif item_type == "function_call":
             if item_status in {"queued", "in_progress", "incomplete"}:
                 continue

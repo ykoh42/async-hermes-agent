@@ -59,12 +59,12 @@ def _plugin_scope(
     return scope
 
 
-def _provider_snapshot() -> dict[str, WebSearchProvider]:
+def _provider_snapshot(scope: str | None = None) -> dict[str, WebSearchProvider]:
     with _lock:
         providers = dict(_providers)
-        scope = _plugin_scope()
-        if scope is not None:
-            providers.update(_plugin_providers.get(scope, {}))
+        active_scope = scope if scope is not None else _plugin_scope()
+        if active_scope is not None:
+            providers.update(_plugin_providers.get(active_scope, {}))
         return providers
 
 
@@ -73,7 +73,11 @@ def _clear_plugin_scope(scope: object) -> None:
         _plugin_providers.pop(scope, None)
 
 
-def register_provider(provider: WebSearchProvider) -> None:
+def register_provider(
+    provider: WebSearchProvider,
+    *,
+    scope: str | None = None,
+) -> None:
     """Register a web search/extract provider.
 
     Re-registration (same ``name``) overwrites the previous entry and logs
@@ -89,13 +93,17 @@ def register_provider(provider: WebSearchProvider) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Web provider .name must be a non-empty string")
     with _lock:
-        scope = _plugin_scope(
-            registration=True,
-            module_name=type(provider).__module__,
+        registration_scope = (
+            scope
+            if scope is not None
+            else _plugin_scope(
+                registration=True,
+                module_name=type(provider).__module__,
+            )
         )
         target = (
-            _plugin_providers.setdefault(scope, {})
-            if scope is not None
+            _plugin_providers.setdefault(registration_scope, {})
+            if registration_scope is not None
             else _providers
         )
         existing = target.get(name)
@@ -112,17 +120,52 @@ def register_provider(provider: WebSearchProvider) -> None:
         )
 
 
-def list_providers() -> list[WebSearchProvider]:
+def list_providers(*, scope: str | None = None) -> list[WebSearchProvider]:
     """Return all registered providers, sorted by name."""
-    items = list(_provider_snapshot().values())
+    items = list(_provider_snapshot(scope).values())
     return sorted(items, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> WebSearchProvider | None:
+def get_provider(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> WebSearchProvider | None:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    return _provider_snapshot().get(name.strip())
+    return _provider_snapshot(scope).get(name.strip())
+
+
+def snapshot_registration(
+    name: str,
+    *,
+    scope: str | None = None,
+) -> WebSearchProvider | None:
+    with _lock:
+        target = _providers if scope is None else _plugin_providers.get(scope, {})
+        return target.get(name.strip())
+
+
+def restore_registration(
+    name: str,
+    current: WebSearchProvider,
+    previous: WebSearchProvider | None,
+    *,
+    scope: str | None = None,
+) -> bool:
+    with _lock:
+        target = _providers if scope is None else _plugin_providers.setdefault(scope, {})
+        key = name.strip()
+        if target.get(key) is not current:
+            return False
+        if previous is None:
+            target.pop(key, None)
+        else:
+            target[key] = previous
+        if scope is not None and not target:
+            _plugin_providers.pop(scope, None)
+        return True
 
 
 # ---------------------------------------------------------------------------

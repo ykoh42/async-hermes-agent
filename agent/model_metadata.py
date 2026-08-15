@@ -456,6 +456,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "llama": 131072,
     # Qwen — specific model families before the catch-all.
     # Official docs: https://help.aliyun.com/zh/model-studio/developer-reference/
+    "qwen3.8-max": 1_000_000,     # 1M context (OpenRouter & Nous portal, verified 2026-08-03)
     "qwen3.6-plus": 1048576,      # 1M context (DashScope/Alibaba & OpenRouter)
     "qwen3.7-plus": 1048576,      # 1M context (DashScope/Alibaba)
     "qwen3-coder-plus": 1000000,  # 1M context
@@ -587,6 +588,14 @@ def grok_supports_reasoning_effort(model: str) -> bool:
         if sep in name:
             name = name.rsplit(sep, 1)[-1]
     return any(name.startswith(prefix) for prefix in _GROK_EFFORT_CAPABLE_PREFIXES)
+
+
+def is_grok_46_family(model: str) -> bool:
+    """Return whether *model* is a Grok 4.6 family identifier."""
+    name = (model or "").strip().lower().replace("_", "-")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name == "grok-4.6" or name.startswith("grok-4.6-")
 
 
 _CONTEXT_LENGTH_KEYS = (
@@ -1520,6 +1529,13 @@ async def save_context_length(model: str, base_url: str, length: int) -> None:
     Cache key is ``model@base_url`` so the same model name served from
     different providers can have different limits.
     """
+    if isinstance(length, bool) or length <= 0:
+        logger.warning(
+            "Refusing to cache non-positive context length %s -> %s tokens",
+            f"{model}@{base_url}",
+            length,
+        )
+        return
     key = _context_cache_key(model, base_url)
     path = _get_context_cache_path()
     async with await _context_cache_lock.for_path(path):
@@ -2111,6 +2127,17 @@ def _model_name_suggests_kimi(model: str) -> bool:
     return lower.startswith("kimi") or "moonshot" in lower
 
 
+def _model_name_suggests_minimax(model: str) -> bool:
+    """Return True for MiniMax-family models with stale 32K metadata."""
+    lower = model.lower()
+    return lower.startswith("minimax") or "minimaxai/" in lower
+
+
+def _model_name_suggests_stale_32k_underreport(model: str) -> bool:
+    """Return True for model families known to be underreported as 32K."""
+    return _model_name_suggests_kimi(model) or _model_name_suggests_minimax(model)
+
+
 def _model_name_suggests_minimax_m3(model: str) -> bool:
     """Return True if the model name looks like MiniMax M3.
 
@@ -2541,10 +2568,10 @@ async def _resolve_nous_context_length(
         ctx = entry.get("context_length")
         if ctx is None:
             return None
-        if ctx <= 32768 and _model_name_suggests_kimi(or_id):
+        if ctx <= 32768 and _model_name_suggests_stale_32k_underreport(or_id):
             logger.info(
                 "Rejecting OpenRouter metadata context=%s for %r "
-                "(Kimi-family underreport, Nous path); falling through to hardcoded defaults",
+                "(known 32K underreport, Nous path); falling through to hardcoded defaults",
                 ctx, or_id,
             )
             return None
@@ -2652,7 +2679,29 @@ async def get_model_context_length(
             logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
         # Fall through to the generic default if aggregator resolution failed.
 
-    # 0b. custom_providers per-model override — check before any probe.
+    # 0b. model_overrides config — explicit provider/model metadata wins
+    # before custom providers or any network probe.
+    if provider and model:
+        try:
+            from agent.models_dev import _explicit_model_override
+
+            override = await _explicit_model_override(provider, model)
+            override_context = (
+                int(override["context_window"])
+                if isinstance(override, dict)
+                and isinstance(override.get("context_window"), (int, float))
+                and not isinstance(override.get("context_window"), bool)
+                and int(override["context_window"]) > 0
+                else None
+            )
+            if override_context is not None:
+                return override_context
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    # 0c. custom_providers per-model override — check before any probe.
     # This closes the gap where /model switch and display paths used to fall
     # back to 128K despite the user having a per-model context_length set.
     # See #15779.
@@ -2707,10 +2756,20 @@ async def get_model_context_length(
     if base_url and not _skip_persistent_context_cache(base_url, provider):
         cached = await get_cached_context_length(model, base_url)
         if cached is not None:
-            # Invalidate stale 32k cache entries for Kimi-family models.
-            if cached <= 32768 and _model_name_suggests_kimi(model):
+            if cached <= 0:
+                logger.warning(
+                    "Dropping non-positive context cache entry %s@%s -> %s; re-resolving",
+                    model,
+                    base_url,
+                    cached,
+                )
+                await _invalidate_cached_context_length(model, base_url)
+            # Invalidate stale 32K cache entries for Kimi- and MiniMax-family
+            # models; older catalogs underreported both families.
+            elif cached <= 32768 and _model_name_suggests_stale_32k_underreport(model):
                 logger.info(
-                    "Dropping stale Kimi cache entry %s@%s -> %s (OpenRouter underreport); "
+                    "Dropping stale context cache entry %s@%s -> %s "
+                    "(known OpenRouter underreport); "
                     "re-resolving via hardcoded defaults",
                     model, base_url, f"{cached:,}",
                 )
@@ -3015,7 +3074,8 @@ async def get_model_context_length(
             # Guard against the known OpenRouter Kimi-family 32k underreport
             # (same class the hardcoded overrides exist to mitigate).
             if isinstance(or_ctx, int) and or_ctx > 0 and not (
-                or_ctx == 32768 and _model_name_suggests_kimi(model)
+                or_ctx == 32768
+                and _model_name_suggests_stale_32k_underreport(model)
             ):
                 return or_ctx
 
@@ -3045,7 +3105,10 @@ async def get_model_context_length(
         if model in metadata:
             or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
             # Guard against stale OpenRouter metadata for Kimi-family models.
-            if or_ctx == 32768 and _model_name_suggests_kimi(model):
+            if (
+                or_ctx == 32768
+                and _model_name_suggests_stale_32k_underreport(model)
+            ):
                 logger.info(
                     "Rejecting OpenRouter metadata context=%s for %r "
                     "(Kimi-family underreport); falling through to hardcoded defaults",

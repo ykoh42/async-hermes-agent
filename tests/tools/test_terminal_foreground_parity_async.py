@@ -404,7 +404,7 @@ async def test_redaction_write_cancellation_discards_raw_spill_and_temporary(
 
     def open_with_blocked_write(file, mode="r", *args, **kwargs):
         manager = original_open(file, mode, *args, **kwargs)
-        if str(file) == str(spill) and "w" in mode:
+        if str(file) == str(spill) and mode in {"w", "x", "a"}:
             return BlockingOpen(manager)
         return manager
 

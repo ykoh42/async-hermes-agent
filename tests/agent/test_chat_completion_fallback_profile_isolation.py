@@ -27,7 +27,7 @@ def _restore_multiplex_state():
         set_multiplex_active(previous)
 
 
-def _fallback_agent(*, base_url: str, key_env: str | None = None):
+def _fallback_agent(*, base_url: str, key_env: str | None = None, api_mode: str | None = None):
     fallback = {
         "provider": "custom",
         "model": "fallback-model",
@@ -35,6 +35,8 @@ def _fallback_agent(*, base_url: str, key_env: str | None = None):
     }
     if key_env is not None:
         fallback["key_env"] = key_env
+    if api_mode is not None:
+        fallback["api_mode"] = api_mode
 
     agent = SimpleNamespace(
         provider="custom",
@@ -73,7 +75,7 @@ def _fallback_agent(*, base_url: str, key_env: str | None = None):
         agent.model = pending["model"]
         agent.api_key = pending["api_key"]
         agent.base_url = pending["base_url"]
-        agent.api_mode = "chat_completions"
+        agent.api_mode = pending.get("api_mode") or "chat_completions"
         agent.client = object()
         agent._deferred_provider_runtime = None
 
@@ -163,3 +165,18 @@ async def test_unscoped_fallback_key_env_fails_closed(monkeypatch):
         await try_activate_fallback(agent)
 
     agent._try_activate_fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_fallback_api_mode_is_not_redetected(monkeypatch):
+    set_multiplex_active(False)
+    agent = _fallback_agent(
+        base_url="https://api.openai.com/v1",
+        api_mode="chat_completions",
+    )
+    with (
+        patch("agent.credential_pool.load_pool", AsyncMock(return_value=None)),
+        patch("agent.chat_completion_helpers._reset_stale_streak", lambda _agent: None),
+    ):
+        assert await try_activate_fallback(agent) is True
+    assert agent.api_mode == "chat_completions"

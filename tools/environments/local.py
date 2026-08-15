@@ -26,6 +26,7 @@ import aiofiles.os
 
 # Prime modules used by retained local imports before subprocess async paths run.
 import hermes_constants as _hermes_constants  # noqa: F401
+from tools import self_repo_guard as _self_repo_guard_bootstrap  # noqa: F401
 
 from agent.delegation_context import delegated_child_subprocess_env
 from tools.environments.base import (

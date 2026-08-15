@@ -65,6 +65,15 @@ async def test_switch_to_openrouter_reapplies_attribution_headers(mock_ctx_len):
     assert headers.get("X-Title")
 
 
+def test_kimi_coding_headers_use_hermes_attribution():
+    agent = _make_agent(provider="custom", base_url="https://example.com/v1")
+    agent._apply_client_headers_for_base_url("https://api.kimi.com/coding/v1")
+    headers = agent._client_kwargs.get("default_headers") or {}
+    assert headers["User-Agent"].startswith("HermesAgent/")
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+
+
 
 
 @pytest.mark.asyncio

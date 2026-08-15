@@ -7,10 +7,12 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from tools.url_safety import (
+    async_is_safe_url,
     is_safe_url,
     is_always_blocked_url,
     normalize_url_for_request,
     redirect_target_from_response,
+    create_ssrf_safe_async_client,
     create_ssrf_safe_client,
     SSRFConnectionBlocked,
     _SSRFGuardedNetworkBackend,
@@ -23,6 +25,15 @@ from tools.url_safety import (
 
 import ipaddress
 import pytest
+
+
+def test_upstream_async_public_names_share_native_implementations():
+    """The native port preserves upstream async names without duplicate code."""
+    from tools import url_safety
+
+    assert async_is_safe_url is url_safety.is_safe_url
+    assert create_ssrf_safe_async_client is url_safety.create_ssrf_safe_client
+    assert url_safety.ssrf_safe_async_http_transport is url_safety.ssrf_safe_http_transport
 
 
 def _resolves_to(*ips):

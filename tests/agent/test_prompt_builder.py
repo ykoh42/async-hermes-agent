@@ -4,7 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from blockbuster import BlockBuster
@@ -568,6 +568,76 @@ class TestBuildContextFilesPrompt:
         assert "Project Context" in result
 
     @pytest.mark.asyncio
+    async def test_agents_md_chain_merges_root_to_cwd(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("Root: use Ruff.")
+        package = tmp_path / "packages"
+        package.mkdir()
+        (package / "AGENTS.md").write_text("Packages: workspace.")
+        app = package / "webapp"
+        app.mkdir()
+        (app / "AGENTS.md").write_text("Webapp: app rules.")
+
+        result = await build_context_files_prompt(cwd=str(app), skip_soul=True)
+
+        assert "Root: use Ruff." in result
+        assert "Packages: workspace." in result
+        assert "Webapp: app rules." in result
+        assert result.index("Root: use Ruff.") < result.index("Packages: workspace.")
+        assert result.index("Packages: workspace.") < result.index("Webapp: app rules.")
+        assert "## ../../AGENTS.md" in result
+        assert "## ../AGENTS.md" in result
+        assert "## AGENTS.md" in result
+
+    @pytest.mark.asyncio
+    async def test_agents_md_chain_skips_gaps(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("Root rules.")
+        deep = tmp_path / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+
+        result = await build_context_files_prompt(cwd=str(deep), skip_soul=True)
+
+        assert "Root rules." in result
+        assert result.count("## ") == 1
+
+    @pytest.mark.asyncio
+    async def test_agents_md_chain_dedupes_identical_content(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("Same rules everywhere.")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("Same rules everywhere.")
+
+        result = await build_context_files_prompt(cwd=str(sub), skip_soul=True)
+
+        assert result.count("Same rules everywhere.") == 1
+
+    @pytest.mark.asyncio
+    async def test_agents_md_single_file_output_unchanged(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("Only file.")
+
+        from agent.prompt_builder import _load_agents_md
+
+        assert await _load_agents_md(sub) == "## AGENTS.md\n\nOnly file."
+
+    @pytest.mark.asyncio
+    async def test_agents_md_no_git_root_stays_cwd_only(self, tmp_path):
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        (parent / "AGENTS.md").write_text("Planted in parent.")
+        cwd = parent / "work"
+        cwd.mkdir()
+
+        from agent.prompt_builder import _load_agents_md
+
+        with patch("agent.prompt_builder._find_git_root", return_value=None):
+            assert await _load_agents_md(cwd) == ""
+
+    @pytest.mark.asyncio
     async def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
@@ -741,6 +811,28 @@ class TestStripYamlFrontmatter:
 # =========================================================================
 
 class TestEnvironmentHints:
+    def test_windows_marketing_version_distinguishes_windows_11(self, monkeypatch):
+        import agent.prompt_builder as prompt_builder
+
+        monkeypatch.setattr(
+            prompt_builder.sys,
+            "getwindowsversion",
+            lambda: type("Version", (), {"build": 22631})(),
+            raising=False,
+        )
+        assert prompt_builder._windows_marketing_version() == "11"
+
+    def test_windows_marketing_version_handles_windows_10(self, monkeypatch):
+        import agent.prompt_builder as prompt_builder
+
+        monkeypatch.setattr(
+            prompt_builder.sys,
+            "getwindowsversion",
+            lambda: type("Version", (), {"build": 19045})(),
+            raising=False,
+        )
+        assert prompt_builder._windows_marketing_version() == "10"
+
     @pytest.mark.asyncio
     async def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()

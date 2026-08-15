@@ -71,6 +71,7 @@ def _cache_agent(
         _use_native_cache_layout=native,
         _cache_ttl=cache_ttl,
         provider=provider,
+        model="test/model",
         tools=tools or [],
         _direct_native_anthropic_tool_cache_capability=lambda: direct_tool_cache,
         client=None,

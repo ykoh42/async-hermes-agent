@@ -6,9 +6,20 @@ lifecycle or stream consumption.
 """
 
 import hashlib
+import inspect
 import json
 import re
 from typing import Any
+
+
+_CRON_SESSION_ID_RE = re.compile(r"^(cron_.+)_\d{8}_\d{6}$")
+
+
+def _cache_scope_from_session_id(session_id: str | None) -> str:
+    """Normalize timestamped cron sessions to one stable cache scope."""
+    sid = str(session_id or "")
+    match = _CRON_SESSION_ID_RE.match(sid)
+    return match.group(1) if match else sid
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
@@ -71,7 +82,55 @@ def _default_prompt_cache_retention_for_request(
     return None
 
 
-def _content_cache_key(instructions: str, tools: list[dict[str, Any]] | None) -> str | None:
+_XAI_CLIENT_WEB_SEARCH_ALIAS = "hermes_web_search"
+
+
+def _xai_prefers_native_web_search(provider_name: str | None = None) -> bool:
+    """Choose native xAI search unless an async registry selected a client backend."""
+    if provider_name is not None:
+        return str(provider_name).strip().lower() == "xai"
+    try:
+        from agent.web_search_registry import get_active_search_provider
+
+        if inspect.iscoroutinefunction(get_active_search_provider):
+            return True
+        provider = get_active_search_provider()
+        if not inspect.isawaitable(provider):
+            if provider is not None:
+                return getattr(provider, "name", None) == "xai"
+            from tools.web_tools import _get_search_backend
+
+            if inspect.iscoroutinefunction(_get_search_backend):
+                return True
+            backend = _get_search_backend()
+            if not inspect.isawaitable(backend):
+                return str(backend or "").strip().lower() == "xai"
+    except Exception:
+        pass
+    # ``build_kwargs`` is intentionally synchronous for public transport parity;
+    # the async request builder supplies the resolved provider name when known.
+    return True
+
+
+def _rename_client_web_search_for_xai(
+    response_tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rewritten: list[dict[str, Any]] = []
+    for tool in response_tools:
+        if isinstance(tool, dict) and tool.get("name") == "web_search":
+            aliased = dict(tool)
+            aliased["name"] = _XAI_CLIENT_WEB_SEARCH_ALIAS
+            rewritten.append(aliased)
+        else:
+            rewritten.append(tool)
+    return rewritten
+
+
+def _content_cache_key(
+    instructions: str,
+    tools: list[dict[str, Any]] | None,
+    scope_id: str = "",
+) -> str | None:
     """Content-address the prompt cache key from the static request prefix.
 
     Returns ``pck_<sha256[:24]>`` of (instructions + sorted tool schemas), or
@@ -97,9 +156,8 @@ def _content_cache_key(instructions: str, tools: list[dict[str, Any]] | None) ->
         tools_part = json.dumps(
             sorted_tools, sort_keys=True, ensure_ascii=False, separators=(",", ":")
         )
-    # \x00 separator so instructions ending in the tool JSON can't collide with
-    # a request whose instructions contain that JSON and whose tools are empty.
-    content = f"{instructions or ''}\x00{tools_part}"
+    # Separators keep scope/instructions/tools boundaries unambiguous.
+    content = f"{scope_id}\x00{instructions or ''}\x00{tools_part}"
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"pck_{digest}"
 
@@ -202,6 +260,10 @@ class ResponsesApiTransport(ProviderTransport):
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
         )
+        # Native server-side compaction (gpt-5.6 on direct OpenAI/Codex
+        # routes only). Eligibility is resolved by the caller; ``None``
+        # means the request shape remains unchanged.
+        context_management = params.get("context_management")
 
         # Resolve the issuing endpoint for this call. Stashed on the
         # transport so normalize_response can stamp it onto reasoning
@@ -226,8 +288,15 @@ class ResponsesApiTransport(ProviderTransport):
             # Ultra is the Codex product tier; the Responses API wire value is max.
             _effort_clamp["ultra"] = "max"
         if params.get("is_xai_responses", False):
-            # xAI Responses tops out at high; keep generic stronger values usable.
-            _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
+            from agent.model_metadata import is_grok_46_family
+
+            if not is_grok_46_family(model):
+                _effort_clamp["xhigh"] = "high"
+            _effort_clamp.update({"max": "high", "ultra": "high"})
+        if (params.get("provider") or "").strip().lower() == "actual":
+            # Actual Computer relays to SGLang/vLLM backends that accept only
+            # none/low/medium/high/max for reasoning effort.
+            _effort_clamp.update({"xhigh": "high", "ultra": "max"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
@@ -283,12 +352,17 @@ class ResponsesApiTransport(ProviderTransport):
                 for t in response_tools
             )
             if has_client_web_search:
-                filtered = [
-                    t for t in response_tools
-                    if not (isinstance(t, dict) and t.get("name") == "web_search")
-                ]
-                filtered.append({"type": "web_search"})
-                response_tools = filtered
+                if _xai_prefers_native_web_search(
+                    params.get("web_search_provider")
+                ):
+                    filtered = [
+                        t for t in response_tools
+                        if not (isinstance(t, dict) and t.get("name") == "web_search")
+                    ]
+                    filtered.append({"type": "web_search"})
+                    response_tools = filtered
+                else:
+                    response_tools = _rename_client_web_search_for_xai(response_tools)
 
         # ``tools`` MUST be omitted entirely when there are no functions to
         # expose: the openai SDK's ``responses.stream()`` / ``responses.parse()``
@@ -314,6 +388,8 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
+        if isinstance(context_management, list) and context_management:
+            kwargs["context_management"] = context_management
 
         session_id = params.get("session_id")
         # prompt_cache_key is content-addressed from the static prefix
@@ -322,7 +398,11 @@ class ResponsesApiTransport(ProviderTransport):
         # cache-cold. session_id is left untouched for transcript isolation and
         # the cache-scope routing headers below. Falls back to session_id when
         # there is no static content to hash.
-        cache_key = _content_cache_key(instructions, response_tools) or session_id
+        cache_scope = _cache_scope_from_session_id(session_id)
+        cache_key = (
+            _content_cache_key(instructions, response_tools, cache_scope)
+            or cache_scope
+        )
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
@@ -385,7 +465,13 @@ class ResponsesApiTransport(ProviderTransport):
         # those leak paths, so strip defensively when targeting xAI.  See
         # #28490 for the original report.
         if is_xai_responses:
-            kwargs.pop("service_tier", None)
+            from agent.model_metadata import is_grok_46_family
+
+            if not (
+                is_grok_46_family(model)
+                and kwargs.get("service_tier") == "priority"
+            ):
+                kwargs.pop("service_tier", None)
 
         # Forward per-request timeout to the SDK so OpenAI/Anthropic clients
         # honor it.  Without this, ``providers.<id>.request_timeout_seconds``
@@ -409,8 +495,10 @@ class ResponsesApiTransport(ProviderTransport):
             # remain high.  Send session_id / x-client-request-id as HTTP
             # headers while keeping ``prompt_cache_key`` in the body for
             # standard OpenAI routing as a belt-and-braces fallback.
-            cache_scope_id = _bounded_prompt_cache_key(session_id)
-            if cache_scope_id:
+            final_cache_key = kwargs.get("prompt_cache_key") or _bounded_prompt_cache_key(
+                cache_scope
+            )
+            if session_id or final_cache_key:
                 existing_extra_headers = kwargs.get("extra_headers")
                 merged_extra_headers: dict[str, str] = {}
                 if isinstance(existing_extra_headers, dict):
@@ -421,8 +509,10 @@ class ResponsesApiTransport(ProviderTransport):
                             if key and value is not None
                         }
                     )
-                merged_extra_headers["session_id"] = cache_scope_id
-                merged_extra_headers["x-client-request-id"] = cache_scope_id
+                if session_id:
+                    merged_extra_headers["session_id"] = str(session_id)
+                if final_cache_key:
+                    merged_extra_headers["x-client-request-id"] = final_cache_key
                 kwargs["extra_headers"] = merged_extra_headers
 
         max_tokens = params.get("max_tokens")
@@ -440,7 +530,7 @@ class ResponsesApiTransport(ProviderTransport):
                         if key and value is not None
                     }
                 )
-            merged_extra_headers["x-grok-conv-id"] = session_id
+            merged_extra_headers["x-grok-conv-id"] = cache_scope
             kwargs["extra_headers"] = merged_extra_headers
 
             # xAI Responses cache-routing — body-level field per
@@ -451,7 +541,9 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_body: dict[str, Any] = {}
             if isinstance(existing_extra_body, dict):
                 merged_extra_body.update(existing_extra_body)
-            merged_extra_body.setdefault("prompt_cache_key", cache_key)
+            merged_extra_body.setdefault(
+                "prompt_cache_key", kwargs.get("prompt_cache_key", cache_key)
+            )
             kwargs["extra_body"] = merged_extra_body
 
         extra_body = kwargs.get("extra_body")
@@ -487,9 +579,16 @@ class ResponsesApiTransport(ProviderTransport):
                     provider_data["call_id"] = tc.call_id
                 if hasattr(tc, "response_item_id") and tc.response_item_id:
                     provider_data["response_item_id"] = tc.response_item_id
+                name = (
+                    tc.function.name
+                    if hasattr(tc, "function")
+                    else getattr(tc, "name", "")
+                )
+                if name == _XAI_CLIENT_WEB_SEARCH_ALIAS:
+                    name = "web_search"
                 tool_calls.append(ToolCall(
-                    id=tc.id if hasattr(tc, "id") else (tc.function.name if hasattr(tc, "function") else None),
-                    name=tc.function.name if hasattr(tc, "function") else getattr(tc, "name", ""),
+                    id=tc.id if hasattr(tc, "id") else (name or None),
+                    name=name,
                     arguments=tc.function.arguments if hasattr(tc, "function") else getattr(tc, "arguments", "{}"),
                     provider_data=provider_data or None,
                 ))

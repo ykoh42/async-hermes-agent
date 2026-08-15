@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -84,6 +85,25 @@ _transports_bootstrap._discover_transports()
 # ``logger = logging.getLogger(__name__)``, which resolves to "run_agent"
 # from inside that module.)
 logger = logging.getLogger("run_agent")
+
+
+_warned_unavailable_providers: set[str] = set()
+
+
+def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
+    """Warn once when a configured memory provider cannot be activated."""
+    if name in _warned_unavailable_providers:
+        return
+    _warned_unavailable_providers.add(name)
+    logger.warning(
+        "Memory provider %r is selected but reports unavailable — external memory "
+        "is disabled for this session (built-in memory still works). Check the "
+        "provider's credentials/config with 'hermes memory status'. Note: "
+        "systemd/gateway services do not inherit ~/.hermes/.env automatically; "
+        "set any required variables in the service environment.%s",
+        name,
+        f" {reason}" if reason else "",
+    )
 
 
 def _apply_runtime_config(agent: Any, config: dict[str, Any]) -> None:
@@ -216,6 +236,20 @@ def _apply_runtime_config(agent: Any, config: dict[str, Any]) -> None:
 
     max_attempts = _parse_int(compression.get("max_attempts", 3), 3)
     agent.max_compression_attempts = min(10, max_attempts) if max_attempts > 0 else 3
+    agent.codex_responses_native_compaction = is_truthy_value(
+        compression.get("codex_responses_native", False)
+    )
+    _native_threshold_raw = compression.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(_native_threshold_raw, bool):
+            raise ValueError
+        agent.codex_responses_compact_threshold = int(_native_threshold_raw)
+        if agent.codex_responses_compact_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        agent.codex_responses_compact_threshold = 200_000
     try:
         agent.compression_idle_compact_after_seconds = max(
             0, int(compression.get("idle_compact_after_seconds", 0))
@@ -559,6 +593,16 @@ def _provider_timeout_from_snapshot(
 def _provider_default_routes(provider: str) -> set[str]:
     """Return known exact default routes for a canonical provider id."""
     routes: set[str] = set()
+    # OpenRouter's built-in route is intentionally not represented by a
+    # provider overlay (the overlay permits a user base-url override), and the
+    # lazy registry may not be populated during state-only construction. Keep
+    # the canonical route available without triggering discovery/network I/O.
+    if provider == "openrouter":
+        from hermes_constants import OPENROUTER_BASE_URL
+
+        route = _normalize_route_base_url(OPENROUTER_BASE_URL)
+        if route:
+            routes.add(route)
     try:
         from hermes_cli.providers import HERMES_OVERLAYS, get_provider
 
@@ -656,7 +700,15 @@ def _context_route_mismatch(
 
     if active_route:
         configured_routes = _provider_default_routes(configured_provider)
-        return not configured_routes or active_route not in configured_routes
+        if configured_routes:
+            return active_route not in configured_routes
+        # A named custom provider stores its route outside the model metadata.
+        # When the provider identity still matches, an empty configured URL is
+        # therefore the same route rather than evidence that its context pin
+        # must be discarded.
+        if active_provider and configured_provider == active_provider:
+            return False
+        return True
     return bool(
         configured_provider
         and active_provider
@@ -982,6 +1034,9 @@ def init_agent(
     reasoning_callback: Callable[..., Any] | None = None,
     clarify_callback: Callable[..., Any] | None = None,
     read_terminal_callback: Callable[..., Any] | None = None,
+    read_preview_callback: Callable[..., Any] | None = None,
+    read_window_below_callback: Callable[..., Any] | None = None,
+    setup_mcp_callback: Callable[..., Any] | None = None,
     step_callback: Callable[..., Any] | None = None,
     stream_delta_callback: Callable[..., Any] | None = None,
     interim_assistant_callback: Callable[..., Any] | None = None,
@@ -1008,6 +1063,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None,
@@ -1105,6 +1161,7 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.skip_memory = skip_memory
     agent.load_soul_identity = load_soul_identity
+    agent.skip_background_review = bool(skip_background_review)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1246,6 +1303,9 @@ def init_agent(
     agent.reasoning_callback = reasoning_callback
     agent.clarify_callback = clarify_callback
     agent.read_terminal_callback = read_terminal_callback
+    agent.read_preview_callback = read_preview_callback
+    agent.read_window_below_callback = read_window_below_callback
+    agent.setup_mcp_callback = setup_mcp_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback
@@ -1290,6 +1350,12 @@ def init_agent(
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
+    agent._active_children_lock = threading.Lock()
+    # The review fork shares the parent's session/runtime and must not race a
+    # new live turn against the same credentials. Keep a direct pointer so the
+    # next turn can interrupt an in-flight review without waiting on it.
+    agent._background_review_agent = None
+    agent._background_review_lock = threading.Lock()
     agent._background_delegations: set[asyncio.Task] = set()
     agent._background_review_tasks: set[asyncio.Task] = set()
     # Async-first runtime ownership. The lock binds to the event loop on first
@@ -2068,6 +2134,26 @@ def init_agent(
             codex_app_server_auto_compaction,
         )
         codex_app_server_auto_compaction = "native"
+    # Native OpenAI Responses server-side compaction (opt-in).  Eligibility
+    # is resolved at the async request boundary by agent.native_compaction.
+    codex_responses_native_compaction = is_truthy_value(
+        _compression_cfg.get("codex_responses_native", False)
+    )
+    _native_threshold_raw = _compression_cfg.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(_native_threshold_raw, bool):
+            raise ValueError
+        codex_responses_compact_threshold = int(_native_threshold_raw)
+        if codex_responses_compact_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; using 200000.",
+            _native_threshold_raw,
+        )
+        codex_responses_compact_threshold = 200_000
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
@@ -2590,6 +2676,8 @@ def init_agent(
         )
     agent.max_compression_attempts = compression_max_attempts
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
+    agent.codex_responses_native_compaction = codex_responses_native_compaction
+    agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
@@ -3101,11 +3189,19 @@ async def _initialize_memory_manager(
 
         manager = MemoryManager()
         provider = await load_memory_provider(provider_name)
-        if provider is None or not await provider.is_available():
+        if provider is None:
             logger.debug(
                 "Memory provider '%s' not found or not available",
                 provider_name,
             )
+            agent._memory_manager_started = True
+            return
+        if not await provider.is_available():
+            try:
+                reason = provider.unavailable_reason()
+            except Exception:
+                reason = ""
+            _warn_memory_provider_unavailable(provider_name, reason)
             agent._memory_manager_started = True
             return
         manager.add_provider(provider)

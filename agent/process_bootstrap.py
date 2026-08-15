@@ -59,6 +59,9 @@ from tools import browser_tool as _BrowserToolBootstrap  # noqa: F401
 from tools import browser_supervisor as _BrowserSupervisorBootstrap  # noqa: F401
 from tools import computer_use as _ComputerUseBootstrap  # noqa: F401
 from tools import memory_tool as _MemoryToolBootstrap  # noqa: F401
+from agent import models_dev as _ModelsDevBootstrap  # noqa: F401
+from tools import shell_heredoc as _ShellHeredocBootstrap  # noqa: F401
+from tools import self_repo_guard as _SelfRepoGuardBootstrap  # noqa: F401
 from hermes_cli import nous_subscription as _NousSubscriptionBootstrap  # noqa: F401
 import gateway.status as _GatewayStatusBootstrap  # noqa: F401
 import hermes_state as _HermesStateBootstrap  # noqa: F401

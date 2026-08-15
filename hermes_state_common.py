@@ -18,6 +18,11 @@ from agent.skill_commands import (
 )
 
 
+def escape_like(text: str) -> str:
+    """Escape SQL LIKE wildcards for literal operator/session filters."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 _SESSION_RUNTIME_CONFIG: contextvars.ContextVar[Mapping[str, Any] | None] = (
     contextvars.ContextVar("session_runtime_config", default=None)
 )
@@ -118,19 +123,59 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
-# Rows that surface in pickers: roots + branch children (subagent runs and
-# compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+_RESET_END_REASONS = (
+    "session_reset",
+    # Legacy rows can have been resumed and then switched away before the
+    # reset marker was introduced. Treat that boundary like a reset so the
+    # old child cannot become the resume target again.
+    "session_switch",
+    "idle",
+    "daily",
+    "suspended",
+    "resume_pending_expired",
+)
+_RESET_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RESET_END_REASONS)
+
+
+def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
+    """Return the markerless legacy reset-child predicate for *alias*."""
+    return (
+        f"EXISTS (SELECT 1 FROM sessions p"
+        f"            WHERE p.id = {alias}.parent_session_id"
+        f"            AND p.end_reason IN ({reasons_sql})"
+        f"            AND {alias}.session_key IS NOT NULL"
+        f"            AND {alias}.session_key != ''"
+        f"            AND {alias}.session_key = p.session_key)"
+    )
+
+
+# A reset child is user-visible even though it retains parent_session_id for
+# durable lineage. New writers carry _reset_from; the session-key fallback
+# keeps rows created before that marker was introduced listable.
+_RESET_CHILD_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._reset_from') IS NOT NULL"
+    " OR " + _legacy_reset_child_sql("{a}", _RESET_END_REASONS_SQL)
+)
+
+
+# Rows that surface in pickers: roots + branch/reset children (subagent runs
+# and compression continuations stay hidden).
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')}"
+    f" OR {_RESET_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
-    """Subagent runs (cascade-delete targets), not branches or compression tips."""
+    """Subagent runs, not branch/reset or compression children."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
     compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    reset = _RESET_CHILD_SQL.format(a=alias)
     return (
         f"({alias}.parent_session_id IS NOT NULL"
         f" AND NOT ({branch})"
-        f" AND NOT ({compression}))"
+        f" AND NOT ({compression})"
+        f" AND NOT ({reset}))"
     )
 
 
@@ -262,6 +307,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_source TEXT,
     last_activity_at REAL,
     last_activity_description TEXT,
     last_activity_provenance TEXT,
@@ -277,6 +323,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -625,6 +672,12 @@ _FTS_CJK_TRIGGERS = (
 # on are missing from the cjk index, so it must not serve reads until
 # `hermes sessions optimize-storage` rebuilds it on a capable host.
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
+
+
+# state_meta breadcrumb set when a corrupt FTS shadow index is detached so
+# canonical message writes can continue.  A later writable SessionDB open
+# rebuilds the derived indexes atomically before restoring their triggers.
+FTS_STALE_KEY = "fts_stale"
 
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────

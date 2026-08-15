@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from decimal import Decimal
 
 import pytest
 
@@ -7,6 +8,7 @@ pytestmark = pytest.mark.asyncio
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
+    format_cost_label,
     get_pricing_entry,
     normalize_usage,
     resolve_billing_route,
@@ -320,3 +322,25 @@ async def test_vertex_default_model_estimates_cached_usage(monkeypatch):
 
     assert result.status == "estimated"
     assert result.amount_usd is not None and result.amount_usd > 0
+
+
+async def test_sub_cent_cost_labels_never_round_to_zero():
+    assert format_cost_label(Decimal("0")) == "$0.00"
+    assert format_cost_label(Decimal("0.004640")) == "~$0.0046"
+    assert format_cost_label(Decimal("0.00004")) == "~$<0.0001"
+    assert format_cost_label(Decimal("0.00005")) == "~$<0.0001"
+    assert format_cost_label(Decimal("0.01")) == "~$0.01"
+    assert format_cost_label(Decimal("1.23")) == "~$1.23"
+
+
+async def test_subscription_included_cost_has_explicit_note():
+    result = await estimate_usage_cost(
+        "gpt-5.6",
+        CanonicalUsage(input_tokens=1000, output_tokens=200),
+        provider="openai-codex",
+    )
+    assert result.status == "included"
+    assert result.label == "included"
+    assert result.notes == (
+        "subscription-included; no provider invoice for usage",
+    )

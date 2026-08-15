@@ -227,6 +227,10 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_session_id",
+    default="",
+)
 _elicitation_approval_callback: contextvars.ContextVar[object | None] = (
     contextvars.ContextVar("elicitation_approval_callback", default=None)
 )
@@ -254,19 +258,22 @@ def set_current_observability_context(
     *,
     turn_id: str = "",
     tool_call_id: str = "",
-) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
+    session_id: str = "",
+) -> tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]]:
     """Bind active tool correlation IDs to approval hooks."""
     return (
         _approval_turn_id.set(turn_id or ""),
         _approval_tool_call_id.set(tool_call_id or ""),
+        _approval_session_id.set(session_id or ""),
     )
 
 
 def reset_current_observability_context(
-    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
+    tokens: tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]],
 ) -> None:
     """Restore prior approval-hook correlation IDs."""
-    turn_token, tool_token = tokens
+    turn_token, tool_token, session_token = tokens
+    _approval_session_id.reset(session_token)
     _approval_tool_call_id.reset(tool_token)
     _approval_turn_id.reset(turn_token)
 
@@ -278,6 +285,9 @@ async def _fire_approval_hook(hook_name: str, **kwargs) -> None:
 
         kwargs.setdefault("turn_id", _approval_turn_id.get())
         kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        session_id = _approval_session_id.get()
+        if session_id:
+            kwargs.setdefault("session_id", session_id)
         await invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)
@@ -977,6 +987,28 @@ DANGEROUS_PATTERNS = [
     # "del"/"rm" (e.g. `-File c:\del-logs\run.ps1`) is not.
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+(?:-(?:command|c)\s+)?["\']?(?:remove-item|rmdir|erase|del|rd|ri|rm)\b', "Windows PowerShell destructive delete"),
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:encodedcommand|enc|e)\b', "PowerShell encoded command execution"),
+    (r'\bremove-item\b[^\n;|&]*\s-(?:recurse|force)\b', "PowerShell destructive delete (Remove-Item)"),
+    (r'\b(?:del|erase|rd|rmdir)\s+(?:/[a-z]\s+)*/[sq]\b', "Windows destructive delete (recursive/quiet switch)"),
+    (r'\b(?:iwr|invoke-webrequest|invoke-restmethod|irm|curl|wget)\b[^\n]*\|\s*(?:iex|invoke-expression)\b', "pipe remote content to PowerShell (iwr | iex)"),
+    (r'\b(?:iex|invoke-expression)\s*\(\s*(?:iwr|invoke-webrequest|invoke-restmethod|irm)\b', "execute remote content via Invoke-Expression"),
+    (r'\btaskkill\b[^\n]*\s/f\b', "force kill processes (taskkill /F)"),
+    (r'\bstop-process\b[^\n]*\s-force\b', "force kill processes (Stop-Process -Force)"),
+    (r'\bformat-volume\b', "format filesystem (Format-Volume)"),
+    (r'\bclear-disk\b', "wipe disk (Clear-Disk)"),
+    (r'\bdiskpart\b', "disk partitioning (diskpart)"),
+    (r'\bformat(?:\.com)?\s+[a-z]:', "format drive (format.com)"),
+    (r'\bcipher\s+/w\b', "wipe free space (cipher /w)"),
+    (r'\bicacls\b[^\n]*\s/grant\b[^\n]*\b(?:everyone|todos|jeder|tout\s+le\s+monde|\*s-1-1-0)\b', "grant Everyone access (icacls)"),
+    (r'\bicacls\b[^\n]*\s/reset\b', "reset ACLs recursively (icacls /reset)"),
+    (r'\bvssadmin\b[^\n]*\bdelete\s+shadows\b', "delete volume shadow copies (vssadmin)"),
+    (r'\bwbadmin\b[^\n]*\bdelete\b', "delete backups (wbadmin)"),
+    (r'\bbcdedit\b[^\n]*\s/set\b', "modify boot configuration (bcdedit /set)"),
+    (r'\breg(?:\.exe)?\s+delete\b', "registry delete (reg delete)"),
+    (r'\bremove-itemproperty\b[^\n]*\s-force\b', "registry value delete (Remove-ItemProperty -Force)"),
+    (r'\bstop-service\b[^\n]*\s-force\b', "force stop service (Stop-Service -Force)"),
+    (r'\bsc(?:\.exe)?\s+(?:stop|delete)\b', "stop/delete service (sc)"),
+    (r'\busers[\\/][^\\/\s]+[\\/]\.ssh\b', "access to SSH keys (Windows path)"),
+    (r'\bappdata[\\/](?:local|roaming)[\\/]hermes[^\n]*\.env\b', "access to Hermes secrets (Windows path)"),
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
     (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
     (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
@@ -2341,6 +2373,18 @@ async def _command_detection_variants(command: str):
     grep_safe, _ = _grep_safe_detection_variant(normalized)
     seen = {grep_safe}
     yield grep_safe
+    # Preserve a normalized forward-slash spelling for Windows drive/UNC
+    # paths; the shell-escape normalizer otherwise removes backslashes before
+    # the credential-path patterns get a chance to inspect them.
+    if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(
+        r"[A-Za-z]:\\", command
+    ):
+        win_variant = await _normalize_command_for_detection(
+            _mask_quoted_newlines(command.replace("\\", "/"))
+        )
+        if win_variant not in seen:
+            seen.add(win_variant)
+            yield win_variant
     # Program-bearing options are parsed in their owning command's context.
     # Surfacing only their payload lets the hardline floor inspect the command
     # that will actually run without promoting similar flags or quoted prose.

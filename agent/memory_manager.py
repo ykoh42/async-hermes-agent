@@ -584,6 +584,32 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
+    def describe_recall(self) -> str:
+        """Build a deterministic indicator for memory injected this turn."""
+        segments: list[str] = []
+        for provider in self._providers:
+            try:
+                status = provider.recall_status()
+            except Exception as exc:
+                logger.debug(
+                    "Memory provider '%s' recall_status failed (non-fatal): %s",
+                    provider.name,
+                    exc,
+                )
+                continue
+            if status is None:
+                continue
+            if status.count == 1:
+                detail = "recalled 1 memory"
+            elif status.count > 1:
+                detail = f"recalled {status.count} memories"
+            else:
+                detail = "recalled relevant memory"
+            segments.append(
+                f"{status.glyph} {status.provider_label} — {detail}"
+            )
+        return "  ".join(segments)
+
     async def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
     ) -> str:

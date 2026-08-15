@@ -171,3 +171,25 @@ def test_unset_config_zero_behavior_change():
     import inspect
     sig = inspect.signature(c._prune_old_tool_results)
     assert sig.parameters["min_prune_chars"].default == 200
+
+
+def test_rearm_runway_blocks_second_cache_break_until_growth():
+    c = _compressor(
+        proactive_prune_tokens=48_000,
+        proactive_prune_min_result_chars=8_000,
+        proactive_prune_min_reclaim_tokens=0,
+    )
+    msgs = _build(10, big_indices={0, 1, 2, 3, 4})
+    first, pruned = c.prune_tool_results_only(msgs, current_tokens=120_000)
+    assert pruned >= 1
+    # A persisted runway is measured in the same rough message-token basis as
+    # the output.  It must suppress an immediate second rewrite even when the
+    # caller's provider-reported token count remains above the trigger.
+    c._proactive_prune_rearm_tokens = sum(
+        len(str(message.get("content") or "")) // 4 for message in first
+    ) + 1
+    second, second_pruned = c.prune_tool_results_only(
+        first, current_tokens=120_000
+    )
+    assert second_pruned == 0
+    assert second is first

@@ -44,6 +44,9 @@ _UPSTREAM_METHOD_ORDER = (
     "_run_trigram_search",
     "search_messages",
     "_describe_search_path",
+    "_compile_like_boolean_query",
+    "_search_messages_like_fallback",
+    "_refresh_fts_stale_state",
     "_search_messages_impl",
     "_search_unindexed_gap",
     "search_sessions_by_id",
@@ -62,6 +65,7 @@ _SYNC_METHODS = {
     "_has_lone_cjk_run",
     "_trigram_eligible_tokens",
     "_describe_search_path",
+    "_compile_like_boolean_query",
 }
 
 

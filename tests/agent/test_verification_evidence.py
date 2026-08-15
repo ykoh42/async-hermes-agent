@@ -11,6 +11,7 @@ from agent.verification_evidence import (
     classify_verification_command,
     mark_workspace_edited,
     record_terminal_result,
+    record_verify_run,
     verification_status,
 )
 
@@ -189,6 +190,24 @@ async def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
     status = await verification_status(session_id="old-session", cwd=tmp_path)
     assert status["status"] == "unverified"
     assert status["changed_paths"] == []
+
+
+async def test_record_verify_run_marks_workspace_passed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+
+    evidence = await record_verify_run(
+        root=tmp_path,
+        session_id="verify-session",
+        ok=True,
+        output="all checks passed",
+    )
+
+    assert evidence["kind"] == "verify"
+    assert evidence["canonical_command"] == "hermes verify"
+    status = await verification_status(session_id="verify-session", cwd=tmp_path)
+    assert status["status"] == "passed"
+    assert status["evidence"]["output_summary"] == "all checks passed"
 
 
 async def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):

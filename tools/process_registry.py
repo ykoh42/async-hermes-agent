@@ -1033,7 +1033,7 @@ class ProcessRegistry:
         return results
 
     async def read_log(
-        self, session_id: str, offset: int = 0, limit: int = 200
+        self, session_id: str, offset: int | None = None, limit: int = 200
     ) -> dict[str, Any]:
         """Return the process output using Hermes' line pagination contract."""
         from tools.ansi_strip import strip_ansi
@@ -1042,10 +1042,11 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         lines = strip_ansi(session.output_buffer).splitlines()
-        if offset == 0 and limit > 0:
+        if offset is None and limit > 0:
             selected = lines[-limit:]
             consumed = bool(selected) or not lines
         else:
+            offset = offset or 0
             selected = lines[offset : offset + limit]
             stop = slice(offset, offset + limit).indices(len(lines))[1]
             consumed = not lines or (bool(selected) and stop == len(lines))
@@ -1249,7 +1250,7 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
-        payload = str(data).encode()
+        payload = str(data).encode("utf-8", "surrogateescape")
         try:
             if session._pty_master_fd is not None:
                 await self._write_pty(session._pty_master_fd, payload)
@@ -1559,7 +1560,9 @@ class ProcessRegistry:
                     send(signal.SIGKILL)
         return True
 
-    async def _write_checkpoint(self) -> None:
+    async def _write_checkpoint(
+        self, extra_entries: list[dict[str, Any]] | None = None
+    ) -> None:
         """Persist running host-process metadata with an atomic async replace."""
         await self._activate_profile_state()
         async with self._checkpoint_lock:
@@ -1596,6 +1599,14 @@ class ProcessRegistry:
                         "notify_on_complete": session.notify_on_complete,
                         "watch_patterns": session.watch_patterns,
                     }
+                )
+            if extra_entries:
+                tracked_ids = {entry.get("session_id") for entry in entries}
+                entries.extend(
+                    entry
+                    for entry in extra_entries
+                    if isinstance(entry, dict)
+                    and entry.get("session_id") not in tracked_ids
                 )
             checkpoint = self._checkpoint_path()
             temporary = checkpoint.with_name(

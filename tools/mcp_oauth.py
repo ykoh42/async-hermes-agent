@@ -1260,6 +1260,56 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
     return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
+async def _invalidate_tokens_on_client_change(
+    storage: "HermesTokenStorage",
+    new_client_id: str,
+    new_client_secret: str | None,
+) -> None:
+    """Drop cached tokens when a configured OAuth client identity changes.
+
+    Tokens are minted for a particular client identity.  Compare the stored
+    registration before replacing it, and remove only the token and metadata
+    files when the configured identity changed.  The file operations stay on
+    the native async boundary used by :class:`HermesTokenStorage`.
+    """
+    existing = await _read_json(storage._client_info_path())
+    if not isinstance(existing, dict):
+        return
+    old_client_id = existing.get("client_id")
+    if not old_client_id:
+        return
+    old_client_secret = existing.get("client_secret") or None
+    if old_client_id == new_client_id and old_client_secret == (
+        new_client_secret or None
+    ):
+        return
+
+    removed = False
+    for path in (storage._tokens_path(), storage._meta_path()):
+        try:
+            if await aiofiles.os.path.exists(path):
+                await aiofiles.os.remove(path)
+                removed = True
+        except OSError as exc:
+            logger.warning(
+                "MCP OAuth '%s': could not remove stale %s after client "
+                "change: %s",
+                storage._server_name,
+                path.name,
+                exc,
+            )
+    if removed:
+        logger.warning(
+            "MCP OAuth '%s': configured OAuth client changed (client_id %r "
+            "-> %r); discarded tokens minted under the previous client. "
+            "Re-authorize with: hermes mcp login %s",
+            storage._server_name,
+            old_client_id,
+            new_client_id,
+            storage._server_name,
+        )
+
+
 async def _maybe_preregister_client(
     storage: "HermesTokenStorage",
     cfg: dict,
@@ -1271,6 +1321,9 @@ async def _maybe_preregister_client(
         return
     if OAuthClientInformationFull is None:
         _ensure_sdk_loaded()
+    await _invalidate_tokens_on_client_change(
+        storage, client_id, cfg.get("client_secret")
+    )
     redirect_uri = _resolve_redirect_uri(cfg, cfg["_resolved_port"])
     info_dict: dict[str, Any] = {
         "client_id": client_id,

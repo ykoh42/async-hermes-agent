@@ -63,6 +63,34 @@ class TestGating:
 class TestInstall:
     pytestmark = pytest.mark.asyncio
 
+    async def test_npx_form_uses_versioned_package_spec(self, monkeypatch):
+        monkeypatch.setattr(
+            browser_tool, "_running_in_docker", AsyncMock(return_value=False)
+        )
+        monkeypatch.setattr(
+            browser_tool, "load_config_readonly", AsyncMock(return_value={})
+        )
+        monkeypatch.setattr(
+            browser_tool,
+            "_find_agent_browser",
+            AsyncMock(return_value=browser_tool.NPX_AGENT_BROWSER_SENTINEL),
+        )
+        monkeypatch.setattr(browser_tool, "_resolve_npx_bin", AsyncMock(return_value="/usr/bin/npx"))
+        monkeypatch.setattr(browser_tool, "_chromium_installed", AsyncMock(return_value=True))
+        create = AsyncMock(return_value=_Process())
+        monkeypatch.setattr(browser_tool.asyncio, "create_subprocess_exec", create)
+
+        assert await browser_tool._maybe_autoinstall_chromium() is True
+        command = create.await_args.args
+        assert command[:5] == (
+            "/usr/bin/npx",
+            "--ignore-scripts",
+            "-y",
+            browser_tool.AGENT_BROWSER_NPX_SPEC,
+            "install",
+        )
+        assert "--with-deps" not in command
+
     async def test_success_installs_binary_only_and_rechecks(self, monkeypatch):
         monkeypatch.setattr(
             browser_tool, "_running_in_docker", AsyncMock(return_value=False)

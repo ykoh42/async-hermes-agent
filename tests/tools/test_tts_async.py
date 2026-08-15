@@ -139,13 +139,14 @@ async def test_command_provider_runs_end_to_end_without_blocking_loop(
         running = False
         await ticker_task
 
-    assert result == {
-        "success": True,
-        "file_path": str(output),
-        "media_tag": f"MEDIA:{output}",
-        "provider": "test-command",
-        "voice_compatible": False,
-    }
+    assert result["success"] is True
+    assert result["file_path"] == str(output)
+    assert result["file_paths"] == [str(output)]
+    assert result["media_tag"] == f"MEDIA:{output}"
+    assert result["provider"] == "test-command"
+    assert result["voice_compatible"] is False
+    assert result["chunk_count"] == 1
+    assert result["delivery_file_count"] == 1
     async with aiofiles.open(output, encoding="utf-8") as output_file:
         assert await output_file.read() == "Hello from Hermes"
     assert ticks > 1

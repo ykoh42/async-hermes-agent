@@ -86,7 +86,14 @@ async def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
 async def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     """Persist audio bytes for MCP/tool consumption."""
     _validate_size(data, "audio")
-    return await _write_cached("audio", "audio", data, _safe_extension(ext, ".ogg"))
+    # Keep the inbound cache honest when a platform supplies only a guessed
+    # extension (for example Telegram ``.oga`` or an iOS M4A-branded MP4).
+    # The detector is pure CPU work; the actual write remains at the awaited
+    # native file boundary below.
+    from tools.audio_container import sniff_audio_ext
+
+    extension = sniff_audio_ext(data, _safe_extension(ext, ".ogg"))
+    return await _write_cached("audio", "audio", data, extension)
 
 
 async def cache_document_from_bytes(data: bytes, filename: str) -> str:

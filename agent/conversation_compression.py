@@ -265,6 +265,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_compression_telemetry",
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
+    "_proactive_prune_rearm_tokens",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -655,6 +656,27 @@ async def _hydrate_persisted_compression_guards(
     except Exception as exc:
         logger.debug("async compression guard hydrate failed: %s", exc)
 
+    runway_getter = getattr(session_db, "get_session_model_config_value", None)
+    if callable(runway_getter):
+        try:
+            from agent.context_compressor import (
+                PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
+            )
+
+            value = await runway_getter(
+                session_id,
+                PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
+                0,
+            )
+            compressor._proactive_prune_rearm_tokens = max(
+                0,
+                int(value) if isinstance(value, (int, float, str)) else 0,
+            )
+        except (TypeError, ValueError):
+            compressor._proactive_prune_rearm_tokens = 0
+        except Exception as exc:
+            logger.debug("proactive prune runway hydrate failed: %s", exc)
+
 
 async def _persist_compression_guards(
     compressor: Any, session_db: Any, session_id: str
@@ -861,6 +883,26 @@ async def recover_rotated_compression_session(
                 return recovered
             holder = await holder_getter(session_id) if callable(holder_getter) else None
             if not holder or attempt == 20:
+                if not holder:
+                    reopener = getattr(
+                        session_db, "reopen_orphaned_compression_session", None
+                    )
+                    if callable(reopener):
+                        try:
+                            reopened = await reopener(session_id)
+                            if reopened:
+                                logger.warning(
+                                    "compression recovery reopened orphaned "
+                                    "session=%s with no continuation",
+                                    session_id,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "orphaned compression session reopen failed "
+                                "for %s: %s",
+                                session_id,
+                                exc,
+                            )
                 return None
             await asyncio.sleep(0.05)
         return None
@@ -2125,16 +2167,58 @@ async def compress_context(
         if not in_place and _lock_db is not None and _lock_sid:
             durable_parent = await _lock_db.get_messages_as_conversation(_lock_sid)
             if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                logger.info(
-                    "compression: session=%s grew before lease (%d → %d msgs); "
-                    "adopting durable snapshot",
-                    _lock_sid,
-                    len(messages),
-                    len(durable_parent),
-                )
-                messages = durable_parent
-                _pre_msg_count = len(messages)
-                approx_tokens = 0
+                # The in-memory transcript can carry the current turn's
+                # unpersisted user tail. Flush that tail before adopting a
+                # longer durable snapshot; otherwise adoption silently drops
+                # the user's input from the summary/rotation boundary.
+                preflush_idx = getattr(agent, "_persist_user_message_idx", None)
+                preflush_ok = False
+                if isinstance(preflush_idx, int) and 0 <= preflush_idx < len(messages):
+                    try:
+                        preflush_ok = bool(
+                            await agent._flush_messages_to_session_db(
+                                messages,
+                                conversation_history=messages[:preflush_idx],
+                            )
+                        )
+                    except Exception:
+                        preflush_ok = False
+                else:
+                    # No anchor means the in-memory snapshot is fully durable;
+                    # preserve the historical direct-adoption behavior.
+                    preflush_ok = True
+
+                if preflush_ok:
+                    durable_parent = await _lock_db.get_messages_as_conversation(
+                        _lock_sid
+                    )
+                if (
+                    preflush_ok
+                    and isinstance(durable_parent, list)
+                    and len(durable_parent) > len(messages)
+                ):
+                    logger.info(
+                        "compression: session=%s grew before lease (%d → %d msgs); "
+                        "adopting durable snapshot",
+                        _lock_sid,
+                        len(messages),
+                        len(durable_parent),
+                    )
+                    messages = durable_parent
+                    _pre_msg_count = len(messages)
+                    approx_tokens = 0
+                    # Every adopted row is durable, including the flushed live
+                    # tail. Re-anchor the later flush so it cannot append the
+                    # concurrent rows or tail a second time.
+                    agent._persist_user_message_idx = len(messages)
+                elif not preflush_ok:
+                    logger.warning(
+                        "compression: session=%s grew before lease (%d → %d msgs) "
+                        "but the pre-adoption flush failed; retaining live input",
+                        _lock_sid,
+                        len(messages),
+                        len(durable_parent),
+                    )
 
         # Give the external memory provider a chance to preserve insights before
         # compression discards old context.

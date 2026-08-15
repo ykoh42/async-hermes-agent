@@ -46,17 +46,64 @@ class TestFalCatalog:
             assert not missing, f"{mid} missing required keys: {missing}"
 
 
-    def test_only_flux2_pro_upscales_by_default(self, image_tool):
-        """Upscaling should default to False for all new models to preserve
-        the <1s / fast-render value prop. Only flux-2-pro stays True for
-        backward-compat with the previous default."""
+    def test_upscale_defaults_track_native_resolution(self, image_tool):
+        """Low-resolution models use the upstream default upscale pass.
+
+        Native hi-res models skip it to avoid an unnecessary second paid
+        request; an explicit ``upscale`` argument is tested separately.
+        """
+        native_hi_res = {
+            "bytedance/seedream/v5/pro/text-to-image",
+            "bytedance/seedream/v5/lite/text-to-image",
+            "fal-ai/krea/v2/large/text-to-image",
+        }
         for mid, meta in image_tool.FAL_MODELS.items():
-            if mid == "fal-ai/flux-2-pro":
-                assert meta["upscale"] is True, \
-                    "flux-2-pro should keep upscale=True for backward-compat"
-            else:
+            if mid in native_hi_res:
                 assert meta["upscale"] is False, \
-                    f"{mid} should default to upscale=False"
+                    f"{mid} is native hi-res — should not double-upscale"
+            else:
+                assert meta["upscale"] is True, \
+                    f"{mid} should default to upscale=True"
+
+
+    def test_nano_banana_2_in_catalog(self, image_tool):
+        meta = image_tool.FAL_MODELS["fal-ai/nano-banana-2"]
+        assert meta["size_style"] == "aspect_ratio"
+        assert meta["edit_endpoint"] == "fal-ai/nano-banana-2/edit"
+        assert meta["max_reference_images"] == 14
+        assert meta["edit_supports"] >= {"prompt", "image_urls"}
+
+
+    def test_new_upstream_catalog_models_are_present(self, image_tool):
+        expected = {
+            "bytedance/seedream/v5/pro/text-to-image",
+            "bytedance/seedream/v5/lite/text-to-image",
+            "ideogram/v4/instant",
+            "ideogram/v4/fast",
+            "alibaba/qwen-image-3/text-to-image",
+            "microsoft/mai-image-2.5-pro",
+            "google/nano-banana-2-lite",
+            "fal-ai/recraft/v4.1/text-to-image",
+            "fal-ai/nano-banana-2",
+        }
+        assert expected <= image_tool.FAL_MODELS.keys()
+
+
+    def test_edit_endpoints_have_reference_contracts(self, image_tool):
+        for model_id, meta in image_tool.FAL_MODELS.items():
+            if "edit_endpoint" not in meta:
+                continue
+            assert "image_urls" in meta["edit_supports"]
+            assert isinstance(meta.get("max_reference_images"), int)
+
+
+    def test_recraft_v41_filters_unsupported_parameters(self, image_tool):
+        payload = image_tool._build_fal_payload(
+            "fal-ai/recraft/v4.1/text-to-image", "hello", "landscape",
+            overrides={"num_images": 2, "output_format": "png", "seed": 1},
+        )
+        assert payload["image_size"] == "landscape_16_9"
+        assert not {"num_images", "output_format", "seed"} & payload.keys()
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +136,27 @@ class TestAspectRatioFamily:
     def test_nano_banana_portrait_uses_aspect_ratio(self, image_tool):
         p = image_tool._build_fal_payload("fal-ai/nano-banana-pro", "hello", "portrait")
         assert p["aspect_ratio"] == "9:16"
+
+
+    def test_nano_banana_2_pins_flash_defaults(self, image_tool):
+        p = image_tool._build_fal_payload(
+            "fal-ai/nano-banana-2", "hello", "landscape"
+        )
+        assert p["aspect_ratio"] == "16:9"
+        assert p["resolution"] == "1K"
+        assert p["limit_generations"] is True
+        assert "image_size" not in p
+
+
+    def test_nano_banana_2_lite_has_no_resolution_knob(self, image_tool):
+        meta = image_tool.FAL_MODELS["google/nano-banana-2-lite"]
+        assert "resolution" not in meta["supports"]
+        assert "resolution" not in meta["defaults"]
+        p = image_tool._build_fal_payload(
+            "google/nano-banana-2-lite", "hello", "square"
+        )
+        assert p["aspect_ratio"] == "1:1"
+        assert "resolution" not in p
 
 
 class TestGptLiteralFamily:
@@ -253,12 +321,13 @@ class TestRegistryIntegration:
 
     def test_schema_exposes_expected_agent_params(self, image_tool):
         """The agent-facing schema exposes the unified text+image surface:
-        prompt (required), aspect_ratio, and the image-to-image inputs
-        image_url + reference_image_urls. Model selection stays a user-level
-        config choice, never an agent-level arg."""
+        prompt (required), aspect_ratio, image-to-image inputs, and the
+        explicit upscale override. Model selection stays a user-level config
+        choice, never an agent-level arg."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
         assert set(props.keys()) == {
             "prompt", "aspect_ratio", "image_url", "reference_image_urls",
+            "upscale",
         }
         assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
 
