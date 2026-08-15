@@ -1,6 +1,6 @@
 ---
 title: Sessions
-description: Preserve and resume ordered conversations with the awaitable SQLite SessionDB.
+description: Preserve and resume ordered conversations with awaitable SQLite or PostgreSQL SessionDB.
 sidebar_position: 4
 ---
 
@@ -47,6 +47,57 @@ durable transcript persistence at the turn prologue and selects the database
 path. A recall tool may otherwise open the default `$HERMES_HOME/state.db`
 lazily. In either case the agent closes the database it owns during shutdown.
 `SessionDB.close()` is idempotent.
+
+## Use PostgreSQL for a service
+
+SQLite remains the default and is a good fit for a single-process application.
+For a service whose workers share a durable store, install the optional
+PostgreSQL backend and inject it through the same existing `session_db=`
+argument:
+
+```bash
+uv sync --extra postgres
+```
+
+```python
+from hermes_state_postgres import SessionDB
+from run_agent import AIAgent
+
+
+async def postgres_conversation():
+    db = SessionDB(
+        "postgresql+asyncpg://user:password@db.example:5432/hermes",
+    )
+    try:
+        async with AIAgent(
+            ...,
+            session_db=db,
+            session_id="project-review",
+        ) as agent:
+            return await agent.run_conversation("Review this project.")
+    finally:
+        await db.close()
+```
+
+The PostgreSQL `SessionDB` keeps the SQLite method names and awaited calling
+style; only the import and explicit DSN change. A store reads the active
+profile's `database.postgres` pool and driver settings once when its first
+database operation initializes the engine. Create a new store after changing
+those settings. See [SessionDB storage and PostgreSQL settings](../developer-guide/session-storage.md)
+for the supported options.
+
+For a read-only endpoint, pass `read_only=True`:
+
+```python
+readonly_db = SessionDB(read_replica_url, read_only=True)
+```
+
+This blocks SessionDB writes and enables PostgreSQL transaction read-only mode;
+it does not choose a replica automatically. In a multi-worker service, create
+and close one store per worker lifespan and share it with that worker's agents.
+Plan for a possible connection count of
+`workers * (pool_size + max_overflow)`. Other retained stores, such as memory
+plugin databases, remain separate from the core PostgreSQL SessionDB.
 
 ## Resume in a new agent
 
