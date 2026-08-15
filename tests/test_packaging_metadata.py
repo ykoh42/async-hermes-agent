@@ -163,6 +163,11 @@ def test_ci_postgres_matrix_covers_supported_python_and_server_pairs():
     ):
         assert pair in postgres_job
     assert "--extra postgres" in postgres_job
+    assert (
+        "uv run --locked --python ${{ matrix.python-version }}"
+        in postgres_job
+    )
+    assert "--extra dev --extra postgres pytest" in postgres_job
     assert "HERMES_POSTGRES_TEST_DSN" in postgres_job
     assert "tests/integration/test_postgres_session_db.py" in postgres_job
     assert "tests/integration/test_postgres_compaction_e2e.py" in postgres_job

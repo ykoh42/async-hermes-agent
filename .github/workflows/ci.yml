@@ -166,7 +166,8 @@ jobs:
 
       - name: Test PostgreSQL SessionDB against the service
         run: >-
-          uv run pytest -q
+          uv run --locked --python ${{ matrix.python-version }}
+          --extra dev --extra postgres pytest -q
           tests/integration/test_postgres_session_db.py
           tests/integration/test_postgres_compaction_e2e.py
           -W error::pytest.PytestUnhandledThreadExceptionWarning
