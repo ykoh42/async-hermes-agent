@@ -550,6 +550,7 @@ async def test_postgres_read_only_enforces_server_transaction_and_reads_existing
     if not dsn:
         pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
     from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
 
     session_id = f"pytest-read-only-existing-{uuid.uuid4()}"
     writer = PostgresSessionDB(dsn)
@@ -712,12 +713,18 @@ async def test_postgres_command_and_statement_timeouts_reach_real_connection(tmp
     if not dsn:
         pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
     from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
 
     home = tmp_path / "profile"
     home.mkdir()
     (home / "config.yaml").write_text(
         "database:\n  postgres:\n    connect_args:\n"
-        "      command_timeout: 0.05\n"
+        # Keep the client timeout above the server timeout so PostgreSQL can
+        # finish cancelling the statement before SQLAlchemy resets the
+        # connection on context exit.  The assertion below exercises the
+        # server-side statement timeout; command-timeout propagation is
+        # covered by the option-capture test above.
+        "      command_timeout: 1.0\n"
         "      server_settings:\n        statement_timeout: '100'\n",
         encoding="utf-8",
     )
@@ -729,8 +736,11 @@ async def test_postgres_command_and_statement_timeouts_reach_real_connection(tmp
             assert (
                 await connection.execute(text("SHOW statement_timeout"))
             ).scalar_one() == "100ms"
-            with pytest.raises(TimeoutError):
+            with pytest.raises((TimeoutError, DBAPIError)) as timeout_error:
                 await connection.execute(text("SELECT pg_sleep(0.5)"))
+            if isinstance(timeout_error.value, DBAPIError):
+                assert getattr(timeout_error.value.orig, "sqlstate", None) == "57014"
+            await connection.rollback()
     finally:
         reset_hermes_home_override(token)
         await database.close()
