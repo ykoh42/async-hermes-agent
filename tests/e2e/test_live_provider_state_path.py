@@ -82,20 +82,23 @@ async def test_live_provider_memory_and_cross_instance_session_resume(
         no_task_leaks(action=LeakAction.RAISE),
     ):
         first_db = SessionDB(state_path)
-        async with AIAgent(
-            **provider_kwargs,
-            session_db=first_db,
-            session_id=first_session_id,
-            max_iterations=4,
-            enabled_toolsets=["memory"],
-            save_trajectories=True,
-        ) as first_agent:
-            first_result = await first_agent.run_conversation(
-                f"Remember that this session marker is {session_marker}, but do not "
-                "write that session marker to memory. Call the memory tool exactly once "
-                f"with target memory, action add, and content {memory_marker}. "
-                "After the tool observation, reply exactly LIVE_MEMORY_SAVED."
-            )
+        try:
+            async with AIAgent(
+                **provider_kwargs,
+                session_db=first_db,
+                session_id=first_session_id,
+                max_iterations=4,
+                enabled_toolsets=["memory"],
+                save_trajectories=True,
+            ) as first_agent:
+                first_result = await first_agent.run_conversation(
+                    f"Remember that this session marker is {session_marker}, but do not "
+                    "write that session marker to memory. Call the memory tool exactly once "
+                    f"with target memory, action add, and content {memory_marker}. "
+                    "After the tool observation, reply exactly LIVE_MEMORY_SAVED."
+                )
+        finally:
+            await first_db.close()
 
         memory_file = hermes_home / "memories" / "MEMORY.md"
         async with aiofiles.open(memory_file, encoding="utf-8") as handle:
@@ -127,33 +130,36 @@ async def test_live_provider_memory_and_cross_instance_session_resume(
         assert memory_result["final_response"].strip() == memory_marker
 
         resume_db = SessionDB(state_path)
-        tip = await resume_db.resolve_resume_session_id(first_session_id)
-        model_history, display_history = await resume_db.get_resume_conversations(tip)
-        assert [message["role"] for message in model_history] == [
-            "user",
-            "assistant",
-            "tool",
-            "assistant",
-        ]
-        assert [message["role"] for message in display_history] == [
-            "user",
-            "assistant",
-            "tool",
-            "assistant",
-        ]
+        try:
+            tip = await resume_db.resolve_resume_session_id(first_session_id)
+            model_history, display_history = await resume_db.get_resume_conversations(tip)
+            assert [message["role"] for message in model_history] == [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+            ]
+            assert [message["role"] for message in display_history] == [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+            ]
 
-        async with AIAgent(
-            **provider_kwargs,
-            session_db=resume_db,
-            session_id=tip,
-            max_iterations=2,
-            disabled_toolsets=["*"],
-        ) as resumed_agent:
-            resumed_result = await resumed_agent.run_conversation(
-                "From the resumed conversation, reply with only the session marker "
-                "beginning LIVE_SESSION_.",
-                conversation_history=model_history,
-            )
+            async with AIAgent(
+                **provider_kwargs,
+                session_db=resume_db,
+                session_id=tip,
+                max_iterations=2,
+                disabled_toolsets=["*"],
+            ) as resumed_agent:
+                resumed_result = await resumed_agent.run_conversation(
+                    "From the resumed conversation, reply with only the session marker "
+                    "beginning LIVE_SESSION_.",
+                    conversation_history=model_history,
+                )
+        finally:
+            await resume_db.close()
 
         assert resumed_result["completed"] is True
         assert resumed_result["final_response"].strip() == session_marker

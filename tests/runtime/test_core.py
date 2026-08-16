@@ -2933,7 +2933,7 @@ async def test_close_detaches_borrowed_session_db_without_closing_it(tmp_path):
     database = SessionDB(tmp_path / "borrowed.db")
     await database.create_session("before-child-close", "test")
     agent._session_db = database
-    agent._close_session_db_on_close = False
+    agent._owns_session_db = False
     agent._end_session_on_close = False
 
     await agent.close()
@@ -3855,12 +3855,12 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
         raise AssertionError("the public async turn must not call asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
-    blockbuster = BlockBuster()
     try:
         async with (
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),
         ):
+            blockbuster = BlockBuster()
             blockbuster.activate()
             try:
                 result = await agent.run_conversation("hello async")

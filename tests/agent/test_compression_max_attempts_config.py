@@ -69,21 +69,23 @@ async def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
             session_id="max-attempts-test",
         )
     await agent._ensure_provider_runtime()
-    return agent
+    return agent, db
 
 
 class TestCompressionMaxAttemptsConfig:
     @pytest.mark.asyncio
     async def test_default_is_three_when_unset(self, monkeypatch, tmp_path):
-        agent = await _make_agent(monkeypatch, tmp_path)
+        agent, db = await _make_agent(monkeypatch, tmp_path)
         assert agent.max_compression_attempts == 3
         await agent.close()
+        await db.close()
 
     @pytest.mark.asyncio
     async def test_custom_value_is_honored(self, monkeypatch, tmp_path):
-        agent = await _make_agent(monkeypatch, tmp_path, max_attempts=6)
+        agent, db = await _make_agent(monkeypatch, tmp_path, max_attempts=6)
         assert agent.max_compression_attempts == 6
         await agent.close()
+        await db.close()
 
 
 
@@ -99,7 +101,8 @@ class TestCompressionMaxAttemptsConfig:
         # configured agent exposes its value, and an object without the
         # attribute (older pickle / minimal stub) degrades to the prior
         # hardcoded behavior.
-        agent = await _make_agent(monkeypatch, tmp_path, max_attempts=7)
+        agent, db = await _make_agent(monkeypatch, tmp_path, max_attempts=7)
         assert getattr(agent, "max_compression_attempts", 3) == 7
         assert getattr(object(), "max_compression_attempts", 3) == 3
         await agent.close()
+        await db.close()

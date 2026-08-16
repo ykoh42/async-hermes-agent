@@ -39,6 +39,7 @@ async def test_live_provider_timeout_persists_and_next_turn_recovers(
         pytest.fail(
             f"No default model for live provider {PROVIDER!r}; set HERMES_LIVE_MODEL"
         )
+    database = SessionDB(tmp_path / "state.db")
     kwargs = {
         "provider": PROVIDER,
         "model": model,
@@ -47,7 +48,7 @@ async def test_live_provider_timeout_persists_and_next_turn_recovers(
         "skip_context_files": True,
         "skip_memory": True,
         "disabled_toolsets": ["*"],
-        "session_db": SessionDB(tmp_path / "state.db"),
+        "session_db": database,
     }
     if PROVIDER == "openrouter":
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -60,45 +61,50 @@ async def test_live_provider_timeout_persists_and_next_turn_recovers(
 
     agent = AIAgent(**kwargs)
     cancelled_input = "This live provider request must be timed out and persisted."
-    async with (
-        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
-        no_task_leaks(action=LeakAction.RAISE),
-        agent,
-    ):
-        timeout_trigger = None
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(None) as timeout_scope:
+    try:
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
+            no_task_leaks(action=LeakAction.RAISE),
+            agent,
+        ):
+            timeout_trigger = None
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(None) as timeout_scope:
 
-                async def expire_when_provider_is_active() -> None:
-                    await asyncio.wait_for(
-                        agent._model_request_active.wait(),
-                        timeout=10,
+                    async def expire_when_provider_is_active() -> None:
+                        await asyncio.wait_for(
+                            agent._model_request_active.wait(),
+                            timeout=10,
+                        )
+                        timeout_scope.reschedule(asyncio.get_running_loop().time())
+
+                    timeout_trigger = asyncio.create_task(
+                        expire_when_provider_is_active()
                     )
-                    timeout_scope.reschedule(asyncio.get_running_loop().time())
+                    try:
+                        await agent.run_conversation(cancelled_input)
+                    finally:
+                        await timeout_trigger
 
-                timeout_trigger = asyncio.create_task(expire_when_provider_is_active())
-                try:
-                    await agent.run_conversation(cancelled_input)
-                finally:
-                    await timeout_trigger
+            assert timeout_trigger is not None and timeout_trigger.done()
+            assert agent._inflight_turn_id is None
+            cancelled_rows = await agent._session_db.get_messages(agent.session_id)
+            assert [row["role"] for row in cancelled_rows] == ["user"]
+            assert cancelled_rows[0]["content"] == cancelled_input
 
-        assert timeout_trigger is not None and timeout_trigger.done()
-        assert agent._inflight_turn_id is None
-        cancelled_rows = await agent._session_db.get_messages(agent.session_id)
-        assert [row["role"] for row in cancelled_rows] == ["user"]
-        assert cancelled_rows[0]["content"] == cancelled_input
+            recovered = await agent.run_conversation(
+                "Ignore the interrupted request and reply exactly LIVE_TIMEOUT_RECOVERED."
+            )
 
-        recovered = await agent.run_conversation(
-            "Ignore the interrupted request and reply exactly LIVE_TIMEOUT_RECOVERED."
-        )
-
-        assert recovered["completed"] is True
-        assert recovered["final_response"].strip() == "LIVE_TIMEOUT_RECOVERED"
-        assert agent._inflight_turn_id is None
-        persisted = await agent._session_db.get_messages(agent.session_id)
-        assert [row["role"] for row in persisted] == [
-            "user",
-            "user",
-            "assistant",
-        ]
-        assert persisted[-1]["content"] == "LIVE_TIMEOUT_RECOVERED"
+            assert recovered["completed"] is True
+            assert recovered["final_response"].strip() == "LIVE_TIMEOUT_RECOVERED"
+            assert agent._inflight_turn_id is None
+            persisted = await agent._session_db.get_messages(agent.session_id)
+            assert [row["role"] for row in persisted] == [
+                "user",
+                "user",
+                "assistant",
+            ]
+            assert persisted[-1]["content"] == "LIVE_TIMEOUT_RECOVERED"
+    finally:
+        await database.close()

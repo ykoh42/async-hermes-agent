@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,7 @@ async def test_live_provider_subagent_completion_queue_reenters_parent_and_clean
             f"No default model for live provider {PROVIDER!r}; set HERMES_LIVE_MODEL"
         )
 
+    database = SessionDB(tmp_path / "state.db")
     kwargs = {
         "provider": PROVIDER,
         "model": model,
@@ -76,7 +78,7 @@ async def test_live_provider_subagent_completion_queue_reenters_parent_and_clean
         "skip_memory": True,
         "enabled_toolsets": ["delegation"],
         "save_trajectories": True,
-        "session_db": SessionDB(tmp_path / "state.db"),
+        "session_db": database,
     }
     if PROVIDER == "openrouter":
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -88,11 +90,13 @@ async def test_live_provider_subagent_completion_queue_reenters_parent_and_clean
         )
 
     agent = AIAgent(**kwargs)
-    async with (
-        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
-        no_task_leaks(action=LeakAction.RAISE),
-        agent,
-    ):
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25)
+        )
+        await stack.enter_async_context(no_task_leaks(action=LeakAction.RAISE))
+        stack.push_async_callback(database.close)
+        await stack.enter_async_context(agent)
         initial = await agent.run_conversation(
             "Call delegate_task exactly once with goal: Reply exactly "
             "LIVE_SUBAGENT_CHILD. The tool dispatches in the background. "

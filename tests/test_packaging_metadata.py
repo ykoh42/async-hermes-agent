@@ -172,6 +172,7 @@ def test_ci_postgres_matrix_covers_supported_python_and_server_pairs():
     assert "HERMES_POSTGRES_TEST_DSN" in postgres_job
     assert "tests/integration/test_postgres_session_db.py" in postgres_job
     assert "tests/integration/test_postgres_compaction_e2e.py" in postgres_job
+    assert "tests/integration/test_postgres_sqlite_differential.py" in postgres_job
 
 
 def test_pages_workflow_validates_pull_requests_without_deploying_them():

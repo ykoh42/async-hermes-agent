@@ -40,7 +40,7 @@ from hermes_state import SessionDB
 
 
 _BUILT_AGENTS = []
-_BUILT_DBS = []
+_BUILT_DATABASES = []
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -49,15 +49,13 @@ async def _close_async_agents():
     for agent in _BUILT_AGENTS:
         await agent.close()
     _BUILT_AGENTS.clear()
-    for db in _BUILT_DBS:
+    for db in _BUILT_DATABASES:
         await db.close()
-    _BUILT_DBS.clear()
+    _BUILT_DATABASES.clear()
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str):
     """Build an AIAgent that's wired to ``db`` and pinned to ``session_id``."""
-    if not any(existing is db for existing in _BUILT_DBS):
-        _BUILT_DBS.append(db)
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -102,6 +100,8 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     agent.compression_in_place = False
     agent._runtime_config_loaded = True
     _BUILT_AGENTS.append(agent)
+    if db not in _BUILT_DATABASES:
+        _BUILT_DATABASES.append(db)
     return agent
 
 

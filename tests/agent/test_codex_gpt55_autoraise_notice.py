@@ -84,7 +84,7 @@ async def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
         )
 
     await agent._ensure_provider_runtime()
-    return agent, stdout.getvalue()
+    return agent, stdout.getvalue(), db
 
 
 def _threshold_ratio(agent: AIAgent) -> float:
@@ -106,13 +106,13 @@ async def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(
     # Gateway spam scenario (#54432): the gateway rebuilds the agent per
     # inbound message. The first init shows the notice; the second stays
     # silent because the per-profile marker was recorded.
-    agent1, stdout1 = await _make_codex_agent(
+    agent1, stdout1, db1 = await _make_codex_agent(
         monkeypatch, tmp_path, show_notice=True
     )
     assert "auto-compaction was raised" not in stdout1
     assert getattr(agent1, "_compression_warning") is not None
 
-    agent2, stdout2 = await _make_codex_agent(
+    agent2, stdout2, db2 = await _make_codex_agent(
         monkeypatch, tmp_path, show_notice=True
     )
     assert _threshold_ratio(agent2) == 0.85  # autoraise still applies
@@ -120,6 +120,8 @@ async def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(
     assert getattr(agent2, "_compression_warning") is None
     await agent1.close()
     await agent2.close()
+    await db1.close()
+    await db2.close()
 
 
 # ── per-profile dedupe marker (#54432) ───────────────────────────────────────

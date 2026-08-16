@@ -152,7 +152,7 @@ async def test_agent_close_releases_all_computer_use_session_ids(monkeypatch):
     agent._drain_session_activity_persist = AsyncMock()
     agent._end_session_on_close = False
     agent._session_db = None
-    agent._close_session_db_on_close = False
+    agent._owns_session_db = False
 
     await agent._close_unlocked()
     assert {call.args[0] for call in release.await_args_list} == {

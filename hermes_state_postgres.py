@@ -1301,6 +1301,7 @@ class SessionDB:
         current.update(changes)
         prompt = current.get("system_prompt")
         prompt_hash = _system_prompt_hash(prompt) if isinstance(prompt, str) else None
+        current["system_prompt_hash"] = prompt_hash
         if prompt_hash is not None:
             await connection.execute(
                 _sa.text(
@@ -2321,13 +2322,21 @@ class SessionDB:
                     }
                 )
             elif name == "update_session_runtime_lock":
-                changes["runtime_lock"] = {
-                    "model": args["model"],
-                    "provider": args["provider"],
-                    "model_options": args["model_options"],
-                    "route_source": args["route_source"],
-                    "confirmed": args["confirmed"],
+                config = _json_value(session.get("model_config"), {})
+                if not isinstance(config, dict):
+                    config = {}
+                config["browser_model_lock"] = {
+                    "model": args["model"] or "",
+                    "provider": args["provider"] or "",
+                    "model_options": args["model_options"] or {},
+                    "route_source": args["route_source"] or "",
+                    "confirmed": bool(args["confirmed"]),
+                    "updated_at": time.time(),
                 }
+                changes["model_config"] = _json_text(config)
+                if args["model"] is not None:
+                    changes["model"] = args["model"]
+                changes["system_prompt"] = None
             elif name == "update_system_prompt":
                 changes["system_prompt"] = args["system_prompt"]
             elif name == "touch_session_activity":
@@ -2526,6 +2535,19 @@ class SessionDB:
                         )
                 return None
             changed = await self._update_session(connection, sid, changes)
+            if name == "update_session_runtime_lock":
+                prompts = self._tables["system_prompts"]
+                sessions_table = self._tables["sessions"]
+                await connection.execute(
+                    _sa.delete(prompts).where(
+                        ~_sa.exists(
+                            _sa.select(1).where(
+                                sessions_table.c.system_prompt_hash
+                                == prompts.c.hash
+                            )
+                        )
+                    )
+                )
             if name == "update_token_counts" and not args["absolute"] and has_accounted_usage:
                 await self._record_model_usage(
                     connection,
@@ -2808,13 +2830,15 @@ class SessionDB:
                     _sa.func.coalesce(messages_table.c.content, empty)
                     + _sa.literal_column("' '")
                     + _sa.func.coalesce(messages_table.c.tool_name, empty)
+                    + _sa.literal_column("' '")
+                    + _sa.func.coalesce(messages_table.c.tool_calls, empty)
                 )
                 search_vector = _sa.func.to_tsvector("simple", search_text)
                 search_query = _sa.func.websearch_to_tsquery("simple", query)
                 rank = _sa.func.ts_rank_cd(search_vector, search_query)
                 headline = _sa.func.ts_headline(
                     "simple",
-                    _sa.func.coalesce(messages_table.c.content, empty),
+                    search_text,
                     search_query,
                     "StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=40",
                 )
@@ -2914,7 +2938,18 @@ class SessionDB:
                 result = []
                 for row in (await connection.execute(statement)).all():
                     message = self._message_from_row(row)
-                    text = str(message.get("content") or message.get("tool_name") or "")
+                    tool_calls = message.get("tool_calls")
+                    tool_text = (
+                        json.dumps(tool_calls, ensure_ascii=False, default=str)
+                        if tool_calls is not None
+                        else ""
+                    )
+                    text = str(
+                        message.get("content")
+                        or message.get("tool_name")
+                        or tool_text
+                        or ""
+                    )
                     snippet = getattr(row, "_search_headline", None) or text
                     if ">>>" not in snippet:
                         index = text.lower().find(query.lower())
@@ -2984,6 +3019,14 @@ class SessionDB:
                     if not args.get("include_archived", True) and item.get("archived"):
                         continue
                     result.append(item)
+                result.sort(
+                    key=lambda item: (
+                        item.get("last_active") or item.get("started_at") or 0,
+                        item.get("started_at") or 0,
+                        item.get("id") or "",
+                    ),
+                    reverse=True,
+                )
                 start = args.get("offset", 0)
                 return result[start : start + args.get("limit", 20)]
             if name == "distinct_session_cwds":
@@ -3148,9 +3191,19 @@ class SessionDB:
                     )
                 if args.get("order_by_last_active"):
                     result.sort(
-                        key=lambda item: item.get("last_active")
-                        or item.get("started_at")
-                        or 0,
+                        key=lambda item: (
+                            item.get("last_active") or item.get("started_at") or 0,
+                            item.get("started_at") or 0,
+                            item.get("id") or "",
+                        ),
+                        reverse=True,
+                    )
+                else:
+                    result.sort(
+                        key=lambda item: (
+                            item.get("started_at") or 0,
+                            item.get("id") or "",
+                        ),
                         reverse=True,
                     )
                 offset = args.get("offset", 0)
