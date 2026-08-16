@@ -133,6 +133,9 @@ async def find_messages(db):
 
 ## PostgreSQL settings and read-only connections
 
+See the [PostgreSQL production-readiness report](./postgres-production-readiness.md)
+for the reproducible multi-worker, pool-recovery, and failure tests.
+
 The optional PostgreSQL backend keeps the `SessionDB(db_path, read_only=False)`
 constructor shape. Pass an explicit `postgresql+asyncpg://` DSN; do not rely on
 an implicit `DATABASE_URL` lookup inside the library:

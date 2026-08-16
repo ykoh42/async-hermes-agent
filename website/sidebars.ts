@@ -89,6 +89,7 @@ const sidebars: SidebarsConfig = {
             'developer-guide/upstream-differences',
             'developer-guide/agent-loop',
             'developer-guide/session-storage',
+            'developer-guide/postgres-production-readiness',
           ],
         },
         {
