@@ -184,14 +184,25 @@ statements. Server-side statement and lock timeouts belong in the libpq
 `server_settings`, and asyncpg statement-cache settings) are rejected rather
 than silently translated.
 
-On a writable store, first initialization creates or additively reconciles the
-retained tables, foreign keys, and query indexes under a PostgreSQL advisory
-transaction lock, then records the retained schema version. It does not run
-Alembic or perform destructive rewrites. A read-only store only validates the
-existing version and never creates or migrates schema. When a future upstream
-release changes the SQLite schema, the corresponding PostgreSQL column/data
-migration must be ported and tested before that release is advertised for
-existing PostgreSQL databases.
+On a writable store, first initialization creates a fresh schema or applies a
+known PostgreSQL physical migration under a PostgreSQL transaction advisory
+lock. The logical schema version follows upstream; PostgreSQL-only index and
+constraint layout is tracked in the existing `state_meta` table. The migration
+uses ordinary transactional DDL so data, indexes, constraints, and version
+metadata commit or roll back together. It intentionally does not use
+`CREATE INDEX CONCURRENTLY`: that operation cannot be included in the same
+transaction and may leave an invalid index after failure. Writes may therefore
+wait while a production preflight runs, while reads remain available.
+
+The migration is fail-closed for newer, missing, malformed, or ambiguous
+schemas. It does not run Alembic, destructive rewrites, or arbitrary
+missing-column repair. A read-only store requires both the current logical
+schema and current PostgreSQL physical layout and never creates or migrates
+schema. For production, take a backup/PITR point, drain writer workers, run a
+single preflight against the direct PostgreSQL endpoint, verify the catalog,
+and only then start new workers. A future upstream SQLite schema change must
+be ported as an explicit PostgreSQL migration and tested before that release
+is advertised for existing PostgreSQL databases.
 
 For a read replica or a search/diagnostic connection, use:
 

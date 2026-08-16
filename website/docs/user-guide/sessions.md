@@ -85,9 +85,19 @@ style; only the import and explicit DSN change. A store reads the active
 profile's `database.postgres` pool and driver settings once when its first
 database operation initializes the engine. Create a new store after changing
 those settings. See [SessionDB storage and PostgreSQL settings](../developer-guide/session-storage.md)
-for the supported options. Writable initialization creates or additively
-reconciles the retained tables and indexes; read-only initialization never
-migrates an existing database.
+for the supported options. Writable initialization performs only a known,
+versioned PostgreSQL migration under a transaction advisory lock. It never
+guesses the source of a partial schema or silently adds arbitrary missing
+columns. Read-only initialization requires the current logical and
+PostgreSQL physical schema and never migrates an existing database.
+
+For production, drain writer workers and run one preflight initialization
+against the direct PostgreSQL endpoint before starting serving workers. The
+preflight may create normal indexes and therefore blocks writes while it runs;
+it is intentionally atomic and retryable rather than a zero-downtime online
+migration. Configure a backup/PITR point and `lock_timeout`/`statement_timeout`
+before the preflight. Do not run old and new writer versions through the
+migration at the same time.
 
 For a read-only endpoint, pass `read_only=True`:
 

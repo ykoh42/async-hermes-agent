@@ -30,6 +30,7 @@ from agent.skill_commands import (
 from hermes_state_common import (
     _RESET_END_REASONS,
     _shape_preview,
+    SCHEMA_VERSION,
     escape_like as _escape_like,
 )
 from hermes_constants import (
@@ -45,8 +46,19 @@ except ImportError:  # pragma: no cover - exercised by the missing-extra test
     _sa = None
     _create_async_engine = None
 
-SCHEMA_VERSION = 25
 _CONTENT_JSON_PREFIX = "\x00json:"
+_POSTGRES_STORAGE_VERSION_KEY = "postgres_storage_version"
+_POSTGRES_STORAGE_VERSION = 2
+_POSTGRES_MIGRATION_LOCK = 731948251
+_POSTGRES_MIGRATION_TABLES = (
+    "schema_version",
+    "state_meta",
+    "system_prompts",
+    "sessions",
+    "messages",
+    "session_model_usage",
+    "compression_locks",
+)
 
 _POSTGRES_POOL_DEFAULTS = {
     "pool_size": 5,
@@ -414,23 +426,34 @@ class SessionDB:
             )
             if present.scalar_one_or_none() is not None:
                 continue
-            try:
-                await connection.execute(
-                    _sa.text(
-                        f'ALTER TABLE "{table}" ADD CONSTRAINT "{name}" '
-                        f"{definition}"
-                    )
+            await connection.execute(
+                _sa.text(
+                    f'ALTER TABLE "{table}" ADD CONSTRAINT "{name}" '
+                    f"{definition}"
                 )
-            except Exception as exc:
-                # Another process may have created the same fixed constraint
-                # after the existence check.  All other errors, including
-                # invalid legacy references, remain fatal.
-                original = getattr(exc, "orig", None)
-                if getattr(original, "sqlstate", None) != "42710":
-                    raise
+            )
 
     async def _ensure_postgres_indexes(self, connection: Any) -> None:
         """Create the fixed indexes used by retained SQLite query paths."""
+        fixed_names = ", ".join(
+            f"'{name}'" for name in sorted(_POSTGRES_INDEX_NAMES)
+        )
+        invalid_indexes = await connection.execute(
+            _sa.text(
+                "SELECT c.relname FROM pg_class AS c "
+                "JOIN pg_index AS i ON i.indexrelid = c.oid "
+                "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = current_schema() "
+                f"AND c.relname IN ({fixed_names}) "
+                "AND (NOT i.indisvalid OR NOT i.indisready)"
+            )
+        )
+        for row in invalid_indexes:
+            name = str(row[0])
+            if name in _POSTGRES_INDEX_NAMES:
+                await connection.execute(
+                    _sa.text(f'DROP INDEX IF EXISTS "{name}"')
+                )
         for statement in _POSTGRES_INDEX_DDL:
             await connection.execute(_sa.text(statement))
 
@@ -495,33 +518,9 @@ class SessionDB:
                 _sa.text(_POSTGRES_SEARCH_INDEX_DDL)
             )
 
-    async def _postgres_schema_is_current(
+    async def _postgres_tables_and_columns_are_current(
         self, connection: Any, metadata: Any
     ) -> bool:
-        """Return whether the additive PostgreSQL schema work is complete.
-
-        Every SessionDB instance performs the readiness handshake in its own
-        process.  Avoid re-running DDL for an already-current schema: a
-        second process entering ``CREATE TABLE``/``ALTER TABLE`` while the
-        first process is serving normal writes can otherwise deadlock on
-        relation locks.  The catalog checks are read-only and run while the
-        advisory transaction lock is held, so a process that observed a
-        partial schema simply waits for the migrator and rechecks it here.
-        """
-        schema_table = await connection.execute(
-            _sa.text("SELECT to_regclass(:table_name)"),
-            {"table_name": "schema_version"},
-        )
-        if schema_table.scalar_one_or_none() is None:
-            return False
-        current_version = (
-            await connection.execute(
-                _sa.text("SELECT max(version) FROM schema_version")
-            )
-        ).scalar_one()
-        if current_version is None or int(current_version) != SCHEMA_VERSION:
-            return False
-
         for table in metadata.tables.values():
             table_name = str(table.name)
             exists = await connection.execute(
@@ -541,6 +540,16 @@ class SessionDB:
             present_columns = {str(row[0]) for row in columns}
             if any(column.name not in present_columns for column in table.columns):
                 return False
+        return True
+
+    async def _postgres_catalog_is_current(
+        self, connection: Any, metadata: Any
+    ) -> bool:
+        """Check the fixed PostgreSQL catalog without changing it."""
+        if not await self._postgres_tables_and_columns_are_current(
+            connection, metadata
+        ):
+            return False
 
         index_rows = await connection.execute(
             _sa.text(
@@ -550,6 +559,25 @@ class SessionDB:
         )
         if not _POSTGRES_INDEX_NAMES.issubset(
             {str(row[0]) for row in index_rows}
+        ):
+            return False
+        index_states = await connection.execute(
+            _sa.text(
+                "SELECT c.relname, i.indisvalid, i.indisready "
+                "FROM pg_class AS c "
+                "JOIN pg_index AS i ON i.indexrelid = c.oid "
+                "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = current_schema()"
+            )
+        )
+        states = {
+            str(row[0]): (bool(row[1]), bool(row[2]))
+            for row in index_states
+        }
+        if any(
+            not states.get(name, (False, False))[0]
+            or not states.get(name, (False, False))[1]
+            for name in _POSTGRES_INDEX_NAMES
         ):
             return False
         title_index = await connection.execute(
@@ -586,6 +614,111 @@ class SessionDB:
         )
         constraint_names = {str(row[0]) for row in constraint_rows}
         return _POSTGRES_FOREIGN_KEY_NAMES.issubset(constraint_names)
+
+    async def _postgres_schema_versions(self, connection: Any) -> list[int]:
+        rows = await connection.execute(
+            _sa.text("SELECT version FROM schema_version ORDER BY version")
+        )
+        return [int(value) for value in rows.scalars().all()]
+
+    async def _postgres_storage_version(self, connection: Any) -> int | None:
+        state_meta_exists = await connection.execute(
+            _sa.text("SELECT to_regclass(:table_name)"),
+            {"table_name": "state_meta"},
+        )
+        if state_meta_exists.scalar_one_or_none() is None:
+            return None
+        value = (
+            await connection.execute(
+                _sa.text(
+                    "SELECT value FROM state_meta WHERE key = :key"
+                ),
+                {"key": _POSTGRES_STORAGE_VERSION_KEY},
+            )
+        ).scalar_one_or_none()
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "PostgreSQL storage schema version is malformed"
+            ) from exc
+
+    async def _postgres_legacy_storage_is_known(
+        self, connection: Any
+    ) -> bool:
+        """Recognize the physical layout shipped before storage versioning."""
+        title_index = (
+            await connection.execute(
+                _sa.text(
+                    "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                    "WHERE indexrelid = to_regclass(:index_name)"
+                ),
+                {"index_name": "idx_sessions_title_unique"},
+            )
+        ).scalar_one_or_none()
+        search_index = (
+            await connection.execute(
+                _sa.text(
+                    "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                    "WHERE indexrelid = to_regclass(:index_name)"
+                ),
+                {"index_name": "messages_hermes_search_idx"},
+            )
+        ).scalar_one_or_none()
+        title_definition = str(title_index or "").lower()
+        search_definition = str(search_index or "").lower()
+        return (
+            "create unique index" not in title_definition
+            or "where (title is not null)" not in title_definition
+            or "tool_calls" not in search_definition
+        )
+
+    async def _postgres_schema_is_current(
+        self, connection: Any, metadata: Any
+    ) -> bool:
+        schema_table = await connection.execute(
+            _sa.text("SELECT to_regclass(:table_name)"),
+            {"table_name": "schema_version"},
+        )
+        if schema_table.scalar_one_or_none() is None:
+            return False
+        versions = await self._postgres_schema_versions(connection)
+        storage_version = await self._postgres_storage_version(connection)
+        return (
+            versions == [SCHEMA_VERSION]
+            and storage_version == _POSTGRES_STORAGE_VERSION
+            and await self._postgres_catalog_is_current(connection, metadata)
+        )
+
+    async def _lock_postgres_migration_tables(self, connection: Any) -> None:
+        quoted_tables = ", ".join(
+            f'"{table_name}"' for table_name in _POSTGRES_MIGRATION_TABLES
+        )
+        await connection.execute(
+            _sa.text(
+                f"LOCK TABLE {quoted_tables} "
+                "IN SHARE ROW EXCLUSIVE MODE"
+            )
+        )
+
+    async def _write_postgres_schema_versions(self, connection: Any) -> None:
+        await connection.execute(_sa.text("DELETE FROM schema_version"))
+        await connection.execute(
+            _sa.text("INSERT INTO schema_version(version) VALUES (:version)"),
+            {"version": SCHEMA_VERSION},
+        )
+        await connection.execute(
+            _sa.text(
+                "INSERT INTO state_meta(key, value) VALUES (:key, :value) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+            ),
+            {
+                "key": _POSTGRES_STORAGE_VERSION_KEY,
+                "value": str(_POSTGRES_STORAGE_VERSION),
+            },
+        )
 
     async def _ensure_ready(self) -> None:
         if self._closed:
@@ -809,73 +942,120 @@ class SessionDB:
                             "PostgreSQL read-only SessionDB did not receive "
                             "transaction_read_only=on"
                         )
-                    try:
-                        current_version = (
-                            await connection.execute(
-                                _sa.text("SELECT max(version) FROM schema_version")
-                            )
-                        ).scalar_one()
-                    except Exception as exc:
-                        original = getattr(exc, "orig", None)
-                        if getattr(original, "sqlstate", None) == "42P01":
-                            raise RuntimeError(
-                                "read-only PostgreSQL SessionDB requires an "
-                                "initialized schema"
-                            ) from exc
-                        raise
-                    if current_version is None:
+                    schema_table = await connection.execute(
+                        _sa.text("SELECT to_regclass(:table_name)"),
+                        {"table_name": "schema_version"},
+                    )
+                    if schema_table.scalar_one_or_none() is None:
                         raise RuntimeError(
-                            "read-only PostgreSQL SessionDB requires a schema "
-                            "version row"
+                            "read-only PostgreSQL SessionDB requires an "
+                            "initialized schema"
                         )
-                    if int(current_version) > SCHEMA_VERSION:
+                    versions = await self._postgres_schema_versions(connection)
+                    if any(version > SCHEMA_VERSION for version in versions):
                         raise RuntimeError(
                             "PostgreSQL SessionDB schema is newer than this backend"
+                        )
+                    if not await self._postgres_schema_is_current(
+                        connection, metadata
+                    ):
+                        raise RuntimeError(
+                            "read-only PostgreSQL SessionDB requires the current "
+                            "schema; writable migration is required"
                         )
                     self._ready = True
                     return
                 await connection.execute(
                     _sa.text("SELECT pg_advisory_xact_lock(:key)"),
-                    {"key": 731948251},
+                    {"key": _POSTGRES_MIGRATION_LOCK},
                 )
                 if await self._postgres_schema_is_current(connection, metadata):
                     self._ready = True
                     return
-                await connection.run_sync(metadata.create_all)
-                # ``create_all`` intentionally does not alter an existing
-                # table.  Keep the migration boundary explicit and additive
-                # so a database created by an earlier backend revision can be
-                # opened without Alembic or an implicit destructive rewrite.
-                for table in metadata.tables.values():
-                    for column in table.columns:
-                        type_sql = column.type.compile(
-                            dialect=connection.dialect
+                schema_table = await connection.execute(
+                    _sa.text("SELECT to_regclass(:table_name)"),
+                    {"table_name": "schema_version"},
+                )
+                if schema_table.scalar_one_or_none() is None:
+                    existing_tables = await connection.execute(
+                        _sa.text(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() "
+                            "AND table_type = 'BASE TABLE' "
+                            "LIMIT 1"
                         )
-                        await connection.execute(
-                            _sa.text(
-                                f'ALTER TABLE "{table.name}" '
-                                f'ADD COLUMN IF NOT EXISTS "{column.name}" '
-                                f"{type_sql}"
-                            )
-                        )
-                await self._ensure_postgres_constraints(connection)
-                await self._ensure_postgres_indexes(connection)
-                current_version = (
-                    await connection.execute(
-                        _sa.text("SELECT max(version) FROM schema_version")
                     )
-                ).scalar_one()
-                if current_version is not None and int(current_version) > SCHEMA_VERSION:
+                    if existing_tables.first() is not None:
+                        raise RuntimeError(
+                            "PostgreSQL SessionDB found a non-empty schema without "
+                            "schema_version; refusing to guess its migration source"
+                        )
+                    await connection.run_sync(metadata.create_all)
+                    await self._ensure_postgres_constraints(connection)
+                    await self._ensure_postgres_indexes(connection)
+                    await self._write_postgres_schema_versions(connection)
+                    self._ready = True
+                    return
+
+                versions = await self._postgres_schema_versions(connection)
+                if len(versions) != 1:
+                    raise RuntimeError(
+                        "PostgreSQL SessionDB requires exactly one schema_version row"
+                    )
+                current_version = versions[0]
+                if current_version > SCHEMA_VERSION:
                     raise RuntimeError(
                         "PostgreSQL SessionDB schema is newer than this backend"
                     )
-                await connection.execute(
-                    _sa.text(
-                        "INSERT INTO schema_version(version) VALUES (:version) "
-                        "ON CONFLICT (version) DO NOTHING"
-                    ),
-                    {"version": SCHEMA_VERSION},
+                if current_version < SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "PostgreSQL SessionDB logical schema version is unsupported; "
+                        "restore a supported backup or migrate it explicitly"
+                    )
+                if not await self._postgres_tables_and_columns_are_current(
+                    connection, metadata
+                ):
+                    raise RuntimeError(
+                        "PostgreSQL SessionDB has an unsupported or incomplete "
+                        "table shape; refusing implicit column migration"
+                    )
+
+                storage_version = await self._postgres_storage_version(connection)
+                catalog_current = await self._postgres_catalog_is_current(
+                    connection, metadata
                 )
+                if storage_version is None:
+                    if catalog_current:
+                        storage_version = _POSTGRES_STORAGE_VERSION
+                    elif await self._postgres_legacy_storage_is_known(connection):
+                        storage_version = 1
+                    else:
+                        raise RuntimeError(
+                            "PostgreSQL SessionDB physical schema is ambiguous; "
+                            "refusing implicit repair"
+                        )
+                if storage_version > _POSTGRES_STORAGE_VERSION:
+                    raise RuntimeError(
+                        "PostgreSQL SessionDB physical schema is newer than this "
+                        "backend"
+                    )
+                if storage_version < 1:
+                    raise RuntimeError(
+                        "PostgreSQL SessionDB physical schema version is unsupported"
+                    )
+
+                if storage_version == 1 or not catalog_current:
+                    await self._lock_postgres_migration_tables(connection)
+                    await self._ensure_postgres_constraints(connection)
+                    await self._ensure_postgres_indexes(connection)
+                    if not await self._postgres_catalog_is_current(
+                        connection, metadata
+                    ):
+                        raise RuntimeError(
+                            "PostgreSQL SessionDB migration did not produce the "
+                            "expected catalog"
+                        )
+                await self._write_postgres_schema_versions(connection)
             self._ready = True
 
     async def _read(self, operation):

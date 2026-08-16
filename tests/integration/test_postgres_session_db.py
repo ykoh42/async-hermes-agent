@@ -419,7 +419,7 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
                     )
                 ).all()
             }
-            assert {
+            expected_indexes = {
                 "idx_sessions_title_unique",
                 "idx_sessions_source",
                 "idx_sessions_source_id",
@@ -438,7 +438,26 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
                 "idx_sessions_system_prompt_hash",
                 "idx_messages_platform_msg_id",
                 "messages_hermes_search_idx",
-            } <= indexes
+            }
+            assert expected_indexes <= indexes
+            index_states = {
+                row[0]: (row[1], row[2])
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT c.relname, i.indisvalid, i.indisready "
+                            "FROM pg_class AS c "
+                            "JOIN pg_index AS i ON i.indexrelid = c.oid "
+                            "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                            "WHERE n.nspname = current_schema()"
+                        )
+                    )
+                ).all()
+            }
+            assert all(
+                index_states[name] == (True, True)
+                for name in expected_indexes
+            )
             search_indexdef = (
                 await connection.execute(
                     text(
@@ -506,6 +525,235 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
 
 
 @pytest.mark.asyncio
+async def test_postgres_persists_one_logical_and_physical_schema_version():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    from sqlalchemy import text
+
+    database = PostgresSessionDB(dsn)
+    try:
+        await database._ensure_ready()
+        async with database._engine.connect() as connection:
+            versions = (
+                await connection.execute(
+                    text("SELECT version FROM schema_version ORDER BY version")
+                )
+            ).scalars().all()
+            storage_version = (
+                await connection.execute(
+                    text(
+                        "SELECT value FROM state_meta "
+                        "WHERE key = 'postgres_storage_version'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert versions == [SCHEMA_VERSION]
+        assert storage_version == "2"
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_read_only_requires_current_physical_schema_version():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    from sqlalchemy import text
+
+    writer = PostgresSessionDB(dsn)
+    readonly = None
+    try:
+        await writer._ensure_ready()
+        async with writer._engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE state_meta SET value = '1' "
+                    "WHERE key = 'postgres_storage_version'"
+                )
+            )
+        await writer.close()
+        readonly = PostgresSessionDB(dsn, read_only=True)
+        with pytest.raises(RuntimeError, match="migration|storage schema"):
+            await readonly._ensure_ready()
+    finally:
+        if readonly is not None:
+            await readonly.close()
+        writer = PostgresSessionDB(dsn)
+        try:
+            await writer._ensure_ready()
+        finally:
+            await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_nonempty_schema_without_version_fails_closed(tmp_path):
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    import psycopg
+
+    schema = f"migration_missing_version_{uuid.uuid4().hex}"
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "database:\n  postgres:\n    connect_args:\n"
+        f"      options: '-c search_path={schema}'\n",
+        encoding="utf-8",
+    )
+    admin_dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+    admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+    token = set_hermes_home_override(home)
+    database = PostgresSessionDB(dsn)
+    try:
+        async with admin.cursor() as cursor:
+            await cursor.execute(f'CREATE SCHEMA "{schema}"')
+            await cursor.execute(
+                f'CREATE TABLE "{schema}".sessions (id text PRIMARY KEY)'
+            )
+        with pytest.raises(RuntimeError, match="without schema_version"):
+            await database._ensure_ready()
+        async with admin.cursor() as cursor:
+            await cursor.execute(
+                "SELECT to_regclass(%s)",
+                (f'"{schema}".messages',),
+            )
+            assert (await cursor.fetchone())[0] is None
+    finally:
+        reset_hermes_home_override(token)
+        await database.close()
+        await admin.close()
+        admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_storage_migration_rolls_back_and_retries(tmp_path, monkeypatch):
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    import psycopg
+    from sqlalchemy import text
+
+    schema = f"migration_rollback_{uuid.uuid4().hex}"
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "database:\n  postgres:\n    connect_args:\n"
+        f"      options: '-c search_path={schema}'\n",
+        encoding="utf-8",
+    )
+    admin_dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+    admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+    token = set_hermes_home_override(home)
+    database = PostgresSessionDB(dsn)
+    retry = None
+    try:
+        async with admin.cursor() as cursor:
+            await cursor.execute(f'CREATE SCHEMA "{schema}"')
+        await database._ensure_ready()
+        async with database._engine.begin() as connection:
+            await connection.execute(
+                text('DROP INDEX IF EXISTS "idx_sessions_title_unique"')
+            )
+            await connection.execute(
+                text("DROP INDEX IF EXISTS messages_hermes_search_idx")
+            )
+            await connection.execute(
+                text(
+                    "CREATE INDEX messages_hermes_search_idx "
+                    "ON messages USING GIN (to_tsvector('simple', "
+                    "coalesce(content, '') || ' ' || coalesce(tool_name, ''))"
+                    ")"
+                )
+            )
+            await connection.execute(
+                text(
+                    "DELETE FROM state_meta "
+                    "WHERE key = 'postgres_storage_version'"
+                )
+            )
+        await database.close()
+
+        retry = PostgresSessionDB(dsn)
+        original_indexes = retry._ensure_postgres_indexes
+
+        async def fail_after_ddl(connection):
+            await original_indexes(connection)
+            raise RuntimeError("injected migration failure")
+
+        monkeypatch.setattr(retry, "_ensure_postgres_indexes", fail_after_ddl)
+        with pytest.raises(RuntimeError, match="injected migration failure"):
+            await retry._ensure_ready()
+        await retry.close()
+
+        inspection = await psycopg.AsyncConnection.connect(
+            admin_dsn, autocommit=True
+        )
+        try:
+            async with inspection.cursor() as cursor:
+                await cursor.execute(f'SET search_path TO "{schema}"')
+                await cursor.execute(
+                    "SELECT to_regclass('idx_sessions_title_unique')"
+                )
+                assert (await cursor.fetchone())[0] is None
+                await cursor.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'postgres_storage_version'"
+                )
+                assert await cursor.fetchone() is None
+                await cursor.execute(
+                    "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                    "WHERE indexrelid = to_regclass("
+                    "'messages_hermes_search_idx')"
+                )
+                rolled_back_search = (await cursor.fetchone())[0]
+                assert "tool_calls" not in rolled_back_search
+        finally:
+            await inspection.close()
+
+        check = PostgresSessionDB(dsn)
+        await check._ensure_ready()
+        async with check._engine.connect() as connection:
+            storage_version = (
+                await connection.execute(
+                    text(
+                        "SELECT value FROM state_meta "
+                        "WHERE key = 'postgres_storage_version'"
+                    )
+                )
+            ).scalar_one()
+            search_index = (
+                await connection.execute(
+                    text(
+                        "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                        "WHERE indexrelid = to_regclass("
+                        "'messages_hermes_search_idx')"
+                    )
+                )
+            ).scalar_one()
+        assert storage_version == "2"
+        assert "tool_calls" in search_index
+        await check.close()
+    finally:
+        reset_hermes_home_override(token)
+        await database.close()
+        if retry is not None:
+            await retry.close()
+        await admin.close()
+        admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_close_repeated_cancellation_is_deterministic():
     dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
     if not dsn:
@@ -527,9 +775,10 @@ async def test_postgres_concurrent_agents_share_one_database_pool():
     database = PostgresSessionDB(dsn)
     session_ids = [f"pytest-concurrent-{uuid.uuid4()}-{index}" for index in range(8)]
     shared_id = f"pytest-concurrent-shared-{uuid.uuid4()}"
+    source = f"concurrent-{uuid.uuid4()}"
 
     async def _write(session_id: str) -> None:
-        await database.create_session(session_id, "concurrent")
+        await database.create_session(session_id, source)
         await database.append_messages_batch(
             session_id,
             [
@@ -541,12 +790,12 @@ async def test_postgres_concurrent_agents_share_one_database_pool():
 
     try:
         await asyncio.gather(*(_write(session_id) for session_id in session_ids))
-        assert await database.session_count(source="concurrent") == len(session_ids)
+        assert await database.session_count(source=source) == len(session_ids)
         counts = await asyncio.gather(
             *(database.message_count(session_id) for session_id in session_ids)
         )
         assert counts == [2] * len(session_ids)
-        await database.create_session(shared_id, "concurrent")
+        await database.create_session(shared_id, source)
         await asyncio.gather(
             *(
                 database.append_message(shared_id, "user", f"message-{index}")

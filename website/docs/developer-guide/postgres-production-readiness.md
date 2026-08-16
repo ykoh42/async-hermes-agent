@@ -28,7 +28,7 @@ with Python 3.11, 3.12, and 3.13 combinations.
 | Backend termination | `pg_terminate_backend()` closes an idle pooled connection and `pool_pre_ping` reconnects the next checkout |
 | Pool cleanup | SQLAlchemy pool `checked_out` is zero after each scenario |
 | Agent and compaction path | `test_postgres_compaction_e2e.py` uses a real `AIAgent`, loopback streaming provider, PostgreSQL persistence, compaction, and resume |
-| Pool exhaustion, cancellation, and schema recovery | The focused `test_postgres_session_db.py` suite exercises bounded timeout, rollback, connection return, migration repair, and read-only behavior |
+| Pool exhaustion, cancellation, and schema recovery | The focused `test_postgres_session_db.py` suite exercises bounded timeout, atomic rollback, connection return, versioned migration, and read-only behavior |
 
 Run the readiness checks locally with a PostgreSQL DSN:
 
@@ -43,6 +43,43 @@ Each test uses unique session IDs and fresh child runtime directories. The
 children receive only the DSN and the paths required for the test; credentials
 are never printed. The parent reaps every child, closes every SQLAlchemy
 connection, and checks the pool before returning.
+
+## Versioned migration procedure
+
+The PostgreSQL backend keeps the upstream logical schema version and a private
+PostgreSQL physical-layout version in the existing `state_meta` table. The
+currently supported upgrade is the physical layout shipped by the earlier
+PostgreSQL release: title uniqueness, retained foreign keys/indexes, and the
+`tool_calls` search expression. The logical upstream version is not
+artificially incremented for these PostgreSQL-only changes.
+
+Migration is lazy at the first awaited database operation, but production
+deployments should run that operation as a single preflight before serving
+workers start:
+
+```python
+db = SessionDB(dsn_with_migration_privileges)
+try:
+    await db.session_count()
+finally:
+    await db.close()
+```
+
+The preflight must have a backup/PITR point, a direct PostgreSQL endpoint,
+drained writer workers, and configured `lock_timeout` and `statement_timeout`.
+Migration uses ordinary transactional DDL. It can block writes while an index
+is built, but a failure or cancellation rolls back the data, catalog, and
+version metadata together. `CREATE INDEX CONCURRENTLY` is deliberately not
+used because it cannot be included in that transaction and may leave an
+invalid index after failure. A read-only store refuses any schema that is not
+already at the current logical and physical versions; it never repairs or
+migrates a replica.
+
+Newer, missing, malformed, or ambiguous schema versions fail closed. Do not
+run old and new writer versions through the same migration window. After the
+preflight commits, verify the catalog and then start the serving workers. This
+is a maintenance-window safety contract, not a zero-downtime or managed-cloud
+failover guarantee.
 
 ## Operational limits
 
