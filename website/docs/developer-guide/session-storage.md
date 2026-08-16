@@ -137,16 +137,20 @@ See the [PostgreSQL production-readiness report](./postgres-production-readiness
 for the reproducible multi-worker, pool-recovery, and failure tests.
 
 The optional PostgreSQL backend keeps the `SessionDB(db_path, read_only=False)`
-constructor shape. Pass an explicit `postgresql+asyncpg://` DSN; do not rely on
+constructor shape. Pass an explicit `postgresql+psycopg://` DSN; do not rely on
 an implicit `DATABASE_URL` lookup inside the library:
 
 ```python
 from hermes_state_postgres import SessionDB
 
-db = SessionDB("postgresql+asyncpg://user:password@db.example/hermes")
+db = SessionDB("postgresql+psycopg://user:password@db.example/hermes")
 ```
 
-Pool and asyncpg options belong under the active profile's `config.yaml` and
+The backend uses psycopg 3's native asyncio connection. Psycopg does not
+support Windows' default Proactor event loop; Windows hosts must select a
+compatible selector loop. No thread-based compatibility fallback is provided.
+
+Pool and psycopg options belong under the active profile's `config.yaml` and
 use the driver names directly:
 
 ```yaml
@@ -159,22 +163,26 @@ database:
     pool_pre_ping: true
     pool_use_lifo: false
     connect_args:
-      timeout: 60
-      command_timeout: null
-      statement_cache_size: 100
-      max_cached_statement_lifetime: 300
-      max_cacheable_statement_size: 15360
-      server_settings:
-        application_name: async-hermes-agent
-        statement_timeout: "60000"
-        lock_timeout: "5000"
-        idle_in_transaction_session_timeout: "600000"
+      connect_timeout: 60
+      prepare_threshold: 5
+      application_name: async-hermes-agent
+      options: >-
+        -c statement_timeout=60000
+        -c lock_timeout=5000
+        -c idle_in_transaction_session_timeout=600000
 ```
 
 The profile selected when the store is constructed owns these settings. The
 async connection is still initialized at the first awaited operation, and the
 validated options remain fixed for that store's lifetime. Changing the config
 requires a newly created store. TLS and endpoint selection remain DSN concerns.
+
+These are the actual psycopg/libpq option names. `connect_timeout` controls
+connection establishment and `prepare_threshold: null` disables prepared
+statements. Server-side statement and lock timeouts belong in the libpq
+`options` string. The former asyncpg-only keys (`timeout`, `command_timeout`,
+`server_settings`, and asyncpg statement-cache settings) are rejected rather
+than silently translated.
 
 On a writable store, first initialization creates or additively reconciles the
 retained tables, foreign keys, and query indexes under a PostgreSQL advisory

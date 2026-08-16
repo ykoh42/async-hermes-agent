@@ -67,7 +67,7 @@ from run_agent import AIAgent
 
 async def postgres_conversation():
     db = SessionDB(
-        "postgresql+asyncpg://user:password@db.example:5432/hermes",
+        "postgresql+psycopg://user:password@db.example:5432/hermes",
     )
     try:
         async with AIAgent(

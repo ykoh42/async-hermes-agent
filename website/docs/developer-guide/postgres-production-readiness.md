@@ -33,7 +33,7 @@ with Python 3.11, 3.12, and 3.13 combinations.
 Run the readiness checks locally with a PostgreSQL DSN:
 
 ```bash
-HERMES_POSTGRES_TEST_DSN='postgresql+asyncpg://user:password@127.0.0.1:5432/hermes' \
+HERMES_POSTGRES_TEST_DSN='postgresql+psycopg://user:password@127.0.0.1:5432/hermes' \
   uv run --extra dev --extra postgres pytest -q \
   tests/integration/test_postgres_production_readiness.py \
   tests/integration/test_postgres_compaction_e2e.py

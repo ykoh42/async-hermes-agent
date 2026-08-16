@@ -88,8 +88,26 @@ def test_postgres_backend_is_optional_and_packaged_as_a_top_level_module():
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
     extra = pyproject["project"]["optional-dependencies"]["postgres"]
-    assert extra == ["SQLAlchemy[asyncio]==2.0.51", "asyncpg==0.31.0"]
+    assert extra == ["SQLAlchemy[asyncio]==2.0.51", "psycopg[binary]==3.3.4"]
     assert "hermes_state_postgres" in pyproject["tool"]["setuptools"]["py-modules"]
+
+
+def test_postgres_backend_live_surface_is_psycopg_only():
+    """The optional SessionDB backend must not retain asyncpg coupling."""
+    source_paths = (
+        REPO_ROOT / "hermes_state_postgres.py",
+        REPO_ROOT / "tests" / "integration" / "test_postgres_session_db.py",
+        REPO_ROOT / "tests" / "integration" / "test_postgres_sqlite_differential.py",
+        REPO_ROOT / "tests" / "integration" / "test_postgres_production_readiness.py",
+    )
+    for path in source_paths:
+        source = path.read_text(encoding="utf-8")
+        assert "asyncpg" not in source, path
+        assert "postgresql+asyncpg" not in source, path
+
+    assert "postgresql+psycopg://" in (
+        REPO_ROOT / "hermes_state_postgres.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_release_workflow_installs_ripgrep_before_testing_source():

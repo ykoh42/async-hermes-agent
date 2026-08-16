@@ -155,7 +155,7 @@ uv sync --extra postgres
 from hermes_state_postgres import SessionDB
 from run_agent import AIAgent
 
-db = SessionDB("postgresql+asyncpg://user:password@db.example/hermes")
+db = SessionDB("postgresql+psycopg://user:password@db.example/hermes")
 try:
     async with AIAgent(provider="openrouter", session_db=db) as agent:
         answer = await agent.run_conversation("Question")
@@ -163,9 +163,9 @@ finally:
     await db.close()
 ```
 
-The DSN selects the PostgreSQL endpoint and credentials. Pool and asyncpg
+The DSN selects the PostgreSQL endpoint and credentials. Pool and psycopg
 runtime settings are optional and use the same names as SQLAlchemy and
-asyncpg in the active profile's `config.yaml`:
+psycopg in the active profile's `config.yaml`:
 
 ```yaml
 database:
@@ -177,16 +177,13 @@ database:
     pool_pre_ping: true
     pool_use_lifo: false
     connect_args:
-      timeout: 60
-      command_timeout: null
-      statement_cache_size: 100
-      max_cached_statement_lifetime: 300
-      max_cacheable_statement_size: 15360
-      server_settings:
-        application_name: async-hermes-agent
-        statement_timeout: "60000"
-        lock_timeout: "5000"
-        idle_in_transaction_session_timeout: "600000"
+      connect_timeout: 60
+      prepare_threshold: 5
+      application_name: async-hermes-agent
+      options: >-
+        -c statement_timeout=60000
+        -c lock_timeout=5000
+        -c idle_in_transaction_session_timeout=600000
 ```
 
 These settings are captured when the store is first initialized and are not
@@ -196,7 +193,7 @@ PostgreSQL transaction-level read-only mode:
 
 ```python
 readonly_db = SessionDB(
-    "postgresql+asyncpg://user:password@db.example/hermes",
+    "postgresql+psycopg://user:password@db.example/hermes",
     read_only=True,
 )
 ```
@@ -205,6 +202,12 @@ readonly_db = SessionDB(
 selects the endpoint. For a service, size the database for the possible
 connection count across workers: approximately
 `workers * (pool_size + max_overflow)`.
+
+The PostgreSQL settings use psycopg/libpq names. `connect_timeout` controls
+connection establishment, `prepare_threshold: null` disables prepared
+statements, and server timeouts are passed through libpq's `options` string.
+The old asyncpg-only names (`timeout`, `command_timeout`, `server_settings`,
+and asyncpg statement-cache options) are not accepted.
 
 The injected store is borrowed by the agent, so a FastAPI or ASGI lifespan
 should create and close one store per worker and share it among that worker's
