@@ -406,6 +406,7 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
                 "session_model_usage",
                 "state_meta",
                 "compression_locks",
+                "async_delegations",
             } <= tables
 
             indexes = {
@@ -438,6 +439,7 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
                 "idx_sessions_system_prompt_hash",
                 "idx_messages_platform_msg_id",
                 "messages_hermes_search_idx",
+                "idx_async_delegations_delivery",
             }
             assert expected_indexes <= indexes
             index_states = {
@@ -525,7 +527,7 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
 
 
 @pytest.mark.asyncio
-async def test_postgres_persists_one_logical_and_physical_schema_version():
+async def test_postgres_persists_logical_and_private_layout_versions():
     dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
     if not dsn:
         pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
@@ -540,7 +542,7 @@ async def test_postgres_persists_one_logical_and_physical_schema_version():
                     text("SELECT version FROM schema_version ORDER BY version")
                 )
             ).scalars().all()
-            storage_version = (
+            private_storage_marker = (
                 await connection.execute(
                     text(
                         "SELECT value FROM state_meta "
@@ -549,13 +551,13 @@ async def test_postgres_persists_one_logical_and_physical_schema_version():
                 )
             ).scalar_one_or_none()
         assert versions == [SCHEMA_VERSION]
-        assert storage_version == "2"
+        assert private_storage_marker == "3"
     finally:
         await database.close()
 
 
 @pytest.mark.asyncio
-async def test_postgres_read_only_requires_current_physical_schema_version():
+async def test_postgres_read_only_requires_the_current_catalog():
     dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
     if not dsn:
         pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
@@ -566,15 +568,16 @@ async def test_postgres_read_only_requires_current_physical_schema_version():
     try:
         await writer._ensure_ready()
         async with writer._engine.begin() as connection:
+            await connection.execute(text("DROP TABLE async_delegations"))
             await connection.execute(
                 text(
-                    "UPDATE state_meta SET value = '1' "
+                    "UPDATE state_meta SET value = '2' "
                     "WHERE key = 'postgres_storage_version'"
                 )
             )
         await writer.close()
         readonly = PostgresSessionDB(dsn, read_only=True)
-        with pytest.raises(RuntimeError, match="migration|storage schema"):
+        with pytest.raises(RuntimeError, match="current schema|migration"):
             await readonly._ensure_ready()
     finally:
         if readonly is not None:
@@ -736,7 +739,7 @@ async def test_postgres_storage_migration_rolls_back_and_retries(tmp_path, monke
                     )
                 )
             ).scalar_one()
-        assert storage_version == "2"
+        assert storage_version == "3"
         assert "tool_calls" in search_index
         await check.close()
     finally:

@@ -131,6 +131,15 @@ async def find_messages(db):
 
 `session_search` exposes this storage to the model when its toolset is enabled.
 
+## PostgreSQL-backed delegation
+
+The optional PostgreSQL backend also stores durable async-delegation records
+when the same store is explicitly injected into `AIAgent(session_db=...)`.
+Delegation completion and `session_search(db=...)` then use the PostgreSQL
+SessionDB; no SQLite sidecar is created. The default delegation path remains
+SQLite when no PostgreSQL store is injected, and memory/plugin stores are not
+implicitly routed to PostgreSQL.
+
 ## PostgreSQL settings and read-only connections
 
 See the [PostgreSQL production-readiness report](./postgres-production-readiness.md)

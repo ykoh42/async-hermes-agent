@@ -212,8 +212,10 @@ and asyncpg statement-cache options) are not accepted.
 The injected store is borrowed by the agent, so a FastAPI or ASGI lifespan
 should create and close one store per worker and share it among that worker's
 agents. SQLite remains the default. PostgreSQL uses native ranking rather than
-SQLite FTS5 BM25 scores, and the independent memory/delegation databases are
-still SQLite-backed.
+SQLite FTS5 BM25 scores. When an explicit PostgreSQL store is injected into
+`AIAgent(session_db=...)`, durable async-delegation records and
+`session_search(db=...)` use that same store; the default SQLite delegation
+path and independent memory/plugin databases remain unchanged.
 
 ## Skills, MCP, and memory
 

@@ -46,6 +46,7 @@ _STALE_CHECK_INTERVAL = 30.0
 _STALE_IDLE_SECONDS = 450.0
 _STALE_IN_TOOL_SECONDS = 1200.0
 _STALL_GRACE_SECONDS = 120.0
+_OWNER_LEASE_SECONDS = 180.0
 
 @dataclass
 class _DelegationScopeState:
@@ -60,6 +61,9 @@ class _DelegationScopeState:
     db_lock_users: int = 0
     restore_lock: asyncio.Lock | None = None
     restore_lock_users: int = 0
+    # A caller-owned PostgreSQL SessionDB may be bound by an AIAgent's
+    # awaited initialization.  SQLite remains the default when this is None.
+    session_db_ref: weakref.ReferenceType[Any] | None = None
 
 
 _scope_states: weakref.WeakKeyDictionary[
@@ -72,6 +76,10 @@ _scope_guard = threading.RLock()
 _active_scope: contextvars.ContextVar[
     tuple[str, _DelegationScopeState] | None
 ] = contextvars.ContextVar("async_delegation_profile_scope", default=None)
+_SESSION_DB_UNSET = object()
+_active_session_db: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "async_delegation_session_db", default=_SESSION_DB_UNSET
+)
 _legacy_scope = _DelegationScopeState("")
 
 # Private compatibility projections for older tests and integrations. Runtime
@@ -84,7 +92,88 @@ _restored_queues: set[tuple[int, str]] = _legacy_scope.restored_queues
 _db_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 _restore_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 _process_start_times: dict[int, int | None] = {}
+_owner_instance_pid: int | None = None
+_owner_instance_token: str | None = None
 _DeliveryResult = TypeVar("_DeliveryResult")
+
+
+def _postgres_session_db(state: _DelegationScopeState | None = None) -> Any:
+    """Return the explicitly bound PostgreSQL store, never a guessed fallback."""
+    selected_override = _active_session_db.get()
+    selected = state or _current_scope_state()
+    if selected_override is not _SESSION_DB_UNSET:
+        if selected_override is None:
+            return None
+        reference = selected.session_db_ref
+        if reference is None:
+            # A task-local binding inherited from another profile must never
+            # route this profile's delegation to that database.
+            return None
+        database = reference()
+        if database is None:
+            raise RuntimeError(
+                "The PostgreSQL SessionDB bound to async delegation is no longer alive"
+            )
+        if database is not selected_override:
+            raise RuntimeError(
+                "The PostgreSQL SessionDB binding does not match this delegation profile"
+            )
+        return database
+    reference = selected.session_db_ref
+    if reference is None:
+        return None
+    database = reference()
+    if database is None:
+        raise RuntimeError(
+            "The PostgreSQL SessionDB bound to async delegation is no longer alive"
+        )
+    return database
+
+
+async def _bind_session_db(session_db: Any) -> None:
+    """Bind an injected PostgreSQL store to the current delegation scope."""
+    state = await _activate_scope_state()
+    if session_db is None:
+        # Explicitly selecting the default SQLite path in this context must
+        # not inherit a PostgreSQL binding left by another agent in the same
+        # profile/event loop.
+        _active_session_db.set(None)
+        return
+    # SQLite SessionDB deliberately has no _read/_write Core boundaries.  This
+    # private capability keeps the public backend surface and the upstream
+    # delegation functions unchanged without importing the optional PG extra.
+    if not callable(getattr(session_db, "_read", None)) or not callable(
+        getattr(session_db, "_write", None)
+    ):
+        # An explicitly supplied SQLite store must override any PostgreSQL
+        # binding inherited by the caller's context.  The scope-level weak
+        # reference remains available to sibling PG agents, but this task is
+        # fail-closed to the default SQLite path.
+        _active_session_db.set(None)
+        return
+    try:
+        reference = weakref.ref(session_db)
+    except TypeError as exc:
+        raise TypeError(
+            "PostgreSQL SessionDB used for async delegation must support weak references"
+        ) from exc
+    current = state.session_db_ref() if state.session_db_ref is not None else None
+    if current is not None and current is not session_db:
+        raise RuntimeError(
+            "One PostgreSQL SessionDB must be shared by a delegation profile and event loop"
+        )
+    state.session_db_ref = reference
+    _active_session_db.set(session_db)
+
+
+def _owner_instance_id() -> str:
+    """Return a process-local owner token and refresh it after fork."""
+    global _owner_instance_pid, _owner_instance_token
+    pid = os.getpid()
+    if _owner_instance_pid != pid or _owner_instance_token is None:
+        _owner_instance_pid = pid
+        _owner_instance_token = f"{pid}:{uuid.uuid4().hex}"
+    return _owner_instance_token
 
 
 def _db_path():
@@ -368,11 +457,74 @@ async def _safe_process_start_time(pid: int) -> int | None:
 async def _persist_dispatch(record: dict[str, Any]) -> None:
     now = time.time()
     owner_started_at = await _safe_process_start_time(os.getpid())
+    state = _current_scope_state()
+    postgres = _postgres_session_db(state)
     task_payload = {
         key: record.get(key)
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
         if key in record
     }
+    if postgres is not None:
+        from sqlalchemy import text
+
+        owner = record.get("_owner_instance_id") or _owner_instance_id()
+
+        async def _write(connection):
+            await connection.execute(
+                text(
+                    """INSERT INTO async_delegations
+                       (delegation_id, origin_session, origin_ui_session_id,
+                        parent_session_id, state, dispatched_at, updated_at,
+                        delivery_state, delivery_attempts, owner_pid,
+                        owner_started_at, task_json, origin_session_id,
+                        owner_instance_id, lease_expires_at)
+                       VALUES (:delegation_id, :origin_session, :origin_ui,
+                               :parent_session, 'running', :dispatched_at,
+                               :updated_at, 'pending', 0, :owner_pid,
+                               :owner_started_at, :task_json, :origin_session_id,
+                               :owner_instance_id,
+                               EXTRACT(EPOCH FROM clock_timestamp()) + :lease)
+                       ON CONFLICT (delegation_id) DO UPDATE SET
+                           origin_session = excluded.origin_session,
+                           origin_ui_session_id = excluded.origin_ui_session_id,
+                           parent_session_id = excluded.parent_session_id,
+                           state = excluded.state,
+                           dispatched_at = excluded.dispatched_at,
+                           completed_at = NULL,
+                           updated_at = excluded.updated_at,
+                           event_json = NULL,
+                           result_json = NULL,
+                           delivery_state = 'pending',
+                           delivery_attempts = 0,
+                           delivered_at = NULL,
+                           owner_pid = excluded.owner_pid,
+                           owner_started_at = excluded.owner_started_at,
+                           task_json = excluded.task_json,
+                           delivery_claim = NULL,
+                           delivery_claimed_at = NULL,
+                           origin_session_id = excluded.origin_session_id,
+                           owner_instance_id = excluded.owner_instance_id,
+                           lease_expires_at = excluded.lease_expires_at"""
+                ),
+                {
+                    "delegation_id": record["delegation_id"],
+                    "origin_session": record.get("session_key", ""),
+                    "origin_ui": record.get("origin_ui_session_id", ""),
+                    "parent_session": record.get("parent_session_id"),
+                    "dispatched_at": record["dispatched_at"],
+                    "updated_at": now,
+                    "owner_pid": os.getpid(),
+                    "owner_started_at": owner_started_at,
+                    "task_json": json.dumps(task_payload),
+                    "origin_session_id": record.get("origin_session_id", ""),
+                    "owner_instance_id": owner,
+                    "lease": _OWNER_LEASE_SECONDS,
+                },
+            )
+
+        await postgres._write(_write)
+        await _prune_durable_records()
+        return
     async with _db_lock():
         async with _transaction() as conn:
             await conn.execute(
@@ -399,6 +551,20 @@ async def _persist_dispatch(record: dict[str, Any]) -> None:
 
 
 async def _delete_durable_delegation(delegation_id: str) -> None:
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        if bool(getattr(postgres, "_read_only", False)):
+            return
+        from sqlalchemy import text
+
+        async def _write(connection):
+            await connection.execute(
+                text("DELETE FROM async_delegations WHERE delegation_id = :id"),
+                {"id": delegation_id},
+            )
+
+        await postgres._write(_write)
+        return
     async with _db_lock():
         async with _transaction() as conn:
             await conn.execute(
@@ -409,6 +575,58 @@ async def _delete_durable_delegation(delegation_id: str) -> None:
 
 async def _prune_durable_records() -> None:
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            await connection.execute(
+                text(
+                    "DELETE FROM async_delegations "
+                    "WHERE delivery_state = 'delivered' AND updated_at < :cutoff"
+                ),
+                {"cutoff": cutoff},
+            )
+            count = await connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM async_delegations "
+                    "WHERE state NOT IN ('running', 'finalizing')"
+                )
+            )
+            excess = max(0, int(count.scalar_one()) - _MAX_RETAINED_COMPLETED)
+            if excess:
+                await connection.execute(
+                    text(
+                        "DELETE FROM async_delegations WHERE delegation_id IN ("
+                        "SELECT delegation_id FROM async_delegations "
+                        "WHERE state NOT IN ('running', 'finalizing') "
+                        "ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END, "
+                        "updated_at ASC LIMIT :limit)"
+                    ),
+                    {"limit": excess},
+                )
+            pending = await connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM async_delegations "
+                    "WHERE state NOT IN ('running', 'finalizing') "
+                    "AND delivery_state = 'pending'"
+                )
+            )
+            overflow = max(0, int(pending.scalar_one()) - _MAX_DURABLE_PENDING)
+            if overflow:
+                await connection.execute(
+                    text(
+                        "DELETE FROM async_delegations WHERE delegation_id IN ("
+                        "SELECT delegation_id FROM async_delegations "
+                        "WHERE state NOT IN ('running', 'finalizing') "
+                        "AND delivery_state = 'pending' "
+                        "ORDER BY updated_at ASC LIMIT :limit)"
+                    ),
+                    {"limit": overflow},
+                )
+
+        await postgres._write(_write)
+        return
     async with _db_lock():
         async with _transaction() as conn:
             await conn.execute(
@@ -447,8 +665,43 @@ async def _prune_durable_records() -> None:
                 )
 
 
-async def _persist_completion(event: dict[str, Any], result: dict[str, Any]) -> None:
+async def _persist_completion(
+    event: dict[str, Any], result: dict[str, Any]
+) -> bool | None:
     now = time.time()
+    state = _current_scope_state()
+    postgres = _postgres_session_db(state)
+    if postgres is not None:
+        from sqlalchemy import text
+
+        owner = state.records.get(event.get("delegation_id"), {}).get(
+            "_owner_instance_id"
+        ) or _owner_instance_id()
+
+        async def _write(connection):
+            result_cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET state = :state,
+                       completed_at = :completed_at, updated_at = :updated_at,
+                       event_json = :event_json, result_json = :result_json,
+                       delivery_state = 'pending', lease_expires_at = NULL
+                       WHERE delegation_id = :delegation_id
+                         AND owner_instance_id = :owner_instance_id
+                         AND state IN ('running', 'finalizing')"""
+                ),
+                {
+                    "state": event.get("status", "completed"),
+                    "completed_at": event.get("completed_at", now),
+                    "updated_at": now,
+                    "event_json": json.dumps(event),
+                    "result_json": json.dumps(result),
+                    "delegation_id": event["delegation_id"],
+                    "owner_instance_id": owner,
+                },
+            )
+            return result_cursor.rowcount == 1
+
+        return await postgres._write(_write)
     async with _db_lock():
         async with _transaction() as conn:
             await conn.execute(
@@ -464,9 +717,26 @@ async def _persist_completion(event: dict[str, Any], result: dict[str, Any]) -> 
                     event["delegation_id"],
                 ),
             )
+    return None
 
 
 async def _note_delivery_attempt(delegation_id: str) -> None:
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            await connection.execute(
+                text(
+                    "UPDATE async_delegations SET delivery_attempts = "
+                    "delivery_attempts + 1, updated_at = :updated_at "
+                    "WHERE delegation_id = :delegation_id"
+                ),
+                {"updated_at": time.time(), "delegation_id": delegation_id},
+            )
+
+        await postgres._write(_write)
+        return
     async with _db_lock():
         async with _transaction() as conn:
             await conn.execute(
@@ -477,6 +747,84 @@ async def _note_delivery_attempt(delegation_id: str) -> None:
 
 
 async def recover_abandoned_delegations() -> int:
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        now = time.time()
+
+        async def _write(connection):
+            cursor = await connection.execute(
+                text(
+                    """SELECT delegation_id, origin_session,
+                              origin_ui_session_id, parent_session_id,
+                              dispatched_at, task_json, origin_session_id
+                       FROM async_delegations
+                       WHERE state IN ('running', 'finalizing')
+                         AND (lease_expires_at IS NULL OR
+                              lease_expires_at < EXTRACT(EPOCH FROM clock_timestamp()))
+                       FOR UPDATE SKIP LOCKED"""
+                )
+            )
+            recovered = 0
+            for row in cursor:
+                (
+                    delegation_id,
+                    session_key,
+                    origin_ui,
+                    parent_id,
+                    dispatched_at,
+                    task_json,
+                    origin_session_id,
+                ) = row
+                task = json.loads(task_json or "{}")
+                error = (
+                    "Delegation owner exited before recording a terminal result; "
+                    "outcome unknown."
+                )
+                event = {
+                    "type": "async_delegation",
+                    "delegation_id": delegation_id,
+                    "session_key": session_key,
+                    "origin_ui_session_id": origin_ui,
+                    "origin_session_id": origin_session_id or "",
+                    "parent_session_id": parent_id,
+                    "goal": task.get("goal", ""),
+                    "goals": task.get("goals"),
+                    "context": task.get("context"),
+                    "toolsets": task.get("toolsets"),
+                    "role": task.get("role"),
+                    "model": task.get("model"),
+                    "is_batch": bool(task.get("is_batch")),
+                    "status": "unknown",
+                    "summary": None,
+                    "error": error,
+                    "dispatched_at": dispatched_at,
+                    "completed_at": now,
+                }
+                result = {"status": "unknown", "summary": None, "error": error}
+                await connection.execute(
+                    text(
+                        """UPDATE async_delegations SET state = 'unknown',
+                           completed_at = :completed_at, updated_at = :updated_at,
+                           event_json = :event_json, result_json = :result_json,
+                           delivery_state = 'pending', lease_expires_at = NULL
+                           WHERE delegation_id = :delegation_id
+                             AND state IN ('running', 'finalizing')"""
+                    ),
+                    {
+                        "completed_at": now,
+                        "updated_at": now,
+                        "event_json": json.dumps(event),
+                        "result_json": json.dumps(result),
+                        "delegation_id": delegation_id,
+                    },
+                )
+                recovered += 1
+            return recovered
+
+        return await postgres._write(_write)
+
     from gateway.status import _pid_exists
 
     now = time.time()
@@ -546,6 +894,43 @@ async def recover_abandoned_delegations() -> int:
 async def restore_undelivered_completions(target_queue) -> int:
     """Restore durable pending events exactly once for a queue instance."""
     state = await _activate_scope_state()
+    postgres = _postgres_session_db(state)
+    if postgres is not None:
+        if bool(getattr(postgres, "_read_only", False)):
+            raise PermissionError(
+                "Writable PostgreSQL SessionDB is required for delegation delivery"
+            )
+        queue_key = (id(target_queue), f"postgres:{id(postgres)}")
+        async with _restore_lock():
+            if queue_key in state.restored_queues:
+                return 0
+            await recover_abandoned_delegations()
+            from sqlalchemy import text
+
+            async def _read(connection):
+                cursor = await connection.execute(
+                    text(
+                        """SELECT delegation_id, event_json
+                           FROM async_delegations
+                           WHERE state != 'running'
+                             AND delivery_state = 'pending'
+                             AND event_json IS NOT NULL
+                           ORDER BY completed_at, delegation_id"""
+                    )
+                )
+                return cursor.fetchall()
+
+            rows = await postgres._read(_read)
+            restored: list[dict[str, Any]] = []
+            for _delegation_id, payload in rows:
+                event = json.loads(payload)
+                if isinstance(event, dict):
+                    event["restored"] = True
+                    restored.append(event)
+            for event in restored:
+                target_queue.put_nowait(event)
+            state.restored_queues.add(queue_key)
+            return len(restored)
     queue_key = (id(target_queue), await _canonical_path_identity(_db_path()))
     async with _restore_lock():
         if queue_key in state.restored_queues:
@@ -603,6 +988,27 @@ async def _propagate_after_delivery_transition(
 
 async def _mark_completion_delivered(delegation_id: str) -> bool:
     now = time.time()
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET delivery_state = 'delivered',
+                       delivered_at = :delivered_at, updated_at = :updated_at
+                       WHERE delegation_id = :delegation_id
+                         AND delivery_state != 'delivered'"""
+                ),
+                {
+                    "delivered_at": now,
+                    "updated_at": now,
+                    "delegation_id": delegation_id,
+                },
+            )
+            return cursor.rowcount == 1
+
+        return await postgres._write(_write)
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -622,6 +1028,43 @@ async def mark_completion_delivered(delegation_id: str) -> bool:
 
 async def _claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     now = time.time()
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            exists = await connection.execute(
+                text(
+                    "SELECT delegation_id FROM async_delegations "
+                    "WHERE delegation_id = :delegation_id"
+                ),
+                {"delegation_id": delegation_id},
+            )
+            if exists.first() is None:
+                return True
+            cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET delivery_claim = :claim_id,
+                       delivery_claimed_at = :claimed_at,
+                       delivery_attempts = delivery_attempts + 1,
+                       updated_at = :updated_at
+                       WHERE delegation_id = :delegation_id
+                         AND delivery_state = 'pending'
+                         AND (delivery_claim IS NULL OR
+                              delivery_claimed_at < :expired_at)
+                       RETURNING delegation_id"""
+                ),
+                {
+                    "claim_id": claim_id,
+                    "claimed_at": now,
+                    "updated_at": now,
+                    "delegation_id": delegation_id,
+                    "expired_at": now - 300,
+                },
+            )
+            return cursor.first() is not None
+
+        return await postgres._write(_write)
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -672,6 +1115,53 @@ async def claim_event_delivery(
 
 async def _release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     now = time.time()
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET delivery_state = 'dropped',
+                       delivery_claim = NULL, delivery_claimed_at = NULL,
+                       updated_at = :updated_at
+                       WHERE delegation_id = :delegation_id
+                         AND delivery_state = 'pending'
+                         AND delivery_claim = :claim_id
+                         AND delivery_attempts >= :max_attempts"""
+                ),
+                {
+                    "updated_at": now,
+                    "delegation_id": delegation_id,
+                    "claim_id": claim_id,
+                    "max_attempts": _MAX_DELIVERY_ATTEMPTS,
+                },
+            )
+            if cursor.rowcount == 1:
+                logger.warning(
+                    "Async delegation %s exhausted its %d delivery attempts; "
+                    "marking terminally dropped (result remains queryable).",
+                    delegation_id,
+                    _MAX_DELIVERY_ATTEMPTS,
+                )
+                return True
+            cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET delivery_claim = NULL,
+                       delivery_claimed_at = NULL, updated_at = :updated_at
+                       WHERE delegation_id = :delegation_id
+                         AND delivery_state = 'pending'
+                         AND delivery_claim = :claim_id"""
+                ),
+                {
+                    "updated_at": now,
+                    "delegation_id": delegation_id,
+                    "claim_id": claim_id,
+                },
+            )
+            return cursor.rowcount == 1
+
+        return await postgres._write(_write)
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -706,6 +1196,29 @@ async def release_completion_delivery(delegation_id: str, claim_id: str) -> bool
 
 
 async def _drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET delivery_state = 'dropped',
+                       updated_at = :updated_at, delivery_claim = NULL,
+                       delivery_claimed_at = NULL
+                       WHERE delegation_id = :delegation_id
+                         AND delivery_state = 'pending'
+                         AND delivery_claim = :claim_id"""
+                ),
+                {
+                    "updated_at": time.time(),
+                    "delegation_id": delegation_id,
+                    "claim_id": claim_id,
+                },
+            )
+            return cursor.rowcount == 1
+
+        return await postgres._write(_write)
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -726,6 +1239,30 @@ async def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 async def _complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     now = time.time()
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _write(connection):
+            cursor = await connection.execute(
+                text(
+                    """UPDATE async_delegations SET delivery_state = 'delivered',
+                       delivered_at = :delivered_at, updated_at = :updated_at,
+                       delivery_claim = NULL, delivery_claimed_at = NULL
+                       WHERE delegation_id = :delegation_id
+                         AND delivery_state = 'pending'
+                         AND delivery_claim = :claim_id"""
+                ),
+                {
+                    "delivered_at": now,
+                    "updated_at": now,
+                    "delegation_id": delegation_id,
+                    "claim_id": claim_id,
+                },
+            )
+            return cursor.rowcount == 1
+
+        return await postgres._write(_write)
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -762,6 +1299,36 @@ async def release_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
 async def get_durable_delegation(
     delegation_id: str,
 ) -> dict[str, Any] | None:
+    postgres = _postgres_session_db()
+    if postgres is not None:
+        from sqlalchemy import text
+
+        async def _read(connection):
+            cursor = await connection.execute(
+                text(
+                    """SELECT origin_session, state, dispatched_at, completed_at,
+                              result_json, delivery_state, delivery_attempts,
+                              origin_session_id
+                       FROM async_delegations WHERE delegation_id = :delegation_id"""
+                ),
+                {"delegation_id": delegation_id},
+            )
+            return cursor.first()
+
+        row = await postgres._read(_read)
+        if row is None:
+            return None
+        return {
+            "delegation_id": delegation_id,
+            "origin_session": row[0],
+            "state": row[1],
+            "dispatched_at": row[2],
+            "completed_at": row[3],
+            "result": json.loads(row[4]) if row[4] else None,
+            "delivery_state": row[5],
+            "delivery_attempts": row[6],
+            "origin_session_id": row[7] or "",
+        }
     async with _db_lock():
         async with _transaction() as conn:
             cursor = await conn.execute(
@@ -1045,6 +1612,7 @@ async def _dispatch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "_owner_instance_id": _owner_instance_id(),
     }
     if is_batch:
         record["goals"] = goals
@@ -1064,7 +1632,7 @@ async def _dispatch(
     task.add_done_callback(
         lambda _task, rid=delegation_id, owner=state: owner.tasks.pop(rid, None)
     )
-    if progress_fn is not None:
+    if progress_fn is not None or _postgres_session_db(state) is not None:
         _ensure_stale_monitor(state)
     return {"status": "dispatched", "delegation_id": delegation_id}
 
@@ -1265,7 +1833,11 @@ async def _publish_completion(
     home_token = set_hermes_home_override(state.profile_home)
     scope_token = _active_scope.set((_lexical_profile_identity(), state))
     try:
-        await _persist_completion(event, result)
+        persisted = await _persist_completion(event, result)
+        # A PostgreSQL owner that lost its lease must not re-publish a
+        # completion after another worker fenced the row and recovered it.
+        if persisted is False:
+            return
         from tools.process_registry import process_registry
 
         await process_registry._activate_profile_state()
@@ -1293,10 +1865,44 @@ async def _stop_stale_monitor_if_idle(state: _DelegationScopeState) -> None:
         record.get("status") in {"running", "stalling"}
         and callable(record.get("progress_fn"))
         for record in state.records.values()
+    ) or (
+        _postgres_session_db(state) is not None
+        and any(
+            record.get("status") in {"running", "finalizing"}
+            for record in state.records.values()
+        )
     ):
         return
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def _renew_postgres_leases(state: _DelegationScopeState) -> None:
+    try:
+        postgres = _postgres_session_db(state)
+        if postgres is None:
+            return
+        from sqlalchemy import text
+
+        async def _write(connection):
+            await connection.execute(
+                text(
+                    """UPDATE async_delegations
+                       SET lease_expires_at =
+                           EXTRACT(EPOCH FROM clock_timestamp()) + :lease
+                       WHERE owner_instance_id = :owner
+                         AND state IN ('running', 'finalizing')"""
+                ),
+                {"lease": _OWNER_LEASE_SECONDS, "owner": _owner_instance_id()},
+            )
+
+        await postgres._write(_write)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Could not renew PostgreSQL async delegation lease", exc_info=True
+        )
 
 
 async def _stale_monitor_loop(state: _DelegationScopeState) -> None:
@@ -1305,6 +1911,7 @@ async def _stale_monitor_loop(state: _DelegationScopeState) -> None:
     try:
         while True:
             await asyncio.sleep(_STALE_CHECK_INTERVAL)
+            await _renew_postgres_leases(state)
             now = time.time()
             stalled: list[str] = []
             expired: list[str] = []
@@ -1350,7 +1957,11 @@ async def _stale_monitor_loop(state: _DelegationScopeState) -> None:
                     )
             for delegation_id in expired:
                 await _finalize_stalled(state, delegation_id)
-            if not any(
+            postgres_active = _postgres_session_db(state) is not None and any(
+                record.get("status") in {"running", "finalizing"}
+                for record in state.records.values()
+            )
+            if not postgres_active and not any(
                 record.get("status") in {"running", "stalling"}
                 and callable(record.get("progress_fn"))
                 for record in state.records.values()
@@ -1581,10 +2192,12 @@ async def _reset_for_tests() -> None:
         state.db_lock_users = 0
         state.restore_lock = None
         state.restore_lock_users = 0
+        state.session_db_ref = None
     with _scope_guard:
         _scope_states.pop(loop, None)
         _scope_aliases.pop(loop, None)
     _active_scope.set(None)
+    _active_session_db.set(_SESSION_DB_UNSET)
     _project_compatibility_globals(_legacy_scope)
     _monitor_task = None
     _process_start_times.clear()

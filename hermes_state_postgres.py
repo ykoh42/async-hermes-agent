@@ -48,7 +48,8 @@ except ImportError:  # pragma: no cover - exercised by the missing-extra test
 
 _CONTENT_JSON_PREFIX = "\x00json:"
 _POSTGRES_STORAGE_VERSION_KEY = "postgres_storage_version"
-_POSTGRES_STORAGE_VERSION = 2
+_POSTGRES_STORAGE_VERSION = 3
+_POSTGRES_DELEGATION_INDEX = "idx_async_delegations_delivery"
 _POSTGRES_MIGRATION_LOCK = 731948251
 _POSTGRES_MIGRATION_TABLES = (
     "schema_version",
@@ -126,6 +127,84 @@ _POSTGRES_INDEX_DDL = (
     "WHERE platform_message_id IS NOT NULL",
     _POSTGRES_SEARCH_INDEX_DDL,
 )
+
+_POSTGRES_DELEGATION_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS async_delegations (
+    delegation_id TEXT PRIMARY KEY,
+    origin_session TEXT NOT NULL,
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT,
+    state TEXT NOT NULL,
+    dispatched_at DOUBLE PRECISION NOT NULL,
+    completed_at DOUBLE PRECISION,
+    updated_at DOUBLE PRECISION NOT NULL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at DOUBLE PRECISION,
+    owner_pid INTEGER,
+    owner_started_at BIGINT,
+    task_json TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at DOUBLE PRECISION,
+    origin_session_id TEXT NOT NULL DEFAULT '',
+    owner_instance_id TEXT,
+    lease_expires_at DOUBLE PRECISION
+)
+"""
+_POSTGRES_DELEGATION_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery "
+    "ON async_delegations(delivery_state, completed_at)"
+)
+_POSTGRES_DELEGATION_COLUMNS = frozenset(
+    {
+        "delegation_id",
+        "origin_session",
+        "origin_ui_session_id",
+        "parent_session_id",
+        "state",
+        "dispatched_at",
+        "completed_at",
+        "updated_at",
+        "event_json",
+        "result_json",
+        "delivery_state",
+        "delivery_attempts",
+        "delivered_at",
+        "owner_pid",
+        "owner_started_at",
+        "task_json",
+        "delivery_claim",
+        "delivery_claimed_at",
+        "origin_session_id",
+        "owner_instance_id",
+        "lease_expires_at",
+    }
+)
+_POSTGRES_DELEGATION_COLUMN_TYPES = {
+    "delegation_id": "text",
+    "origin_session": "text",
+    "origin_ui_session_id": "text",
+    "parent_session_id": "text",
+    "state": "text",
+    "dispatched_at": "double precision",
+    "completed_at": "double precision",
+    "updated_at": "double precision",
+    "event_json": "text",
+    "result_json": "text",
+    "delivery_state": "text",
+    "delivery_attempts": "integer",
+    "delivered_at": "double precision",
+    "owner_pid": "integer",
+    "owner_started_at": "bigint",
+    "task_json": "text",
+    "delivery_claim": "text",
+    "delivery_claimed_at": "double precision",
+    "origin_session_id": "text",
+    "owner_instance_id": "text",
+    "lease_expires_at": "double precision",
+}
 
 _POSTGRES_INDEX_NAMES = frozenset(
     {
@@ -518,6 +597,74 @@ class SessionDB:
                 _sa.text(_POSTGRES_SEARCH_INDEX_DDL)
             )
 
+    async def _ensure_postgres_delegation_storage(
+        self, connection: Any
+    ) -> None:
+        """Create the upstream async-delegation table during PG storage setup."""
+        await connection.execute(_sa.text(_POSTGRES_DELEGATION_TABLE_DDL))
+        columns = await connection.execute(
+            _sa.text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'async_delegations'"
+            )
+        )
+        present = {str(row[0]) for row in columns}
+        for name, sql_type in (
+            ("origin_session_id", "TEXT NOT NULL DEFAULT ''"),
+            ("owner_instance_id", "TEXT"),
+            ("lease_expires_at", "DOUBLE PRECISION"),
+        ):
+            if name not in present:
+                await connection.execute(
+                    _sa.text(
+                        f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}"
+                    )
+                )
+        await connection.execute(_sa.text(_POSTGRES_DELEGATION_INDEX_DDL))
+
+    async def _postgres_delegation_catalog_is_current(
+        self, connection: Any
+    ) -> bool:
+        table = await connection.execute(
+            _sa.text("SELECT to_regclass(:table_name)"),
+            {"table_name": "async_delegations"},
+        )
+        if table.scalar_one_or_none() is None:
+            return False
+        columns = await connection.execute(
+            _sa.text(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'async_delegations'"
+            )
+        )
+        column_types = {str(row[0]): str(row[1]) for row in columns}
+        if not _POSTGRES_DELEGATION_COLUMNS.issubset(column_types):
+            return False
+        if any(
+            column_types[name] != expected
+            for name, expected in _POSTGRES_DELEGATION_COLUMN_TYPES.items()
+        ):
+            return False
+        index_result = await connection.execute(
+            _sa.text(
+                "SELECT c.relname, i.indisvalid, i.indisready, "
+                "pg_get_indexdef(i.indexrelid) "
+                "FROM pg_class AS c "
+                "JOIN pg_index AS i ON i.indexrelid = c.oid "
+                "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = current_schema() "
+                "AND c.relname = :index_name"
+            ),
+            {"index_name": _POSTGRES_DELEGATION_INDEX},
+        )
+        index = index_result.first()
+        if index is None or not bool(index[1]) or not bool(index[2]):
+            return False
+        definition = re.sub(r"\s+", " ", str(index[3]).lower()).strip()
+        return "(delivery_state, completed_at)" in definition
+
     async def _postgres_tables_and_columns_are_current(
         self, connection: Any, metadata: Any
     ) -> bool:
@@ -645,10 +792,10 @@ class SessionDB:
                 "PostgreSQL storage schema version is malformed"
             ) from exc
 
-    async def _postgres_legacy_storage_is_known(
+    async def _postgres_catalog_repair_is_known(
         self, connection: Any
     ) -> bool:
-        """Recognize the physical layout shipped before storage versioning."""
+        """Recognize a catalog drift that this backend can repair safely."""
         title_index = (
             await connection.execute(
                 _sa.text(
@@ -669,11 +816,30 @@ class SessionDB:
         ).scalar_one_or_none()
         title_definition = str(title_index or "").lower()
         search_definition = str(search_index or "").lower()
-        return (
+        known_index_shape = (
             "create unique index" not in title_definition
             or "where (title is not null)" not in title_definition
             or "tool_calls" not in search_definition
         )
+        index_rows = await connection.execute(
+            _sa.text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = current_schema()"
+            )
+        )
+        if _POSTGRES_INDEX_NAMES - {str(row[0]) for row in index_rows}:
+            return True
+        constraint_rows = await connection.execute(
+            _sa.text(
+                "SELECT c.conname FROM pg_constraint AS c "
+                "JOIN pg_namespace AS n ON n.oid = c.connamespace "
+                "WHERE c.contype = 'f' AND n.nspname = current_schema()"
+            )
+        )
+        missing_constraints = _POSTGRES_FOREIGN_KEY_NAMES - {
+            str(row[0]) for row in constraint_rows
+        }
+        return known_index_shape or bool(missing_constraints)
 
     async def _postgres_schema_is_current(
         self, connection: Any, metadata: Any
@@ -690,6 +856,7 @@ class SessionDB:
             versions == [SCHEMA_VERSION]
             and storage_version == _POSTGRES_STORAGE_VERSION
             and await self._postgres_catalog_is_current(connection, metadata)
+            and await self._postgres_delegation_catalog_is_current(connection)
         )
 
     async def _lock_postgres_migration_tables(self, connection: Any) -> None:
@@ -992,6 +1159,7 @@ class SessionDB:
                         )
                     await connection.run_sync(metadata.create_all)
                     await self._ensure_postgres_constraints(connection)
+                    await self._ensure_postgres_delegation_storage(connection)
                     await self._ensure_postgres_indexes(connection)
                     await self._write_postgres_schema_versions(connection)
                     self._ready = True
@@ -1026,8 +1194,11 @@ class SessionDB:
                 )
                 if storage_version is None:
                     if catalog_current:
-                        storage_version = _POSTGRES_STORAGE_VERSION
-                    elif await self._postgres_legacy_storage_is_known(connection):
+                        # The marker was introduced with the explicit PG
+                        # layout migration.  A current pre-marker catalog is
+                        # the known source layout for that migration.
+                        storage_version = 2
+                    elif await self._postgres_catalog_repair_is_known(connection):
                         storage_version = 1
                     else:
                         raise RuntimeError(
@@ -1045,6 +1216,11 @@ class SessionDB:
                     )
 
                 if storage_version == 1 or not catalog_current:
+                    if not await self._postgres_catalog_repair_is_known(connection):
+                        raise RuntimeError(
+                            "PostgreSQL SessionDB physical schema is ambiguous; "
+                            "refusing implicit repair"
+                        )
                     await self._lock_postgres_migration_tables(connection)
                     await self._ensure_postgres_constraints(connection)
                     await self._ensure_postgres_indexes(connection)
@@ -1055,6 +1231,16 @@ class SessionDB:
                             "PostgreSQL SessionDB migration did not produce the "
                             "expected catalog"
                         )
+
+                if storage_version < _POSTGRES_STORAGE_VERSION:
+                    await self._ensure_postgres_delegation_storage(connection)
+                elif not await self._postgres_delegation_catalog_is_current(
+                    connection
+                ):
+                    raise RuntimeError(
+                        "PostgreSQL SessionDB delegation schema is incomplete; "
+                        "refusing implicit repair"
+                    )
                 await self._write_postgres_schema_versions(connection)
             self._ready = True
 

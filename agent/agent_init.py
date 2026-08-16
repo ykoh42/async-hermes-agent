@@ -3290,10 +3290,13 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
     # Rehydrate durable background-delegation completions at an awaited
     # runtime boundary. The registry constructor remains state-only, while
     # the durable queue is available before this agent starts accepting turns.
-    from tools.async_delegation import restore_undelivered_completions
+    # An explicitly injected PostgreSQL SessionDB is bound first so the
+    # delegation table cannot silently fall back to a local SQLite sidecar.
+    from tools.async_delegation import _bind_session_db, restore_undelivered_completions
     from tools.process_registry import process_registry
 
     try:
+        await _bind_session_db(getattr(agent, "_session_db", None))
         await restore_undelivered_completions(process_registry.completion_queue)
     except asyncio.CancelledError:
         raise
