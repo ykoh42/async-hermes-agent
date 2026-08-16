@@ -31,6 +31,13 @@ def _dsn() -> str:
     return dsn
 
 
+async def _admin_fetchval(connection, statement, params=()):
+    async with connection.cursor() as cursor:
+        await cursor.execute(statement, params)
+        row = await cursor.fetchone()
+    return None if row is None else row[0]
+
+
 def _worker_env(root: Path, dsn: str) -> dict[str, str]:
     """Pass only the credentials and runtime paths needed by the child."""
     return {
@@ -265,7 +272,7 @@ async def test_postgres_worker_kill_then_cold_resume_has_no_duplicate_rows(tmp_p
 @pytest.mark.asyncio
 async def test_postgres_terminated_backend_is_reconnected_by_pre_ping(tmp_path):
     dsn = _dsn()
-    import asyncpg
+    import psycopg
     from sqlalchemy import text
 
     home = tmp_path / "profile"
@@ -287,11 +294,13 @@ async def test_postgres_terminated_backend_is_reconnected_by_pre_ping(tmp_path):
         ).scalar_one()
         await connection.close()
         connection = None
-        admin = await asyncpg.connect(
-            dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+        admin = await psycopg.AsyncConnection.connect(
+            dsn.replace("postgresql+psycopg://", "postgresql://", 1)
         )
-        assert await admin.fetchval(
-            "SELECT pg_terminate_backend($1::integer)", backend_pid
+        assert await _admin_fetchval(
+            admin,
+            "SELECT pg_terminate_backend(%s::integer)",
+            (backend_pid,),
         ) is True
         await admin.close()
         admin = None

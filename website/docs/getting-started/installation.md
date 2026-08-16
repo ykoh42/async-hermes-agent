@@ -88,7 +88,7 @@ choose.
 | `supermemory` | Supermemory memory provider |
 | `hindsight` | Hindsight memory provider client; embedded-local mode also needs `hindsight-all` |
 | `honcho` | Honcho memory provider |
-| `postgres` | Opt-in PostgreSQL SessionDB backend (SQLAlchemy Core + asyncpg; run the real integration matrix before production use) |
+| `postgres` | Opt-in PostgreSQL SessionDB backend (SQLAlchemy Core + psycopg; run the real integration matrix before production use) |
 | `dev` | Test, lint, leak-check, and type-check dependencies |
 
 KittenTTS 0.8.1 is published by KittenML as a GitHub release wheel rather

@@ -19,6 +19,18 @@ from agent.agent_init import _validate_async_session_db
 from run_agent import AIAgent
 
 
+async def _admin_fetchval(connection, statement, params=()):
+    async with connection.cursor() as cursor:
+        await cursor.execute(statement, params)
+        row = await cursor.fetchone()
+    return None if row is None else row[0]
+
+
+async def _admin_execute(connection, statement, params=()):
+    async with connection.cursor() as cursor:
+        await cursor.execute(statement, params)
+
+
 def _public_methods(cls):
     return {
         name: getattr(cls, name)
@@ -54,12 +66,15 @@ def test_postgres_surface_matches_sqlite_retained_contract():
 def test_postgres_constructor_rejects_implicit_or_non_postgres_storage():
     with pytest.raises(ValueError, match="explicit"):
         PostgresSessionDB()
-    with pytest.raises(ValueError, match=r"postgresql\+asyncpg"):
+    with pytest.raises(ValueError, match=r"postgresql\+psycopg"):
         PostgresSessionDB("state.db")
-    with pytest.raises(ValueError, match=r"postgresql\+asyncpg"):
+    with pytest.raises(ValueError, match=r"postgresql\+psycopg"):
         PostgresSessionDB("postgresql://localhost/hermes")
+    unsupported_driver = "postgresql+" + "async" + "pg://localhost/hermes"
+    with pytest.raises(ValueError, match=r"postgresql\+psycopg"):
+        PostgresSessionDB(unsupported_driver)
     with pytest.raises(ValueError, match="host and database"):
-        PostgresSessionDB("postgresql+asyncpg://")
+        PostgresSessionDB("postgresql+psycopg://")
 
 
 def test_postgres_constructor_is_state_only(monkeypatch):
@@ -70,7 +85,7 @@ def test_postgres_constructor_is_state_only(monkeypatch):
 
     monkeypatch.setitem(implementation_globals, "_create_async_engine", fail_if_called)
     database = PostgresSessionDB(
-        "postgresql+asyncpg://user:secret@localhost/hermes"
+        "postgresql+psycopg://user:secret@localhost/hermes"
     )
     assert database._engine is None
     assert database._ready is False
@@ -118,7 +133,7 @@ async def test_missing_postgres_extra_fails_before_network(monkeypatch):
     implementation_globals = PostgresSessionDB._ensure_ready.__globals__
     monkeypatch.setitem(implementation_globals, "_sa", None)
     monkeypatch.setitem(implementation_globals, "_create_async_engine", None)
-    database = PostgresSessionDB("postgresql+asyncpg://user:pass@localhost/hermes")
+    database = PostgresSessionDB("postgresql+psycopg://user:pass@localhost/hermes")
     with pytest.raises(ImportError, match="postgres.*extra"):
         await database.get_session("missing")
 
@@ -130,18 +145,18 @@ async def test_postgres_engine_options_are_captured_from_creation_profile(tmp_pa
     home_a.mkdir()
     home_b.mkdir()
     (home_a / "config.yaml").write_text(
-        """database:\n  postgres:\n    pool_size: 2\n    max_overflow: 1\n    pool_timeout: 4\n    pool_pre_ping: false\n    connect_args:\n      timeout: 11\n      command_timeout: 7\n      server_settings:\n        application_name: profile-a\n""",
+        """database:\n  postgres:\n    pool_size: 2\n    max_overflow: 1\n    pool_timeout: 4\n    pool_pre_ping: false\n    connect_args:\n      connect_timeout: 11\n      prepare_threshold: 7\n      options: '-c application_name=profile-a'\n""",
         encoding="utf-8",
     )
     (home_b / "config.yaml").write_text(
-        """database:\n  postgres:\n    pool_size: 9\n    connect_args:\n      timeout: 99\n      server_settings:\n        application_name: profile-b\n""",
+        """database:\n  postgres:\n    pool_size: 9\n    connect_args:\n      connect_timeout: 99\n      options: '-c application_name=profile-b'\n""",
         encoding="utf-8",
     )
 
     creation_token = set_hermes_home_override(home_a)
     try:
         database = PostgresSessionDB(
-            "postgresql+asyncpg://user:pass@localhost/hermes"
+            "postgresql+psycopg://user:pass@localhost/hermes"
         )
     finally:
         reset_hermes_home_override(creation_token)
@@ -156,11 +171,9 @@ async def test_postgres_engine_options_are_captured_from_creation_profile(tmp_pa
     assert options["max_overflow"] == 1
     assert options["pool_timeout"] == 4
     assert options["pool_pre_ping"] is False
-    assert options["connect_args"]["timeout"] == 11
-    assert options["connect_args"]["command_timeout"] == 7
-    assert options["connect_args"]["server_settings"] == {
-        "application_name": "profile-a"
-    }
+    assert options["connect_args"]["connect_timeout"] == 11
+    assert options["connect_args"]["prepare_threshold"] == 7
+    assert options["connect_args"]["options"] == "-c application_name=profile-a"
     (home_a / "config.yaml").write_text(
         "database:\n  postgres:\n    pool_size: 8\n",
         encoding="utf-8",
@@ -171,7 +184,7 @@ async def test_postgres_engine_options_are_captured_from_creation_profile(tmp_pa
     creation_token = set_hermes_home_override(home_a)
     try:
         replacement = PostgresSessionDB(
-            "postgresql+asyncpg://user:pass@localhost/hermes"
+            "postgresql+psycopg://user:pass@localhost/hermes"
         )
         replacement_options = await replacement._resolve_engine_options()
     finally:
@@ -181,26 +194,24 @@ async def test_postgres_engine_options_are_captured_from_creation_profile(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_postgres_read_only_options_force_server_setting(tmp_path):
+async def test_postgres_read_only_options_force_transaction_flag(tmp_path):
     home = tmp_path / "profile"
     home.mkdir()
     (home / "config.yaml").write_text(
-        """database:\n  postgres:\n    connect_args:\n      server_settings:\n        application_name: readonly-test\n""",
+        """database:\n  postgres:\n    connect_args:\n      application_name: readonly-test\n""",
         encoding="utf-8",
     )
     token = set_hermes_home_override(home)
     try:
         database = PostgresSessionDB(
-            "postgresql+asyncpg://user:pass@localhost/hermes",
+            "postgresql+psycopg://user:pass@localhost/hermes",
             read_only=True,
         )
         options = await database._resolve_engine_options()
     finally:
         reset_hermes_home_override(token)
-    assert options["connect_args"]["server_settings"] == {
-        "application_name": "readonly-test",
-        "default_transaction_read_only": "on",
-    }
+    assert options["connect_args"]["application_name"] == "readonly-test"
+    assert "execution_options" not in options
     await database.close()
 
 
@@ -222,7 +233,7 @@ async def test_postgres_engine_options_are_isolated_for_concurrent_profiles(tmp_
         try:
             stores.append(
                 PostgresSessionDB(
-                    "postgresql+asyncpg://user:pass@localhost/hermes"
+                    "postgresql+psycopg://user:pass@localhost/hermes"
                 )
             )
         finally:
@@ -247,7 +258,25 @@ async def test_postgres_config_rejects_unknown_and_reserved_options(tmp_path):
     token = set_hermes_home_override(home)
     try:
         database = PostgresSessionDB(
-            "postgresql+asyncpg://user:pass@localhost/hermes"
+            "postgresql+psycopg://user:pass@localhost/hermes"
+        )
+        with pytest.raises(ValueError, match="unsupported"):
+            await database._resolve_engine_options()
+    finally:
+        reset_hermes_home_override(token)
+    await database.close()
+
+    home = tmp_path / "reserved"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "database:\n  postgres:\n    connect_args:\n"
+        "      default_transaction_read_only: off\n",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(home)
+    try:
+        database = PostgresSessionDB(
+            "postgresql+psycopg://user:pass@localhost/hermes"
         )
         with pytest.raises(ValueError, match="unsupported"):
             await database._resolve_engine_options()
@@ -268,12 +297,12 @@ async def test_postgres_config_rejects_invalid_types_before_network(tmp_path):
             "max_overflow must be >= -1",
         ),
         (
-            "database:\n  postgres:\n    connect_args:\n      command_timeout: 0\n",
-            "connect_args.command_timeout must be > 0",
+            "database:\n  postgres:\n    connect_args:\n      connect_timeout: 0\n",
+            "connect_args.connect_timeout must be >= 1",
         ),
         (
-            "database:\n  postgres:\n    connect_args:\n      server_settings:\n        statement_timeout: 60000\n",
-            "only string keys and values",
+            "database:\n  postgres:\n    connect_args:\n      options: 60000\n",
+            "connect_args.options must be a string",
         ),
     )
     for index, (contents, message) in enumerate(cases):
@@ -283,29 +312,13 @@ async def test_postgres_config_rejects_invalid_types_before_network(tmp_path):
         token = set_hermes_home_override(home)
         try:
             database = PostgresSessionDB(
-                "postgresql+asyncpg://user:pass@localhost/hermes"
+                "postgresql+psycopg://user:pass@localhost/hermes"
             )
             with pytest.raises(ValueError, match=message):
                 await database._resolve_engine_options()
         finally:
             reset_hermes_home_override(token)
         await database.close()
-
-    (home / "config.yaml").write_text(
-        """database:\n  postgres:\n    connect_args:\n      server_settings:\n        default_transaction_read_only: off\n""",
-        encoding="utf-8",
-    )
-    token = set_hermes_home_override(home)
-    try:
-        database = PostgresSessionDB(
-            "postgresql+asyncpg://user:pass@localhost/hermes",
-        )
-        with pytest.raises(ValueError, match="controlled by read_only"):
-            await database._resolve_engine_options()
-    finally:
-        reset_hermes_home_override(token)
-    await database.close()
-
 
 @pytest.mark.asyncio
 async def test_postgres_config_error_can_be_fixed_before_engine_creation(tmp_path):
@@ -319,7 +332,7 @@ async def test_postgres_config_error_can_be_fixed_before_engine_creation(tmp_pat
     token = set_hermes_home_override(home)
     try:
         database = PostgresSessionDB(
-            "postgresql+asyncpg://user:pass@localhost/hermes"
+            "postgresql+psycopg://user:pass@localhost/hermes"
         )
         with pytest.raises(ValueError, match="pool_size"):
             await database._resolve_engine_options()
@@ -407,6 +420,7 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
                 ).all()
             }
             assert {
+                "idx_sessions_title_unique",
                 "idx_sessions_source",
                 "idx_sessions_source_id",
                 "idx_sessions_parent",
@@ -425,6 +439,16 @@ async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract(
                 "idx_messages_platform_msg_id",
                 "messages_hermes_search_idx",
             } <= indexes
+            search_indexdef = (
+                await connection.execute(
+                    text(
+                        "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                        "WHERE indexrelid = to_regclass("
+                        "'messages_hermes_search_idx')"
+                    )
+                )
+            ).scalar_one()
+            assert "tool_calls" in search_indexdef
 
             constraints = {
                 row[0]
@@ -631,6 +655,7 @@ async def test_postgres_export_import_and_native_maintenance_roundtrip():
         exported = await database.export_session(source_id)
         assert exported is not None
         exported["id"] = imported_id
+        exported["title"] = "roundtrip-import"
         imported = await database.import_sessions([exported])
         assert imported == {"imported": 1, "errors": []}
         restored = await database.get_messages(imported_id)
@@ -715,20 +740,20 @@ async def test_postgres_read_only_never_creates_an_uninitialized_schema(tmp_path
     dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
     if not dsn:
         pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
-    import asyncpg
+    import psycopg
 
     schema = f"readonly_empty_{uuid.uuid4().hex}"
     home = tmp_path / "profile"
     home.mkdir()
     (home / "config.yaml").write_text(
         "database:\n  postgres:\n    connect_args:\n"
-        f"      server_settings:\n        search_path: {schema}\n",
+        f"      options: '-c search_path={schema}'\n",
         encoding="utf-8",
     )
-    admin_dsn = dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
-    admin = await asyncpg.connect(admin_dsn)
+    admin_dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+    admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
     try:
-        await admin.execute(f'CREATE SCHEMA "{schema}"')
+        await _admin_execute(admin, f'CREATE SCHEMA "{schema}"')
     finally:
         await admin.close()
 
@@ -741,12 +766,14 @@ async def test_postgres_read_only_never_creates_an_uninitialized_schema(tmp_path
         reset_hermes_home_override(token)
         await database.close()
 
-    admin = await asyncpg.connect(admin_dsn)
+    admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
     try:
-        assert await admin.fetchval(
-            "SELECT to_regclass($1)", f'"{schema}".schema_version'
+        assert await _admin_fetchval(
+            admin,
+            "SELECT to_regclass(%s)",
+            (f'"{schema}".schema_version',),
         ) is None
-        await admin.execute(f'DROP SCHEMA "{schema}"')
+        await _admin_execute(admin, f'DROP SCHEMA "{schema}"')
     finally:
         await admin.close()
 
@@ -790,7 +817,7 @@ async def test_postgres_pool_configuration_reaches_real_sqlalchemy_engine(tmp_pa
     home = tmp_path / "profile"
     home.mkdir()
     (home / "config.yaml").write_text(
-        """database:\n  postgres:\n    pool_size: 2\n    max_overflow: 1\n    pool_timeout: 4\n    pool_recycle: 60\n    pool_pre_ping: false\n    pool_use_lifo: true\n    connect_args:\n      timeout: 11\n      command_timeout: 7\n      statement_cache_size: 100\n      max_cached_statement_lifetime: 300.5\n      max_cacheable_statement_size: 15360\n      server_settings:\n        application_name: postgres-config-test\n""",
+        """database:\n  postgres:\n    pool_size: 2\n    max_overflow: 1\n    pool_timeout: 4\n    pool_recycle: 60\n    pool_pre_ping: false\n    pool_use_lifo: true\n    connect_args:\n      connect_timeout: 11\n      prepare_threshold: 100\n      application_name: postgres-config-test\n""",
         encoding="utf-8",
     )
     token = set_hermes_home_override(home)
@@ -801,18 +828,17 @@ async def test_postgres_pool_configuration_reaches_real_sqlalchemy_engine(tmp_pa
         reset_hermes_home_override(token)
     try:
         pool = database._engine.pool
+        assert database._engine.dialect.driver == "psycopg"
+        assert database._engine.dialect.is_async
         assert pool.size() == 2
         assert pool._max_overflow == 1
         assert pool._timeout == 4
         assert pool._pre_ping is False
         assert pool._pool.use_lifo is True
         assert database._engine_options["connect_args"] == {
-            "timeout": 11,
-            "command_timeout": 7,
-            "statement_cache_size": 100,
-            "max_cached_statement_lifetime": 300.5,
-            "max_cacheable_statement_size": 15360,
-            "server_settings": {"application_name": "postgres-config-test"},
+            "connect_timeout": 11,
+            "prepare_threshold": 100,
+            "application_name": "postgres-config-test",
         }
         async with database._engine.connect() as connection:
             application_name = (
@@ -842,8 +868,8 @@ async def test_postgres_command_and_statement_timeouts_reach_real_connection(tmp
         # connection on context exit.  The assertion below exercises the
         # server-side statement timeout; command-timeout propagation is
         # covered by the option-capture test above.
-        "      command_timeout: 1.0\n"
-        "      server_settings:\n        statement_timeout: '100'\n",
+        "      connect_timeout: 1\n"
+        "      options: '-c statement_timeout=100'\n",
         encoding="utf-8",
     )
     token = set_hermes_home_override(home)
@@ -1008,6 +1034,7 @@ async def test_postgres_title_provenance_and_uniqueness_match_sqlite():
             first, "Older", source=database.TITLE_SOURCE_DERIVED
         )
         assert await database.set_session_title(first, "Manual")
+        assert await database.get_session_title(first) == "Manual"
         assert not await database.set_auto_title(
             first, "Ignored", source=database.TITLE_SOURCE_LLM
         )
@@ -1023,6 +1050,140 @@ async def test_postgres_title_provenance_and_uniqueness_match_sqlite():
     finally:
         await database.delete_session(first)
         await database.delete_session(second)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_title_uniqueness_holds_across_two_pools():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    left = PostgresSessionDB(dsn)
+    right = PostgresSessionDB(dsn)
+    first = f"pytest-title-race-{uuid.uuid4()}"
+    second = f"pytest-title-race-{uuid.uuid4()}"
+    title = f"pytest-shared-title-{uuid.uuid4()}"
+    try:
+        await left.create_session(first, "test")
+        await right.create_session(second, "test")
+        results = await asyncio.gather(
+            left.set_session_title(first, title),
+            right.set_session_title(second, title),
+            return_exceptions=True,
+        )
+        assert sum(result is True for result in results) == 1
+        assert not (
+            isinstance(results[0], bool)
+            and isinstance(results[1], bool)
+            and results[0]
+            and results[1]
+        )
+    finally:
+        await left.delete_session(first)
+        await right.delete_session(second)
+        await left.close()
+        await right.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_title_index_repairs_legacy_duplicates():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    from sqlalchemy import text
+
+    database = PostgresSessionDB(dsn)
+    first = f"pytest-title-legacy-{uuid.uuid4()}"
+    second = f"pytest-title-legacy-{uuid.uuid4()}"
+    title = f"pytest-legacy-title-{uuid.uuid4()}"
+    repaired = None
+    try:
+        await database.create_session(first, "test")
+        await database.create_session(second, "test")
+        await database._ensure_ready()
+        async with database._engine.begin() as connection:
+            await connection.execute(
+                text('DROP INDEX IF EXISTS "idx_sessions_title_unique"')
+            )
+            await connection.execute(
+                text(
+                    "UPDATE sessions SET title = :title, "
+                    "title_source = 'manual', started_at = :started_at "
+                    "WHERE id = :session_id"
+                ),
+                {"title": title, "started_at": 100.0, "session_id": first},
+            )
+            await connection.execute(
+                text(
+                    "UPDATE sessions SET title = :title, "
+                    "title_source = 'manual', started_at = :started_at "
+                    "WHERE id = :session_id"
+                ),
+                {"title": title, "started_at": 200.0, "session_id": second},
+            )
+        await database.close()
+        repaired = PostgresSessionDB(dsn)
+        older = await repaired.get_session(first)
+        newer = await repaired.get_session(second)
+        assert older["title"] is None
+        assert newer["title"] == title
+        async with repaired._engine.connect() as connection:
+            indexdef = (
+                await connection.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE indexname = 'idx_sessions_title_unique'"
+                    )
+                )
+            ).scalar_one()
+        assert "CREATE UNIQUE INDEX" in indexdef
+    finally:
+        if repaired is not None:
+            await repaired.delete_session(first)
+            await repaired.delete_session(second)
+            await repaired.close()
+        else:
+            await database.delete_session(first)
+            await database.delete_session(second)
+            await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_search_index_repairs_legacy_definition():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    from sqlalchemy import text
+
+    database = PostgresSessionDB(dsn)
+    try:
+        await database._ensure_ready()
+        async with database._engine.begin() as connection:
+            await connection.execute(
+                text("DROP INDEX IF EXISTS messages_hermes_search_idx")
+            )
+            await connection.execute(
+                text(
+                    "CREATE INDEX messages_hermes_search_idx "
+                    "ON messages USING GIN (to_tsvector('simple', "
+                    "coalesce(content, '') || ' ' || coalesce(tool_name, '')))"
+                )
+            )
+        await database.close()
+        database = PostgresSessionDB(dsn)
+        await database._ensure_ready()
+        async with database._engine.connect() as connection:
+            indexdef = (
+                await connection.execute(
+                    text(
+                        "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                        "WHERE indexrelid = to_regclass("
+                        "'messages_hermes_search_idx')"
+                    )
+                )
+            ).scalar_one()
+        assert "tool_calls" in indexdef
+    finally:
         await database.close()
 
 

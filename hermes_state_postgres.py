@@ -59,15 +59,19 @@ _POSTGRES_POOL_DEFAULTS = {
 _POSTGRES_POOL_KEYS = frozenset(_POSTGRES_POOL_DEFAULTS)
 _POSTGRES_CONNECT_KEYS = frozenset(
     {
-        "timeout",
-        "command_timeout",
-        "statement_cache_size",
-        "max_cached_statement_lifetime",
-        "max_cacheable_statement_size",
-        "server_settings",
+        "connect_timeout",
+        "prepare_threshold",
+        "application_name",
+        "options",
     }
 )
-_POSTGRES_READ_ONLY_SETTING = "default_transaction_read_only"
+
+_POSTGRES_SEARCH_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS messages_hermes_search_idx "
+    "ON messages USING GIN (to_tsvector('simple', "
+    "coalesce(content, '') || ' ' || coalesce(tool_name, '') || ' ' || "
+    "coalesce(tool_calls, '')))"
+)
 
 # Keep the retained SQLite access paths indexed on PostgreSQL as well.  These
 # statements use fixed identifiers only; no caller-controlled SQL is interpolated.
@@ -108,13 +112,12 @@ _POSTGRES_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
     "ON messages(session_id, platform_message_id) "
     "WHERE platform_message_id IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS messages_hermes_search_idx "
-    "ON messages USING GIN (to_tsvector('simple', "
-    "coalesce(content, '') || ' ' || coalesce(tool_name, '')))",
+    _POSTGRES_SEARCH_INDEX_DDL,
 )
 
 _POSTGRES_INDEX_NAMES = frozenset(
     {
+        "idx_sessions_title_unique",
         "idx_sessions_source",
         "idx_sessions_source_id",
         "idx_sessions_parent",
@@ -171,7 +174,7 @@ def _config_number(
     minimum: float | int | None = None,
     allow_none: bool = False,
 ) -> int | float | None:
-    """Validate one serializable SQLAlchemy/asyncpg numeric option."""
+    """Validate one serializable SQLAlchemy/psycopg numeric option."""
     if value is None and allow_none:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -258,13 +261,13 @@ class SessionDB:
         if db_path is None:
             raise ValueError(
                 "PostgreSQL SessionDB requires an explicit "
-                "postgresql+asyncpg:// URL"
+                "postgresql+psycopg:// URL"
             )
         if not isinstance(db_path, str) or not db_path.startswith(
-            "postgresql+asyncpg://"
+            "postgresql+psycopg://"
         ):
             raise ValueError(
-                "db_path must be a postgresql+asyncpg:// URL; "
+                "db_path must be a postgresql+psycopg:// URL; "
                 "environment/database-file fallback is disabled"
             )
         parsed = urlsplit(db_path)
@@ -360,27 +363,12 @@ class SessionDB:
 
         connect_args: dict[str, Any] = {}
         numeric_connect = {
-            "timeout": (False, 0, False),
-            "command_timeout": (False, 0, True),
-            "statement_cache_size": (True, 0, False),
-            "max_cached_statement_lifetime": (False, 0, False),
-            "max_cacheable_statement_size": (True, 0, False),
+            "connect_timeout": (True, 1, False),
+            "prepare_threshold": (True, 0, True),
         }
         for name, (integer, minimum, allow_none) in numeric_connect.items():
             if name not in raw_connect_args:
                 continue
-            if name == "command_timeout" and raw_connect_args[name] is not None:
-                value = raw_connect_args[name]
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    raise ValueError(
-                        "database.postgres.connect_args.command_timeout "
-                        "must be a number"
-                    )
-                if value <= 0:
-                    raise ValueError(
-                        "database.postgres.connect_args.command_timeout "
-                        "must be > 0"
-                    )
             value = _config_number(
                 raw_connect_args[name],
                 f"connect_args.{name}",
@@ -388,36 +376,18 @@ class SessionDB:
                 minimum=minimum,
                 allow_none=allow_none,
             )
-            if value is not None:
+            if value is not None or name == "prepare_threshold":
                 connect_args[name] = value
 
-        server_settings = raw_connect_args.get("server_settings", {})
-        if server_settings is None:
-            server_settings = {}
-        if not isinstance(server_settings, dict):
-            raise ValueError(
-                "database.postgres.connect_args.server_settings must be a mapping"
-            )
-        if _POSTGRES_READ_ONLY_SETTING in server_settings:
-            raise ValueError(
-                "database.postgres.connect_args.server_settings."
-                f"{_POSTGRES_READ_ONLY_SETTING} is controlled by read_only"
-            )
-        if not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in server_settings.items()
-        ):
-            raise ValueError(
-                "database.postgres.connect_args.server_settings must contain "
-                "only string keys and values"
-            )
-        if self._read_only:
-            server_settings = {
-                **server_settings,
-                _POSTGRES_READ_ONLY_SETTING: "on",
-            }
-        if server_settings:
-            connect_args["server_settings"] = dict(server_settings)
+        for name in ("application_name", "options"):
+            if name not in raw_connect_args:
+                continue
+            value = raw_connect_args[name]
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"database.postgres.connect_args.{name} must be a string"
+                )
+            connect_args[name] = value
 
         if connect_args:
             options["connect_args"] = connect_args
@@ -463,6 +433,67 @@ class SessionDB:
         """Create the fixed indexes used by retained SQLite query paths."""
         for statement in _POSTGRES_INDEX_DDL:
             await connection.execute(_sa.text(statement))
+
+        title_index = (
+            await connection.execute(
+                _sa.text(
+                    "SELECT pg_get_indexdef(indexrelid) "
+                    "FROM pg_index "
+                    "WHERE indexrelid = to_regclass(:index_name)"
+                ),
+                {"index_name": "idx_sessions_title_unique"},
+            )
+        ).scalar_one_or_none()
+        normalized = str(title_index or "").lower()
+        if title_index is not None and (
+            "create unique index" not in normalized
+            or "where (title is not null)" not in normalized
+        ):
+            await connection.execute(
+                _sa.text('DROP INDEX IF EXISTS "idx_sessions_title_unique"')
+            )
+            title_index = None
+        if title_index is None:
+            # Older PostgreSQL schemas did not enforce the same title
+            # uniqueness as SQLite.  Preserve the newest row's title before
+            # creating the fixed partial unique index so repair is idempotent
+            # and remains inside the advisory-lock transaction.
+            await connection.execute(
+                _sa.text(
+                    "WITH ranked AS ("
+                    "SELECT id, row_number() OVER ("
+                    "PARTITION BY title ORDER BY started_at DESC NULLS LAST, id DESC"
+                    ") AS position FROM sessions WHERE title IS NOT NULL) "
+                    "UPDATE sessions AS sessions_to_repair SET title = NULL, "
+                    "title_source = NULL FROM ranked "
+                    "WHERE sessions_to_repair.id = ranked.id "
+                    "AND ranked.position > 1"
+                )
+            )
+            await connection.execute(
+                _sa.text(
+                    "CREATE UNIQUE INDEX idx_sessions_title_unique "
+                    "ON sessions(title) WHERE title IS NOT NULL"
+                )
+            )
+
+        search_index = (
+            await connection.execute(
+                _sa.text(
+                    "SELECT pg_get_indexdef(indexrelid) "
+                    "FROM pg_index "
+                    "WHERE indexrelid = to_regclass(:index_name)"
+                ),
+                {"index_name": "messages_hermes_search_idx"},
+            )
+        ).scalar_one_or_none()
+        if "tool_calls" not in str(search_index or "").lower():
+            await connection.execute(
+                _sa.text("DROP INDEX IF EXISTS messages_hermes_search_idx")
+            )
+            await connection.execute(
+                _sa.text(_POSTGRES_SEARCH_INDEX_DDL)
+            )
 
     async def _postgres_schema_is_current(
         self, connection: Any, metadata: Any
@@ -521,6 +552,30 @@ class SessionDB:
             {str(row[0]) for row in index_rows}
         ):
             return False
+        title_index = await connection.execute(
+            _sa.text(
+                "SELECT pg_get_indexdef(indexrelid) "
+                "FROM pg_index "
+                "WHERE indexrelid = to_regclass(:index_name)"
+            ),
+            {"index_name": "idx_sessions_title_unique"},
+        )
+        title_indexdef = str(title_index.scalar_one_or_none() or "").lower()
+        if (
+            "create unique index" not in title_indexdef
+            or "where (title is not null)" not in title_indexdef
+        ):
+            return False
+        search_index = await connection.execute(
+            _sa.text(
+                "SELECT pg_get_indexdef(indexrelid) "
+                "FROM pg_index "
+                "WHERE indexrelid = to_regclass(:index_name)"
+            ),
+            {"index_name": "messages_hermes_search_idx"},
+        )
+        if "tool_calls" not in str(search_index.scalar_one_or_none() or "").lower():
+            return False
 
         constraint_rows = await connection.execute(
             _sa.text(
@@ -558,9 +613,13 @@ class SessionDB:
             if _sa is None or _create_async_engine is None:
                 raise ImportError(
                     "PostgreSQL SessionDB requires the 'postgres' extra "
-                    "(SQLAlchemy[asyncio] and asyncpg)"
+                    "(SQLAlchemy[asyncio] and psycopg[binary])"
                 )
             engine_options = await self._resolve_engine_options()
+            if self._read_only:
+                engine_options["execution_options"] = {
+                    "postgresql_readonly": True,
+                }
             self._engine = _create_async_engine(
                 self._db_path,
                 future=True,
@@ -941,6 +1000,7 @@ class SessionDB:
             "cost_status",
             "cost_source",
             "pricing_version",
+            "title",
             "title_source",
             "last_active",
             "last_activity_at",
