@@ -60,7 +60,7 @@ from hermes_state_common import (
     _sql_session_last_active_by_id,
 )
 from hermes_state_portability import SessionPortabilityMixin
-from hermes_state_schema import SessionSchemaMixin
+from hermes_state_schema import SessionSchemaMixin, _rebuild_corrupt_fts_schema
 from hermes_state_search import SessionSearchMixin
 
 logger = logging.getLogger(__name__)
@@ -621,7 +621,21 @@ async def _db_opens_cleanly(db_path: Path) -> str | None:
             if row and str(row[0]).lower() != "ok"
         ]
         if problems:
-            return "; ".join(problems[:3])
+            normalized: list[str] = []
+            for problem in problems[:3]:
+                # SQLite 3.45+ reports a stale B-tree as one or more
+                # ``row N missing from index NAME`` entries, while older
+                # builds use the stable ``wrong # of entries`` wording.
+                # Keep the private repair diagnostic version-independent.
+                problem = re.sub(
+                    r"row\s+\d+\s+missing\s+from\s+index\s+([^;\s]+)",
+                    r"wrong # of entries in index \1",
+                    problem,
+                    flags=re.IGNORECASE,
+                )
+                if problem not in normalized:
+                    normalized.append(problem)
+            return "; ".join(normalized)
         await (await conn.execute("SELECT COUNT(*) FROM sessions")).fetchone()
 
         for fts_table in (
@@ -696,7 +710,8 @@ async def repair_state_db_schema(
     if not await aiofiles.os.path.exists(db_path):
         report["error"] = f"{db_path} does not exist"
         return report
-    if await _db_opens_cleanly(db_path) is None:
+    initial_reason = await _db_opens_cleanly(db_path)
+    if initial_reason is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
@@ -732,6 +747,34 @@ async def repair_state_db_schema(
             return report
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
+
+    # A damaged FTS5 shadow table may reject the virtual-table ``rebuild``
+    # command as well as DROP TABLE.  Recreate only the derived catalog from
+    # canonical message rows before falling through to B-tree/schema repair.
+    # Do not touch FTS schema for an unrelated stale B-tree or malformed
+    # sqlite_master database.
+    reason_text = str(initial_reason).lower()
+    if "fts" in reason_text or "vtable constructor failed" in reason_text:
+        try:
+            conn = await aiosqlite.connect(db_path, isolation_level=None)
+            try:
+                await load_fts5_cjk_extension(conn)
+                await _rebuild_corrupt_fts_schema(conn)
+            finally:
+                await conn.close()
+            if await _db_opens_cleanly(db_path) is None:
+                report["repaired"] = True
+                report["strategy"] = "rebuild_fts"
+                logger.warning(
+                    "state.db FTS indexes rebuilt after replacing corrupt "
+                    "shadow schema: %s",
+                    db_path,
+                )
+                return report
+        except sqlite3.DatabaseError as exc:
+            logger.warning(
+                "state.db corrupt FTS catalog replacement failed: %s", exc
+            )
 
     try:
         conn = await aiosqlite.connect(db_path, isolation_level=None)

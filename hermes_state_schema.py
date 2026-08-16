@@ -33,6 +33,91 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")
 
 
+async def _rebuild_corrupt_fts_schema(conn: aiosqlite.Connection) -> None:
+    """Replace corrupt FTS catalog entries using canonical ``messages`` rows.
+
+    SQLite can refuse to drop a damaged FTS5 virtual table because constructing
+    the table itself fails.  The shadow tables are derived state, so a bounded
+    ``writable_schema`` surgery is safe here: only ``messages_fts*`` catalog
+    rows are removed, then the retained legacy or external-content schema is
+    recreated and backfilled.  Canonical session/message tables are untouched.
+    """
+    base_cursor = await conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'messages_fts'"
+    )
+    try:
+        base_row = await base_cursor.fetchone()
+    finally:
+        await base_cursor.close()
+    trigram_cursor = await conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+    )
+    try:
+        include_trigram = await trigram_cursor.fetchone() is not None
+    finally:
+        await trigram_cursor.close()
+    if base_row is None:
+        raise sqlite3.DatabaseError("messages_fts schema is missing")
+    base_sql = str(base_row[0] or "")
+    legacy = "content='messages'" not in "".join(base_sql.split()).lower()
+
+    await conn.execute("PRAGMA writable_schema=ON")
+    try:
+        await conn.execute(
+            "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+        )
+        await conn.execute("PRAGMA writable_schema=OFF")
+        await conn.commit()
+    except BaseException:
+        try:
+            await conn.execute("PRAGMA writable_schema=OFF")
+        except sqlite3.Error:
+            pass
+        await conn.rollback()
+        raise
+    await conn.execute("VACUUM")
+
+    if legacy:
+        rebuild_sql = LEGACY_FTS_SQL
+        if include_trigram:
+            rebuild_sql += LEGACY_FTS_TRIGRAM_SQL
+        rebuild_sql += """
+            INSERT INTO messages_fts(rowid, content)
+            SELECT id,
+                   COALESCE(content, '') || ' ' ||
+                   COALESCE(tool_name, '') || ' ' ||
+                   COALESCE(tool_calls, '')
+            FROM messages;
+        """
+        if include_trigram:
+            rebuild_sql += """
+                INSERT INTO messages_fts_trigram(rowid, content)
+                SELECT id,
+                       COALESCE(content, '') || ' ' ||
+                       COALESCE(tool_name, '') || ' ' ||
+                       COALESCE(tool_calls, '')
+                FROM messages;
+            """
+    else:
+        rebuild_sql = FTS_SQL
+        if include_trigram:
+            rebuild_sql += FTS_TRIGRAM_SQL
+        rebuild_sql += "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+        if include_trigram:
+            rebuild_sql += (
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild');"
+            )
+    await conn.executescript(
+        "BEGIN IMMEDIATE;"
+        + rebuild_sql
+        + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
+        + "COMMIT;"
+    )
+
+
 class SessionSchemaMixin:
     """Native-async retained schema migrations for ``SessionDB``."""
 
@@ -401,12 +486,36 @@ class SessionSchemaMixin:
                 await cursor.commit()
             except sqlite3.Error:
                 pass
-            logger.error(
-                "Automatic rebuild of stale FTS indexes failed (%s); "
-                "canonical writes remain enabled with FTS detached.",
-                exc,
-            )
-            return False
+            # Some SQLite builds reject DROP TABLE for a corrupt FTS5 virtual
+            # table (``vtable constructor failed``).  The canonical
+            # ``messages`` table is still healthy, so remove only the derived
+            # FTS catalog entries and rebuild them from canonical rows.  This
+            # is the same bounded recovery used by the offline repair path;
+            # it must not touch user/session tables.
+            try:
+                await _rebuild_corrupt_fts_schema(cursor)
+            except sqlite3.DatabaseError as fallback_exc:
+                try:
+                    await cursor.execute("PRAGMA writable_schema=OFF")
+                except sqlite3.Error:
+                    pass
+                try:
+                    await cursor.rollback()
+                except sqlite3.Error:
+                    pass
+                try:
+                    await self._drop_all_fts_triggers(cursor)  # type: ignore[attr-defined]
+                    await cursor.commit()
+                except sqlite3.Error:
+                    pass
+                logger.error(
+                    "Automatic rebuild of stale FTS indexes failed (%s; "
+                    "catalog recovery: %s); canonical writes remain enabled "
+                    "with FTS detached.",
+                    exc,
+                    fallback_exc,
+                )
+                return False
 
         self._fts_stale = False
         self._fts_enabled = True
