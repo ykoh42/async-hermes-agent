@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import hermes_time as _hermes_time
@@ -55,6 +56,42 @@ from hermes_constants import get_hermes_home
 from tools import env_probe as _env_probe
 
 logger = logging.getLogger(__name__)
+
+
+def _agent_home(agent: Any) -> Path | None:
+    """Resolve the agent's own profile home before ambient process state."""
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if override:
+            return Path(override)
+    except Exception:
+        pass
+    try:
+        db_path = getattr(getattr(agent, "_session_db", None), "db_path", None)
+        if db_path:
+            return Path(db_path).parent
+    except Exception:
+        pass
+    return None
+
+
+def _agent_skills_dir(agent: Any) -> Path | None:
+    home = _agent_home(agent)
+    return home / "skills" if home is not None else None
+
+
+async def _profile_name_for_home(home: Path) -> str:
+    """Derive ``profiles/<name>`` from the process-level Hermes root."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = await get_default_hermes_root()
+        relative = home.resolve().relative_to((root / "profiles").resolve())
+        return relative.parts[0] if relative.parts else "default"
+    except (OSError, ValueError):
+        return "default"
 
 
 def _restore_plugin_prompt_sections(prompt: str) -> tuple[Any, ...]:
@@ -240,8 +277,12 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _agent_home_path = _agent_home(agent)
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = await _r.load_soul_md(_ctx_len)
+        _soul_content = await _r.load_soul_md(
+            _ctx_len,
+            home_override=_agent_home_path,
+        )
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -364,6 +405,7 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            skills_dir_override=_agent_skills_dir(agent),
         )
     else:
         skills_prompt = ""
@@ -449,15 +491,25 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
     try:
-        from agent.file_safety import _resolve_active_profile_name
+        if _agent_home_path is not None:
+            active_profile = await _profile_name_for_home(_agent_home_path)
+        else:
+            from agent.file_safety import _resolve_active_profile_name
 
-        active_profile = await _resolve_active_profile_name()
+            active_profile = await _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
+    if _agent_home_path is not None:
+        from hermes_constants import get_default_hermes_root
+
+        _home_str = str(_agent_home_path)
+        _root_str = str(await get_default_hermes_root())
+    else:
+        _home_str = _root_str = str(get_hermes_home())
     if active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+            "under " + _root_str + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/memories unless the user explicitly directs "
@@ -466,8 +518,8 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
     else:
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
+            f"and writes {_home_str}/. The default "
+            f"profile's data lives at {_root_str}/skills/, {_root_str}/plugins/, "
             f"{get_hermes_home()}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/memories unless the user "
@@ -508,7 +560,9 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
         context_files_prompt = await _r.build_context_files_prompt(
             cwd=_context_cwd, skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            home_override=_agent_home_path,
+        )
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
