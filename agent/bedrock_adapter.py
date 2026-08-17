@@ -1675,7 +1675,7 @@ def build_converse_kwargs(
     model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int | None = 4096,
     temperature: float | None = None,
     top_p: float | None = None,
     stop_sequences: list[str] | None = None,
@@ -1688,12 +1688,14 @@ def build_converse_kwargs(
     system_prompt, converse_messages = convert_messages_to_converse(messages)
     cache_enabled = _model_supports_prompt_cache(model)
 
+    inference_config: dict[str, Any] = {}
+    if max_tokens is not None:
+        inference_config["maxTokens"] = max_tokens
+
     kwargs: dict[str, Any] = {
         "modelId": model,
         "messages": converse_messages,
-        "inferenceConfig": {
-            "maxTokens": max_tokens,
-        },
+        "inferenceConfig": inference_config,
     }
 
     if system_prompt:
@@ -1742,6 +1744,9 @@ def build_converse_kwargs(
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config
 
+    if not kwargs["inferenceConfig"]:
+        del kwargs["inferenceConfig"]
+
     return kwargs
 
 
@@ -1750,7 +1755,7 @@ async def call_converse(
     model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int | None = 4096,
     temperature: float | None = None,
     top_p: float | None = None,
     stop_sequences: list[str] | None = None,
@@ -1796,7 +1801,7 @@ async def call_converse_stream(
     model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int | None = 4096,
     temperature: float | None = None,
     top_p: float | None = None,
     stop_sequences: list[str] | None = None,
