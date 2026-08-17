@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - exercised by the missing-extra test
 
 _CONTENT_JSON_PREFIX = "\x00json:"
 _POSTGRES_STORAGE_VERSION_KEY = "postgres_storage_version"
-_POSTGRES_STORAGE_VERSION = 3
+_POSTGRES_STORAGE_VERSION = 4
 _POSTGRES_DELEGATION_INDEX = "idx_async_delegations_delivery"
 _POSTGRES_MIGRATION_LOCK = 731948251
 _POSTGRES_MIGRATION_TABLES = (
@@ -623,6 +623,25 @@ class SessionDB:
                 )
         await connection.execute(_sa.text(_POSTGRES_DELEGATION_INDEX_DDL))
 
+    async def _ensure_postgres_hidden_session_column(
+        self, connection: Any
+    ) -> None:
+        """Apply the upstream additive ``sessions.hidden`` column."""
+        present = await connection.execute(
+            _sa.text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'sessions' AND column_name = 'hidden'"
+            )
+        )
+        if present.scalar_one_or_none() is None:
+            await connection.execute(
+                _sa.text(
+                    "ALTER TABLE sessions ADD COLUMN hidden INTEGER "
+                    "NOT NULL DEFAULT 0"
+                )
+            )
+
     async def _postgres_delegation_catalog_is_current(
         self, connection: Any
     ) -> bool:
@@ -688,6 +707,28 @@ class SessionDB:
             if any(column.name not in present_columns for column in table.columns):
                 return False
         return True
+
+    async def _postgres_only_hidden_column_is_missing(
+        self, connection: Any, metadata: Any
+    ) -> bool:
+        """Recognize only the additive upstream hidden-column gap."""
+        missing: set[tuple[str, str]] = set()
+        for table in metadata.tables.values():
+            columns = await connection.execute(
+                _sa.text(
+                    "SELECT attname FROM pg_attribute "
+                    "WHERE attrelid = to_regclass(:table_name) "
+                    "AND attnum > 0 AND NOT attisdropped"
+                ),
+                {"table_name": str(table.name)},
+            )
+            present_columns = {str(row[0]) for row in columns}
+            missing.update(
+                (str(table.name), str(column.name))
+                for column in table.columns
+                if column.name not in present_columns
+            )
+        return missing == {("sessions", "hidden")}
 
     async def _postgres_catalog_is_current(
         self, connection: Any, metadata: Any
@@ -994,6 +1035,7 @@ class SessionDB:
                     _sa.Column("pricing_version", _sa.Text),
                     _sa.Column("archived", _sa.Integer, nullable=False, default=0),
                     _sa.Column("pinned", _sa.Integer, nullable=False, default=0),
+                    _sa.Column("hidden", _sa.Integer, nullable=False, default=0),
                     _sa.Column("last_read_at", _sa.Float),
                     _sa.Column("last_active", _sa.Float),
                     _sa.Column("title", _sa.Text),
@@ -1180,15 +1222,24 @@ class SessionDB:
                         "PostgreSQL SessionDB logical schema version is unsupported; "
                         "restore a supported backup or migrate it explicitly"
                     )
-                if not await self._postgres_tables_and_columns_are_current(
-                    connection, metadata
+                storage_version = await self._postgres_storage_version(connection)
+                table_shape_current = (
+                    await self._postgres_tables_and_columns_are_current(
+                        connection, metadata
+                    )
+                )
+                if not table_shape_current and not (
+                    storage_version is not None
+                    and storage_version < _POSTGRES_STORAGE_VERSION
+                    and await self._postgres_only_hidden_column_is_missing(
+                        connection, metadata
+                    )
                 ):
                     raise RuntimeError(
                         "PostgreSQL SessionDB has an unsupported or incomplete "
                         "table shape; refusing implicit column migration"
                     )
 
-                storage_version = await self._postgres_storage_version(connection)
                 catalog_current = await self._postgres_catalog_is_current(
                     connection, metadata
                 )
@@ -1213,6 +1264,16 @@ class SessionDB:
                 if storage_version < 1:
                     raise RuntimeError(
                         "PostgreSQL SessionDB physical schema version is unsupported"
+                    )
+
+                if storage_version < _POSTGRES_STORAGE_VERSION:
+                    await self._lock_postgres_migration_tables(connection)
+                    if storage_version < 4:
+                        await self._ensure_postgres_hidden_session_column(
+                            connection
+                        )
+                    catalog_current = await self._postgres_catalog_is_current(
+                        connection, metadata
                     )
 
                 if storage_version == 1 or not catalog_current:
@@ -1328,6 +1389,7 @@ class SessionDB:
             "rewind_count": 0,
             "archived": 0,
             "pinned": 0,
+            "hidden": 0,
             "last_read_at": None,
             "last_active": now,
         }
@@ -1398,6 +1460,7 @@ class SessionDB:
                 "tool_call_count": row.tool_call_count,
                 "archived": row.archived,
                 "pinned": row.pinned,
+                "hidden": row.hidden,
                 "last_read_at": row.last_read_at,
             }
         )
@@ -2283,6 +2346,7 @@ class SessionDB:
             "set_session_title_source",
             "set_session_archived",
             "set_session_pinned",
+            "set_session_hidden",
             "set_session_read",
             "update_session_model",
             "update_session_cwd",
@@ -2630,7 +2694,12 @@ class SessionDB:
                 return None
             if session is None and sid:
                 return False if name.startswith("set_") else None
-            if name in {"set_session_archived", "set_session_pinned", "set_session_read"}:
+            if name in {
+                "set_session_archived",
+                "set_session_pinned",
+                "set_session_hidden",
+                "set_session_read",
+            }:
                 if not sid:
                     return False
                 lineage_ids = await self._compression_lineage_ids(connection, sid)
@@ -2645,6 +2714,7 @@ class SessionDB:
                 field = {
                     "set_session_archived": "archived",
                     "set_session_pinned": "pinned",
+                    "set_session_hidden": "hidden",
                     "set_session_read": "last_read_at",
                 }[name]
                 value = (
@@ -2652,6 +2722,8 @@ class SessionDB:
                     if name == "set_session_archived"
                     else int(bool(args["pinned"]))
                     if name == "set_session_pinned"
+                    else int(bool(args["hidden"]))
+                    if name == "set_session_hidden"
                     else time.time() if args["read"] else 0.0
                 )
                 result = await connection.execute(
@@ -3577,6 +3649,10 @@ class SessionDB:
                             continue
                     elif not args.get("include_archived", False) and item.get(
                         "archived"
+                    ):
+                        continue
+                    if not args.get("include_hidden", False) and item.get(
+                        "hidden"
                     ):
                         continue
                     if args.get("source") is not None and item["source"] != args["source"]:
@@ -5119,7 +5195,7 @@ class SessionDB:
     async def list_recent_user_messages(self, session_id: str, limit: int = 20, include_inactive: bool = False) -> list[dict[str, Any]]:
         return await self._dispatch('list_recent_user_messages', locals())
 
-    async def list_sessions_rich(self, source: str | None = None, sources: list[str] | None = None, exclude_sources: list[str] | None = None, cwd_prefix: str | None = None, limit: int = 20, offset: int = 0, include_children: bool = False, min_message_count: int = 0, project_compression_tips: bool = True, order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False, id_query: str | None = None, search_query: str | None = None, compact_rows: bool = False, include_pinned: bool = False, session_key: str | None = None) -> list[dict[str, typing.Any]]:
+    async def list_sessions_rich(self, source: str | None = None, sources: list[str] | None = None, exclude_sources: list[str] | None = None, cwd_prefix: str | None = None, limit: int = 20, offset: int = 0, include_children: bool = False, min_message_count: int = 0, project_compression_tips: bool = True, order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False, id_query: str | None = None, search_query: str | None = None, compact_rows: bool = False, include_pinned: bool = False, session_key: str | None = None, include_hidden: bool = False) -> list[dict[str, typing.Any]]:
         return await self._dispatch('list_sessions_rich', locals())
 
     async def list_skill_scaffolded_sessions(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -5241,6 +5317,9 @@ class SessionDB:
 
     async def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
         return await self._dispatch('set_session_pinned', locals())
+
+    async def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
+        return await self._dispatch('set_session_hidden', locals())
 
     async def set_session_read(self, session_id: str, read: bool = True) -> bool:
         return await self._dispatch('set_session_read', locals())

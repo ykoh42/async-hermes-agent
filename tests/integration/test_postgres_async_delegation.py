@@ -513,7 +513,7 @@ async def test_postgres_storage_v2_migrates_delegations_atomically(tmp_path):
                     text("SELECT to_regclass('async_delegations')")
                 )
             ).scalar_one()
-        assert storage == "3"
+        assert storage == "4"
         assert table == "async_delegations"
     finally:
         if migrated is not None:

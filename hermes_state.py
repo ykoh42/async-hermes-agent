@@ -5467,6 +5467,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compact_rows: bool = False,
         include_pinned: bool = False,
         session_key: str | None = None,
+        include_hidden: bool = False,
     ) -> list[dict[str, Any]]:
         """List enriched sessions with upstream filtering and projection."""
         await self.flush_token_counts()
@@ -5501,6 +5502,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if not include_hidden:
+            where_clauses.append("s.hidden = 0")
 
         where_sql = (
             f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
@@ -6595,6 +6598,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 WHERE id IN (SELECT id FROM lineage)
                 """,
                 (session_id, session_id, 1 if pinned else 0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = (
+                    await (await conn.execute("SELECT changes()")).fetchone()
+                )[0]
+            return rowcount
+
+        rowcount = await self._execute_write(_do)
+        return rowcount > 0
+
+    async def set_session_hidden(
+        self, session_id: str, hidden: bool
+    ) -> bool:
+        """Hide or unhide a session and its compression lineage.
+
+        Hidden sessions stay resumable by the surface that owns them, but are
+        omitted from the default session listing. Compression ancestors and
+        descendants are updated together, matching the archived and pinned
+        session flags.
+        """
+        async def _do(conn):
+            cursor = await conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET hidden = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, 1 if hidden else 0),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:

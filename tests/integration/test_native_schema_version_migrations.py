@@ -37,9 +37,9 @@ async def _fetchall(connection, sql: str, params=()):
         return await cursor.fetchall()
 
 
-async def test_core_schema_sql_matches_upstream_v2026_8_13():
+async def test_core_schema_sql_matches_retained_upstream_v2026_8_16():
     assert hashlib.sha256(SCHEMA_SQL.encode()).hexdigest() == (
-        "c87efa081022ef5954172f4141750659d4828be57324f2a284d3b8f21c6fc8e8"
+        "007ec8b25045e7361bc45a4ad819a8f48738c50a7ac1e6122e4186aba6152291"
     )
 
 

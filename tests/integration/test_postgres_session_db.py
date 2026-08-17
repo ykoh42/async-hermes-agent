@@ -551,9 +551,112 @@ async def test_postgres_persists_logical_and_private_layout_versions():
                 )
             ).scalar_one_or_none()
         assert versions == [SCHEMA_VERSION]
-        assert private_storage_marker == "3"
+        assert private_storage_marker == "4"
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_hidden_sessions_match_sqlite_listing_contract():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+
+    database = PostgresSessionDB(dsn)
+    try:
+        await database.create_session("visible", source="cli")
+        await database.create_session("secret", source="cli")
+        await database.append_message("visible", "user", "hello")
+        await database.append_message("secret", "user", "hello")
+        assert await database.set_session_hidden("secret", True) is True
+        assert (await database.get_session("secret"))["hidden"] == 1
+
+        visible = {
+            row["id"]
+            for row in await database.list_sessions_rich(min_message_count=1)
+        }
+        all_rows = {
+            row["id"]
+            for row in await database.list_sessions_rich(
+                min_message_count=1,
+                include_hidden=True,
+            )
+        }
+        assert visible == {"visible"}
+        assert all_rows == {"visible", "secret"}
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_storage_v3_adds_upstream_hidden_column_atomically(tmp_path):
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    import psycopg
+    from sqlalchemy import text
+
+    schema = f"hidden_v3_{uuid.uuid4().hex}"
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "database:\n  postgres:\n    connect_args:\n"
+        f"      options: '-c search_path={schema}'\n",
+        encoding="utf-8",
+    )
+    admin_dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+    admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+    token = set_hermes_home_override(home)
+    database = PostgresSessionDB(dsn)
+    retry = None
+    try:
+        async with admin.cursor() as cursor:
+            await cursor.execute(f'CREATE SCHEMA "{schema}"')
+        await database._ensure_ready()
+        async with database._engine.begin() as connection:
+            await connection.execute(text("ALTER TABLE sessions DROP COLUMN hidden"))
+            await connection.execute(
+                text(
+                    "UPDATE state_meta SET value = '3' "
+                    "WHERE key = 'postgres_storage_version'"
+                )
+            )
+        await database.close()
+        retry = PostgresSessionDB(dsn)
+        await retry._ensure_ready()
+        async with retry._engine.connect() as connection:
+            hidden_type = (
+                await connection.execute(
+                    text(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'sessions' "
+                        "AND column_name = 'hidden'"
+                    )
+                )
+            ).scalar_one()
+            storage = (
+                await connection.execute(
+                    text(
+                        "SELECT value FROM state_meta "
+                        "WHERE key = 'postgres_storage_version'"
+                    )
+                )
+            ).scalar_one()
+        assert hidden_type == "integer"
+        assert storage == "4"
+    finally:
+        reset_hermes_home_override(token)
+        await database.close()
+        if retry is not None:
+            await retry.close()
+        await admin.close()
+        admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            await admin.close()
 
 
 @pytest.mark.asyncio
@@ -739,7 +842,7 @@ async def test_postgres_storage_migration_rolls_back_and_retries(tmp_path, monke
                     )
                 )
             ).scalar_one()
-        assert storage_version == "3"
+        assert storage_version == "4"
         assert "tool_calls" in search_index
         await check.close()
     finally:
