@@ -4890,7 +4890,18 @@ class SessionDB:
             messages = self._tables["messages"]
             usage = self._tables["session_model_usage"]
             if name in {"delete_session", "delete_session_if_empty"}:
-                session = await self._session(connection, args["session_id"])
+                session_row = (
+                    await connection.execute(
+                        _sa.select(sessions)
+                        .where(sessions.c.id == args["session_id"])
+                        .with_for_update()
+                    )
+                ).first()
+                session = (
+                    self._session_from_row(session_row)
+                    if session_row is not None
+                    else None
+                )
                 if session is None or (
                     name == "delete_session_if_empty" and session["message_count"]
                 ):
