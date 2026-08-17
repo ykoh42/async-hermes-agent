@@ -6,6 +6,7 @@ tool registration or provider resolution.
 """
 
 import asyncio
+import ast
 import logging
 import os
 import re
@@ -462,11 +463,30 @@ async def get_disabled_skill_names(platform: str | None = None) -> set[str]:
 
 
 def _normalize_string_set(values) -> set[str]:
-    if values is None:
-        return set()
-    if isinstance(values, str):
-        values = [values]
-    return {str(v).strip() for v in values if str(v).strip()}
+    return {
+        name.strip()
+        for name in parse_config_string_list(values)
+        if name.strip()
+    }
+
+
+def parse_config_string_list(value) -> list[str]:
+    """Normalize a config list or its quoted array-string representation."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item) for item in value]
+    return []
 
 
 # ── External skills directories ──────────────────────────────────────────

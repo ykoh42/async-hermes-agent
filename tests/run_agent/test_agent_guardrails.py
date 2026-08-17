@@ -181,6 +181,29 @@ class TestDeduplicateToolCalls:
         out = AIAgent._deduplicate_tool_calls(tcs)
         assert len(out) == 1
 
+    def test_duplicate_json_objects_with_reordered_keys_deduplicated(self):
+        first = make_tc("terminal", '{"command":"printf hello","timeout":10}')
+        second = make_tc("terminal", '{"timeout":10,"command":"printf hello"}')
+        assert AIAgent._deduplicate_tool_calls([first, second]) == [first]
+
+    def test_malformed_arguments_use_raw_string_for_deduplication(self):
+        first = make_tc("terminal", '{"command":"one"')
+        duplicate = make_tc("terminal", '{"command":"one"')
+        distinct = make_tc("terminal", '{ "command":"one"')
+        assert AIAgent._deduplicate_tool_calls([first, duplicate, distinct]) == [
+            first,
+            distinct,
+        ]
+
+    def test_recursion_error_keeps_raw_arguments(self, monkeypatch):
+        monkeypatch.setattr(
+            "run_agent.json.loads",
+            lambda _value: (_ for _ in ()).throw(RecursionError()),
+        )
+        first = make_tc("terminal", "nested")
+        duplicate = make_tc("terminal", "nested")
+        assert AIAgent._deduplicate_tool_calls([first, duplicate]) == [first]
+
 
 
 

@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent.copilot_acp_client import CopilotACPClient, _build_subprocess_env
+from agent.copilot_acp_client import (
+    CopilotACPClient,
+    _ACP_PROBE_CACHE,
+    _acp_supported,
+    _build_subprocess_env,
+)
 
 
 class _Writer:
@@ -28,6 +33,60 @@ class _Writer:
 
 def _fake_process() -> SimpleNamespace:
     return SimpleNamespace(stdin=_Writer())
+
+
+class _ProbeProcess:
+    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+        self._stdout = stdout
+        self.returncode = returncode
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self):
+        return self._stdout, b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        self.waited = True
+
+
+@pytest.fixture(autouse=True)
+def _clear_acp_probe_cache():
+    _ACP_PROBE_CACHE.clear()
+    yield
+    _ACP_PROBE_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_acp_probe_is_native_async_and_cached(monkeypatch):
+    process = _ProbeProcess(b"Usage: copilot [--acp] [--stdio]\n")
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    assert await _acp_supported("copilot", ["--acp", "--stdio"]) is True
+    assert await _acp_supported("copilot", ["--acp", "--stdio"]) is True
+    assert spawn.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_acp_probe_rejects_clean_help_without_acp(monkeypatch):
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_ProbeProcess(b"Usage: claude [--print]\n")),
+    )
+    assert await _acp_supported("claude", ["--acp", "--stdio"]) is False
+
+
+@pytest.mark.asyncio
+async def test_acp_probe_skips_custom_transport(monkeypatch):
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    assert await _acp_supported("custom", ["--jsonl"]) is True
+    spawn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1607,14 +1607,12 @@ class AIAgent:
         # (Nemotron 3 Ultra, OpenAI o1/o3, Anthropic Opus 4.x thinking,
         # DeepSeek R1, Qwen QwQ, xAI Grok reasoning, etc.) whose cloud
         # gateways idle-kill before the model's thinking phase ends.
-        # uses_implicit_default is False here so the local-endpoint
-        # short-circuit in _compute_non_stream_stale_timeout does not
-        # disable stale detection for users running reasoning models on a
-        # local NIM endpoint.
+        # Keep the floor implicit so local endpoints retain their historical
+        # opt-out while cloud reasoning models still get the finite floor.
         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
         reasoning_floor = get_reasoning_stale_timeout_floor(self.model)
         if reasoning_floor is not None:
-            return reasoning_floor, False
+            return reasoning_floor, True
 
         return 90.0, True
 
@@ -1971,19 +1969,29 @@ class AIAgent:
         focus: str | None = None,
     ) -> None:
         """Schedule the retained review fork as an owned native async task."""
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import (
+            is_background_review_enabled,
+            load_background_review_settings,
+            spawn_background_review_thread,
+        )
 
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
-            focus=focus,
-        )
-        review_task = asyncio.create_task(
-            target(),
-            name="hermes-background-review",
-        )
+        async def _run_review() -> None:
+            task_cfg = None
+            if not focus:
+                enabled, task_cfg = await load_background_review_settings()
+                if not enabled or not await is_background_review_enabled(task_cfg):
+                    return
+            target, _prompt = spawn_background_review_thread(
+                self,
+                messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+                focus=focus,
+                task_cfg=task_cfg,
+            )
+            await target()
+
+        review_task = asyncio.create_task(_run_review(), name="hermes-background-review")
         task_set = getattr(self, "_background_review_tasks", None)
         if task_set is None:
             task_set = set()
@@ -2175,6 +2183,7 @@ class AIAgent:
         self,
         messages: list[dict],
         conversation_history: list[dict] | None = None,
+        _adoption_budget: int = 1,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2421,6 +2430,13 @@ class AIAgent:
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    turn_lease_holder=getattr(
+                        self, "_active_session_turn_lease_holder", None
+                    ),
+                    turn_lease_ttl_seconds=(
+                        getattr(self, "_active_session_turn_lease_ttl_seconds", 300.0)
+                        or 300.0
+                    ),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -2437,6 +2453,51 @@ class AIAgent:
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
             logger.warning("Session DB append_message failed: %s", e)
+            from hermes_state import (
+                CompressionSessionClosedError,
+                classify_persistence_error,
+            )
+
+            self._last_persistence_error_cause = classify_persistence_error(e)
+            if isinstance(e, CompressionSessionClosedError) and _adoption_budget > 0:
+                old_id = self.session_id
+                try:
+                    tip = await self._session_db.get_compression_tip(old_id)
+                    tip_row = (
+                        await self._session_db.get_session(tip)
+                        if tip and tip != old_id
+                        else None
+                    )
+                except Exception as tip_exc:
+                    logger.warning(
+                        "compression tip lookup failed for %s: %s", old_id, tip_exc
+                    )
+                    tip = None
+                    tip_row = None
+                if (
+                    tip
+                    and tip != old_id
+                    and isinstance(tip_row, dict)
+                    and tip_row.get("ended_at") is None
+                ):
+                    logger.warning(
+                        "Adopted live compression tip %s for closed session %s; "
+                        "retrying flush once",
+                        tip,
+                        old_id,
+                    )
+                    self.session_id = tip
+                    self._flushed_db_message_ids = set()
+                    self._last_flushed_db_idx = 0
+                    self._flushed_db_message_session_id = tip
+                    self._db_flush_scan_prefix = None
+                    self._compression_adoption_failed = False
+                    return await self._flush_messages_to_session_db_unlocked(
+                        messages,
+                        conversation_history,
+                        _adoption_budget=0,
+                    )
+                self._compression_adoption_failed = True
             return False
 
     def _get_messages_up_to_last_assistant(self, messages: list[dict]) -> list[dict]:
@@ -4853,13 +4914,29 @@ class AIAgent:
     def _deduplicate_tool_calls(tool_calls: list) -> list:
         """Remove duplicate (tool_name, arguments) pairs within a single turn.
 
-        Only the first occurrence of each unique pair is kept.
+        Valid JSON arguments are canonicalized so equivalent objects do not
+        evade deduplication merely because their keys or whitespace differ.
+        Malformed or excessively nested arguments retain their raw
+        representation. Only the first occurrence of each unique pair is kept.
         Returns the original list if no duplicates were found.
         """
+        seen_raw: set = set()
         seen: set = set()
         unique: list = []
         for tc in tool_calls:
-            key = (tc.function.name, tc.function.arguments)
+            raw_key = (tc.function.name, tc.function.arguments)
+            if raw_key in seen_raw:
+                logger.warning("Removed duplicate tool call: %s", tc.function.name)
+                continue
+            seen_raw.add(raw_key)
+            arguments = tc.function.arguments
+            try:
+                arguments = json.dumps(
+                    json.loads(arguments), separators=(",", ":"), sort_keys=True
+                )
+            except (RecursionError, TypeError, ValueError):
+                pass
+            key = (tc.function.name, arguments)
             if key not in seen:
                 seen.add(key)
                 unique.append(tc)
@@ -6124,6 +6201,34 @@ class AIAgent:
                     _stream_diag["bytes"] = int(
                         _stream_diag.get("bytes", 0)
                     ) + _chat_completion_helpers._estimate_chunk_bytes(chunk)
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    # Several OpenAI-compatible providers encode validation
+                    # failures in an HTTP-200 terminal chunk instead of
+                    # raising an SDK error. Preserve that error for the normal
+                    # classifier rather than turning it into EmptyStreamError.
+                    error_type = getattr(chunk, "error_type", None)
+                    error_message = getattr(chunk, "error_message", None)
+                    if error_type or error_message:
+                        status_code = (
+                            _chat_completion_helpers._status_code_from_payload(
+                                {"code": error_type, "message": error_message}
+                            )
+                            or _chat_completion_helpers._status_code_from_value(
+                                error_type
+                            )
+                        )
+                        raise _chat_completion_helpers.ProviderStreamError(
+                            status_code=status_code,
+                            body=_chat_completion_helpers._provider_error_body(
+                                {
+                                    "code": error_type or "provider_in_stream_error",
+                                    "message": str(error_message or chunk),
+                                },
+                                status_code,
+                            ),
+                            raw_text=f"{error_type}: {error_message}",
+                        )
                 # Preserve the existing streaming display contract while the
                 # accumulator reconstructs tool calls/reasoning for the loop.
                 try:
@@ -8047,6 +8152,9 @@ class AIAgent:
             getattr(self, "_session_runtime_config", None)
         )
         interrupt_token = _bind_interrupt_event(self._interrupt_event)
+        durable_turn_lease = None
+        durable_turn_lease_stop = None
+        durable_turn_lease_task = None
         try:
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
@@ -8064,6 +8172,171 @@ class AIAgent:
                 else None,
                 getattr(self, "session_id", None),
             )
+            turn_db = getattr(self, "_session_db", None)
+            durable_session_exists = False
+            if turn_db is not None and session_id:
+                try:
+                    durable_session_exists = (
+                        await turn_db.get_session(session_id) is not None
+                    )
+                except Exception:
+                    # A failed existence probe is not evidence that the row is
+                    # absent. Acquire the lease rather than running
+                    # load/run/flush without cross-process serialization.
+                    logger.warning(
+                        "Could not check durable session before turn lease; "
+                        "will acquire rather than run without serialization",
+                        exc_info=True,
+                    )
+                    durable_session_exists = True
+            if (
+                turn_db is not None
+                and session_id
+                and not getattr(self, "_persist_disabled", False)
+                and durable_session_exists
+                and callable(
+                    getattr(type(turn_db), "acquire_session_turn_lease", None)
+                )
+            ):
+                self._session_db_created = True
+                durable_turn_lease = (
+                    f"pid={os.getpid()}:turn={effective_task_id}:platform="
+                    f"{getattr(self, 'platform', None) or 'unknown'}"
+                )
+                lease_waited = False
+
+                def _on_session_turn_lease_wait(elapsed: float) -> None:
+                    nonlocal lease_waited
+                    lease_waited = True
+                    if elapsed < 1.0:
+                        self._emit_status(
+                            "⏳ Another Hermes process is using this session; "
+                            "waiting for it to finish before starting your turn..."
+                        )
+                    else:
+                        self._emit_status(
+                            "⏳ Still waiting for the other Hermes process on "
+                            f"this session ({int(elapsed)}s)..."
+                        )
+
+                if not await turn_db.acquire_session_turn_lease(
+                    session_id,
+                    durable_turn_lease,
+                    ttl_seconds=300.0,
+                    wait_seconds=1800.0,
+                    on_wait=_on_session_turn_lease_wait,
+                    should_abort=lambda: getattr(
+                        self, "_interrupt_requested", False
+                    ),
+                ):
+                    if getattr(self, "_interrupt_requested", False):
+                        self.clear_interrupt()
+                        return {
+                            "final_response": (
+                                "Stopped waiting for another Hermes process on "
+                                "this session. Your message was not processed."
+                            ),
+                            "messages": list(conversation_history or []),
+                            "api_calls": 0,
+                            "completed": False,
+                            "interrupted": True,
+                        }
+                    timeout_message = (
+                        "⏳ Another Hermes process kept this session busy too "
+                        "long. Your message was not processed - wait for the "
+                        "other process to finish, then send it again."
+                    )
+                    logger.error(
+                        "session turn lease wait timed out for %s", session_id
+                    )
+                    self._emit_warning(timeout_message)
+                    return {
+                        "final_response": timeout_message,
+                        "messages": list(conversation_history or []),
+                        "api_calls": 0,
+                        "completed": False,
+                        "failed": True,
+                        "error": f"session_turn_lease_timeout:{session_id}",
+                    }
+                self._active_session_turn_lease_holder = durable_turn_lease
+                self._active_session_turn_lease_ttl_seconds = 300.0
+                if lease_waited:
+                    self._emit_status(
+                        "Session is free; loading the latest transcript..."
+                    )
+                    latest_session_id = await turn_db.resolve_resume_session_id(
+                        session_id
+                    )
+                    if latest_session_id:
+                        self.session_id = latest_session_id
+                        session_id = latest_session_id
+                    conversation_history = await turn_db.get_messages_as_conversation(
+                        self.session_id,
+                        repair_alternation=True,
+                        include_row_ids=True,
+                    )
+
+                durable_turn_lease_stop = asyncio.Event()
+
+                async def _refresh_durable_turn_lease() -> None:
+                    while True:
+                        try:
+                            await asyncio.wait_for(
+                                durable_turn_lease_stop.wait(), timeout=60.0
+                            )
+                            return
+                        except TimeoutError:
+                            pass
+                        try:
+                            refreshed = await turn_db.refresh_session_turn_lease(
+                                session_id,
+                                durable_turn_lease,
+                                ttl_seconds=300.0,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Failed to refresh session turn lease: %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                            try:
+                                self.interrupt(
+                                    "Session turn lease could not be refreshed; "
+                                    "stopping to protect the transcript.",
+                                    hard_cancel=True,
+                                )
+                            except Exception:
+                                self._interrupt_requested = True
+                                self._interrupt_message = (
+                                    "Session turn lease could not be refreshed; "
+                                    "stopping to protect the transcript."
+                                )
+                            continue
+                        if not refreshed:
+                            logger.error(
+                                "Lost session turn lease while turn is active: %s",
+                                session_id,
+                            )
+                            try:
+                                self.interrupt(
+                                    "Session turn lease lost; stopping to protect "
+                                    "the transcript.",
+                                    hard_cancel=True,
+                                )
+                            except Exception:
+                                self._interrupt_requested = True
+                                self._interrupt_message = (
+                                    "Session turn lease lost; stopping to protect "
+                                    "the transcript."
+                                )
+                            return
+
+                durable_turn_lease_task = asyncio.create_task(
+                    _refresh_durable_turn_lease(),
+                    name="session-turn-lease-refresh",
+                )
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
@@ -8116,6 +8389,29 @@ class AIAgent:
                     )
                 )
             finally:
+                if durable_turn_lease_stop is not None:
+                    durable_turn_lease_stop.set()
+
+                async def _cleanup_durable_turn_lease() -> None:
+                    if durable_turn_lease_task is not None:
+                        await durable_turn_lease_task
+                    if durable_turn_lease is not None and turn_db is not None:
+                        await turn_db.release_session_turn_lease(
+                            session_id,
+                            durable_turn_lease,
+                        )
+                        if (
+                            getattr(self, "_active_session_turn_lease_holder", None)
+                            == durable_turn_lease
+                        ):
+                            self._active_session_turn_lease_holder = None
+
+                if durable_turn_lease is not None and turn_db is not None:
+                    cleanup_task = asyncio.create_task(
+                        _cleanup_durable_turn_lease(),
+                        name="session-turn-lease-cleanup",
+                    )
+                    await _finish_owned_task(cleanup_task)
                 _reset_session_runtime_config(session_runtime_token)
                 turn_lock.release()
 

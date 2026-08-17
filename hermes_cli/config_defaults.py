@@ -867,7 +867,7 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
-        "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
+        "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
@@ -892,7 +892,7 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
-        "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
+        "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.

@@ -1,11 +1,11 @@
 [tool.async-hermes]
-upstream_version = "0.20.1"
-upstream_tag = "v2026.8.13"
-async_revision = 2
+upstream_version = "0.20.2"
+upstream_tag = "v2026.8.16"
+async_revision = 1
 
 [project]
 name = "async-hermes-agent"
-version = "0.20.1.2"
+version = "0.20.2.1"
 description = "A native-async AI agent harness for tools, MCP, skills, memory, and trajectory generation"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -76,6 +76,7 @@ dependencies = [
   # Native CDP transport for browser_cdp and the persistent supervisor.
   "websockets==15.0.1",
   "rich==14.3.3",
+  "fire==0.7.1",
   "pyyaml==6.0.3",
   # Bumped from 2.12.5 to 2.13.4 to pull in pydantic-core 2.46.4.
   # pydantic-core 2.41.5 (pulled by 2.12.5) segfaults when the OpenAI SDK's

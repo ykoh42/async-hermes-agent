@@ -590,8 +590,20 @@ class SessionSchemaMixin:
                     )
                     await alter_cursor.close()
                 except sqlite3.OperationalError as exc:
-                    logger.debug(
-                        "reconcile %s.%s: %s",
+                    message = str(exc).lower()
+                    if "duplicate column" in message:
+                        logger.debug(
+                            "reconcile %s.%s: %s",
+                            table_name,
+                            column_name,
+                            exc,
+                        )
+                        continue
+                    if "locked" in message or "busy" in message:
+                        raise
+                    logger.warning(
+                        "reconcile %s.%s failed; store remains behind "
+                        "SCHEMA_SQL: %s",
                         table_name,
                         column_name,
                         exc,

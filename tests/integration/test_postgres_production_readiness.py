@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -347,4 +348,45 @@ async def test_postgres_readiness_processes_have_no_signal_leaks(tmp_path):
             process.kill()
             await process.communicate()
         await database.delete_session(session_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_delete_serializes_with_inflight_append():
+    """A delete waits for an append before removing its parent session."""
+    dsn = _dsn()
+    database = SessionDB(dsn)
+    session_id = f"readiness-delete-race-{uuid.uuid4()}"
+    append_connection = None
+    append_transaction = None
+    delete_task = None
+    try:
+        await database.create_session(session_id, "postgres-readiness")
+        append_connection = await database._engine.connect()
+        append_transaction = await append_connection.begin()
+        await database._append(
+            append_connection,
+            {
+                "session_id": session_id,
+                "role": "user",
+                "content": "in-flight",
+                "timestamp": time.time(),
+            },
+        )
+
+        delete_task = asyncio.create_task(database.delete_session(session_id))
+        await asyncio.sleep(0.1)
+        assert not delete_task.done()
+
+        await append_transaction.commit()
+        assert await delete_task is True
+    finally:
+        if delete_task is not None:
+            if not delete_task.done():
+                delete_task.cancel()
+                await asyncio.gather(delete_task, return_exceptions=True)
+        if append_transaction is not None and append_transaction.is_active:
+            await append_transaction.rollback()
+        if append_connection is not None:
+            await append_connection.close()
         await database.close()

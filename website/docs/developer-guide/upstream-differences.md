@@ -1,17 +1,17 @@
 ---
 sidebar_position: 2
 title: "Upstream Differences"
-description: "The deliberate differences between Hermes Agent v2026.8.13 and Async Hermes Agent"
+description: "The deliberate differences between Hermes Agent v2026.8.16 and Async Hermes Agent"
 ---
 
 # Upstream differences
 
-Async Hermes Agent is based on upstream Hermes Agent `v2026.8.13` (Python
-package version `0.20.1`). The table below records the deliberate differences
+Async Hermes Agent is based on upstream Hermes Agent `v2026.8.16` (Python
+package version `0.20.2`). The table below records the deliberate differences
 in the retained library surface. It is a migration guide, not a claim that the
 removed upstream applications are still shipped.
 
-| Area | Upstream `v2026.8.13` | Async Hermes Agent `0.20.1.2` | Integration impact |
+| Area | Upstream `v2026.8.16` | Async Hermes Agent `0.20.2.1` | Integration impact |
 | --- | --- | --- | --- |
 | Public entry points | Retained names and module paths | The same retained names, arguments, defaults, and return shapes; I/O-bearing calls are coroutines | Existing library callers normally add `await` at the call site |
 | Agent construction | Synchronous upstream lifecycle | `AIAgent.__init__()` is state-only; provider, session, MCP, and plugin setup starts at an awaited boundary | Use `async with AIAgent(...)` or `await agent.close()` |
@@ -23,13 +23,13 @@ removed upstream applications are still shipped.
 | PostgreSQL SessionDB | Upstream ships its SQLite session store | Additive `hermes_state_postgres.SessionDB` uses SQLAlchemy Core + psycopg; `hermes_state.SessionDB` remains unchanged | Install `postgres`, inject one worker-owned store explicitly, and close it from the host lifespan; PostgreSQL ranking can differ from SQLite BM25 |
 | Async delegation persistence | Upstream delegation records use the retained SQLite state path | An explicitly injected PostgreSQL `SessionDB` also stores durable delegation records and serves `session_search(db=...)`; default SQLite delegation and plugin stores remain unchanged | Inject the existing store; no automatic profile-to-DSN routing or new public API is added |
 | Trajectories | Upstream reasoning/tool/observation format | Same ordering and retained JSON shape, with async persistence and compression | Existing trajectory consumers can read the same retained fields |
-| Training-data runner | Synchronous runner boundaries | `MiniSWERunner` and `BatchRunner` keep their upstream names while becoming coroutines; checkpoint, resume, shards, merged JSONL, and statistics remain | `await runner.run_task(...)` or `await runner.run(...)` |
+| Training-data runner | Synchronous runner boundaries and `python batch_runner.py --...` entrypoint | `MiniSWERunner` and `BatchRunner` keep their upstream names while becoming coroutines; the upstream CLI syntax is retained at a process boundary, while checkpoint, resume, shards, merged JSONL, and statistics remain | Use the CLI unchanged, `await runner.run_task(...)`/`await runner.run(...)` in a library, and await the same methods from a web host |
 | Profile isolation | Process-oriented environment and cache assumptions | Task-local secrets plus canonical `HERMES_HOME` state isolate concurrent profiles and symlink aliases | A/B profiles can run in one process without borrowing each other's credentials or files |
 | Provider policy | Synchronous adapters, including SDK-specific bootstrap behavior | Native async adapters are used where available; unsupported or unsafe synchronous paths fail explicitly rather than moving to a hidden worker thread | Install the relevant extra and follow provider-specific limitations |
-| FastAPI/service boundary | Upstream product applications may own service surfaces | No FastAPI server, CLI/TUI, messaging bridge, scheduler, dashboard, or desktop application is bundled | The host application owns HTTP lifecycle, auth, routing, quotas, and shutdown |
+| FastAPI/service boundary | Upstream product applications may own service surfaces | No FastAPI server or interactive Hermes CLI/TUI, messaging bridge, scheduler, dashboard, or desktop application is bundled; the upstream BatchRunner script entrypoint is retained | The host application owns HTTP lifecycle, auth, routing, quotas, and shutdown; web code awaits BatchRunner directly |
 | MCP and skills | Upstream product-managed discovery | Retained stdio, Streamable HTTP, and SSE MCP clients plus filesystem/external skill discovery with async lifecycle cleanup | Configure them from the host's Hermes home and close the agent at shutdown |
 | Optional providers and tools | Upstream distribution layout | Provider-specific extras remain opt-in (`anthropic`, `vertex`, `azure-identity`, `bedrock`, memory, web, media, and execution backends) | Install only the extras used by the selected configuration |
-| Python and package version | Upstream baseline `0.20.1` | Python `>=3.11,<3.14`; package `0.20.1.2` (`async_revision=2`) | The first three version segments track upstream; the fourth tracks this async distribution |
+| Python and package version | Upstream baseline `0.20.2` | Python `>=3.11,<3.14`; package `0.20.2.1` (`async_revision=1`) | The first three version segments track upstream; the fourth tracks this async distribution |
 
 ## Intentional public-surface exception
 

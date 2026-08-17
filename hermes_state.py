@@ -69,6 +69,16 @@ MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
 
 
+def _json_value(value: str | None, default: Any = None) -> Any:
+    """Decode stored JSON text while preserving the SQLite fallback contract."""
+    if value is None:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def _configured_transcript_limit(key: str, fallback: int) -> int:
     """Resolve a transcript safety limit without synchronous config I/O."""
     try:
@@ -167,6 +177,8 @@ _last_init_error: str | None = None
 _wal_fallback_warned_paths: set[str] = set()
 _wal_reset_bug_warned_paths: set[str] = set()
 _repair_attempted_paths: set[str] = set()
+_MAX_PERSISTENT_REPAIR_ATTEMPTS = 3
+_MAX_MALFORMED_BACKUPS = 3
 
 
 def _set_last_init_error(msg: str | None) -> None:
@@ -561,6 +573,117 @@ def _claim_repair_attempt(db_path: Path) -> bool:
     return True
 
 
+def _repair_ledger_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".repair-attempts.json")
+
+
+async def _db_fingerprint(db_path: Path) -> str | None:
+    """Return a cheap identity for a damaged database file."""
+    try:
+        metadata = await aiofiles.os.stat(db_path)
+    except OSError:
+        return None
+    return f"{metadata.st_size}:{metadata.st_mtime_ns}"
+
+
+async def _read_repair_ledger(db_path: Path) -> dict[str, Any]:
+    try:
+        async with aiofiles.open(_repair_ledger_path(db_path), encoding="utf-8") as reader:
+            raw = json.loads(await reader.read())
+    except (OSError, ValueError, TypeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+async def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
+    fingerprint = await _db_fingerprint(db_path)
+    if fingerprint is None:
+        return False
+    ledger = await _read_repair_ledger(db_path)
+    try:
+        attempts = int(ledger.get("failed_attempts", 0))
+    except (TypeError, ValueError):
+        attempts = 0
+    return (
+        ledger.get("fingerprint") == fingerprint
+        and attempts >= _MAX_PERSISTENT_REPAIR_ATTEMPTS
+    )
+
+
+async def _record_repair_outcome(
+    db_path: Path,
+    *,
+    repaired: bool,
+    fingerprint: str | None = None,
+) -> None:
+    """Persist the cross-process repair budget without blocking the loop."""
+    ledger_path = _repair_ledger_path(db_path)
+    try:
+        if repaired:
+            await aiofiles.os.remove(ledger_path)
+            return
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    try:
+        fingerprint = fingerprint or await _db_fingerprint(db_path)
+        if fingerprint is None:
+            return
+        ledger = await _read_repair_ledger(db_path)
+        try:
+            previous = int(ledger.get("failed_attempts", 0))
+        except (TypeError, ValueError):
+            previous = 0
+        attempts = previous + 1 if ledger.get("fingerprint") == fingerprint else 1
+        payload = json.dumps(
+            {
+                "fingerprint": fingerprint,
+                "failed_attempts": attempts,
+                "last_attempt": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        async with aiofiles.open(ledger_path, "w", encoding="utf-8") as writer:
+            await writer.write(payload)
+    except Exception as exc:  # pragma: no cover - best effort diagnostic
+        logger.warning("Could not update state.db repair ledger: %s", exc)
+
+
+async def _existing_malformed_backups(db_path: Path) -> list[Path]:
+    prefix = f"{db_path.name}.malformed-backup-"
+    try:
+        names = await aiofiles.os.listdir(db_path.parent)
+    except OSError:
+        return []
+    return sorted(
+        (
+            db_path.parent / name
+            for name in names
+            if name.startswith(prefix) and not name.endswith(("-wal", "-shm"))
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+
+async def _prune_malformed_backups(
+    db_path: Path,
+    keep: int = _MAX_MALFORMED_BACKUPS,
+) -> None:
+    for stale in (await _existing_malformed_backups(db_path))[keep:]:
+        for victim in (
+            stale,
+            stale.with_name(stale.name + "-wal"),
+            stale.with_name(stale.name + "-shm"),
+        ):
+            try:
+                await aiofiles.os.remove(victim)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:  # pragma: no cover - best effort
+                logger.warning("Could not prune stale DB backup %s: %s", victim, exc)
+
+
 async def _backup_db_file(db_path: Path) -> Path | None:
     """Copy a malformed database and its sidecars beside the original."""
     tracking_key = str(await _realpath(str(db_path)))
@@ -577,6 +700,27 @@ async def _backup_db_file(db_path: Path) -> Path | None:
         f"{db_path.name}.malformed-backup-{stamp}"
     )
     try:
+        try:
+            source_metadata = await aiofiles.os.stat(db_path)
+            for existing in (await _existing_malformed_backups(db_path))[:1]:
+                existing_metadata = await aiofiles.os.stat(existing)
+                if (
+                    existing_metadata.st_size == source_metadata.st_size
+                    and existing_metadata.st_mtime_ns == source_metadata.st_mtime_ns
+                ):
+                    logger.info(
+                        "Reusing existing forensic backup %s (identical to the damaged DB).",
+                        existing,
+                    )
+                    return existing
+        except OSError:
+            pass
+        sequence = 1
+        while await aiofiles.os.path.exists(backup_path):
+            backup_path = db_path.with_name(
+                f"{db_path.name}.malformed-backup-{stamp}_{sequence}"
+            )
+            sequence += 1
         for source, destination in (
             (db_path, backup_path),
             (
@@ -602,6 +746,7 @@ async def _backup_db_file(db_path: Path) -> Path | None:
                 destination,
                 ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
             )
+        await _prune_malformed_backups(db_path)
         return backup_path
     except Exception as exc:
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
@@ -710,10 +855,20 @@ async def repair_state_db_schema(
     if not await aiofiles.os.path.exists(db_path):
         report["error"] = f"{db_path} does not exist"
         return report
+    if await _persistent_repair_attempts_exhausted(db_path):
+        report["error"] = (
+            f"automatic repair has already failed {_MAX_PERSISTENT_REPAIR_ATTEMPTS} "
+            "times on this exact file; manual recovery is required. Restore a "
+            f"backup or salvage with `sqlite3 {db_path} \".recover\"`. Delete "
+            f"{_repair_ledger_path(db_path).name} to force another attempt."
+        )
+        logger.error("state.db repair skipped: %s", report["error"])
+        return report
     initial_reason = await _db_opens_cleanly(db_path)
     if initial_reason is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
+        await _record_repair_outcome(db_path, repaired=True)
         return report
     if backup:
         backup_path = await _backup_db_file(db_path)
@@ -740,6 +895,7 @@ async def repair_state_db_schema(
         if await _db_opens_cleanly(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
+            await _record_repair_outcome(db_path, repaired=True)
             logger.warning(
                 "state.db FTS indexes rebuilt in place (schema preserved): %s",
                 db_path,
@@ -765,6 +921,7 @@ async def repair_state_db_schema(
             if await _db_opens_cleanly(db_path) is None:
                 report["repaired"] = True
                 report["strategy"] = "rebuild_fts"
+                await _record_repair_outcome(db_path, repaired=True)
                 logger.warning(
                     "state.db FTS indexes rebuilt after replacing corrupt "
                     "shadow schema: %s",
@@ -786,6 +943,7 @@ async def repair_state_db_schema(
         if await _db_opens_cleanly(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
+            await _record_repair_outcome(db_path, repaired=True)
             logger.warning(
                 "state.db B-tree indexes rebuilt via REINDEX: %s",
                 db_path,
@@ -817,6 +975,7 @@ async def repair_state_db_schema(
         if await _db_opens_cleanly(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
+            await _record_repair_outcome(db_path, repaired=True)
             logger.warning(
                 "state.db schema repaired by de-duplicating sqlite_master "
                 "(FTS index preserved): %s",
@@ -842,6 +1001,7 @@ async def repair_state_db_schema(
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
+            await _record_repair_outcome(db_path, repaired=True)
             logger.warning(
                 "state.db schema repaired by dropping FTS schema; indexes "
                 "will rebuild from messages on next open: %s",
@@ -853,6 +1013,7 @@ async def repair_state_db_schema(
         report["error"] = str(exc)
 
     if not report["repaired"]:
+        await _record_repair_outcome(db_path, repaired=False)
         logger.error(
             "state.db schema repair could not recover %s automatically "
             "(backup: %s); manual restore from backup may be required.",
@@ -1097,20 +1258,34 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in text.lower() for marker in _DISK_FULL_MARKERS)
 
 
-PERSISTENCE_ERROR_CAUSES = ("locked", "disk", "unknown")
+PERSISTENCE_ERROR_CAUSES = (
+    "locked",
+    "compression",
+    "compression_closed",
+    "turn_lease",
+    "disk",
+    "unknown",
+)
 
 
 def classify_persistence_error(exc_or_str: BaseException | str | None) -> str:
     """Classify a session write failure for user-facing retry guidance."""
     if exc_or_str is None:
         return "unknown"
+    if isinstance(exc_or_str, SessionTurnLeaseLostError):
+        return "turn_lease"
+    if isinstance(exc_or_str, CompressionSessionClosedError):
+        return "compression_closed"
     if isinstance(exc_or_str, CompressionSessionBusyError):
-        return "locked"
+        return "compression"
     text = str(exc_or_str).lower()
-    if any(
-        marker in text
-        for marker in ("locked", "busy", "being compressed", "compression lease")
-    ):
+    if "turn lease" in text:
+        return "turn_lease"
+    if "closed by compression" in text:
+        return "compression_closed"
+    if "being compressed" in text or "compression lease" in text:
+        return "compression"
+    if "locked" in text or "busy" in text:
         return "locked"
     if (
         is_disk_full_error(exc_or_str)
@@ -1321,6 +1496,10 @@ class CompressionSessionClosedError(RuntimeError):
 
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
+
+
+class SessionTurnLeaseLostError(RuntimeError):
+    """A transcript write no longer owns the durable turn lease."""
 
 
 class SessionCompressionInProgressError(CompressionSessionBusyError):
@@ -2378,22 +2557,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         connection,
         session_id: str,
         compression_lock_holder: str | None,
+        turn_lease_holder: str | None = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Apply transcript admission guards inside the active transaction."""
-        active_lock = await (
-            await connection.execute(
-                "SELECT holder FROM compression_locks "
-                "WHERE session_id = ? AND expires_at > ?",
-                (session_id, time.time()),
+        # Appends do not check compression_locks. The lock serializes
+        # competing compressions; archive_and_compact() commits against a
+        # watermark and clones rows appended during the slow summary call.
+        if turn_lease_holder:
+            conversation_id = await self._session_turn_lease_key_on_connection(
+                connection, session_id
             )
-        ).fetchone()
-        if (
-            active_lock is not None
-            and active_lock["holder"] != compression_lock_holder
-        ):
-            raise SessionCompressionInProgressError(
-                f"Session {session_id!r} is being compressed by another writer"
-            )
+            lease = await (
+                await connection.execute(
+                    "SELECT holder, expires_at FROM session_turn_leases "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+            ).fetchone()
+            if lease is None or lease["holder"] != turn_lease_holder:
+                raise SessionTurnLeaseLostError(
+                    "Session turn lease lost; refusing transcript write "
+                    f"for {session_id!r}"
+                )
+            now = time.time()
+            if float(lease["expires_at"]) <= now:
+                await connection.execute(
+                    "UPDATE session_turn_leases SET expires_at = ? "
+                    "WHERE conversation_id = ? AND holder = ?",
+                    (
+                        now + max(0.1, float(turn_lease_ttl_seconds)),
+                        conversation_id,
+                        turn_lease_holder,
+                    ),
+                )
         session = await (
             await connection.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
@@ -2637,6 +2834,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_kind: str | None = None,
         display_metadata: dict[str, Any] | None = None,
         compression_lock_holder: str | None = None,
+        turn_lease_holder: str | None = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Append one transcript row using the same wire serialization as SessionDB."""
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -2662,7 +2861,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         async def _append(connection):
             await self._check_transcript_write_guards(
-                connection, session_id, compression_lock_holder
+                connection,
+                session_id,
+                compression_lock_holder,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
             cursor = await connection.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -2793,7 +2996,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         messages: list[dict[str, Any]],
         compression_lock_holder: str | None = None,
+        turn_lease_holder: str | None = None,
         chunk_rows: int | None = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Append one turn atomically, optionally chunking large copy jobs."""
         if not messages:
@@ -2808,12 +3013,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         session_id,
                         messages[start : start + chunk_rows],
                         compression_lock_holder=compression_lock_holder,
+                        turn_lease_holder=turn_lease_holder,
+                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,
                     )
                 return inserted_total
 
         async def _append_batch(connection):
             await self._check_transcript_write_guards(
-                connection, session_id, compression_lock_holder
+                connection,
+                session_id,
+                compression_lock_holder,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
             inserted, tool_calls_total = await self._insert_message_rows(
                 connection, session_id, messages
@@ -3044,6 +3255,202 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchone()
         return row["holder"] if row is not None else None
 
+    async def _session_turn_lease_key(self, session_id: str) -> str:
+        """Return the stable serialization key for every compression segment."""
+        if not session_id:
+            return session_id
+        try:
+            current = await self.get_session(session_id)
+            seen = {session_id}
+            while current and await self._is_compression_child_row(current):
+                parent_id = current.get("parent_session_id")
+                if not parent_id or parent_id in seen:
+                    break
+                parent = await self.get_session(parent_id)
+                if not parent:
+                    break
+                seen.add(parent_id)
+                current = parent
+            return str(current.get("id") or session_id) if current else session_id
+        except Exception:
+            return session_id
+
+    async def _session_turn_lease_key_on_connection(
+        self, connection, session_id: str
+    ) -> str:
+        """Resolve the lease key without opening a nested SQLite connection."""
+        if not session_id:
+            return session_id
+        rows = await (
+            await connection.execute(
+                "SELECT id, parent_session_id, end_reason, source, model_config "
+                "FROM sessions"
+            )
+        ).fetchall()
+        by_id = {str(row["id"]): row for row in rows}
+        current = by_id.get(session_id)
+        seen = {session_id}
+        while current:
+            raw_config = current["model_config"]
+            config = _json_value(raw_config, {}) if raw_config else {}
+            explicit_fork = current["source"] == "tool" or (
+                isinstance(config, dict)
+                and bool(config.get("_branched_from") or config.get("_delegate_from"))
+            )
+            parent_id = current["parent_session_id"]
+            if explicit_fork or not parent_id or parent_id in seen:
+                break
+            parent = by_id.get(str(parent_id))
+            if parent is None or parent["end_reason"] != "compression":
+                break
+            seen.add(str(parent_id))
+            current = parent
+        return str(current["id"]) if current else session_id
+
+    async def try_acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+        patience_s: float | None = None,
+    ) -> bool:
+        """Atomically acquire the cross-process turn lease for a conversation."""
+        if not session_id or not holder:
+            return False
+        conversation_id = await self._session_turn_lease_key(session_id)
+        now = time.time()
+
+        async def _acquire(connection):
+            row = await (
+                await connection.execute(
+                    "SELECT holder, expires_at FROM session_turn_leases "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+            ).fetchone()
+            if row is not None and (
+                float(row["expires_at"]) <= now
+                or await _compression_lock_holder_process_is_dead(row["holder"])
+            ):
+                await connection.execute(
+                    "DELETE FROM session_turn_leases "
+                    "WHERE conversation_id = ? AND holder = ?",
+                    (conversation_id, row["holder"]),
+                )
+            await connection.execute(
+                "INSERT OR IGNORE INTO session_turn_leases "
+                "(conversation_id, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (conversation_id, holder, now, now + max(0.1, float(ttl_seconds))),
+            )
+            owner = await (
+                await connection.execute(
+                    "SELECT holder FROM session_turn_leases "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+            ).fetchone()
+            return owner is not None and owner["holder"] == holder
+
+        return bool(await self._execute_write(_acquire, patience_s=patience_s))
+
+    async def acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+        wait_seconds: float = 1800.0,
+        poll_interval_seconds: float = 1.0,
+        on_wait=None,
+        wait_notice_interval_seconds: float = 15.0,
+        should_abort=None,
+        acquire_patience_s: float = 0.5,
+    ) -> bool:
+        """Wait for a cross-process turn lease without holding a SQLite lock."""
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        while True:
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        return False
+                except Exception:
+                    logger.debug(
+                        "session turn lease should_abort callback failed",
+                        exc_info=True,
+                    )
+            try:
+                if await self.try_acquire_session_turn_lease(
+                    session_id,
+                    holder,
+                    ttl_seconds=ttl_seconds,
+                    patience_s=acquire_patience_s,
+                ):
+                    return True
+            except sqlite3.Error as exc:
+                if classify_persistence_error(exc) != "locked":
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            elapsed = max(0.0, float(wait_seconds) - remaining)
+            if on_wait is not None and (
+                elapsed == 0.0
+                or wait_notice_interval_seconds <= 0.0
+                or elapsed % max(0.01, float(wait_notice_interval_seconds))
+                < max(0.01, float(poll_interval_seconds))
+            ):
+                try:
+                    on_wait(elapsed)
+                except Exception:
+                    logger.debug(
+                        "session turn lease on_wait callback failed",
+                        exc_info=True,
+                    )
+            await asyncio.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
+
+    async def refresh_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Extend a turn lease only while its holder still matches."""
+        if not session_id or not holder:
+            return False
+        conversation_id = await self._session_turn_lease_key(session_id)
+
+        async def _refresh(connection):
+            cursor = await connection.execute(
+                "UPDATE session_turn_leases SET expires_at = ? "
+                "WHERE conversation_id = ? AND holder = ?",
+                (
+                    time.time() + max(0.1, float(ttl_seconds)),
+                    conversation_id,
+                    holder,
+                ),
+            )
+            return cursor.rowcount > 0
+
+        return bool(await self._execute_write(_refresh))
+
+    async def release_session_turn_lease(self, session_id: str, holder: str) -> None:
+        """Release a turn lease iff its holder still matches; idempotent."""
+        if not session_id or not holder:
+            return
+        conversation_id = await self._session_turn_lease_key(session_id)
+
+        async def _release(connection):
+            await connection.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE conversation_id = ? AND holder = ?",
+                (conversation_id, holder),
+            )
+
+        await self._execute_write(_release)
+
     async def touch_session_activity(
         self,
         session_id: str,
@@ -3130,11 +3537,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             last_activity_provenance=row.get("last_activity_provenance"),
         )
 
+    async def get_active_message_watermark(self, session_id: str) -> int:
+        """Return the active message row watermark used by compression."""
+        if not session_id:
+            return 0
+
+        async def _read(connection):
+            row = await (
+                await connection.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS watermark FROM messages "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+            ).fetchone()
+            return int(row["watermark"]) if row else 0
+
+        async with self._read_ctx() as connection:
+            return await _read(connection)
+
     async def archive_and_compact(
         self,
         session_id: str,
         compacted_messages: list[dict[str, Any]],
         model_config_patch: dict[str, Any] | None = None,
+        watermark: int | None = None,
+        lock_holder: str | None = None,
     ) -> int:
         """Atomically archive live rows and insert the compacted transcript.
 
@@ -3143,6 +3570,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         upstream JSON-patch contract used by compression runway state.
         """
         async def _archive(connection):
+            if lock_holder is not None:
+                lock_row = await (
+                    await connection.execute(
+                        "SELECT holder, expires_at FROM compression_locks "
+                        "WHERE session_id = ?",
+                        (session_id,),
+                    )
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or lock_row["holder"] != lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise SessionCompressionInProgressError(
+                        f"Compression lease for {session_id!r} lost before "
+                        "commit; refusing to publish a stale compaction"
+                    )
             patched_model_config: str | None = None
             if model_config_patch is not None:
                 row = await (
@@ -3171,99 +3615,77 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         config[key] = value
                 patched_model_config = json.dumps(config)
 
+            tail_ids: list[int] = []
+            tail_tool_calls = 0
+            if watermark is not None:
+                tail_rows = await (
+                    await connection.execute(
+                        "SELECT id, tool_calls FROM messages "
+                        "WHERE session_id = ? AND active = 1 AND id > ? "
+                        "ORDER BY id",
+                        (session_id, int(watermark)),
+                    )
+                ).fetchall()
+                for row in tail_rows:
+                    tail_ids.append(int(row["id"]))
+                    raw_tool_calls = row["tool_calls"]
+                    if raw_tool_calls:
+                        try:
+                            parsed = (
+                                json.loads(raw_tool_calls)
+                                if isinstance(raw_tool_calls, str)
+                                else raw_tool_calls
+                            )
+                            tail_tool_calls += (
+                                len(parsed) if isinstance(parsed, list) else 0
+                            )
+                        except (TypeError, ValueError):
+                            pass
+
             await connection.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
-            now_ts = time.time()
-            tool_calls_total = 0
-            for message in compacted_messages:
-                role = message.get("role", "unknown")
-                tool_calls = message.get("tool_calls")
-                if isinstance(tool_calls, str):
-                    try:
-                        tool_calls = json.loads(tool_calls)
-                    except (json.JSONDecodeError, TypeError):
-                        tool_calls = []
-                timestamp = message.get("timestamp", now_ts)
-                try:
-                    timestamp = float(
-                        timestamp.timestamp()
-                        if hasattr(timestamp, "timestamp")
-                        else timestamp
-                    )
-                except (TypeError, ValueError):
-                    timestamp = now_ts
-                reasoning_details = (
-                    message.get("reasoning_details") if role == "assistant" else None
-                )
-                codex_reasoning_items = (
-                    message.get("codex_reasoning_items") if role == "assistant" else None
-                )
-                codex_message_items = (
-                    message.get("codex_message_items") if role == "assistant" else None
-                )
+            inserted, tool_calls_total = await self._insert_message_rows(
+                connection, session_id, compacted_messages
+            )
+            if tail_ids:
+                columns = [
+                    str(row["name"])
+                    for row in await (
+                        await connection.execute("PRAGMA table_info(messages)")
+                    ).fetchall()
+                    if str(row["name"]) not in {"id", "active", "compacted"}
+                ]
+                column_list = ", ".join(columns)
+                placeholders = ",".join("?" for _ in tail_ids)
                 await connection.execute(
-                    """INSERT INTO messages (session_id, role, content, tool_call_id,
-                       tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
-                       reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                       codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        role,
-                        self._encode_content(message.get("content")),
-                        message.get("tool_call_id"),
-                        json.dumps(tool_calls) if tool_calls else None,
-                        _scrub_surrogates(message.get("tool_name")),
-                        message.get("effect_disposition"),
-                        timestamp,
-                        message.get("token_count"),
-                        message.get("finish_reason"),
-                        _scrub_surrogates(message.get("reasoning"))
-                        if role == "assistant"
-                        else None,
-                        _scrub_surrogates(message.get("reasoning_content"))
-                        if role == "assistant"
-                        else None,
-                        json.dumps(reasoning_details) if reasoning_details else None,
-                        json.dumps(codex_reasoning_items) if codex_reasoning_items else None,
-                        json.dumps(codex_message_items) if codex_message_items else None,
-                        message.get("platform_message_id") or message.get("message_id"),
-                        1 if message.get("observed") else 0,
-                        1,
-                        _scrub_surrogates(message.get("api_content"))
-                        if isinstance(message.get("api_content"), str)
-                        else None,
-                        _scrub_surrogates(message.get("display_kind"))
-                        if isinstance(message.get("display_kind"), str)
-                        else None,
-                        self._encode_display_metadata(message.get("display_metadata")),
-                    ),
+                    f"INSERT INTO messages ({column_list}, active, compacted) "
+                    f"SELECT {column_list}, 1, 0 FROM messages "
+                    f"WHERE id IN ({placeholders}) ORDER BY id",
+                    tuple(tail_ids),
                 )
-                tool_calls_total += (
-                    len(tool_calls) if isinstance(tool_calls, list) else int(tool_calls is not None)
-                )
-                now_ts = max(now_ts + 1e-6, timestamp + 1e-6)
+                inserted += len(tail_ids)
+                tool_calls_total += tail_tool_calls
             if model_config_patch is None:
                 await connection.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ? "
                     "WHERE id = ?",
-                    (len(compacted_messages), tool_calls_total, session_id),
+                    (inserted, tool_calls_total, session_id),
                 )
             else:
                 await connection.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
                     "model_config = ? WHERE id = ?",
                     (
-                        len(compacted_messages),
+                        inserted,
                         tool_calls_total,
                         patched_model_config,
                         session_id,
                     ),
                 )
-            return len(compacted_messages)
+            return inserted
 
         return await self._execute_write(_archive)
 
@@ -3491,6 +3913,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: float | None = None,
+        api_call_count: int = 1,
     ) -> None:
         """Record one auxiliary-model usage delta for the session."""
         if not session_id or not task:
@@ -3514,7 +3937,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 actual_cost_usd=None,
                 cost_status=None,
                 cost_source=None,
-                api_call_count=1,
+                api_call_count=api_call_count,
                 task=task,
             )
 
@@ -4395,6 +4818,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.archived = 0")
         return " AND ".join(clauses), params
 
+    @staticmethod
+    def _apply_prune_age_filter(
+        older_than_days: float | None, filters: dict[str, Any]
+    ) -> None:
+        """Translate the legacy age window into the shared activity filter."""
+        if (
+            filters.get("last_active_before") is None
+            and filters.get("started_before") is None
+            and older_than_days is not None
+        ):
+            filters["last_active_before"] = time.time() - (
+                float(older_than_days) * 86_400
+            )
+
     async def list_prune_candidates(
         self,
         older_than_days: float | None = None,
@@ -4402,14 +4839,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         **filters,
     ) -> list[dict[str, Any]]:
         """Return sessions a matching prune/archive call would touch."""
-        if (
-            filters.get("last_active_before") is None
-            and filters.get("started_before") is None
-            and older_than_days is not None
-        ):
-            filters["last_active_before"] = time.time() - (
-                older_than_days * 86_400
-            )
+        self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
         connection = await self._get_connection()
         rows = await (
@@ -4427,6 +4857,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         ).fetchall()
         return [dict(row) for row in rows]
+
+    async def count_open_prune_matches(
+        self,
+        older_than_days: float | None = None,
+        source: str | None = None,
+        **filters,
+    ) -> int:
+        """Count live sessions skipped by a matching destructive prune.
+
+        The normal prune predicate always requires an ended session.  This
+        visibility-only query applies the same filters while inverting only
+        that safety guard, so callers can explain skipped rows without making
+        active sessions eligible for deletion.
+        """
+        self._apply_prune_age_filter(older_than_days, filters)
+        where, params = self._prune_filter_where(source=source, **filters)
+        ended_guard = "s.ended_at IS NOT NULL"
+        if not where.startswith(ended_guard):
+            raise RuntimeError("prune filter lost its ended-session safety guard")
+        open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
+            )
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     async def archive_sessions(
         self,
@@ -4477,14 +4934,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         sessions_dir: Path | None = None,
         **filters,
     ) -> int:
-        if (
-            filters.get("last_active_before") is None
-            and filters.get("started_before") is None
-            and older_than_days is not None
-        ):
-            filters["last_active_before"] = time.time() - (
-                float(older_than_days) * 86_400
-            )
+        self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
         removed_ids: list[str] = []
 
@@ -5467,6 +5917,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compact_rows: bool = False,
         include_pinned: bool = False,
         session_key: str | None = None,
+        include_hidden: bool = False,
     ) -> list[dict[str, Any]]:
         """List enriched sessions with upstream filtering and projection."""
         await self.flush_token_counts()
@@ -5501,6 +5952,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if not include_hidden:
+            where_clauses.append("s.hidden = 0")
 
         where_sql = (
             f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
@@ -5921,7 +6374,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> list[dict[str, Any]]:
         """Load a conversation through the native async SQLite connection."""
         session_ids = [session_id]
-        if include_ancestors:
+        if include_ancestors and not await self._is_explicit_branch_session(session_id):
             session_ids = await self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
@@ -5963,7 +6416,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         output (see test_get_resume_conversations_matches_separate_reads).
         """
         await self.assert_resume_safe(session_id)
-        session_ids = await self._session_lineage_root_to_tip(session_id)
+        session_ids = (
+            [session_id]
+            if await self._is_explicit_branch_session(session_id)
+            else await self._session_lineage_root_to_tip(session_id)
+        )
         async with self._read_ctx() as connection:
             placeholders = ",".join("?" for _ in session_ids)
             rows = await (
@@ -6097,6 +6554,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         returns ONLY the genuine ancestor messages, identified by
         ``session_id != tip_session_id``. (#65919)
         """
+        if await self._is_explicit_branch_session(session_id):
+            return []
         session_ids = await self._session_lineage_root_to_tip(session_id)
         if len(session_ids) <= 1:
             return []
@@ -6149,6 +6608,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     else row[0]
                 )
         return list(reversed(chain)) or [session_id]
+
+    async def _is_explicit_branch_session(self, session_id: str) -> bool:
+        """Return whether a session owns a copied branch transcript."""
+        if not session_id:
+            return False
+        async with self._read_ctx() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT model_config FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+        if row is None:
+            return False
+        raw_config = row["model_config"] if hasattr(row, "keys") else row[0]
+        if not raw_config:
+            return False
+        try:
+            config = (
+                json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+            )
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(config, dict) and bool(config.get("_branched_from"))
 
     async def find_live_compression_child(
         self, parent_session_id: str
@@ -6606,6 +7089,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = await self._execute_write(_do)
         return rowcount > 0
 
+    async def set_session_hidden(
+        self, session_id: str, hidden: bool
+    ) -> bool:
+        """Hide or unhide a session and its compression lineage.
+
+        Hidden sessions stay resumable by the surface that owns them, but are
+        omitted from the default session listing. Compression ancestors and
+        descendants are updated together, matching the archived and pinned
+        session flags.
+        """
+        async def _do(conn):
+            cursor = await conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET hidden = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, 1 if hidden else 0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = (
+                    await (await conn.execute("SELECT changes()")).fetchone()
+                )[0]
+            return rowcount
+
+        rowcount = await self._execute_write(_do)
+        return rowcount > 0
+
     async def set_session_read(self, session_id: str, read: bool = True) -> bool:
         """Mark a session read/unread across its compression lineage.
 
@@ -6678,6 +7214,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str | None = None,
         compression_lock_holder: str | None = None,
         require_compression_lease: bool = True,
+        watermark: int | None = None,
+        watermark_ceiling: int | None = None,
     ) -> None:
         """Publish a compressed continuation without a sync SQLite bridge."""
         if not messages:
@@ -6806,9 +7344,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     len(tool_calls) if isinstance(tool_calls, list) else int(tool_calls is not None)
                 )
                 now_ts = max(now_ts + 1e-6, timestamp + 1e-6)
+            if watermark is not None:
+                ceiling_clause = ""
+                tail_params: list[Any] = [parent_session_id, int(watermark)]
+                if watermark_ceiling is not None:
+                    ceiling_clause = " AND id <= ?"
+                    tail_params.append(int(watermark_ceiling))
+                tail_rows = await (
+                    await connection.execute(
+                        "SELECT id, tool_calls FROM messages "
+                        "WHERE session_id = ? AND active = 1 AND id > ?"
+                        f"{ceiling_clause} ORDER BY id",
+                        tuple(tail_params),
+                    )
+                ).fetchall()
+                if tail_rows:
+                    tail_ids = [int(row["id"]) for row in tail_rows]
+                    columns = [
+                        str(row["name"])
+                        for row in await (
+                            await connection.execute("PRAGMA table_info(messages)")
+                        ).fetchall()
+                        if str(row["name"])
+                        not in {"id", "session_id", "active", "compacted"}
+                    ]
+                    column_list = ", ".join(columns)
+                    placeholders = ",".join("?" for _ in tail_ids)
+                    await connection.execute(
+                        f"INSERT INTO messages ({column_list}, session_id, active, compacted) "
+                        f"SELECT {column_list}, ?, 1, 0 FROM messages "
+                        f"WHERE id IN ({placeholders}) ORDER BY id",
+                        (child_session_id, *tail_ids),
+                    )
+                    for row in tail_rows:
+                        raw_tool_calls = row["tool_calls"]
+                        if not raw_tool_calls:
+                            continue
+                        try:
+                            parsed = (
+                                json.loads(raw_tool_calls)
+                                if isinstance(raw_tool_calls, str)
+                                else raw_tool_calls
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(parsed, list):
+                            tool_calls_total += len(parsed)
+                    messages_count = len(messages) + len(tail_rows)
+                else:
+                    messages_count = len(messages)
+            else:
+                messages_count = len(messages)
             await connection.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (len(messages), tool_calls_total, child_session_id),
+                (messages_count, tool_calls_total, child_session_id),
             )
             updated = await connection.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "

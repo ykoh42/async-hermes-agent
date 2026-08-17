@@ -382,6 +382,50 @@ class TestMemoryToolDispatcher:
         assert "content is required" in result["error"]
         assert "current_entries" not in result
 
+    async def test_new_text_alias_for_single_operation(self, store):
+        await store.add("memory", "fact A")
+        result = json.loads(
+            await memory_tool(
+                action="replace",
+                old_text="fact A",
+                new_text="fact A refined",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert "fact A refined" in store.memory_entries
+
+    async def test_new_text_alias_for_batch_operation(self, store):
+        await store.add("memory", "old entry")
+        result = json.loads(
+            await memory_tool(
+                operations=[
+                    {
+                        "action": "replace",
+                        "old_text": "old entry",
+                        "new_text": "updated entry",
+                    },
+                    {"action": "add", "new_text": "new entry"},
+                ],
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert set(store.memory_entries) == {"updated entry", "new entry"}
+
+    async def test_content_wins_over_new_text(self, store):
+        result = json.loads(
+            await memory_tool(
+                action="add",
+                content="canonical content",
+                new_text="ignored alias",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert "canonical content" in store.memory_entries
+        assert "ignored alias" not in store.memory_entries
+
 
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""

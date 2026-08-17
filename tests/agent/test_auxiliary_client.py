@@ -41,6 +41,34 @@ from agent.auxiliary_client import (
 
 
 @pytest.mark.asyncio
+async def test_bedrock_auxiliary_omitted_max_tokens_is_uncapped(monkeypatch):
+    from agent.auxiliary_client import BedrockAuxiliaryClient
+
+    captured = []
+
+    async def fake_call_converse(**kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("agent.bedrock_adapter.call_converse", fake_call_converse)
+    client = BedrockAuxiliaryClient("us-east-1", "test-model")
+
+    await client.chat.completions.create(
+        model="test-model",
+        messages=[{"role": "user", "content": "describe"}],
+        temperature=0.1,
+    )
+    await client.chat.completions.create(
+        model="test-model",
+        messages=[{"role": "user", "content": "describe"}],
+        max_tokens=1234,
+    )
+
+    assert captured[0]["max_tokens"] is None
+    assert captured[1]["max_tokens"] == 1234
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "paid_service_access, expected", [(True, True), (False, False), (None, False)]
 )

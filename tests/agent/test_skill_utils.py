@@ -17,6 +17,7 @@ from agent.skill_utils import (
     is_external_skill_path,
     is_skill_support_path,
     iter_skill_index_files,
+    parse_config_string_list,
     parse_frontmatter,
     resolve_skill_config_values,
     skill_matches_platform,
@@ -245,6 +246,17 @@ class TestSkillMatchesPlatformTermux:
             assert skill_matches_platform(fm) is True
             assert skill_matches_platform_list(fm["platforms"]) is True
 
+
+
+def test_parse_config_string_list_supports_json_and_python_array_strings():
+    assert parse_config_string_list('["skill-a", "skill-b"]') == [
+        "skill-a",
+        "skill-b",
+    ]
+    assert parse_config_string_list("['skill-a']") == ["skill-a"]
+    assert parse_config_string_list("skill-a") == ["skill-a"]
+    assert parse_config_string_list("[]") == []
+    assert parse_config_string_list(None) == []
 
 
 @pytest.mark.asyncio

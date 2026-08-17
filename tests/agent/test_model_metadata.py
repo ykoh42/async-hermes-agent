@@ -43,6 +43,7 @@ from agent.model_metadata import (
     _MODEL_CACHE_TTL,
     estimate_request_tokens_rough,
 )
+from agent.model_metadata import _wire_message_shadow
 
 
 class TestStaticContextLength:
@@ -75,6 +76,14 @@ class TestEstimateTokensRough:
 
 
 class TestEstimateMessagesTokensRough:
+
+    async def test_persistence_timestamp_does_not_affect_wire_token_shadow(self):
+        message = {
+            "role": "user",
+            "content": "hello",
+            "timestamp": 1234567890.0,
+        }
+        assert "timestamp" not in _wire_message_shadow(message)
 
 
 

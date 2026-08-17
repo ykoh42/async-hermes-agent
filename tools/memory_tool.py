@@ -508,7 +508,9 @@ class MemoryStore:
             return {"success": False, "error": "operations list is empty."}
         for index, operation in enumerate(operations):
             action = (operation or {}).get("action")
-            content = (operation or {}).get("content")
+            content = (operation or {}).get("content") or (operation or {}).get(
+                "new_text"
+            )
             if action in {"add", "replace"} and content:
                 scan_error = _scan_memory_content(content)
                 if scan_error:
@@ -524,7 +526,9 @@ class MemoryStore:
             for index, operation in enumerate(operations):
                 operation = operation or {}
                 action = operation.get("action")
-                content = (operation.get("content") or "").strip()
+                content = (
+                    operation.get("content") or operation.get("new_text") or ""
+                ).strip()
                 old_text = (operation.get("old_text") or "").strip()
                 label = f"Operation {index + 1} ({action or 'unknown'})"
                 if action == "add":
@@ -789,6 +793,7 @@ async def memory_tool(
     target: str = "memory",
     content: str | None = None,
     old_text: str | None = None,
+    new_text: str | None = None,
     operations: list[dict[str, Any]] | None = None,
     store: MemoryStore | None = None,
 ) -> str:
@@ -798,6 +803,8 @@ async def memory_tool(
             "Memory is not available. It may be disabled in config or this environment.",
             success=False,
         )
+    if content is None and new_text is not None:
+        content = new_text
     if target is None:
         target = "memory"
     if target not in {"memory", "user"}:
@@ -886,6 +893,10 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "The entry content. Required for 'add' and 'replace' (single-op shape)."
             },
+            "new_text": {
+                "type": "string",
+                "description": "Alias for 'content' (single-op shape and batch operations)."
+            },
             "old_text": {
                 "type": "string",
                 "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
@@ -901,7 +912,8 @@ MEMORY_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                        "content": {"type": "string", "description": "Entry content for add/replace."},
+                        "content": {"type": "string", "description": "Entry content for add/replace. Alias: 'new_text'."},
+                        "new_text": {"type": "string", "description": "Alias for 'content' in a batch operation."},
                         "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
                     },
                     "required": ["action"],
@@ -924,6 +936,7 @@ async def _handle_memory(args: dict, **kwargs) -> str:
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        new_text=args.get("new_text"),
         operations=args.get("operations"),
         store=kwargs.get("store"),
     )

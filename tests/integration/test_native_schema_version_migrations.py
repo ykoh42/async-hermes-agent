@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import sqlite3
 
 import pytest
 from blockbuster import BlockBuster
@@ -36,9 +37,9 @@ async def _fetchall(connection, sql: str, params=()):
         return await cursor.fetchall()
 
 
-async def test_core_schema_sql_matches_upstream_v2026_8_13():
+async def test_core_schema_sql_matches_retained_upstream_v2026_8_16():
     assert hashlib.sha256(SCHEMA_SQL.encode()).hexdigest() == (
-        "c87efa081022ef5954172f4141750659d4828be57324f2a284d3b8f21c6fc8e8"
+        "cfae91dbc91892d6826bda8223f9d33ee1752dc31d085b01cb1b542f5be2b277"
     )
 
 
@@ -394,3 +395,35 @@ async def test_schema_migration_module_preserves_coroutine_api_shape():
         "_init_schema",
     ):
         assert inspect.iscoroutinefunction(getattr(SessionDB, name))
+
+
+async def test_reconcile_locked_alter_is_not_silently_swallowed(monkeypatch):
+    """A locked ALTER must escape so the whole schema init can retry."""
+    class _Result:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def fetchall(self):
+            return []
+
+    class _Cursor:
+        def execute(self, sql, *_args):
+            if sql.lstrip().upper().startswith("ALTER TABLE"):
+                raise sqlite3.OperationalError("database is locked")
+            return _Result()
+
+    database = SessionDB.__new__(SessionDB)
+
+    async def _columns(_schema):
+        return {"sessions": {"new_column": "TEXT"}}
+
+    monkeypatch.setattr(
+        database,
+        "_parse_schema_columns",
+        _columns,
+    )
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await database._reconcile_columns(_Cursor())

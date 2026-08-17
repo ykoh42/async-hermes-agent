@@ -154,6 +154,71 @@ async def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
     assert implicit is True
 
 
+@pytest.mark.asyncio
+async def test_automatic_reasoning_floor_preserves_local_nonstream_opt_out(
+    monkeypatch, tmp_path
+):
+    """An automatic floor remains implicit for local endpoint opt-out."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+    import run_agent
+
+    monkeypatch.setattr(
+        run_agent, "get_provider_stale_timeout", AsyncMock(return_value=None)
+    )
+    agent = _make_agent(
+        tmp_path,
+        provider="openai-api",
+        base_url="http://localhost:5001/v1",
+        model="Qwen3.8-27B",
+    )
+    base, implicit = await agent._resolved_api_call_stale_timeout_base()
+    assert base == 180.0
+    assert implicit is True
+    assert await agent._compute_non_stream_stale_timeout({"messages": []}) == float("inf")
+
+
+@pytest.mark.asyncio
+async def test_automatic_reasoning_floor_remains_finite_for_cloud_endpoint(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+    import run_agent
+
+    monkeypatch.setattr(
+        run_agent, "get_provider_stale_timeout", AsyncMock(return_value=None)
+    )
+    agent = _make_agent(
+        tmp_path,
+        provider="openai-api",
+        base_url="https://models.example.com/v1",
+        model="Qwen3.8-27B",
+    )
+    assert await agent._compute_non_stream_stale_timeout({"messages": []}) == 180.0
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_reasoning_timeout_remains_finite(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+    import run_agent
+
+    monkeypatch.setattr(
+        run_agent, "get_provider_stale_timeout", AsyncMock(return_value=420.0)
+    )
+    agent = _make_agent(
+        tmp_path,
+        provider="openai-api",
+        base_url="http://localhost:5001/v1",
+        model="Qwen3.8-27B",
+    )
+    assert await agent._compute_non_stream_stale_timeout({"messages": []}) == 420.0
+
+
 # ── stream-side mirror ────────────────────────────────────────────────────
 
 
@@ -205,5 +270,4 @@ def test_stream_stale_timeout_floor_for_nemotron_3_ultra():
         est_tokens=10_000,
     )
     assert timeout == 600.0
-
 

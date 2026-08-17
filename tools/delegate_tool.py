@@ -164,7 +164,7 @@ def _get_subagent_approval_callback():
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
 
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
 # per process. _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild (via _build_top_level_description / _build_tasks_param_description),
@@ -944,7 +944,7 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
-DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_MAX_ITERATIONS = 250
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.

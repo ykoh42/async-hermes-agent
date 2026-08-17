@@ -188,9 +188,8 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
+    "When you work out a non-trivial workflow, record it with skill_manage "
+    "for future reuse.\n"
     "When using a skill and finding it outdated, incomplete, or wrong, "
     "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
     "Skills that aren't maintained become liabilities.\n"
@@ -782,7 +781,7 @@ def drain_truncation_warnings() -> list:
 # Skills prompt cache
 # =========================================================================
 
-_SKILLS_PROMPT_CACHE_MAX = 8
+_SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
@@ -1017,6 +1016,7 @@ async def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    skills_dir_override: Path | None = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1038,7 +1038,7 @@ async def build_skills_system_prompt(
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
     """
-    skills_dir = get_skills_dir()
+    skills_dir = skills_dir_override or get_skills_dir()
     try:
         external_dirs = await _external_skills_dirs()
     except Exception:
@@ -1417,14 +1417,18 @@ def _truncate_content(
     return head + marker + tail
 
 
-async def load_soul_md(context_length: int | None = None) -> str | None:
+async def load_soul_md(
+    context_length: int | None = None,
+    *,
+    home_override: Path | None = None,
+) -> str | None:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
-    soul_path = get_hermes_home() / "SOUL.md"
+    soul_path = (home_override or get_hermes_home()) / "SOUL.md"
     if not await aiofiles.os.path.isfile(soul_path):
         return None
     try:
@@ -1635,6 +1639,7 @@ async def build_context_files_prompt(
     skip_soul: bool = False,
     context_length: int | None = None,
     allow_install_tree_fallback: bool = False,
+    home_override: Path | None = None,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -1708,7 +1713,10 @@ async def build_context_files_prompt(
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
-        soul_content = await load_soul_md(context_length)
+        soul_content = await load_soul_md(
+            context_length,
+            home_override=home_override,
+        )
         if soul_content:
             sections.append(soul_content)
 

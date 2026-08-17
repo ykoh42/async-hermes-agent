@@ -37,6 +37,7 @@ def test_public_session_interface_is_async():
         "finalize_orphaned_compression_sessions",
         "backfill_repo_roots",
         "list_prune_candidates",
+        "count_open_prune_matches",
         "archive_sessions",
         "archive_stale_sessions",
         "logical_size_bytes",
@@ -1118,6 +1119,32 @@ async def test_prune_sessions_uses_last_activity_and_upstream_filters(db):
     assert await db.prune_sessions(title_like="batch", max_messages=1) == 1
     assert await db.get_session("stale") is None
     assert await db.get_session("active") is not None
+
+
+@pytest.mark.asyncio
+async def test_count_open_prune_matches_inverts_only_ended_guard(db):
+    old = time.time() - 120 * 86_400
+    await db.create_session("open", source="library")
+    await db.append_message("open", role="user", content="open")
+    await db.create_session("ended", source="library")
+    await db.append_message("ended", role="user", content="ended")
+    await db.end_session("ended", "done")
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id IN ('open', 'ended')", (old,)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id IN ('open', 'ended')",
+        (old,),
+    )
+    await connection.commit()
+
+    assert await db.count_open_prune_matches(source="library") == 1
+    assert await db.count_open_prune_matches(
+        older_than_days=30, source="library"
+    ) == 1
+    assert await db.prune_sessions(older_than_days=30, source="library") == 1
+    assert await db.get_session("open") is not None
 
 
 @pytest.mark.asyncio

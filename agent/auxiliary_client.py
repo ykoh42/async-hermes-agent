@@ -1706,7 +1706,10 @@ class _BedrockCompletionsAdapter:
             model=kwargs.get("model", self._model),
             messages=kwargs.get("messages", []),
             tools=kwargs.get("tools"),
-            max_tokens=int(max_tokens) if max_tokens else 4096,
+            # Omitted auxiliary caps should reach Converse as ``None`` so
+            # Bedrock can use the model's maximum output budget. Explicit
+            # values remain unchanged.
+            max_tokens=int(max_tokens) if max_tokens else None,
             temperature=kwargs.get("temperature"),
             top_p=kwargs.get("top_p"),
             stop_sequences=stop,

@@ -2,12 +2,14 @@
 
 Native-async, library-focused distribution of
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), based
-on upstream tag `v2026.8.13` (Python package version `0.20.1`).
+on upstream tag `v2026.8.16` (Python package version `0.20.2`).
 
 This repository keeps the Hermes agent loop, model providers, tool execution,
 MCP, skills, persistent memory and sessions, trajectory generation, runner, and
-batch runner. The CLI/TUI, messaging bridges, scheduler, dashboard, and FastAPI
-application are intentionally outside this package.
+batch runner. The interactive Hermes CLI/TUI, messaging bridges, scheduler,
+dashboard, and FastAPI application are intentionally outside this package. The
+upstream-compatible `batch_runner.py` script entrypoint remains available for
+dataset generation.
 
 The public core API keeps the upstream names and module locations. Existing
 library integrations normally only need to add `await`:
@@ -54,15 +56,15 @@ instances can run concurrently.
 Python 3.11 through 3.13 is supported.
 
 ```bash
-uv pip install "async-hermes-agent==0.20.1.2"
+uv pip install "async-hermes-agent==0.20.2.1"
 ```
 
 Versioned packages are published to PyPI through GitHub OIDC Trusted
 Publishing. The same verified wheel, source distribution, and checksums are
 attached to the corresponding GitHub Release.
 
-The package version has four numeric segments: `0.20.1.2` means upstream
-Python version `0.20.1` plus async-distribution revision `2`. Fork-only releases
+The package version has four numeric segments: `0.20.2.1` means upstream
+Python version `0.20.2` plus async-distribution revision `1`. Fork-only releases
 increment the fourth segment. When a new upstream version is ported, the first
 three segments change to match it and the async revision restarts at `1`.
 
@@ -70,7 +72,7 @@ The earlier `0.20.4` GitHub release used the old independent version scheme.
 If it was installed from that Git tag, migrate explicitly once:
 
 ```bash
-uv pip install --reinstall "async-hermes-agent==0.20.1.2"
+uv pip install --reinstall "async-hermes-agent==0.20.2.1"
 ```
 
 For development:
@@ -104,12 +106,12 @@ runtime.
 The Honcho extra pins the native-async SDK version validated by this package.
 Select `memory.provider: honcho` in `config.yaml`; connection, identity,
 cadence, and session settings are documented in the
-[Honcho provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.2/plugins/memory/honcho/README.md).
+[Honcho provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.2.1/plugins/memory/honcho/README.md).
 
 OpenViking uses the core native-async HTTP transport and needs no Python
 extra. Server setup, provider configuration, async lifecycle, recall, and tool
 behavior are documented in the
-[OpenViking provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.2/plugins/memory/openviking/README.md).
+[OpenViking provider guide](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.2.1/plugins/memory/openviking/README.md).
 
 ## Sessions
 
@@ -302,10 +304,31 @@ async def run_one_task():
 result = asyncio.run(run_one_task())
 ```
 
-For datasets, use `BatchRunner` from the unchanged `batch_runner.py` module and
-await its existing `run()` method. It retains bounded concurrency, checkpoints,
-resume support, and JSONL output. `trajectory_compressor.py` remains available
-for post-processing generated trajectories.
+For datasets, the upstream-compatible command-line entrypoint remains
+available from a source checkout:
+
+```bash
+python batch_runner.py \
+    --dataset_file=data/prompts.jsonl \
+    --batch_size=10 \
+    --run_name=my_first_run \
+    --model=anthropic/claude-sonnet-4.6 \
+    --num_workers=4
+
+# Resume an interrupted run.
+python batch_runner.py \
+    --dataset_file=data/prompts.jsonl \
+    --batch_size=10 \
+    --run_name=my_first_run \
+    --resume
+```
+
+An installed package also supports `python -m batch_runner ...`. The CLI uses
+Fire only at that process boundary; an async web host does not use Fire or
+create a nested event loop. For library and FastAPI use, import `BatchRunner`
+and await its existing `run()` method directly. It retains bounded concurrency,
+checkpoints, resume support, and JSONL output. `trajectory_compressor.py`
+remains available for post-processing generated trajectories.
 
 ```python
 import asyncio
@@ -378,9 +401,9 @@ uv build
 
 ## Contributing and security
 
-Read [CONTRIBUTING.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.2/CONTRIBUTING.md)
+Read [CONTRIBUTING.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.2.1/CONTRIBUTING.md)
 before submitting changes and
-[SECURITY.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.2/SECURITY.md)
+[SECURITY.md](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.2.1/SECURITY.md)
 for private vulnerability reporting.
 
 ## Upstream relationship
@@ -389,9 +412,9 @@ The repository preserves original core file and function names to keep future
 upstream imports reviewable. It is a divergent async distribution, not a claim
 that these changes are drop-in mergeable to the synchronous upstream product.
 
-The deliberate differences from upstream `v2026.8.13` are documented in the
+The deliberate differences from upstream `v2026.8.16` are documented in the
 [upstream differences table](https://ykoh42.github.io/async-hermes-agent/developer-guide/upstream-differences).
 
 Hermes Agent is built by [Nous Research](https://nousresearch.com). This
 distribution retains the upstream MIT license; see
-[LICENSE](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.1.2/LICENSE).
+[LICENSE](https://github.com/ykoh42/async-hermes-agent/blob/v0.20.2.1/LICENSE).

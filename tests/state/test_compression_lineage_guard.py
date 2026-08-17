@@ -112,14 +112,21 @@ async def test_publish_rejects_lost_lease_without_mutation(db):
 
 @pytest.mark.asyncio
 async def test_lease_blocks_non_owner_but_allows_owner_flush(db):
+    """A live compression lease does not fence ordinary appends.
+
+    The watermark commit lets a concurrent turn and the owner's flush land;
+    the commit-side watermark decides what survives compaction.
+    """
     await db.create_session("leased", source="library")
     assert await db.try_acquire_compression_lock("leased", "winner", ttl_seconds=60)
-    with pytest.raises(RuntimeError, match="being compressed"):
-        await db.append_message("leased", "user", "stale")
+    await db.append_message("leased", "user", "late concurrent turn")
     await db.append_message(
         "leased",
         "assistant",
         "winner flush",
         compression_lock_holder="winner",
     )
-    assert [m["content"] for m in await db.get_messages("leased")] == ["winner flush"]
+    assert [m["content"] for m in await db.get_messages("leased")] == [
+        "late concurrent turn",
+        "winner flush",
+    ]

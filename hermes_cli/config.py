@@ -2664,6 +2664,15 @@ def is_provider_enabled(provider_cfg: dict[str, Any] | None) -> bool:
     return bool(flag)
 
 
+def split_model_config_default(raw_default: Any) -> tuple[str, str]:
+    """Flatten a scalar or provider-qualified model default."""
+    if isinstance(raw_default, dict):
+        provider = str(raw_default.get("provider") or "").strip()
+        model = raw_default.get("model") or raw_default.get("default")
+        return str(model or "").strip(), provider
+    return str(raw_default or "").strip(), ""
+
+
 def cfg_get(cfg: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
     """Traverse nested dict keys safely, returning ``default`` on any miss.
 
