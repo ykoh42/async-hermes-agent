@@ -324,6 +324,14 @@ def _get_model_config(
         # Accept "model" as alias for "default" (users intuitively write model.model)
         if not cfg.get("default") and cfg.get("model"):
             cfg["default"] = cfg["model"]
+        _default = cfg.get("default")
+        if isinstance(_default, dict):
+            from hermes_cli.config import split_model_config_default
+
+            cfg_model, cfg_provider = split_model_config_default(_default)
+            cfg["default"] = cfg_model
+            if cfg_provider and not cfg.get("provider"):
+                cfg["provider"] = cfg_provider
         return cfg
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
