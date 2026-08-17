@@ -245,10 +245,10 @@ def test_release_workflow_publishes_verified_artifacts_with_least_privilege():
     assert workflow.count(
         f"re.fullmatch(r'{release_tag_pattern}', tag)"
     ) == 2
-    assert re.fullmatch(release_tag_pattern, "v0.20.1.2")
+    assert re.fullmatch(release_tag_pattern, "v0.20.2.1")
     assert not any(
         re.fullmatch(release_tag_pattern, tag)
-        for tag in ("v0.20.1", "v0.20.1.2.1", "v0.20.1.2rc1", "0.20.1.2")
+        for tag in ("v0.20.2", "v0.20.2.1.1", "v0.20.2.1rc1", "0.20.2.1")
     )
     assert "release:\n    types: [published]" not in workflow
     assert (
@@ -278,8 +278,8 @@ def test_release_workflow_publishes_verified_artifacts_with_least_privilege():
     assert "--json isDraft" in stage_job
     assert 'test "$is_draft" = true' in stage_job
     assert "--draft \\" in stage_job
-    assert 'if [ "$RELEASE_TAG" = "v0.20.1.2" ]; then' in stage_job
-    assert "v2026.8.13" in stage_job
+    assert 'if [ "$RELEASE_TAG" = "v0.20.2.1" ]; then' in stage_job
+    assert "v2026.8.16" in stage_job
     assert '--notes "$release_notes" \\' in stage_job
     assert 'gh release upload "$RELEASE_TAG" dist/* \\' in stage_job
     assert "--clobber \\" in stage_job

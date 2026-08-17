@@ -364,6 +364,28 @@ class TestCodexBuildKwargs:
             )
             assert "reasoning" not in kw, f"{model} must not receive reasoning"
 
+    @pytest.mark.parametrize("effort", ["max", "ultra"])
+    def test_grok_46_aliases_use_model_ceiling(self, transport, effort):
+        kw = transport.build_kwargs(
+            model="x-ai/grok-4.6-latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": effort},
+        )
+        assert kw["reasoning"]["effort"] == "xhigh"
+
+    @pytest.mark.parametrize("effort", ["max", "ultra"])
+    def test_older_grok_aliases_use_high_ceiling(self, transport, effort):
+        kw = transport.build_kwargs(
+            model="grok-4.5",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": effort},
+        )
+        assert kw["reasoning"]["effort"] == "high"
+
 
 
 

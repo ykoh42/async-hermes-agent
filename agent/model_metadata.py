@@ -565,6 +565,7 @@ _GROK_EFFORT_CAPABLE_PREFIXES = (
     "grok-3-mini",
     "grok-4.20-multi-agent",
     "grok-4.3",
+    "grok-4.6",
     # grok-4.5: verified live against /v1/responses 2026-07-08 — accepts
     # effort low/medium/high (default: high when omitted) but REJECTS
     # "none" ("This model does not support `reasoning_effort` value `none`"),

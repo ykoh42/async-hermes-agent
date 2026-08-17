@@ -56,6 +56,224 @@ _STREAM_HEARTBEAT_INTERVAL = 30.0
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+_PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
+_PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
+_PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+
+
+class ProviderStreamError(Exception):
+    """An API error encoded in streaming content instead of SDK metadata."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int | None,
+        body: dict[str, Any],
+        raw_text: str,
+        headers: Any = None,
+    ) -> None:
+        self.status_code = status_code
+        self.body = body
+        self.raw_text = raw_text
+        self.response = SimpleNamespace(headers=headers or {})
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        error = self.body.get("error", {}) if isinstance(self.body, dict) else {}
+        code = error.get("code") if isinstance(error, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        parts = ["Provider stream returned an error event"]
+        if self.status_code:
+            parts.append(f"HTTP {self.status_code}")
+        if code:
+            parts.append(str(code))
+        text = " - ".join(parts)
+        return f"{text}: {message}" if message else text
+
+
+def _status_code_from_value(value: Any) -> int | None:
+    if isinstance(value, int) and 100 <= value < 600:
+        return value
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(?:HTTP_STATUS/)?\b([1-5]\d\d)\b", value, re.I)
+    return int(match.group(1)) if match else None
+
+
+def _status_code_from_payload(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = [payload.get("status_code"), payload.get("status"), payload.get("http_status")]
+    error = payload.get("error")
+    if isinstance(error, dict):
+        candidates.extend(
+            [error.get("status_code"), error.get("status"), error.get("http_status"), error.get("code")]
+        )
+    candidates.append(payload.get("code"))
+    for candidate in candidates:
+        status = _status_code_from_value(candidate)
+        if status is not None:
+            return status
+    return None
+
+
+def _json_object_from_text(text: str) -> dict[str, Any] | None:
+    stripped = (text or "").strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _parse_provider_sse_events(text: str) -> list[dict[str, Any]]:
+    """Parse the small SSE subset used by OpenAI-compatible error streams."""
+    events: list[dict[str, Any]] = []
+    current: dict[str, Any] = {"event": None, "data": [], "comments": [], "fields": {}}
+
+    def flush() -> None:
+        nonlocal current
+        if any(current.values()):
+            data = "\n".join(current["data"])
+            candidates = list(current["comments"])
+            candidates.extend(
+                current["fields"].get(key)
+                for key in ("status", "status_code", "http_status")
+                if key in current["fields"]
+            )
+            events.append(
+                {
+                    "event": current["event"],
+                    "data": data,
+                    "comments": list(current["comments"]),
+                    "fields": dict(current["fields"]),
+                    "status_code": next(
+                        (code for value in candidates if (code := _status_code_from_value(value)) is not None),
+                        None,
+                    ),
+                }
+            )
+        current = {"event": None, "data": [], "comments": [], "fields": {}}
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            flush()
+            continue
+        if line.startswith(":"):
+            current["comments"].append(line[1:].strip())
+            continue
+        field, separator, value = line.partition(":")
+        if not separator:
+            current["fields"][field.strip().lower()] = ""
+            continue
+        field = field.strip().lower()
+        value = value[1:] if value.startswith(" ") else value
+        if field == "event":
+            current["event"] = value.strip()
+        elif field == "data":
+            current["data"].append(value)
+        else:
+            current["fields"][field] = value
+    flush()
+    return events
+
+
+def _provider_error_body(payload: dict[str, Any], status_code: int | None) -> dict[str, Any]:
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        return payload
+    payload = payload if isinstance(payload, dict) else {}
+    code = payload.get("code") or payload.get("error_code") or payload.get("type")
+    code = code or (f"HTTP_{status_code}" if status_code else "provider_stream_error")
+    message = (
+        payload.get("message")
+        or payload.get("error_description")
+        or payload.get("error")
+        or "Provider stream returned an error event."
+    )
+    error: dict[str, Any] = {"message": str(message), "code": str(code)}
+    for key in ("request_id", "param", "type"):
+        if payload.get(key):
+            error[key] = payload[key]
+    return {"error": error}
+
+
+def _payload_has_error_shape(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("error"), (dict, str)):
+        return True
+    return bool(
+        payload.get("message")
+        and (
+            payload.get("code")
+            or payload.get("error_code")
+            or _status_code_from_payload(payload) is not None
+        )
+    )
+
+
+def _provider_stream_error_from_text(
+    text: str,
+    finish_reason: str | None,
+    *,
+    response: Any = None,
+) -> ProviderStreamError | None:
+    if not text or str(finish_reason or "").lower() not in _PROVIDER_STREAM_ERROR_FINISH_REASONS:
+        return None
+    for event in _parse_provider_sse_events(text):
+        event_name = str(event.get("event") or "").strip().lower()
+        payload = _json_object_from_text(event.get("data") or "") or {}
+        status = event.get("status_code") or _status_code_from_payload(payload)
+        if not (
+            status is not None and status >= 400
+            or event_name == "error"
+            or _payload_has_error_shape(payload)
+        ):
+            continue
+        return ProviderStreamError(
+            status_code=status,
+            body=_provider_error_body(payload, status),
+            raw_text=text[:_PROVIDER_STREAM_ERROR_TEXT_LIMIT],
+            headers=getattr(response, "headers", None) if response is not None else None,
+        )
+    payload = _json_object_from_text(text)
+    if payload is not None or text.strip():
+        status = _status_code_from_payload(payload)
+        return ProviderStreamError(
+            status_code=status,
+            body=_provider_error_body(payload or {}, status),
+            raw_text=text[:_PROVIDER_STREAM_ERROR_TEXT_LIMIT],
+            headers=getattr(response, "headers", None) if response is not None else None,
+        )
+    return None
+
+
+def _provider_stream_error_from_json_decode_error(
+    error: json.JSONDecodeError, *, response: Any = None
+) -> ProviderStreamError:
+    from agent.redact import redact_sensitive_text
+    from agent.error_classifier import PROVIDER_STREAM_NON_JSON_ERROR_CODE
+
+    raw_text = str(getattr(error, "doc", "") or "").strip()
+    safe_text = redact_sensitive_text(_sanitize_surrogates(raw_text), force=True)[
+        :_PROVIDER_STREAM_ERROR_TEXT_LIMIT
+    ]
+    return ProviderStreamError(
+        status_code=None,
+        body=_provider_error_body(
+            {
+                "code": PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+                "message": safe_text or "Provider stream returned non-JSON SSE data.",
+            },
+            None,
+        ),
+        raw_text=safe_text,
+        headers=getattr(response, "headers", None) if response is not None else None,
+    )
+
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
     """Estimate context/load tokens from an API payload, dict or messages list.
@@ -728,6 +946,12 @@ def _finalize_chat_stream(accumulator: Any) -> Any:
 
     content = "".join(accumulator.content_parts) or None
     reasoning = "".join(accumulator.reasoning_parts) or None
+    provider_stream_error = _provider_stream_error_from_text(
+        "".join(accumulator.content_parts),
+        accumulator.finish_reason,
+    )
+    if provider_stream_error is not None:
+        raise provider_stream_error
     dropped_without_finish = (
         has_truncated_tool_args and accumulator.finish_reason is None
     )

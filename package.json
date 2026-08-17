@@ -1,6 +1,6 @@
 {
   "name": "async-hermes-agent",
-  "version": "0.20.1-async.2",
+  "version": "0.20.2-async.1",
   "description": "Native-async Hermes Agent runtime with browser tooling.",
   "private": true,
   "repository": {

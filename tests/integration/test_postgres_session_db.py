@@ -377,6 +377,37 @@ async def test_postgres_crud_search_and_lock_contract():
 
 
 @pytest.mark.asyncio
+async def test_postgres_prune_visibility_matches_sqlite_safety_guard():
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+
+    database = PostgresSessionDB(dsn)
+    ended = f"prune-ended-{uuid.uuid4()}"
+    open_session = f"prune-open-{uuid.uuid4()}"
+    try:
+        await database.create_session(ended, source="prune-parity")
+        await database.create_session(open_session, source="prune-parity")
+        await database.end_session(ended, "done")
+
+        assert await database.count_open_prune_matches(source="prune-parity") == 1
+        assert (
+            await database.prune_sessions(
+                older_than_days=None,
+                source="prune-parity",
+            )
+            == 1
+        )
+        assert await database.get_session(ended) is None
+        assert (await database.get_session(open_session))["id"] == open_session
+        assert await database.count_open_prune_matches(source="prune-parity") == 1
+    finally:
+        await database.delete_session(ended)
+        await database.delete_session(open_session)
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_schema_indexes_and_foreign_keys_match_retained_contract():
     dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
     if not dsn:

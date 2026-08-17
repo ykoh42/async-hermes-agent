@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import os
@@ -43,7 +44,51 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_review_runtime(agent: Any) -> dict[str, Any]:
+def _background_review_task_config(
+    task_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if isinstance(task_cfg, dict):
+        return task_cfg
+    # Config loading is async in the retained library.  Callers that need
+    # config pass the already-awaited task block; a sync fallback here would
+    # create an un-awaited coroutine and leak a config read.
+    return {}
+
+
+async def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
+    """Load the automatic review switch and its task block once."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from utils import is_truthy_value
+
+        config = await load_config_readonly()
+        auxiliary = config.get("auxiliary", {})
+        task = auxiliary.get("background_review", {}) if isinstance(auxiliary, dict) else {}
+        task = task if isinstance(task, dict) else {}
+        return is_truthy_value(task.get("enabled"), default=True), task
+    except Exception:
+        logger.warning(
+            "Failed to read background_review.enabled; leaving automatic review enabled",
+            exc_info=True,
+        )
+        return True, {}
+
+
+async def is_background_review_enabled(task_cfg: dict[str, Any] | None = None) -> bool:
+    if task_cfg is None:
+        return (await load_background_review_settings())[0]
+    try:
+        from utils import is_truthy_value
+
+        return is_truthy_value(task_cfg.get("enabled"), default=True)
+    except Exception:
+        return True
+
+
+async def _resolve_review_runtime(
+    agent: Any,
+    task_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Resolve provider/model/credentials for the review fork.
 
     Default (auto / unset / same as parent): inherit the parent's live runtime
@@ -71,11 +116,17 @@ async def _resolve_review_runtime(agent: Any) -> dict[str, Any]:
     }
     try:
         from hermes_cli.config import load_config_readonly
+
         cfg = await load_config_readonly()
     except Exception:
         return parent
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+    task = (
+        aux.get("background_review", {})
+        if task_cfg is None
+        else _background_review_task_config(task_cfg)
+    )
+    task = task if isinstance(task, dict) else {}
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
@@ -650,6 +701,60 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _snapshot_review_usage(review_agent: Any) -> dict[str, Any]:
+    return {
+        "model": getattr(review_agent, "model", None),
+        "provider": getattr(review_agent, "provider", None),
+        "base_url": getattr(review_agent, "base_url", None),
+        "input_tokens": int(getattr(review_agent, "session_input_tokens", 0) or 0),
+        "output_tokens": int(getattr(review_agent, "session_output_tokens", 0) or 0),
+        "cache_read_tokens": int(
+            getattr(review_agent, "session_cache_read_tokens", 0) or 0
+        ),
+        "cache_write_tokens": int(
+            getattr(review_agent, "session_cache_write_tokens", 0) or 0
+        ),
+        "reasoning_tokens": int(
+            getattr(review_agent, "session_reasoning_tokens", 0) or 0
+        ),
+        "api_calls": int(getattr(review_agent, "session_api_calls", 0) or 0),
+        "estimated_cost_usd": getattr(review_agent, "session_estimated_cost_usd", None),
+    }
+
+
+async def _record_review_usage_to_parent(
+    parent_agent: Any,
+    usage: dict[str, Any],
+) -> None:
+    """Best-effort usage attribution without persisting the review transcript."""
+    session_db = getattr(parent_agent, "_session_db", None)
+    session_id = getattr(parent_agent, "session_id", None)
+    if session_db is None or not session_id:
+        return
+    api_calls = int(usage.get("api_calls") or 0)
+    if not api_calls:
+        return
+    try:
+        result = session_db.record_auxiliary_usage(
+            session_id,
+            task="background_review",
+            model=usage.get("model"),
+            billing_provider=usage.get("provider"),
+            billing_base_url=usage.get("base_url"),
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            cache_read_tokens=int(usage.get("cache_read_tokens") or 0),
+            cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
+            reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+            estimated_cost_usd=usage.get("estimated_cost_usd"),
+            api_call_count=api_calls,
+        )
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.debug("Background review usage recording failed", exc_info=True)
+
+
 async def _run_review(
     agent: Any,
     messages_snapshot: list[dict],
@@ -657,6 +762,7 @@ async def _run_review(
     tools_snapshot: list[dict] | None,
     valid_tool_names_snapshot: frozenset[str],
     tool_snapshot_generation: int,
+    task_cfg: dict[str, Any] | None = None,
 ) -> None:
     """Run one background memory/skill review on the caller's event loop."""
     from run_agent import AIAgent, _finish_owned_task
@@ -677,6 +783,7 @@ async def _run_review(
     set_approval_callback(_bg_review_auto_deny)
     review_agent = None
     review_messages: list[dict] = []
+    review_usage: dict[str, Any] = {}
 
     def _unregister_review_agent(agent_ref: Any) -> None:
         """Clear the fork from both parent tracking slots, idempotently."""
@@ -742,7 +849,7 @@ async def _run_review(
                 review_agent = None
 
     try:
-        runtime = await _resolve_review_runtime(agent)
+        runtime = await _resolve_review_runtime(agent, task_cfg)
         routed = bool(runtime.get("routed"))
 
         fork_kwargs: dict[str, Any] = {}
@@ -901,6 +1008,9 @@ async def _run_review(
             )
         finally:
             clear_thread_tool_whitelist()
+            if review_agent is not None:
+                review_usage = _snapshot_review_usage(review_agent)
+                await _record_review_usage_to_parent(agent, review_usage)
             _unregister_review_agent(review_agent)
 
         review_messages = list(
@@ -956,6 +1066,7 @@ def spawn_background_review_thread(
     review_memory: bool = False,
     review_skills: bool = False,
     focus: str | None = None,
+    task_cfg: dict[str, Any] | None = None,
 ):
     """Build the native async review target and prompt.
 
@@ -1017,6 +1128,7 @@ def spawn_background_review_thread(
             tools_snapshot,
             valid_tool_names_snapshot,
             tool_snapshot_generation,
+            task_cfg,
         )
 
     return _target, prompt
@@ -1026,6 +1138,8 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "is_background_review_enabled",
+    "load_background_review_settings",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",

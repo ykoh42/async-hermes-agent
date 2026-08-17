@@ -303,7 +303,6 @@ class _AsyncWorkloadIdentityCredential:
             async with asyncio.timeout(_WORKLOAD_TOKEN_READ_TIMEOUT_SECONDS):
                 async with aiofiles.open(
                     self._token_file_path,
-                    mode="r",
                     encoding="utf-8",
                 ) as token_file:
                     value = await token_file.read(_WORKLOAD_TOKEN_MAX_BYTES + 1)

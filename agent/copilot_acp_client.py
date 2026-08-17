@@ -68,6 +68,69 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw)
 
 
+# Only definitive probe results are cached.  A missing or temporarily broken
+# binary remains inconclusive so an installation made during a process
+# lifetime can still be discovered on the next prompt.
+_ACP_PROBE_CACHE: dict[str, bool] = {}
+
+
+async def _acp_supported(command: str, args: list[str]) -> bool | None:
+    """Probe ACP support without blocking the event loop.
+
+    ``None`` means that ``--help`` could not be completed; the normal spawn
+    path then preserves its established diagnostic.  A clean help response
+    without ``--acp`` is definitive and fails fast before the long-lived ACP
+    child is started.
+    """
+    if "--acp" not in args:
+        return True
+    cached = _ACP_PROBE_CACHE.get(command)
+    if cached is not None:
+        return cached
+
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            command,
+            "--help",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(), timeout=5
+            )
+        except (AttributeError, TypeError):
+            # Keep test doubles and custom process adapters on the established
+            # spawn path when they expose only the stdio surface.
+            return None
+        except TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            return None
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except (FileNotFoundError, OSError):
+        return None
+
+    if process.returncode != 0:
+        return None
+    help_text = stdout.decode("utf-8", errors="replace")
+    verdict = bool(
+        re.search(
+            r"(?:^|[\s\[])--acp(?:[\s=\],]|$)",
+            help_text,
+            re.MULTILINE,
+        )
+    )
+    _ACP_PROBE_CACHE[command] = verdict
+    return verdict
+
+
 async def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
@@ -521,6 +584,14 @@ class CopilotACPClient:
     async def _run_prompt(
         self, prompt_text: str, *, timeout_seconds: float
     ) -> tuple[str, str]:
+        if await _acp_supported(self._acp_command, self._acp_args) is False:
+            preview = " ".join(self._acp_args[:3]) or "(none)"
+            raise RuntimeError(
+                f"ACP transport not supported by '{self._acp_command}': "
+                f"`{preview}` is rejected as an unknown option. Install a "
+                "CLI with --acp support or set "
+                "HERMES_COPILOT_ACP_COMMAND/HERMES_COPILOT_ACP_ARGS."
+            )
         cwd = self._acp_cwd or await aiofiles.os.getcwd()
         resolved_cwd = await aiofiles.os.wrap(Path(cwd).resolve)()
         self._acp_cwd = str(resolved_cwd)

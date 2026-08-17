@@ -21,6 +21,9 @@ class _DB:
         self, session_id: str, holder: str, **kwargs
     ) -> bool:
         self.events.append(("acquire", session_id, holder))
+        on_wait = kwargs.get("on_wait")
+        if on_wait is not None:
+            on_wait(0.0)
         return True
 
     async def resolve_resume_session_id(self, session_id: str) -> str:
@@ -54,6 +57,7 @@ def _bare_agent(db: _DB, *, session_id: str, session_created: bool) -> AIAgent:
     agent._interrupt_event = asyncio.Event()
     agent._active_turn_task = None
     agent._current_turn_id = None
+    agent.status_callback = None
     agent._get_turn_lock = lambda: asyncio.Lock()
 
     async def reset_activity_labels() -> None:

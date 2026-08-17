@@ -796,21 +796,26 @@ async def _adopt_live_compression_child(
     stale contender fail-closed when lineage is ambiguous or the compacted
     handoff cannot be read.
     """
-    finder = getattr(session_db, "find_live_compression_child", None)
+    resolver = getattr(session_db, "get_compression_tip", None)
+    row_getter = getattr(session_db, "get_session", None)
     loader = getattr(session_db, "get_messages_as_conversation", None)
-    if not callable(finder) or not callable(loader):
+    if not callable(resolver) or not callable(row_getter) or not callable(loader):
         return None
-    child = await finder(parent_session_id)
-    if not child or not child.get("id"):
+    # Resolve the whole compression chain so a stale root adopts the live tip.
+    tip = await resolver(parent_session_id)
+    if not tip or str(tip) == str(parent_session_id):
         return None
-    child_session_id = str(child["id"])
+    child_session_id = str(tip)
+    child = await row_getter(child_session_id)
+    if not isinstance(child, dict) or child.get("ended_at") is not None:
+        return None
     recovered = await loader(child_session_id)
     if not isinstance(recovered, list) or not recovered:
         return None
     # Revalidate after loading: the child may have rotated or a competing
     # continuation may have appeared between the two DB reads.
-    confirmed = await finder(parent_session_id)
-    if not confirmed or str(confirmed.get("id") or "") != child_session_id:
+    confirmed = await resolver(parent_session_id)
+    if not confirmed or str(confirmed) != child_session_id:
         return None
 
     agent.session_id = child_session_id
@@ -840,7 +845,7 @@ async def _adopt_live_compression_child(
                 child_session_id,
                 boundary_reason="compression",
                 old_session_id=parent_session_id,
-                session_db=None,
+                session_db=session_db,
                 platform=getattr(agent, "platform", None) or "cli",
                 conversation_id=getattr(agent, "_gateway_session_key", None),
             )
@@ -850,9 +855,23 @@ async def _adopt_live_compression_child(
         bind_state = getattr(agent.context_compressor, "bind_session_state", None)
         if callable(bind_state):
             try:
-                bind_state(session_db=None, session_id=child_session_id)
+                bind_state(session_db=session_db, session_id=child_session_id)
             except Exception:
                 pass
+    try:
+        memory_manager = getattr(agent, "_memory_manager", None)
+        switcher = getattr(memory_manager, "on_session_switch", None)
+        if callable(switcher):
+            result = switcher(
+                child_session_id,
+                parent_session_id=parent_session_id,
+                reset=False,
+                reason="compression",
+            )
+            if inspect.isawaitable(result):
+                await result
+    except Exception as exc:
+        logger.debug("memory manager compression-child adoption failed: %s", exc)
     return recovered
 
 
@@ -1879,6 +1898,8 @@ async def compress_context(
         _lock_ttl = 300.0
     _lock_refresh_interval = getattr(agent, "_compression_lock_refresh_interval", None)
     _lock_refresh_task: asyncio.Task | None = None
+    _compression_watermark: int | None = None
+    _foreign_tail_ceiling: int | None = None
     if _lock_db is not None and _lock_sid:
         _lock_holder = _compression_lock_holder(agent)
         try:
@@ -2082,6 +2103,14 @@ async def compress_context(
             if not existing_prompt:
                 existing_prompt = await agent._build_system_prompt(system_message)
             return messages, existing_prompt
+
+    # Capture the durable active-row watermark before the slow summary call.
+    # In-place compaction uses it at commit to preserve transcript rows that
+    # arrived concurrently while the provider was generating the summary.
+    if in_place and _lock_db is not None and _lock_sid:
+        watermark_getter = getattr(_lock_db, "get_active_message_watermark", None)
+        if callable(watermark_getter):
+            _compression_watermark = await watermark_getter(_lock_sid)
 
     from agent.auxiliary_client import (
         AuxiliaryExplicitCancellation,
@@ -2611,7 +2640,12 @@ async def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    await _lock_db.archive_and_compact(agent.session_id, compressed)
+                    await _lock_db.archive_and_compact(
+                        agent.session_id,
+                        compressed,
+                        watermark=_compression_watermark,
+                        lock_holder=_lock_holder,
+                    )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -2646,6 +2680,14 @@ async def compress_context(
                         and 0 <= current_idx <= len(messages)
                         else None
                     )
+                    try:
+                        _foreign_tail_ceiling = (
+                            await agent._session_db.get_active_message_watermark(
+                                agent.session_id
+                            )
+                        )
+                    except Exception:
+                        _foreign_tail_ceiling = None
                     try:
                         await agent._flush_messages_to_session_db(
                             messages,
@@ -2686,6 +2728,12 @@ async def compress_context(
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
+                        watermark=(
+                            _compression_watermark
+                            if _foreign_tail_ceiling is not None
+                            else None
+                        ),
+                        watermark_ceiling=_foreign_tail_ceiling,
                     )
                     agent.session_id = new_session_id
                     from gateway.session_context import set_current_session_id

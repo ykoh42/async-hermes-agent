@@ -273,3 +273,70 @@ async def test_stale_btree_index_is_reindexed_without_losing_rows(tmp_path):
         assert len(await database.get_messages(session_id)) == 10
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_ledger_stops_repeating_same_failed_surgery(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    path.write_bytes(b"not a recoverable sqlite database")
+
+    for _ in range(hermes_state._MAX_PERSISTENT_REPAIR_ATTEMPTS):
+        await hermes_state._record_repair_outcome(path, repaired=False)
+
+    assert await hermes_state._persistent_repair_attempts_exhausted(path)
+
+    async def unexpected_probe(db_path):
+        raise AssertionError("an exhausted repair budget must fail closed")
+
+    monkeypatch.setattr(hermes_state, "_db_opens_cleanly", unexpected_probe)
+    report = await hermes_state.repair_state_db_schema(path)
+    assert report["repaired"] is False
+    assert "manual recovery" in report["error"]
+
+
+@pytest.mark.asyncio
+async def test_repair_ledger_resets_when_database_fingerprint_changes(tmp_path):
+    path = tmp_path / "state.db"
+    path.write_bytes(b"first damaged file")
+    for _ in range(hermes_state._MAX_PERSISTENT_REPAIR_ATTEMPTS):
+        await hermes_state._record_repair_outcome(path, repaired=False)
+    assert await hermes_state._persistent_repair_attempts_exhausted(path)
+
+    path.write_bytes(b"a different damaged file with a new size")
+    assert not await hermes_state._persistent_repair_attempts_exhausted(path)
+
+
+@pytest.mark.asyncio
+async def test_successful_repair_clears_persistent_ledger(tmp_path):
+    path = tmp_path / "state.db"
+    path.write_bytes(b"damaged")
+    await hermes_state._record_repair_outcome(path, repaired=False)
+    assert hermes_state._repair_ledger_path(path).exists()
+
+    await hermes_state._record_repair_outcome(path, repaired=True)
+    assert not hermes_state._repair_ledger_path(path).exists()
+
+
+@pytest.mark.asyncio
+async def test_malformed_backup_is_deduplicated_and_retained(tmp_path):
+    path = tmp_path / "state.db"
+    path.write_bytes(b"damaged sqlite bytes")
+
+    first = await hermes_state._backup_db_file(path)
+    second = await hermes_state._backup_db_file(path)
+    assert first is not None
+    assert second == first
+    assert len(await hermes_state._existing_malformed_backups(path)) == 1
+
+    for index in range(4):
+        backup = path.with_name(f"{path.name}.malformed-backup-2026010{index}")
+        backup.write_bytes(b"backup")
+        backup.with_name(backup.name + "-wal").write_bytes(b"wal")
+        backup.with_name(backup.name + "-shm").write_bytes(b"shm")
+
+    await hermes_state._prune_malformed_backups(path, keep=3)
+    retained = await hermes_state._existing_malformed_backups(path)
+    assert len(retained) == 3
+    assert not path.with_name(
+        f"{path.name}.malformed-backup-20260100-wal"
+    ).exists()

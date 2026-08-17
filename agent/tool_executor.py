@@ -62,6 +62,17 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     return value
 
 
+def _resolve_sequential_tool_timeout() -> float | None:
+    """Return the sequential-call deadline.
+
+    The native async executor uses the same legacy setting and default as the
+    concurrent path.  Keeping this resolver separate preserves upstream's
+    independently named policy key without introducing a second config or a
+    sync worker-based timeout implementation.
+    """
+    return _resolve_concurrent_tool_timeout()
+
+
 async def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -1174,17 +1185,51 @@ async def _execute_tool_calls_native(
 
         segment_results = [None] * len(calls)
         segment_completions = [None] * len(calls)
+        runtime_state = [None] * len(calls)
         if kind == "sequential":
+            timeout_s = _resolve_sequential_tool_timeout()
             try:
                 for index, tool_call in enumerate(calls):
                     if getattr(agent, "_interrupt_requested", False):
                         raise asyncio.CancelledError
-                    await _one(
-                        index,
-                        tool_call,
-                        segment_results,
-                        segment_completions,
-                    )
+                    try:
+                        if timeout_s is None:
+                            await _one(
+                                index,
+                                tool_call,
+                                segment_results,
+                                segment_completions,
+                                runtime_sink=runtime_state,
+                            )
+                        else:
+                            async with asyncio.timeout(timeout_s):
+                                await _one(
+                                    index,
+                                    tool_call,
+                                    segment_results,
+                                    segment_completions,
+                                    runtime_sink=runtime_state,
+                                )
+                    except TimeoutError:
+                        runtime = runtime_state[index]
+                        if runtime is None:
+                            name = getattr(tool_call.function, "name", "")
+                            args, _ = _parse_tool_arguments(
+                                getattr(tool_call.function, "arguments", "")
+                            )
+                            middleware_trace = []
+                        else:
+                            name, args, middleware_trace = runtime
+                        await _store_timeout_result(
+                            index,
+                            tool_call,
+                            name,
+                            args,
+                            float(timeout_s),
+                            middleware_trace,
+                            segment_results,
+                            segment_completions,
+                        )
             except asyncio.CancelledError:
                 for index, tool_call in enumerate(calls):
                     if segment_results[index] is None:

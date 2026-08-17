@@ -9,6 +9,7 @@ DSN.
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import pathlib
@@ -20,6 +21,8 @@ from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
 
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
 from agent.message_sanitization import _sanitize_surrogates
@@ -1710,6 +1713,42 @@ class SessionDB:
         except Exception:
             return session_id
 
+    async def _session_turn_lease_key_on_connection(
+        self, connection, session_id: str
+    ) -> str:
+        """Resolve the lease key on the append transaction's connection."""
+        if not session_id:
+            return session_id
+        rows = (
+            await connection.execute(
+                _sa.select(
+                    self._tables["sessions"].c.id,
+                    self._tables["sessions"].c.parent_session_id,
+                    self._tables["sessions"].c.end_reason,
+                    self._tables["sessions"].c.source,
+                    self._tables["sessions"].c.model_config,
+                )
+            )
+        ).all()
+        by_id = {str(row.id): row for row in rows}
+        current = by_id.get(session_id)
+        seen = {session_id}
+        while current is not None:
+            config = _json_value(current.model_config, {})
+            explicit_fork = current.source == "tool" or (
+                isinstance(config, dict)
+                and bool(config.get("_branched_from") or config.get("_delegate_from"))
+            )
+            parent_id = current.parent_session_id
+            if explicit_fork or not parent_id or str(parent_id) in seen:
+                break
+            parent = by_id.get(str(parent_id))
+            if parent is None or parent.end_reason != "compression":
+                break
+            seen.add(str(parent_id))
+            current = parent
+        return str(current.id) if current is not None else session_id
+
     async def _messages(
         self,
         connection,
@@ -2114,19 +2153,44 @@ class SessionDB:
         )
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
-        lock_table = self._tables["compression_locks"]
-        lock = (
-            await connection.execute(
-                _sa.select(lock_table).where(lock_table.c.session_id == session_id)
+        # Compression watermarks make ordinary transcript appends safe while a
+        # compressor owns the session lock.  The lock fences competing
+        # compression attempts, not a live turn's writes.
+        turn_lease_holder = values.get("turn_lease_holder")
+        if turn_lease_holder:
+            conversation_id = await self._session_turn_lease_key_on_connection(
+                connection, session_id
             )
-        ).first()
-        if lock is not None and float(lock.expires_at) > time.time():
-            holder = values.get("compression_lock_holder")
-            if lock.holder != holder:
-                from hermes_state import SessionCompressionInProgressError
+            lease_table = self._tables["session_turn_leases"]
+            lease = (
+                await connection.execute(
+                    _sa.select(lease_table).where(
+                        lease_table.c.conversation_id == conversation_id
+                    )
+                )
+            ).first()
+            if lease is None or lease.holder != turn_lease_holder:
+                from hermes_state import SessionTurnLeaseLostError
 
-                raise SessionCompressionInProgressError(
-                    f"Session {session_id!r} is being compressed by another writer"
+                raise SessionTurnLeaseLostError(
+                    "Session turn lease lost; refusing transcript write "
+                    f"for {session_id!r}"
+                )
+            now = time.time()
+            if float(lease.expires_at) <= now:
+                await connection.execute(
+                    _sa.update(lease_table)
+                    .where(
+                        lease_table.c.conversation_id == conversation_id,
+                        lease_table.c.holder == turn_lease_holder,
+                    )
+                    .values(
+                        expires_at=now
+                        + max(
+                            0.1,
+                            float(values.get("turn_lease_ttl_seconds", 300.0)),
+                        )
+                    )
                 )
         if (
             session.get("ended_at") is not None
@@ -2290,6 +2354,10 @@ class SessionDB:
                     row["session_id"] = args["session_id"]
                     row["compression_lock_holder"] = args.get(
                         "compression_lock_holder"
+                    )
+                    row["turn_lease_holder"] = args.get("turn_lease_holder")
+                    row["turn_lease_ttl_seconds"] = args.get(
+                        "turn_lease_ttl_seconds", 300.0
                     )
                     inserted += await self._append(connection, row)
                 return inserted
@@ -2462,6 +2530,7 @@ class SessionDB:
             "search_sessions_by_id",
             "list_sessions_rich",
             "list_prune_candidates",
+            "count_open_prune_matches",
             "list_skill_scaffolded_sessions",
             "distinct_session_cwds",
             "session_count_by_source",
@@ -2524,6 +2593,7 @@ class SessionDB:
             "get_compression_fallback_streak",
             "get_compression_ineffective_count",
             "find_live_compression_child",
+            "get_active_message_watermark",
         }:
             return await self._maintenance_read(name, args)
         return await self._fallback_operation(name, args)
@@ -3161,22 +3231,49 @@ class SessionDB:
     async def _lock_operation(self, name: str, args: dict[str, Any]) -> Any:
         if "session_turn_lease" in name:
             if name == "acquire_session_turn_lease":
-                deadline = time.monotonic() + max(
-                    0.0, float(args["wait_seconds"])
-                )
+                deadline = time.monotonic() + max(0.0, float(args["wait_seconds"]))
+                last_notice = -float("inf")
                 while True:
+                    should_abort = args.get("should_abort")
+                    if should_abort is not None:
+                        try:
+                            if should_abort():
+                                return False
+                        except Exception:
+                            logger.debug(
+                                "session turn lease should_abort callback failed",
+                                exc_info=True,
+                            )
                     if await self._dispatch(
                         "try_acquire_session_turn_lease",
                         {
                             "session_id": args["session_id"],
                             "holder": args["holder"],
                             "ttl_seconds": args["ttl_seconds"],
+                            "patience_s": args.get("acquire_patience_s", 0.5),
                         },
                     ):
                         return True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
+                    elapsed = max(
+                        0.0,
+                        float(args["wait_seconds"]) - remaining,
+                    )
+                    on_wait = args.get("on_wait")
+                    interval = float(args.get("wait_notice_interval_seconds", 15.0))
+                    if on_wait is not None and (
+                        elapsed == 0.0 or interval <= 0.0 or elapsed - last_notice >= interval
+                    ):
+                        try:
+                            on_wait(elapsed)
+                            last_notice = elapsed
+                        except Exception:
+                            logger.debug(
+                                "session turn lease on_wait callback failed",
+                                exc_info=True,
+                            )
                     await asyncio.sleep(
                         min(
                             max(0.01, float(args["poll_interval_seconds"])),
@@ -3838,6 +3935,55 @@ class SessionDB:
                         item.get("started_at") or 0,
                     ),
                 )
+            if name == "count_open_prune_matches":
+                prune_args = dict(args)
+                cutoff = prune_args.get("last_active_before")
+                if cutoff is None and prune_args.get("older_than_days") is not None:
+                    cutoff = time.time() - float(prune_args["older_than_days"]) * 86_400
+                filter_names = {
+                    "last_active_after",
+                    "started_before",
+                    "started_after",
+                    "title_like",
+                    "end_reason",
+                    "cwd_prefix",
+                    "min_messages",
+                    "max_messages",
+                    "archived",
+                    "model_like",
+                    "provider",
+                    "user_id",
+                    "chat_id",
+                    "chat_type",
+                    "branch_like",
+                    "min_tokens",
+                    "max_tokens",
+                    "min_cost",
+                    "max_cost",
+                    "min_tool_calls",
+                    "max_tool_calls",
+                }
+                count = 0
+                for item in sessions:
+                    if item.get("ended_at") is not None:
+                        continue
+                    # _matches_prune deliberately rejects open sessions. Use
+                    # a transient ended marker to reuse the exact predicate,
+                    # while retaining the real row for the count only.
+                    candidate = dict(item)
+                    candidate["ended_at"] = 0.0
+                    if self._matches_prune(
+                        candidate,
+                        source=prune_args.get("source"),
+                        last_active_before=cutoff,
+                        **{
+                            key: value
+                            for key, value in prune_args.items()
+                            if key in filter_names and value is not None
+                        },
+                    ):
+                        count += 1
+                return count
             if name == "list_sessions_rich":
                 result = []
                 for item in sessions:
@@ -4475,6 +4621,78 @@ class SessionDB:
                     row = dict(message)
                     row["session_id"] = args["child_session_id"]
                     await self._append(connection, row)
+                tail_ids: list[int] = []
+                tail_tool_calls = 0
+                if args.get("watermark") is not None:
+                    tail_query = _sa.select(
+                        self._tables["messages"].c.id,
+                        self._tables["messages"].c.tool_calls,
+                    ).where(
+                        self._tables["messages"].c.session_id
+                        == args["parent_session_id"],
+                        self._tables["messages"].c.active == 1,
+                        self._tables["messages"].c.id > int(args["watermark"]),
+                    )
+                    if args.get("watermark_ceiling") is not None:
+                        tail_query = tail_query.where(
+                            self._tables["messages"].c.id
+                            <= int(args["watermark_ceiling"])
+                        )
+                    tail_rows = (
+                        await connection.execute(tail_query.order_by(self._tables["messages"].c.id))
+                    ).all()
+                    tail_ids = [int(row.id) for row in tail_rows]
+                    for row in tail_rows:
+                        raw_tool_calls = row.tool_calls
+                        if not raw_tool_calls:
+                            continue
+                        try:
+                            parsed = (
+                                json.loads(raw_tool_calls)
+                                if isinstance(raw_tool_calls, str)
+                                else raw_tool_calls
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(parsed, list):
+                            tail_tool_calls += len(parsed)
+                if tail_ids:
+                    messages_table = self._tables["messages"]
+                    clone_columns = [
+                        column
+                        for column in messages_table.c
+                        if column.name not in {"id", "session_id", "active", "compacted"}
+                    ]
+                    clone_select = _sa.select(
+                        *clone_columns,
+                        _sa.literal(args["child_session_id"]).label("session_id"),
+                        _sa.literal(1).label("active"),
+                        _sa.literal(0).label("compacted"),
+                    ).where(messages_table.c.id.in_(tail_ids)).order_by(messages_table.c.id)
+                    await connection.execute(
+                        _sa.insert(messages_table).from_select(
+                            [
+                                *(column.name for column in clone_columns),
+                                "session_id",
+                                "active",
+                                "compacted",
+                            ],
+                            clone_select,
+                        )
+                    )
+                    child_state = await self._session(
+                        connection, args["child_session_id"]
+                    )
+                    await self._update_session(
+                        connection,
+                        args["child_session_id"],
+                        {
+                            "message_count": int(child_state.get("message_count") or 0)
+                            + len(tail_ids),
+                            "tool_call_count": int(child_state.get("tool_call_count") or 0)
+                            + tail_tool_calls,
+                        },
+                    )
                 await self._update_session(
                     connection,
                     args["parent_session_id"],
@@ -4487,6 +4705,26 @@ class SessionDB:
                 session = await self._session(connection, args["session_id"])
                 if session is None:
                     raise RuntimeError(f"Session not found: {args['session_id']}")
+                if args.get("lock_holder") is not None:
+                    lock = (
+                        await connection.execute(
+                            _sa.select(self._tables["compression_locks"]).where(
+                                self._tables["compression_locks"].c.session_id
+                                == args["session_id"]
+                            )
+                        )
+                    ).first()
+                    if (
+                        lock is None
+                        or lock.holder != args["lock_holder"]
+                        or float(lock.expires_at) <= time.time()
+                    ):
+                        from hermes_state import SessionCompressionInProgressError
+
+                        raise SessionCompressionInProgressError(
+                            f"Compression lease for {args['session_id']!r} lost "
+                            "before commit; refusing to publish a stale compaction"
+                        )
                 if args.get("model_config_patch") is not None:
                     config = _json_value(session.get("model_config"), {})
                     if not isinstance(config, dict):
@@ -4502,6 +4740,38 @@ class SessionDB:
                         {"model_config": _json_text(config)},
                     )
                 messages_table = self._tables["messages"]
+                tail_ids: list[int] = []
+                tail_tool_calls = 0
+                if args.get("watermark") is not None:
+                    tail_rows = (
+                        await connection.execute(
+                            _sa.select(
+                                messages_table.c.id,
+                                messages_table.c.tool_calls,
+                            )
+                            .where(
+                                messages_table.c.session_id == args["session_id"],
+                                messages_table.c.active == 1,
+                                messages_table.c.id > int(args["watermark"]),
+                            )
+                            .order_by(messages_table.c.id)
+                        )
+                    ).all()
+                    for tail in tail_rows:
+                        tail_ids.append(int(tail.id))
+                        raw_tool_calls = tail.tool_calls
+                        if raw_tool_calls:
+                            try:
+                                parsed = (
+                                    json.loads(raw_tool_calls)
+                                    if isinstance(raw_tool_calls, str)
+                                    else raw_tool_calls
+                                )
+                                tail_tool_calls += (
+                                    len(parsed) if isinstance(parsed, list) else 0
+                                )
+                            except (TypeError, ValueError):
+                                pass
                 await connection.execute(
                     _sa.update(messages_table)
                     .where(
@@ -4519,7 +4789,41 @@ class SessionDB:
                     row = dict(message)
                     row["session_id"] = args["session_id"]
                     await self._append(connection, row)
-                return len(args["compacted_messages"])
+                if tail_ids:
+                    clone_columns = [
+                        column
+                        for column in messages_table.c
+                        if column.name not in {"id", "active", "compacted"}
+                    ]
+                    clone_select = (
+                        _sa.select(
+                            *clone_columns,
+                            _sa.literal(1).label("active"),
+                            _sa.literal(0).label("compacted"),
+                        )
+                        .where(messages_table.c.id.in_(tail_ids))
+                        .order_by(messages_table.c.id)
+                    )
+                    await connection.execute(
+                        _sa.insert(messages_table).from_select(
+                            [
+                                *(column.name for column in clone_columns),
+                                "active",
+                                "compacted",
+                            ],
+                            clone_select,
+                        )
+                    )
+                    await self._update_session(
+                        connection,
+                        args["session_id"],
+                        {
+                            "message_count": len(args["compacted_messages"])
+                            + len(tail_ids),
+                            "tool_call_count": tail_tool_calls,
+                        },
+                    )
+                return len(args["compacted_messages"]) + len(tail_ids)
 
             return await self._write(_archive_compact)
 
@@ -5101,6 +5405,21 @@ class SessionDB:
                 return int(row[0] or 0) if row else 0
 
             return await self._read(_size)
+        if name == "get_active_message_watermark":
+            async def _watermark(connection):
+                table = self._tables["messages"]
+                row = (
+                    await connection.execute(
+                        _sa.select(_sa.func.coalesce(_sa.func.max(table.c.id), 0))
+                        .where(
+                            table.c.session_id == args["session_id"],
+                            table.c.active == 1,
+                        )
+                    )
+                ).first()
+                return int(row[0] or 0) if row else 0
+
+            return await self._read(_watermark)
         if name == "flush_token_counts":
             return True
         if name == "session_count_ge":
@@ -5194,13 +5513,16 @@ class SessionDB:
             f"PostgreSQL SessionDB operation is not implemented: {name}"
         )
 
-    async def append_message(self, session_id: str, role: str, content: str | None = None, tool_name: str | None = None, tool_calls: Any = None, tool_call_id: str | None = None, token_count: int | None = None, finish_reason: str | None = None, reasoning: str | None = None, reasoning_content: str | None = None, reasoning_details: Any = None, codex_reasoning_items: Any = None, codex_message_items: Any = None, platform_message_id: str | None = None, observed: bool = False, effect_disposition: str | None = None, timestamp: Any = None, api_content: str | None = None, display_kind: str | None = None, display_metadata: dict[str, typing.Any] | None = None, compression_lock_holder: str | None = None) -> int:
+    async def append_message(self, session_id: str, role: str, content: str | None = None, tool_name: str | None = None, tool_calls: Any = None, tool_call_id: str | None = None, token_count: int | None = None, finish_reason: str | None = None, reasoning: str | None = None, reasoning_content: str | None = None, reasoning_details: Any = None, codex_reasoning_items: Any = None, codex_message_items: Any = None, platform_message_id: str | None = None, observed: bool = False, effect_disposition: str | None = None, timestamp: Any = None, api_content: str | None = None, display_kind: str | None = None, display_metadata: dict[str, typing.Any] | None = None, compression_lock_holder: str | None = None, turn_lease_holder: str | None = None, turn_lease_ttl_seconds: float = 300.0) -> int:
         return await self._dispatch('append_message', locals())
 
-    async def append_messages_batch(self, session_id: str, messages: list[dict[str, typing.Any]], compression_lock_holder: str | None = None, chunk_rows: int | None = None) -> int:
+    async def append_messages_batch(self, session_id: str, messages: list[dict[str, typing.Any]], compression_lock_holder: str | None = None, turn_lease_holder: str | None = None, chunk_rows: int | None = None, turn_lease_ttl_seconds: float = 300.0) -> int:
         return await self._dispatch('append_messages_batch', locals())
 
-    async def archive_and_compact(self, session_id: str, compacted_messages: list[dict[str, typing.Any]], model_config_patch: dict[str, typing.Any] | None = None) -> int:
+    async def get_active_message_watermark(self, session_id: str) -> int:
+        return await self._dispatch('get_active_message_watermark', locals())
+
+    async def archive_and_compact(self, session_id: str, compacted_messages: list[dict[str, typing.Any]], model_config_patch: dict[str, typing.Any] | None = None, watermark: int | None = None, lock_holder: str | None = None) -> int:
         return await self._dispatch('archive_and_compact', locals())
 
     async def archive_sessions(self, older_than_days: float | None = None, source: str | None = None, **filters) -> int:
@@ -5389,6 +5711,9 @@ class SessionDB:
     async def list_prune_candidates(self, older_than_days: float | None = None, source: str | None = None, **filters) -> list[dict[str, typing.Any]]:
         return await self._dispatch('list_prune_candidates', locals())
 
+    async def count_open_prune_matches(self, older_than_days: float | None = None, source: str | None = None, **filters) -> int:
+        return await self._dispatch('count_open_prune_matches', locals())
+
     async def list_recent_user_messages(self, session_id: str, limit: int = 20, include_inactive: bool = False) -> list[dict[str, Any]]:
         return await self._dispatch('list_recent_user_messages', locals())
 
@@ -5425,7 +5750,7 @@ class SessionDB:
     async def prune_sessions(self, older_than_days: float | None = 90, source: str | None = None, sessions_dir: pathlib.Path | None = None, **filters) -> int:
         return await self._dispatch('prune_sessions', locals())
 
-    async def publish_compression_child(self, *, parent_session_id: str, child_session_id: str, source: str, messages: list[dict[str, typing.Any]], model: str | None = None, model_config: dict[str, typing.Any] | None = None, system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None, compression_lock_holder: str | None = None, require_compression_lease: bool = True) -> None:
+    async def publish_compression_child(self, *, parent_session_id: str, child_session_id: str, source: str, messages: list[dict[str, typing.Any]], model: str | None = None, model_config: dict[str, typing.Any] | None = None, system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None, compression_lock_holder: str | None = None, require_compression_lease: bool = True, watermark: int | None = None, watermark_ceiling: int | None = None) -> None:
         return await self._dispatch('publish_compression_child', locals())
 
     async def queue_token_counts(self, session_id: str, **kwargs) -> None:
@@ -5434,7 +5759,7 @@ class SessionDB:
     async def rebuild_fts(self) -> int:
         return await self._dispatch('rebuild_fts', locals())
 
-    async def record_auxiliary_usage(self, session_id: str, task: str, *, model: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None) -> None:
+    async def record_auxiliary_usage(self, session_id: str, task: str, *, model: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None, api_call_count: int = 1) -> None:
         return await self._dispatch('record_auxiliary_usage', locals())
 
     async def record_compression_failure_cooldown(self, session_id: str, cooldown_until: float, error: str | None = None) -> None:
@@ -5449,6 +5774,7 @@ class SessionDB:
         holder: str,
         *,
         ttl_seconds: float = 300.0,
+        patience_s: float | None = None,
     ) -> bool:
         return await self._dispatch('try_acquire_session_turn_lease', locals())
 
@@ -5459,7 +5785,11 @@ class SessionDB:
         *,
         ttl_seconds: float = 300.0,
         wait_seconds: float = 1800.0,
-        poll_interval_seconds: float = 0.1,
+        poll_interval_seconds: float = 1.0,
+        on_wait: Callable[[float], None] | None = None,
+        wait_notice_interval_seconds: float = 15.0,
+        should_abort: Callable[[], bool] | None = None,
+        acquire_patience_s: float = 0.5,
     ) -> bool:
         return await self._dispatch('acquire_session_turn_lease', locals())
 

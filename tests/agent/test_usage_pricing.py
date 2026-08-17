@@ -74,6 +74,40 @@ async def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
     assert normalized.output_tokens == 200
 
 
+async def test_normalize_usage_handles_dict_shaped_codex_usage():
+    result = normalize_usage(
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {
+                "cached_tokens": 60,
+                "cache_creation_tokens": 10,
+            },
+        },
+        api_mode="codex_responses",
+    )
+    assert result.input_tokens == 30
+    assert result.output_tokens == 20
+    assert result.cache_read_tokens == 60
+    assert result.cache_write_tokens == 10
+
+
+async def test_normalize_usage_handles_dict_shaped_chat_usage():
+    result = normalize_usage(
+        {
+            "prompt_tokens": 500,
+            "completion_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 200},
+            "completion_tokens_details": {"reasoning_tokens": 30},
+        },
+        api_mode="chat_completions",
+    )
+    assert result.input_tokens == 300
+    assert result.output_tokens == 100
+    assert result.cache_read_tokens == 200
+    assert result.reasoning_tokens == 30
+
+
 
 
 

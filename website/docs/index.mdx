@@ -70,7 +70,7 @@ Python 3.11 through 3.13 is supported. Install the currently verified release
 from PyPI:
 
 ```bash
-uv pip install "async-hermes-agent==0.20.1.2"
+uv pip install "async-hermes-agent==0.20.2.1"
 ```
 
 PyPI publication uses OIDC Trusted Publishing. The same verified wheel, source
@@ -90,7 +90,7 @@ library or by this documentation.
 
 Async Hermes Agent is an async-only distribution of the upstream
 [NousResearch/Hermes Agent](https://github.com/NousResearch/hermes-agent), based
-on release `v2026.8.13`. Existing library integrations keep familiar module
+on release `v2026.8.16`. Existing library integrations keep familiar module
 paths and public names; I/O-bearing calls are awaited. The host application
 owns its HTTP service or UI and the agent remains the reusable harness beneath
 it.
@@ -139,7 +139,7 @@ entry points rather than zero-thread, OS-native regular-file or SQLite I/O.
   final answers; generate JSONL trajectories with bounded batch concurrency
 - **Service-ready library** — Embed the agent in FastAPI or another async host
   without bundling a second service framework or HTTP contract
-- **Upstream-traceable** — Derived from Hermes Agent `v2026.8.13` with original
+- **Upstream-traceable** — Derived from Hermes Agent `v2026.8.16` with original
   source paths retained to make later migrations reviewable
 
 ## For LLMs and coding agents

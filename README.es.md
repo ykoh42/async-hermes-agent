@@ -2,7 +2,7 @@
 
 Distribución nativa asíncrona y orientada a biblioteca de
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), basada
-en la etiqueta upstream `v2026.8.13` (versión del paquete Python `0.20.1`).
+en la etiqueta upstream `v2026.8.16` (versión del paquete Python `0.20.2`).
 
 Este repositorio conserva el bucle del agente Hermes, los proveedores de
 modelos, la ejecución de herramientas, MCP, habilidades, memoria y sesiones
@@ -55,15 +55,15 @@ paralelo.
 Se admite Python 3.11 a 3.13.
 
 ```bash
-uv pip install "async-hermes-agent==0.20.1.2"
+uv pip install "async-hermes-agent==0.20.2.1"
 ```
 
 Las versiones se publican en PyPI mediante OIDC Trusted Publishing de GitHub.
 La misma rueda, distribución fuente y sumas de comprobación verificadas se
 adjuntan a la versión correspondiente de GitHub.
 
-La versión tiene cuatro segmentos numéricos: `0.20.1.2` indica la versión
-Python upstream `0.20.1` y la revisión `2` de esta distribución asíncrona. Las
+La versión tiene cuatro segmentos numéricos: `0.20.2.1` indica la versión
+Python upstream `0.20.2` y la revisión `1` de esta distribución asíncrona. Las
 versiones exclusivas del fork incrementan el cuarto segmento; al portar una
 nueva versión upstream, los tres primeros segmentos se actualizan y la revisión
 vuelve a `1`.
@@ -74,7 +74,7 @@ se instaló desde esa etiqueta Git, la migración requiere una reinstalación
 explícita una sola vez:
 
 ```bash
-uv pip install --reinstall "async-hermes-agent==0.20.1.2"
+uv pip install --reinstall "async-hermes-agent==0.20.2.1"
 ```
 
 Para desarrollo:

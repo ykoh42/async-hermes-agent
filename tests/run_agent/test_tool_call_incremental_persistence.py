@@ -156,6 +156,41 @@ async def test_unknown_tool_is_returned_as_observation_instead_of_fail_fast():
 
 
 @pytest.mark.asyncio
+async def test_sequential_tool_timeout_is_native_async_and_persists_result(monkeypatch):
+    """A sequential tool deadline cancels the coroutine without a worker thread."""
+    cancelled = asyncio.Event()
+
+    async def never_returns(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.01")
+    agent = _agent(AsyncMock(return_value=True))
+    call = _tool_call("read_file", "timeout-1")
+    messages = []
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=never_returns),
+        _native_tool_entry(),
+        _native_policy_path(),
+    ):
+        await execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            finalize=False,
+        )
+
+    assert cancelled.is_set()
+    assert len(messages) == 1
+    assert "timed out after 0.0s" in messages[0]["content"]
+    assert messages[0]["effect_disposition"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_session_search_uses_agent_owned_lazy_database():
     from model_tools import _TOOL_HANDLER_CONTEXT
 
