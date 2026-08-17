@@ -865,13 +865,42 @@ class TestBuildSystemPrompt:
                     f"Timestamp line has time-of-day, breaks daily cache stability: {line!r}"
                 )
                 # Must NOT contain a colon followed by two digits (HH:MM pattern)
+                # in the date portion; the explicit UTC offset is intentional.
                 import re as _re
-                assert not _re.search(r":\d{2}", line), (
+                date_part = line.split(" (")[0]
+                assert not _re.search(r":\d{2}", date_part), (
                     f"Timestamp line has HH:MM, breaks daily cache stability: {line!r}"
                 )
                 break
         else:
             assert False, "Expected a 'Conversation started:' line in the system prompt"
+
+    @pytest.mark.asyncio
+    async def test_datetime_includes_utc_offset(self, agent):
+        """Timestamp must carry an explicit UTC offset."""
+        import re as _re
+
+        prompt = await agent._build_system_prompt()
+        for line in prompt.splitlines():
+            if line.startswith("Conversation started:"):
+                assert _re.search(r"UTC[+-]\d{2}:\d{2}", line), line
+                break
+        else:
+            assert False, "Expected a 'Conversation started:' line in the system prompt"
+
+    @pytest.mark.asyncio
+    async def test_datetime_line_is_stable_across_rebuilds(self, agent):
+        """Two rebuilds within one day retain identical timestamp bytes."""
+        def timestamp_line(prompt):
+            return next(
+                line for line in prompt.splitlines()
+                if line.startswith("Conversation started:")
+            )
+
+        first = await agent._build_system_prompt()
+        agent._cached_system_prompt = None
+        second = await agent._build_system_prompt()
+        assert timestamp_line(first) == timestamp_line(second)
 
     @pytest.mark.asyncio
     async def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):

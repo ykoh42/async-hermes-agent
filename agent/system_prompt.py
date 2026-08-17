@@ -606,13 +606,27 @@ async def build_system_prompt_parts(agent: Any, system_message: str | None = Non
         logger.debug("Plugin system-prompt section render failed", exc_info=True)
 
     now = await _hermes_time.now()
+    timezone = await _hermes_time.get_timezone()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
     # on every rebuild path (compression boundary, fresh-agent gateway turns,
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    zone_bits: list[str] = []
+    iana = getattr(timezone, "key", None)
+    if iana:
+        zone_bits.append(iana)
+    abbreviation = now.strftime("%Z")
+    if abbreviation and abbreviation != iana:
+        zone_bits.append(abbreviation)
+    offset = now.strftime("%z")
+    if offset:
+        zone_bits.append(f"UTC{offset[:3]}:{offset[3:]}")
+    zone_suffix = f" ({', '.join(zone_bits)})" if zone_bits else ""
+    timestamp_line = (
+        f"Conversation started: {now.strftime('%A, %B %d, %Y')}{zone_suffix}"
+    )
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:
