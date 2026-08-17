@@ -85,12 +85,15 @@ def _agent_skills_dir(agent: Any) -> Path | None:
 async def _profile_name_for_home(home: Path) -> str:
     """Derive ``profiles/<name>`` from the process-level Hermes root."""
     try:
+        from agent.file_safety import _canonical
         from hermes_constants import get_default_hermes_root
 
         root = await get_default_hermes_root()
-        relative = home.resolve().relative_to((root / "profiles").resolve())
+        home_path = Path(await _canonical(home))
+        profiles_path = Path(await _canonical(root / "profiles"))
+        relative = home_path.relative_to(profiles_path)
         return relative.parts[0] if relative.parts else "default"
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return "default"
 
 

@@ -45,6 +45,22 @@ async def test_db_home_wins_without_bound_override(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_profile_name_uses_async_path_resolution(tmp_path, monkeypatch):
+    from agent import system_prompt
+
+    root = tmp_path / "root"
+    bot_home = root / "profiles" / "mybot"
+    bot_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    def fail_sync_resolution(*_args, **_kwargs):
+        raise AssertionError("profile resolution must not use Path.resolve")
+
+    monkeypatch.setattr(Path, "resolve", fail_sync_resolution)
+    assert await system_prompt._profile_name_for_home(bot_home) == "mybot"
+
+
+@pytest.mark.asyncio
 async def test_soul_and_skills_use_agent_home(tmp_path, monkeypatch):
     from agent import prompt_builder
 
