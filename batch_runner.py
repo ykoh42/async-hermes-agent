@@ -1579,15 +1579,15 @@ async def main(
     # Validate required arguments
     if not dataset_file:
         print("❌ Error: --dataset_file is required")
-        return
+        raise SystemExit(1)
     
     if not batch_size or batch_size < 1:
         print("❌ Error: --batch_size must be a positive integer")
-        return
+        raise SystemExit(1)
     
     if not run_name:
         print("❌ Error: --run_name is required")
-        return
+        raise SystemExit(1)
     
     # Parse provider preferences (comma-separated strings to lists)
     providers_allowed_list = _parse_provider_preferences(providers_allowed)
@@ -1606,7 +1606,7 @@ async def main(
         valid_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         if reasoning_effort not in valid_efforts:
             print(f"❌ Error: --reasoning_effort must be one of: {', '.join(valid_efforts)}")
-            return
+            raise SystemExit(1)
         reasoning_config = {"enabled": True, "effort": reasoning_effort}
         print(f"🧠 Reasoning effort: {reasoning_effort}")
     
@@ -1620,11 +1620,11 @@ async def main(
                 prefill_messages = json.loads(await source.read())
             if not isinstance(prefill_messages, list):
                 print("❌ Error: prefill_messages_file must contain a JSON array of messages")
-                return
+                raise SystemExit(1)
             print(f"💬 Loaded {len(prefill_messages)} prefill messages from {prefill_messages_file}")
         except Exception as e:
             print(f"❌ Error loading prefill messages: {e}")
-            return
+            raise SystemExit(1)
     
     # Initialize and run batch runner
     try:
@@ -1657,7 +1657,7 @@ async def main(
         print(f"\n❌ Fatal error: {e}")
         if verbose:
             traceback.print_exc()
-        return 1
+        raise SystemExit(1)
 
 
 @wraps(main)
