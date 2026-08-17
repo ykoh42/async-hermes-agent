@@ -6,8 +6,10 @@ on upstream tag `v2026.8.13` (Python package version `0.20.1`).
 
 This repository keeps the Hermes agent loop, model providers, tool execution,
 MCP, skills, persistent memory and sessions, trajectory generation, runner, and
-batch runner. The CLI/TUI, messaging bridges, scheduler, dashboard, and FastAPI
-application are intentionally outside this package.
+batch runner. The interactive Hermes CLI/TUI, messaging bridges, scheduler,
+dashboard, and FastAPI application are intentionally outside this package. The
+upstream-compatible `batch_runner.py` script entrypoint remains available for
+dataset generation.
 
 The public core API keeps the upstream names and module locations. Existing
 library integrations normally only need to add `await`:
@@ -302,10 +304,31 @@ async def run_one_task():
 result = asyncio.run(run_one_task())
 ```
 
-For datasets, use `BatchRunner` from the unchanged `batch_runner.py` module and
-await its existing `run()` method. It retains bounded concurrency, checkpoints,
-resume support, and JSONL output. `trajectory_compressor.py` remains available
-for post-processing generated trajectories.
+For datasets, the upstream-compatible command-line entrypoint remains
+available from a source checkout:
+
+```bash
+python batch_runner.py \
+    --dataset_file=data/prompts.jsonl \
+    --batch_size=10 \
+    --run_name=my_first_run \
+    --model=anthropic/claude-sonnet-4.6 \
+    --num_workers=4
+
+# Resume an interrupted run.
+python batch_runner.py \
+    --dataset_file=data/prompts.jsonl \
+    --batch_size=10 \
+    --run_name=my_first_run \
+    --resume
+```
+
+An installed package also supports `python -m batch_runner ...`. The CLI uses
+Fire only at that process boundary; an async web host does not use Fire or
+create a nested event loop. For library and FastAPI use, import `BatchRunner`
+and await its existing `run()` method directly. It retains bounded concurrency,
+checkpoints, resume support, and JSONL output. `trajectory_compressor.py`
+remains available for post-processing generated trajectories.
 
 ```python
 import asyncio

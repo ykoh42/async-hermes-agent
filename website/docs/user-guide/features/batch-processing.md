@@ -1,107 +1,258 @@
 ---
-title: Batch Processing
-description: Generate ordered tool-use trajectories with bounded async concurrency and resumable JSONL output.
-sidebar_position: 7
+sidebar_position: 12
+title: "Batch Processing"
+description: "Generate agent trajectories at scale — parallel processing, checkpointing, and toolset distributions"
 ---
 
 # Batch Processing
 
-`BatchRunner` runs a JSONL prompt dataset through the same agent loop used by
-interactive library calls. It is a training-data and evaluation harness, not a
-fine-tuning trainer.
+Batch processing lets you run the Hermes agent across hundreds or thousands of prompts in parallel, generating structured trajectory data. This is primarily used for **training data generation** — producing ShareGPT-format trajectories with tool usage statistics that can be used for fine-tuning or evaluation.
 
-## Input
+## Overview
 
-Each non-empty JSONL row must contain `prompt`:
+The batch runner (`batch_runner.py`) processes a JSONL dataset of prompts, running each through a full agent session with tool access. Each prompt gets its own isolated environment. The output is structured trajectory data with full conversation history, tool call statistics, and reasoning coverage metrics.
 
-```jsonl
-{"prompt":"Inspect this Python project and explain its async boundaries."}
-{"prompt":"Use the file tools to repair the supplied test fixture."}
+## Quick Start
+
+```bash
+# Basic batch run
+python batch_runner.py \
+    --dataset_file=data/prompts.jsonl \
+    --batch_size=10 \
+    --run_name=my_first_run \
+    --model=anthropic/claude-sonnet-4.6 \
+    --num_workers=4
+
+# Resume an interrupted run
+python batch_runner.py \
+    --dataset_file=data/prompts.jsonl \
+    --batch_size=10 \
+    --run_name=my_first_run \
+    --resume
+
+# List available toolset distributions
+python batch_runner.py --list_distributions
 ```
 
-Malformed rows and rows without `prompt` are skipped. Keep each dataset item
-self-contained: batch runs set `skip_context_files=True`, `skip_memory=True`,
-and do not attach durable sessions.
+An installed package supports the same upstream command through
+`python -m batch_runner ...`.
 
-## Run programmatically
+:::tip Predictable cost at scale
+Batch runs spin up many concurrent agent sessions, each making model calls and tool calls. A [Nous Portal](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway) subscription bundles model access plus web search, image gen, TTS, and cloud browsers under one bill — useful when you want stable cost-per-trajectory without juggling rate limits across five vendor accounts. Configure the provider and model through the library's provider settings; the removed interactive `hermes setup --portal` command is not part of this package.
+:::
 
-There is no supported command-line entrypoint in this library distribution.
-Construct `BatchRunner` and await its existing `run()` method:
+## Async library and web servers
+
+The upstream `BatchRunner` API remains available to an async host. Fire is used only by the process-level CLI entrypoint; a web request imports `BatchRunner` and awaits the same `run()` method:
 
 ```python
-import asyncio
-import os
-
 from batch_runner import BatchRunner
 
 
-async def main() -> None:
+async def run_batch_job() -> None:
     runner = BatchRunner(
-        dataset_file="prompts.jsonl",
-        batch_size=8,
-        run_name="tool-training",
-        distribution="terminal_only",
-        base_url=os.getenv("MODEL_BASE_URL") or None,
-        api_key=os.getenv("MODEL_API_KEY") or None,
-        model=os.environ["MODEL_ID"],
+        dataset_file="data/prompts.jsonl",
+        batch_size=10,
+        run_name="web_job",
+        model="anthropic/claude-sonnet-4.6",
         num_workers=4,
-        max_iterations=20,
-        reasoning_config={"enabled": True, "effort": "low"},
     )
     await runner.run(resume=True)
-
-
-asyncio.run(main())
 ```
 
-`run()` returns `None`; its contract is the files written below.
+The ASGI application owns authentication, user identity, routing, task lifetime, and unique `run_name` values. Different run names can run concurrently on one event loop. Coordination for the same run name across multiple server processes remains the host application's responsibility.
 
-## Concurrency model
+## Dataset Format
 
-Each batch processes its prompts sequentially, preserving shard order. Up to
-`num_workers` batches overlap model and tool I/O through asyncio tasks and a
-semaphore. `num_workers` itself does not create a batch worker pool. Checkpoint
-and shard file operations use the package's current `aiofiles` layer and can
-therefore use its executor-backed regular-file implementation.
+The input dataset is a JSONL file (one JSON object per line). Each entry must have a `prompt` field:
 
-Cancellation cancels and awaits sibling batch tasks. If cancellation arrives
-after a shard-row append has started, that single append completes before
-`CancelledError` propagates. Checkpoint publication uses atomic replacement to
-avoid half-written resume state.
+```jsonl
+{"prompt": "Write a Python function that finds the longest palindromic substring"}
+{"prompt": "Create a REST API endpoint for user authentication using Flask"}
+{"prompt": "Debug this error: TypeError: cannot unpack non-iterable NoneType object"}
+```
 
-## Output
+Entries can optionally include:
+- `image` or `docker_image`: A container image to use for this prompt's sandbox (works with Docker, Modal, and Singularity backends)
+- `cwd`: Working directory override for the task's terminal session
 
-Files are written under `data/<run_name>/`:
+## Configuration Options
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--dataset_file` | (required) | Path to JSONL dataset |
+| `--batch_size` | (required) | Prompts per batch |
+| `--run_name` | (required) | Name for this run (used for output dir and checkpointing) |
+| `--distribution` | `"default"` | Toolset distribution to sample from |
+| `--model` | `claude-sonnet-4.6` | Model to use |
+| `--base_url` | `https://openrouter.ai/api/v1` | API base URL |
+| `--api_key` | (env var) | API key for model |
+| `--max_turns` | `10` | Maximum tool-calling iterations per prompt |
+| `--num_workers` | `4` | Concurrent async batch tasks (upstream name retained) |
+| `--resume` | `false` | Resume from checkpoint |
+| `--verbose` | `false` | Enable verbose logging |
+| `--max_samples` | all | Only process first N samples from dataset |
+| `--max_tokens` | model default | Maximum tokens per model response |
+
+### Provider Routing (OpenRouter)
+
+| Parameter | Description |
+|-----------|-------------|
+| `--providers_allowed` | Comma-separated providers to allow (e.g., `"anthropic,openai"`) |
+| `--providers_ignored` | Comma-separated providers to ignore (e.g., `"together,deepinfra"`) |
+| `--providers_order` | Comma-separated preferred provider order |
+| `--provider_sort` | Sort by `"price"`, `"throughput"`, or `"latency"` |
+
+### Reasoning Control
+
+| Parameter | Description |
+|-----------|-------------|
+| `--reasoning_effort` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `--reasoning_disabled` | Completely disable reasoning/thinking tokens |
+
+### Advanced Options
+
+| Parameter | Description |
+|-----------|-------------|
+| `--ephemeral_system_prompt` | System prompt used during execution but NOT saved to trajectories |
+| `--log_prefix_chars` | Characters to show in log previews (default: 100) |
+| `--prefill_messages_file` | Path to JSON file with prefill messages for few-shot priming |
+
+## Toolset Distributions
+
+Each prompt gets a randomly sampled set of toolsets from a **distribution**. This ensures training data covers diverse tool combinations. Use `--list_distributions` to see all available distributions.
+
+In the current implementation, distributions assign a probability to **each individual toolset**. The sampler flips each toolset independently, then guarantees that at least one toolset is enabled. This is different from a hand-authored table of prebuilt combinations.
+
+## Output Format
+
+All output goes to `data/<run_name>/`:
 
 ```text
-data/tool-training/
-├── batch_0.jsonl
+data/my_run/
+├── trajectories.jsonl    # Combined final output (all batches merged)
+├── batch_0.jsonl         # Individual batch results
 ├── batch_1.jsonl
-├── trajectories.jsonl
-├── checkpoint.json
-└── statistics.json
+├── ...
+├── checkpoint.json       # Resume checkpoint
+└── statistics.json       # Aggregate tool usage stats
 ```
 
-- `batch_*.jsonl` are append-only per-batch shards.
-- `trajectories.jsonl` merges valid shard rows.
-- `checkpoint.json` records completed prompts.
-- `statistics.json` summarizes tool and reasoning coverage.
+### Trajectory Format
 
-Resume scans existing batch files and matches successful samples by prompt
-content before scheduling remaining work. Failed prompts can be retried.
+Each line in `trajectories.jsonl` is a JSON object:
 
-## Trajectory contract
+```json
+{
+  "prompt_index": 42,
+  "conversations": [
+    {"from": "human", "value": "Write a function..."},
+    {"from": "gpt", "value": "I'll create that function...",
+     "tool_calls": [...]},
+    {"from": "tool", "value": "..."},
+    {"from": "gpt", "value": "Here's the completed function..."}
+  ],
+  "metadata": {
+    "batch_num": 2,
+    "timestamp": "2026-01-15T10:30:00",
+    "model": "anthropic/claude-sonnet-4.6"
+  },
+  "completed": true,
+  "partial": false,
+  "api_calls": 3,
+  "toolsets_used": ["terminal", "file"],
+  "tool_stats": {
+    "terminal": {"count": 2, "success": 2, "failure": 0},
+    "read_file": {"count": 1, "success": 1, "failure": 0}
+  },
+  "tool_error_counts": {
+    "terminal": 0,
+    "read_file": 0
+  }
+}
+```
 
-The `conversations` sequence uses ShareGPT-style `from`/`value` entries with
-roles such as `system`, `human`, `gpt`, and `tool`. Reasoning, model-emitted tool
-calls, ordered observations, and the final answer are preserved. Tool statistics
-and error counts are normalized for dataset processing.
+The `conversations` field uses a ShareGPT-like format with `from` and `value` fields. Tool stats are normalized to include all possible tools with zero defaults, ensuring consistent schema across entries for HuggingFace datasets compatibility.
 
-Samples with zero recorded assistant reasoning are discarded from trajectory
-files and marked complete, so resume does not repeatedly regenerate them.
-Invalid JSON and entries containing unknown/hallucinated tool names are excluded
-when shards are merged.
+## Checkpointing
 
-For a single conversation, `AIAgent(save_trajectories=True)` appends successful
-samples to `trajectory_samples.jsonl` in the current working directory and
-failed samples to `failed_trajectories.jsonl`.
+The batch runner has robust checkpointing for fault tolerance:
+
+- **Checkpoint file:** Saved after each batch completes, tracking which prompt indices are done
+- **Content-based resume:** On `--resume`, the runner scans existing batch files and matches completed prompts by their actual text content (not just indices), enabling recovery even if the dataset order changes
+- **Failed prompts:** Only successfully completed prompts are marked as done — failed prompts will be retried on resume
+- **Batch merging:** On completion, all batch files (including from previous runs) are merged into a single `trajectories.jsonl`
+
+### How Resume Works
+
+1. Scan all `batch_*.jsonl` files for completed prompts (by content matching)
+2. Filter the dataset to exclude already-completed prompts
+3. Re-batch the remaining prompts
+4. Process only the remaining prompts
+5. Merge all batch files (old + new) into final output
+
+## Async execution note
+
+The retained async port keeps the upstream ordering and checkpoint semantics. Each batch processes its prompts sequentially; `num_workers` bounds overlapping async batch tasks. Cancellation awaits sibling task cleanup and preserves whole-row/atomic-checkpoint writes before re-raising `CancelledError`.
+
+## Quality Filtering
+
+The batch runner applies automatic quality filtering:
+
+- **No-reasoning filter:** Samples where zero assistant turns contain reasoning (no `<REASONING_SCRATCHPAD>` or native thinking tokens) are discarded
+- **Corrupted entry filter:** Entries with hallucinated tool names (not in the valid tool list) are filtered out during the final merge
+- **Reasoning statistics:** Tracks percentage of turns with/without reasoning across the entire run
+
+## Statistics
+
+After completion, the runner prints comprehensive statistics:
+
+- **Tool usage:** Call counts, success/failure rates per tool
+- **Reasoning coverage:** Percentage of assistant turns with reasoning
+- **Samples discarded:** Count of samples filtered for lacking reasoning
+- **Duration:** Total processing time
+
+Statistics are also saved to `statistics.json` for programmatic analysis.
+
+## Use Cases
+
+### Training Data Generation
+
+Generate diverse tool-use trajectories for fine-tuning:
+
+```bash
+python batch_runner.py \
+    --dataset_file=data/coding_prompts.jsonl \
+    --batch_size=20 \
+    --run_name=coding_v1 \
+    --model=anthropic/claude-sonnet-4.6 \
+    --num_workers=8 \
+    --distribution=default \
+    --max_turns=15
+```
+
+### Model Evaluation
+
+Evaluate how well a model uses tools across standardized prompts:
+
+```bash
+python batch_runner.py \
+    --dataset_file=data/eval_suite.jsonl \
+    --batch_size=10 \
+    --run_name=eval_gpt4 \
+    --model=openai/gpt-4o \
+    --num_workers=4 \
+    --max_turns=10
+```
+
+### Per-Prompt Container Images
+
+For benchmarks requiring specific environments, each prompt can specify its own container image:
+
+```jsonl
+{"prompt": "Install numpy and compute eigenvalues of a 3x3 matrix", "image": "python:3.11-slim"}
+{"prompt": "Compile this Rust program and run it", "image": "rust:1.75"}
+{"prompt": "Set up a Node.js Express server", "image": "node:20-alpine", "cwd": "/app"}
+```
+
+The batch runner verifies Docker images are accessible before running each prompt.

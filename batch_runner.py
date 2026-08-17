@@ -11,6 +11,17 @@ across multiple prompts from a dataset. It includes:
 - Tool usage statistics aggregation across all batches
 
 Usage:
+    # From a source checkout (upstream-compatible CLI):
+    python batch_runner.py \
+        --dataset_file=data/prompts.jsonl \
+        --batch_size=10 \
+        --run_name=my_run \
+        --model=anthropic/claude-sonnet-4.6
+
+    # Or from an installed package:
+    python -m batch_runner --list_distributions
+
+    # Programmatic async use from an existing event loop:
     runner = BatchRunner(
         dataset_file="data.jsonl",
         batch_size=10,
@@ -39,6 +50,7 @@ import aiofiles
 import aiofiles.os
 import aiofiles.tempfile
 import errno
+from functools import wraps
 import logging
 import os
 import stat
@@ -52,6 +64,8 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRe
 from rich.console import Console
 
 logger = logging.getLogger(__name__)
+import fire
+
 from run_agent import AIAgent
 from toolset_distributions import (
     list_distributions, 
@@ -1467,6 +1481,14 @@ class BatchRunner:
         print(f"   - Checkpoint: {self.checkpoint_file.name}")
 
 
+def _parse_provider_preferences(value: Any) -> list[str] | None:
+    """Normalize Fire's tuple form of an upstream comma-separated CLI value."""
+    if not value:
+        return None
+    values = value.split(",") if isinstance(value, str) else value
+    return [provider.strip() for provider in values]
+
+
 async def main(
     dataset_file: str | None = None,
     batch_size: int | None = None,
@@ -1537,12 +1559,15 @@ async def main(
     """
     # Handle list distributions
     if list_distributions:
-        from toolset_distributions import print_distribution_info
+        from toolset_distributions import (
+            list_distributions as _list_distributions,
+            print_distribution_info,
+        )
 
         print("📊 Available Toolset Distributions")
         print("=" * 70)
 
-        all_dists = list_distributions()
+        all_dists = _list_distributions()
         for dist_name in sorted(all_dists.keys()):
             print_distribution_info(dist_name)
         
@@ -1565,9 +1590,9 @@ async def main(
         return
     
     # Parse provider preferences (comma-separated strings to lists)
-    providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
-    providers_ignored_list = [p.strip() for p in providers_ignored.split(",")] if providers_ignored else None
-    providers_order_list = [p.strip() for p in providers_order.split(",")] if providers_order else None
+    providers_allowed_list = _parse_provider_preferences(providers_allowed)
+    providers_ignored_list = _parse_provider_preferences(providers_ignored)
+    providers_order_list = _parse_provider_preferences(providers_order)
     
     # Build reasoning_config from CLI flags
     # --reasoning_disabled takes priority, then --reasoning_effort, then default (medium)
@@ -1633,3 +1658,13 @@ async def main(
         if verbose:
             traceback.print_exc()
         return 1
+
+
+@wraps(main)
+def _run_cli(*args: Any, **kwargs: Any) -> Any:
+    """Run the upstream Fire entry point at the process-level async boundary."""
+    return asyncio.run(main(*args, **kwargs))
+
+
+if __name__ == "__main__":
+    fire.Fire(_run_cli)

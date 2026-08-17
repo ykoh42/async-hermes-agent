@@ -16,9 +16,11 @@ The retained product surface is:
 - reusable provider, plugin, and configuration support required by those
   paths.
 
-This package does not ship a CLI/TUI, messaging bridge, scheduler, dashboard,
-desktop application, or FastAPI application. A downstream application owns its
-user interface, authentication, routing, and service lifecycle.
+This package does not ship the interactive Hermes CLI/TUI, messaging bridge,
+scheduler, dashboard, desktop application, or FastAPI application. It does
+retain the upstream `batch_runner.py` script/module entrypoint for dataset
+generation. A downstream application owns its user interface, authentication,
+routing, and service lifecycle.
 
 Do not document or implement a removed upstream surface before its executable
 code is deliberately restored. When restoring one, bring back its tests and
