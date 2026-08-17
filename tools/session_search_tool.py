@@ -36,6 +36,8 @@ from typing import Any
 import aiofiles
 import aiofiles.os
 
+from hermes_state_common import _RESET_END_REASONS
+
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent"; kanban dispatcher workers are
@@ -79,6 +81,8 @@ _COMPACTION_PREFIXES = (
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY]:",
 )
+
+_FRESH_RESET_END_REASONS = frozenset(_RESET_END_REASONS) | {"new_session"}
 
 
 def _format_timestamp(ts: int | float | str | None) -> str:
@@ -154,6 +158,17 @@ async def _resolve_lineage(db, session_id: str) -> str:
     return (await _resolve_to_parent(db, session_id))[0]
 
 
+async def _session_end_reason(db, session_id: str) -> str | None:
+    """Return a session end reason without hiding lookup failures."""
+    if not session_id:
+        return None
+    try:
+        session = await db.get_session(session_id)
+        return session.get("end_reason") or None if session else None
+    except Exception:
+        return None
+
+
 async def _is_compression_ended(db, session_id: str) -> bool:
     """Return True if *session_id* itself ended with ``end_reason='compression'``.
 
@@ -164,15 +179,13 @@ async def _is_compression_ended(db, session_id: str) -> bool:
     ``end_reason`` is ``None`` — its content is still live to the parent agent,
     so it must stay excluded from discovery.
     """
-    if not session_id:
-        return False
-    try:
-        s = await db.get_session(session_id)
-        if not s:
-            return False
-        return s.get("end_reason") == "compression"
-    except Exception:
-        return False
+    return await _session_end_reason(db, session_id) == "compression"
+
+
+async def _session_left_live_context(db, session_id: str) -> bool:
+    """Return whether a session's transcript is no longer live context."""
+    reason = await _session_end_reason(db, session_id)
+    return reason == "compression" or reason in _FRESH_RESET_END_REASONS
 
 
 async def _get_message_storage_state(db, message_id) -> dict[str, Any] | None:
@@ -454,24 +467,23 @@ async def _list_recent_sessions(db, limit: int, current_session_id: str | None =
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = await db.list_sessions_rich(
-            limit=limit + 5,
+            limit=limit + 15,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
-        )  # fetch extra so we can skip current
+        )  # fetch extra so we can skip current / compression roots
 
-        current_root = (
-            await _resolve_lineage(db, current_session_id)
+        current_root, has_compression_hop = (
+            await _resolve_to_parent(db, current_session_id)
             if current_session_id
-            else None
+            else (None, False)
         )
 
         results = []
         for s in sessions:
             sid = s.get("id", "")
-            if current_root and (sid == current_root or sid == current_session_id):
+            if sid == current_session_id:
                 continue
-            # Skip child / delegation sessions
-            if s.get("parent_session_id"):
+            if has_compression_hop and current_root and sid == current_root:
                 continue
             results.append({
                 "session_id": sid,
@@ -553,11 +565,11 @@ async def _scroll(
                 and anchor_state["active"] == 0
                 and anchor_state["compacted"] != 1
             )
-            is_compression_history = (
+            is_out_of_context_history = (
                 not is_inactive_non_compacted_anchor
-                and await _is_compression_ended(db, anchor_session_id)
+                and await _session_left_live_context(db, anchor_session_id)
             )
-            if not (is_compacted_anchor or is_compression_history):
+            if not (is_compacted_anchor or is_out_of_context_history):
                 return tool_error(
                     "scroll rejected: anchor lives in the current session lineage (already in your active context)",
                     success=False,
@@ -662,7 +674,8 @@ async def _title_match_result(
 
     lineage_root = await _resolve_lineage(db, session_id)
     if current_lineage_root and lineage_root == current_lineage_root:
-        return None
+        if not await _session_left_live_context(db, session_id):
+            return None
 
     try:
         session_meta = await db.get_session(lineage_root) or await db.get_session(session_id) or {}
@@ -702,6 +715,7 @@ async def _title_match_result(
         "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
+        "detail": "full",
         "_lineage_root": lineage_root,
     }
     if lineage_root and lineage_root != session_id:
@@ -715,10 +729,11 @@ async def _discover(
     role_filter: list[str] | None,
     limit: int,
     sort: str | None,
+    detail: str,
     current_session_id: str | None = None,
     link_profile: str | None = None,
 ) -> str:
-    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    """Discovery shape: FTS5 plus adaptive or full result hydration."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = (
         await _resolve_lineage(db, current_session_id)
@@ -754,6 +769,7 @@ async def _discover(
             "success": True,
             "mode": "discover",
             "query": query,
+            "detail": detail,
             "results": [],
             "count": 0,
             "message": "No matching sessions found.",
@@ -794,7 +810,7 @@ async def _discover(
         # (active=0, compacted=1) row. The live-context load filters active=1,
         # so that content is no longer in context — let it through.
         is_compacted_hit = await _is_compacted_message(db, r.get("id"))
-        is_ended_session = await _is_compression_ended(db, raw_sid)
+        is_ended_session = await _session_left_live_context(db, raw_sid)
         if current_lineage_root and resolved_sid == current_lineage_root:
             if not (is_ended_session or is_compacted_hit):
                 continue
@@ -827,6 +843,11 @@ async def _discover(
         except Exception:
             session_meta = {}
 
+        result_detail = "full" if detail == "full" or not results else "compact"
+        window_messages = view.get("window") or []
+        if result_detail == "compact":
+            window_messages = [m for m in window_messages if m.get("id") == msg_id]
+
         entry = {
             "session_id": hit_sid,
             "when": _format_timestamp(
@@ -838,19 +859,31 @@ async def _discover(
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
             "snippet": match_info.get("snippet") or "",
-            "bookend_start": [
-                _shape_message(m, max_content_len=1200)
-                for m in (view.get("bookend_start") or [])
-                if not _is_compaction_summary(m.get("content", ""))
+            "bookend_start": (
+                [
+                    _shape_message(m, max_content_len=1200)
+                    for m in (view.get("bookend_start") or [])
+                    if not _is_compaction_summary(m.get("content", ""))
+                ]
+                if result_detail == "full"
+                else []
+            ),
+            "messages": [
+                _shape_message(m, anchor_id=msg_id, max_content_len=4000)
+                for m in window_messages
             ],
-            "messages": [_shape_message(m, anchor_id=msg_id, max_content_len=4000) for m in (view.get("window") or [])],
-            "bookend_end": [
-                _shape_message(m, max_content_len=1200)
-                for m in (view.get("bookend_end") or [])
-                if not _is_compaction_summary(m.get("content", ""))
-            ],
+            "bookend_end": (
+                [
+                    _shape_message(m, max_content_len=1200)
+                    for m in (view.get("bookend_end") or [])
+                    if not _is_compaction_summary(m.get("content", ""))
+                ]
+                if result_detail == "full"
+                else []
+            ),
             "messages_before": view.get("messages_before", 0),
             "messages_after": view.get("messages_after", 0),
+            "detail": result_detail,
         }
         if lineage_root and lineage_root != hit_sid:
             entry["parent_session_id"] = lineage_root
@@ -863,6 +896,7 @@ async def _discover(
         "success": True,
         "mode": "discover",
         "query": query,
+        "detail": detail,
         "results": results,
         "count": len(results),
         "sessions_searched": len(seen_sessions),
@@ -885,6 +919,8 @@ async def session_search(
     sort: str | None = None,
     # Cross-profile (any shape)
     profile: str | None = None,
+    # Discovery result shaping (appended for positional compatibility)
+    detail: str = "adaptive",
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -992,12 +1028,19 @@ async def session_search(
             if candidate in ("newest", "oldest"):
                 sort_norm = candidate
 
+        detail_norm = (
+            "full"
+            if isinstance(detail, str) and detail.strip().lower() == "full"
+            else "adaptive"
+        )
+
         return await _discover(
             db=db,
             query=query.strip(),
             role_filter=role_list,
             limit=limit,
             sort=sort_norm,
+            detail=detail_norm,
             current_session_id=current_session_id,
             link_profile=profile,
         )
@@ -1127,6 +1170,16 @@ SESSION_SEARCH_SCHEMA = {
                     "and browse shapes."
                 ),
             },
+            "detail": {
+                "type": "string",
+                "enum": ["adaptive", "full"],
+                "default": "adaptive",
+                "description": (
+                    "Discovery shape only. Adaptive keeps the top-ranked hit full "
+                    "and returns compact anchors for lower-ranked hits. Use 'full' "
+                    "to hydrate every result."
+                ),
+            },
             "session_id": {
                 "type": "string",
                 "description": (
@@ -1190,6 +1243,7 @@ async def _session_search_handler(args: dict, **kw) -> str:
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),
         sort=args.get("sort"),
+        detail=args.get("detail", "adaptive"),
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),

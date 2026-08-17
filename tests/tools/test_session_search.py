@@ -212,6 +212,26 @@ class TestDiscoveryShape:
             assert "messages_before" in hit
             assert "messages_after" in hit
 
+    @pytest.mark.asyncio
+    async def test_full_detail_hydrates_every_hit_and_adaptive_marks_lower_hits(self, db):
+        await _seed_modpack_sessions(db)
+        full = json.loads(
+            await session_search(query="modpack", limit=3, detail="full", db=db)
+        )
+        adaptive = json.loads(
+            await session_search(query="modpack", limit=3, db=db)
+        )
+
+        assert full["detail"] == "full"
+        assert all(hit["detail"] == "full" for hit in full["results"])
+        assert adaptive["detail"] == "adaptive"
+        assert adaptive["results"][0]["detail"] == "full"
+        for hit in adaptive["results"][1:]:
+            assert hit["detail"] == "compact"
+            assert len(hit["messages"]) == 1
+            assert hit["bookend_start"] == []
+            assert hit["bookend_end"] == []
+
 
     @pytest.mark.asyncio
     async def test_current_session_filtered_out(self, db):
@@ -985,3 +1005,48 @@ class TestLegacyContinuationPlusDelegation:
 
         # Delegation child must NOT appear
         assert "s_delegate" not in sids
+
+
+@pytest.mark.asyncio
+async def test_new_reset_predecessor_is_searchable_in_current_lineage(db):
+    """A reset child shares lineage but does not carry the predecessor text."""
+    await db.create_session("s_old", source="cli")
+    await db.append_message(
+        "s_old", role="user", content="legacy reset recovery phrase"
+    )
+    await db.end_session("s_old", "session_reset")
+    await db.create_session(
+        "s_new", source="cli", parent_session_id="s_old",
+        model_config={"_reset_from": "s_old"},
+    )
+
+    result = json.loads(
+        await session_search(
+            query="legacy reset recovery", db=db, current_session_id="s_new"
+        )
+    )
+    assert any(hit["session_id"] == "s_old" for hit in result["results"])
+
+
+@pytest.mark.asyncio
+async def test_branched_parent_remains_hidden_from_current_lineage(db):
+    """A branch copies the transcript, so the parent remains in-context."""
+    await db.create_session("s_parent", source="cli")
+    await db.append_message(
+        "s_parent", role="user", content="branched in context phrase"
+    )
+    await db.end_session("s_parent", "branched")
+    await db.create_session(
+        "s_branch", source="cli", parent_session_id="s_parent",
+        model_config={"_branched_from": "s_parent"},
+    )
+    await db.append_message(
+        "s_branch", role="user", content="branched in context phrase"
+    )
+
+    result = json.loads(
+        await session_search(
+            query="branched in context", db=db, current_session_id="s_branch"
+        )
+    )
+    assert all(hit["session_id"] != "s_parent" for hit in result["results"])
