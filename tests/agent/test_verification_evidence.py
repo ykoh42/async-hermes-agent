@@ -88,6 +88,44 @@ async def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert echoed is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    ["pytest || true", "pytest ; true", "pytest | tee test.log", "pytest &"],
+)
+async def test_masking_shell_control_is_not_verification_evidence(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = await classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is None
+
+
+@pytest.mark.parametrize("command", ["prepare && pytest", "pytest && report"])
+async def test_successful_and_chain_preserves_passing_evidence(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = await classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "pytest"
+
+
 
 
 async def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):
