@@ -26,6 +26,7 @@ import yaml
 from utils import base_url_host_matches, base_url_hostname
 
 from agent.ssl_verify import _create_httpx_client, _resolve_httpx_client_verify
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
@@ -3353,7 +3354,10 @@ def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
     )
     shadow: dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details"):
+        if (
+            k in ("_anthropic_content_blocks", "reasoning_details")
+            or k in PERSISTENCE_ONLY_MESSAGE_FIELDS
+        ):
             continue
         if k == "api_content":
             if sidecar_wins:
