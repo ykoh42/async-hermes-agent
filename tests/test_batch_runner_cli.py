@@ -178,3 +178,36 @@ async def test_async_main_runs_inside_host_event_loop(
     assert received["init"]["run_name"] == "host-loop"
     assert received["init"]["num_workers"] == 4
     assert received["init"]["providers_allowed"] == ["anthropic", "openai"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"batch_size": 1, "run_name": "missing-dataset"}, "dataset_file is required"),
+        ({"dataset_file": "data.jsonl", "run_name": "missing-size"}, "batch_size must be a positive integer"),
+        ({"dataset_file": "data.jsonl", "batch_size": 1}, "run_name is required"),
+    ],
+)
+async def test_async_main_preserves_upstream_validation_exit_codes(
+    kwargs: dict[str, Any], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        await batch_runner.main(**kwargs)
+    assert raised.value.code == 1
+    assert message in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_async_main_preserves_upstream_reasoning_validation_exit_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        await batch_runner.main(
+            dataset_file="data.jsonl",
+            batch_size=1,
+            run_name="invalid-reasoning",
+            reasoning_effort="not-a-real-effort",
+        )
+    assert raised.value.code == 1
+    assert "reasoning_effort must be one of" in capsys.readouterr().out
