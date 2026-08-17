@@ -92,3 +92,38 @@ async def test_custom_providers_valid_context_length():
         )
     for c in mock_logger.warning.call_args_list:
         assert "Invalid" not in str(c)
+
+
+@pytest.mark.asyncio
+async def test_dict_valued_model_default_keeps_matching_context_length():
+    """Nested model defaults are compared by their model id, not repr(dict)."""
+    from hermes_cli import config_defaults
+    from run_agent import AIAgent
+
+    config = {
+        "model": {
+            "default": {"provider": "custom", "model": "gpt5.4"},
+            "provider": "custom",
+            "base_url": "http://localhost:4000/v1",
+            "context_length": 256000,
+        }
+    }
+    previous = config_defaults.DEFAULT_CONFIG
+    config_defaults.DEFAULT_CONFIG = config
+    try:
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                model="gpt5.4",
+                api_key="test-key-1234567890",
+                base_url="http://localhost:4000/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+    finally:
+        config_defaults.DEFAULT_CONFIG = previous
+    assert agent._config_context_length == 256000
