@@ -188,9 +188,8 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
+    "When you work out a non-trivial workflow, record it with skill_manage "
+    "for future reuse.\n"
     "When using a skill and finding it outdated, incomplete, or wrong, "
     "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
     "Skills that aren't maintained become liabilities.\n"
@@ -782,7 +781,7 @@ def drain_truncation_warnings() -> list:
 # Skills prompt cache
 # =========================================================================
 
-_SKILLS_PROMPT_CACHE_MAX = 8
+_SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
