@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - exercised by the missing-extra test
 
 _CONTENT_JSON_PREFIX = "\x00json:"
 _POSTGRES_STORAGE_VERSION_KEY = "postgres_storage_version"
-_POSTGRES_STORAGE_VERSION = 4
+_POSTGRES_STORAGE_VERSION = 5
 _POSTGRES_DELEGATION_INDEX = "idx_async_delegations_delivery"
 _POSTGRES_MIGRATION_LOCK = 731948251
 _POSTGRES_MIGRATION_TABLES = (
@@ -59,6 +59,7 @@ _POSTGRES_MIGRATION_TABLES = (
     "messages",
     "session_model_usage",
     "compression_locks",
+    "session_turn_leases",
 )
 
 _POSTGRES_POOL_DEFAULTS = {
@@ -106,6 +107,8 @@ _POSTGRES_INDEX_DDL = (
     "WHERE role = 'assistant' AND tool_calls IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_compression_locks_expires "
     "ON compression_locks(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+    "ON session_turn_leases(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
     "ON session_model_usage(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
@@ -206,6 +209,15 @@ _POSTGRES_DELEGATION_COLUMN_TYPES = {
     "lease_expires_at": "double precision",
 }
 
+_POSTGRES_TURN_LEASE_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS session_turn_leases (
+    conversation_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at DOUBLE PRECISION NOT NULL,
+    expires_at DOUBLE PRECISION NOT NULL
+)
+"""
+
 _POSTGRES_INDEX_NAMES = frozenset(
     {
         "idx_sessions_title_unique",
@@ -217,6 +229,7 @@ _POSTGRES_INDEX_NAMES = frozenset(
         "idx_messages_session_id",
         "idx_messages_assistant_calls_by_session",
         "idx_compression_locks_expires",
+        "idx_session_turn_leases_expires",
         "idx_session_model_usage_session",
         "idx_session_model_usage_model",
         "idx_messages_session_active",
@@ -623,6 +636,18 @@ class SessionDB:
                 )
         await connection.execute(_sa.text(_POSTGRES_DELEGATION_INDEX_DDL))
 
+    async def _ensure_postgres_turn_lease_storage(
+        self, connection: Any
+    ) -> None:
+        """Create the durable turn-lease table for storage version five."""
+        await connection.execute(_sa.text(_POSTGRES_TURN_LEASE_TABLE_DDL))
+        await connection.execute(
+            _sa.text(
+                "CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+                "ON session_turn_leases(expires_at)"
+            )
+        )
+
     async def _ensure_postgres_hidden_session_column(
         self, connection: Any
     ) -> None:
@@ -711,24 +736,37 @@ class SessionDB:
     async def _postgres_only_hidden_column_is_missing(
         self, connection: Any, metadata: Any
     ) -> bool:
-        """Recognize only the additive upstream hidden-column gap."""
+        """Recognize only the known additive storage gaps."""
         missing: set[tuple[str, str]] = set()
         for table in metadata.tables.values():
+            table_name = str(table.name)
+            exists = await connection.execute(
+                _sa.text("SELECT to_regclass(:table_name)"),
+                {"table_name": table_name},
+            )
+            if exists.scalar_one_or_none() is None:
+                missing.add((table_name, "__table__"))
+                continue
             columns = await connection.execute(
                 _sa.text(
                     "SELECT attname FROM pg_attribute "
                     "WHERE attrelid = to_regclass(:table_name) "
                     "AND attnum > 0 AND NOT attisdropped"
                 ),
-                {"table_name": str(table.name)},
+                {"table_name": table_name},
             )
             present_columns = {str(row[0]) for row in columns}
             missing.update(
-                (str(table.name), str(column.name))
+                (table_name, str(column.name))
                 for column in table.columns
                 if column.name not in present_columns
             )
-        return missing == {("sessions", "hidden")}
+        return bool(missing) and missing.issubset(
+            {
+                ("sessions", "hidden"),
+                ("session_turn_leases", "__table__"),
+            }
+        )
 
     async def _postgres_catalog_is_current(
         self, connection: Any, metadata: Any
@@ -1138,6 +1176,14 @@ class SessionDB:
                     _sa.Column("acquired_at", _sa.Float, nullable=False),
                     _sa.Column("expires_at", _sa.Float, nullable=False),
                 ),
+                "session_turn_leases": _sa.Table(
+                    "session_turn_leases",
+                    metadata,
+                    _sa.Column("conversation_id", _sa.String(255), primary_key=True),
+                    _sa.Column("holder", _sa.String(255), nullable=False),
+                    _sa.Column("acquired_at", _sa.Float, nullable=False),
+                    _sa.Column("expires_at", _sa.Float, nullable=False),
+                ),
             }
             async with self._engine.begin() as connection:
                 if self._read_only:
@@ -1267,6 +1313,13 @@ class SessionDB:
                     )
 
                 if storage_version < _POSTGRES_STORAGE_VERSION:
+                    if storage_version < 5:
+                        # The new table must exist before the migration-table
+                        # lock is acquired; PostgreSQL cannot lock a relation
+                        # that has not been created yet.
+                        await self._ensure_postgres_turn_lease_storage(
+                            connection
+                        )
                     await self._lock_postgres_migration_tables(connection)
                     if storage_version < 4:
                         await self._ensure_postgres_hidden_session_column(
@@ -1295,6 +1348,7 @@ class SessionDB:
 
                 if storage_version < _POSTGRES_STORAGE_VERSION:
                     await self._ensure_postgres_delegation_storage(connection)
+                    await self._ensure_postgres_turn_lease_storage(connection)
                 elif not await self._postgres_delegation_catalog_is_current(
                     connection
                 ):
@@ -1627,6 +1681,34 @@ class SessionDB:
         return ancestor_id in await self._compression_lineage_ids(
             connection, descendant_id
         )
+
+    async def _session_turn_lease_key(self, session_id: str) -> str:
+        """Return one durable lease key for a compression conversation."""
+        if not session_id:
+            return session_id
+        try:
+            current = await self.get_session(session_id)
+            seen = {session_id}
+            while current:
+                config = _json_value(current.get("model_config"), {})
+                explicit_fork = current.get("source") == "tool" or (
+                    isinstance(config, dict)
+                    and bool(
+                        config.get("_branched_from")
+                        or config.get("_delegate_from")
+                    )
+                )
+                parent_id = current.get("parent_session_id")
+                if explicit_fork or not parent_id or parent_id in seen:
+                    break
+                parent = await self.get_session(parent_id)
+                if not parent or parent.get("end_reason") != "compression":
+                    break
+                seen.add(parent_id)
+                current = parent
+            return str(current.get("id") or session_id) if current else session_id
+        except Exception:
+            return session_id
 
     async def _messages(
         self,
@@ -2335,6 +2417,10 @@ class SessionDB:
             "refresh_compression_lock",
             "release_compression_lock",
             "get_compression_lock_holder",
+            "try_acquire_session_turn_lease",
+            "acquire_session_turn_lease",
+            "refresh_session_turn_lease",
+            "release_session_turn_lease",
         }:
             return await self._lock_operation(name, args)
         if name in {"get_meta", "set_meta"}:
@@ -3073,6 +3159,117 @@ class SessionDB:
         return await self._write(_write_one)
 
     async def _lock_operation(self, name: str, args: dict[str, Any]) -> Any:
+        if "session_turn_lease" in name:
+            if name == "acquire_session_turn_lease":
+                deadline = time.monotonic() + max(
+                    0.0, float(args["wait_seconds"])
+                )
+                while True:
+                    if await self._dispatch(
+                        "try_acquire_session_turn_lease",
+                        {
+                            "session_id": args["session_id"],
+                            "holder": args["holder"],
+                            "ttl_seconds": args["ttl_seconds"],
+                        },
+                    ):
+                        return True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    await asyncio.sleep(
+                        min(
+                            max(0.01, float(args["poll_interval_seconds"])),
+                            remaining,
+                        )
+                    )
+
+            session_id = args["session_id"]
+            holder = args["holder"]
+            if not session_id or not holder:
+                return False if name != "release_session_turn_lease" else None
+            conversation_id = await self._session_turn_lease_key(session_id)
+
+            async def _turn_lease(connection):
+                table = self._tables["session_turn_leases"]
+                if name == "try_acquire_session_turn_lease":
+                    await connection.execute(
+                        _sa.text(
+                            "SELECT pg_advisory_xact_lock("
+                            "hashtextextended(:conversation_id, 0))"
+                        ),
+                        {"conversation_id": conversation_id},
+                    )
+                    now = float(
+                        (
+                            await connection.execute(
+                                _sa.text(
+                                    "SELECT extract(epoch FROM clock_timestamp())"
+                                )
+                            )
+                        ).scalar_one()
+                    )
+                    row = (
+                        await connection.execute(
+                            _sa.select(table)
+                            .where(table.c.conversation_id == conversation_id)
+                            .with_for_update()
+                        )
+                    ).first()
+                    if row is not None and float(row.expires_at) <= now:
+                        await connection.execute(
+                            _sa.delete(table).where(
+                                table.c.conversation_id == conversation_id
+                            )
+                        )
+                    await connection.execute(
+                        _sa.text(
+                            "INSERT INTO session_turn_leases "
+                            "(conversation_id, holder, acquired_at, expires_at) "
+                            "VALUES (:conversation_id, :holder, :acquired_at, :expires_at) "
+                            "ON CONFLICT (conversation_id) DO NOTHING"
+                        ),
+                        {
+                            "conversation_id": conversation_id,
+                            "holder": holder,
+                            "acquired_at": now,
+                            "expires_at": now
+                            + max(0.1, float(args["ttl_seconds"])),
+                        },
+                    )
+                    owner = (
+                        await connection.execute(
+                            _sa.select(table.c.holder).where(
+                                table.c.conversation_id == conversation_id
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    return owner == holder
+                if name == "refresh_session_turn_lease":
+                    result = await connection.execute(
+                        _sa.text(
+                            "UPDATE session_turn_leases SET expires_at = "
+                            "extract(epoch FROM clock_timestamp()) + :ttl "
+                            "WHERE conversation_id = :conversation_id "
+                            "AND holder = :holder"
+                        ),
+                        {
+                            "ttl": max(0.1, float(args["ttl_seconds"])),
+                            "conversation_id": conversation_id,
+                            "holder": holder,
+                        },
+                    )
+                    return result.rowcount > 0
+                await connection.execute(
+                    _sa.delete(table).where(
+                        table.c.conversation_id == conversation_id,
+                        table.c.holder == holder,
+                    )
+                )
+                return None
+
+            return await self._write(_turn_lease)
+
         async def _lock(connection):
             table = self._tables["compression_locks"]
             sid = args["session_id"]
@@ -5245,6 +5442,38 @@ class SessionDB:
 
     async def refresh_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
         return await self._dispatch('refresh_compression_lock', locals())
+
+    async def try_acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        return await self._dispatch('try_acquire_session_turn_lease', locals())
+
+    async def acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+        wait_seconds: float = 1800.0,
+        poll_interval_seconds: float = 0.1,
+    ) -> bool:
+        return await self._dispatch('acquire_session_turn_lease', locals())
+
+    async def refresh_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        return await self._dispatch('refresh_session_turn_lease', locals())
+
+    async def release_session_turn_lease(self, session_id: str, holder: str) -> None:
+        return await self._dispatch('release_session_turn_lease', locals())
 
     async def release_compression_lock(self, session_id: str, holder: str) -> None:
         return await self._dispatch('release_compression_lock', locals())

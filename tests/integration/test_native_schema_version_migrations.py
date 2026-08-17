@@ -39,7 +39,7 @@ async def _fetchall(connection, sql: str, params=()):
 
 async def test_core_schema_sql_matches_retained_upstream_v2026_8_16():
     assert hashlib.sha256(SCHEMA_SQL.encode()).hexdigest() == (
-        "007ec8b25045e7361bc45a4ad819a8f48738c50a7ac1e6122e4186aba6152291"
+        "cfae91dbc91892d6826bda8223f9d33ee1752dc31d085b01cb1b542f5be2b277"
     )
 
 

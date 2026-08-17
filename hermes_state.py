@@ -1097,7 +1097,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in text.lower() for marker in _DISK_FULL_MARKERS)
 
 
-PERSISTENCE_ERROR_CAUSES = ("locked", "disk", "unknown")
+PERSISTENCE_ERROR_CAUSES = ("locked", "compression", "disk", "unknown")
 
 
 def classify_persistence_error(exc_or_str: BaseException | str | None) -> str:
@@ -1105,12 +1105,11 @@ def classify_persistence_error(exc_or_str: BaseException | str | None) -> str:
     if exc_or_str is None:
         return "unknown"
     if isinstance(exc_or_str, CompressionSessionBusyError):
-        return "locked"
+        return "compression"
     text = str(exc_or_str).lower()
-    if any(
-        marker in text
-        for marker in ("locked", "busy", "being compressed", "compression lease")
-    ):
+    if "being compressed" in text or "compression lease" in text:
+        return "compression"
+    if "locked" in text or "busy" in text:
         return "locked"
     if (
         is_disk_full_error(exc_or_str)
@@ -3043,6 +3042,137 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         ).fetchone()
         return row["holder"] if row is not None else None
+
+    async def _session_turn_lease_key(self, session_id: str) -> str:
+        """Return the stable serialization key for every compression segment."""
+        if not session_id:
+            return session_id
+        try:
+            current = await self.get_session(session_id)
+            seen = {session_id}
+            while current and await self._is_compression_child_row(current):
+                parent_id = current.get("parent_session_id")
+                if not parent_id or parent_id in seen:
+                    break
+                parent = await self.get_session(parent_id)
+                if not parent:
+                    break
+                seen.add(parent_id)
+                current = parent
+            return str(current.get("id") or session_id) if current else session_id
+        except Exception:
+            return session_id
+
+    async def try_acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically acquire the cross-process turn lease for a conversation."""
+        if not session_id or not holder:
+            return False
+        conversation_id = await self._session_turn_lease_key(session_id)
+        now = time.time()
+
+        async def _acquire(connection):
+            row = await (
+                await connection.execute(
+                    "SELECT holder, expires_at FROM session_turn_leases "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+            ).fetchone()
+            if row is not None and (
+                float(row["expires_at"]) <= now
+                or await _compression_lock_holder_process_is_dead(row["holder"])
+            ):
+                await connection.execute(
+                    "DELETE FROM session_turn_leases "
+                    "WHERE conversation_id = ? AND holder = ?",
+                    (conversation_id, row["holder"]),
+                )
+            await connection.execute(
+                "INSERT OR IGNORE INTO session_turn_leases "
+                "(conversation_id, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (conversation_id, holder, now, now + max(0.1, float(ttl_seconds))),
+            )
+            owner = await (
+                await connection.execute(
+                    "SELECT holder FROM session_turn_leases "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+            ).fetchone()
+            return owner is not None and owner["holder"] == holder
+
+        return bool(await self._execute_write(_acquire))
+
+    async def acquire_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+        wait_seconds: float = 1800.0,
+        poll_interval_seconds: float = 0.1,
+    ) -> bool:
+        """Wait for a cross-process turn lease without holding a SQLite lock."""
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        while True:
+            if await self.try_acquire_session_turn_lease(
+                session_id,
+                holder,
+                ttl_seconds=ttl_seconds,
+            ):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
+
+    async def refresh_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Extend a turn lease only while its holder still matches."""
+        if not session_id or not holder:
+            return False
+        conversation_id = await self._session_turn_lease_key(session_id)
+
+        async def _refresh(connection):
+            cursor = await connection.execute(
+                "UPDATE session_turn_leases SET expires_at = ? "
+                "WHERE conversation_id = ? AND holder = ?",
+                (
+                    time.time() + max(0.1, float(ttl_seconds)),
+                    conversation_id,
+                    holder,
+                ),
+            )
+            return cursor.rowcount > 0
+
+        return bool(await self._execute_write(_refresh))
+
+    async def release_session_turn_lease(self, session_id: str, holder: str) -> None:
+        """Release a turn lease iff its holder still matches; idempotent."""
+        if not session_id or not holder:
+            return
+        conversation_id = await self._session_turn_lease_key(session_id)
+
+        async def _release(connection):
+            await connection.execute(
+                "DELETE FROM session_turn_leases "
+                "WHERE conversation_id = ? AND holder = ?",
+                (conversation_id, holder),
+            )
+
+        await self._execute_write(_release)
 
     async def touch_session_activity(
         self,

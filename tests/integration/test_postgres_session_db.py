@@ -551,7 +551,7 @@ async def test_postgres_persists_logical_and_private_layout_versions():
                 )
             ).scalar_one_or_none()
         assert versions == [SCHEMA_VERSION]
-        assert private_storage_marker == "4"
+        assert private_storage_marker == "5"
     finally:
         await database.close()
 
@@ -586,6 +586,90 @@ async def test_postgres_hidden_sessions_match_sqlite_listing_contract():
         assert all_rows == {"visible", "secret"}
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_session_turn_lease_is_atomic_and_migrates_v4(tmp_path):
+    dsn = os.environ.get("HERMES_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set HERMES_POSTGRES_TEST_DSN for a real PostgreSQL run")
+    import psycopg
+    from sqlalchemy import text
+
+    schema = f"turn_lease_v4_{uuid.uuid4().hex}"
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "database:\n  postgres:\n    connect_args:\n"
+        f"      options: '-c search_path={schema}'\n",
+        encoding="utf-8",
+    )
+    admin_dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+    admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+    token = set_hermes_home_override(home)
+    database = None
+    migrated = None
+    try:
+        async with admin.cursor() as cursor:
+            await cursor.execute(f'CREATE SCHEMA "{schema}"')
+        database = PostgresSessionDB(dsn)
+        await database._ensure_ready()
+        async with database._engine.begin() as connection:
+            await connection.execute(text("DROP INDEX idx_session_turn_leases_expires"))
+            await connection.execute(text("DROP TABLE session_turn_leases"))
+            await connection.execute(
+                text(
+                    "UPDATE state_meta SET value = '4' "
+                    "WHERE key = 'postgres_storage_version'"
+                )
+            )
+        await database.close()
+        migrated = PostgresSessionDB(dsn)
+        await migrated._ensure_ready()
+        session_id = f"lease-{uuid.uuid4().hex}"
+        await migrated.create_session(session_id, source="cli")
+        assert await migrated.try_acquire_session_turn_lease(
+            session_id, "holder-a"
+        )
+        assert not await migrated.try_acquire_session_turn_lease(
+            session_id, "holder-b"
+        )
+        assert await migrated.refresh_session_turn_lease(session_id, "holder-a")
+        await migrated.release_session_turn_lease(session_id, "holder-a")
+        assert await migrated.try_acquire_session_turn_lease(
+            session_id, "holder-b"
+        )
+        async with migrated._engine.connect() as connection:
+            storage = (
+                await connection.execute(
+                    text(
+                        "SELECT value FROM state_meta "
+                        "WHERE key = 'postgres_storage_version'"
+                    )
+                )
+            ).scalar_one()
+            index_exists = (
+                await connection.execute(
+                    text(
+                        "SELECT to_regclass('idx_session_turn_leases_expires')"
+                    )
+                )
+            ).scalar_one()
+        assert storage == "5"
+        assert index_exists == "idx_session_turn_leases_expires"
+    finally:
+        reset_hermes_home_override(token)
+        if database is not None:
+            await database.close()
+        if migrated is not None:
+            await migrated.close()
+        await admin.close()
+        admin = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            await admin.close()
 
 
 @pytest.mark.asyncio
@@ -644,7 +728,7 @@ async def test_postgres_storage_v3_adds_upstream_hidden_column_atomically(tmp_pa
                 )
             ).scalar_one()
         assert hidden_type == "integer"
-        assert storage == "4"
+        assert storage == "5"
     finally:
         reset_hermes_home_override(token)
         await database.close()
@@ -842,7 +926,7 @@ async def test_postgres_storage_migration_rolls_back_and_retries(tmp_path, monke
                     )
                 )
             ).scalar_one()
-        assert storage_version == "4"
+        assert storage_version == "5"
         assert "tool_calls" in search_index
         await check.close()
     finally:

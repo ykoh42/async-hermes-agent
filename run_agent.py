@@ -8061,6 +8061,9 @@ class AIAgent:
             getattr(self, "_session_runtime_config", None)
         )
         interrupt_token = _bind_interrupt_event(self._interrupt_event)
+        durable_turn_lease = None
+        durable_turn_lease_stop = None
+        durable_turn_lease_task = None
         try:
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
@@ -8078,6 +8081,87 @@ class AIAgent:
                 else None,
                 getattr(self, "session_id", None),
             )
+            turn_db = getattr(self, "_session_db", None)
+            durable_session_exists = False
+            if turn_db is not None and session_id:
+                try:
+                    durable_session_exists = (
+                        await turn_db.get_session(session_id) is not None
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not check durable session before turn lease",
+                        exc_info=True,
+                    )
+            if (
+                turn_db is not None
+                and session_id
+                and not getattr(self, "_persist_disabled", False)
+                and durable_session_exists
+                and callable(
+                    getattr(type(turn_db), "acquire_session_turn_lease", None)
+                )
+            ):
+                self._session_db_created = True
+                durable_turn_lease = (
+                    f"pid={os.getpid()}:turn={effective_task_id}:platform="
+                    f"{getattr(self, 'platform', None) or 'unknown'}"
+                )
+                if not await turn_db.acquire_session_turn_lease(
+                    session_id,
+                    durable_turn_lease,
+                    ttl_seconds=300.0,
+                    wait_seconds=1800.0,
+                ):
+                    raise TimeoutError(
+                        f"session turn lease wait timed out for {session_id}"
+                    )
+                latest_session_id = await turn_db.resolve_resume_session_id(session_id)
+                if latest_session_id:
+                    self.session_id = latest_session_id
+                    session_id = latest_session_id
+                conversation_history = await turn_db.get_messages_as_conversation(
+                    self.session_id,
+                    repair_alternation=True,
+                )
+
+                durable_turn_lease_stop = asyncio.Event()
+
+                async def _refresh_durable_turn_lease() -> None:
+                    while True:
+                        try:
+                            await asyncio.wait_for(
+                                durable_turn_lease_stop.wait(), timeout=60.0
+                            )
+                            return
+                        except asyncio.TimeoutError:
+                            pass
+                        try:
+                            refreshed = await turn_db.refresh_session_turn_lease(
+                                session_id,
+                                durable_turn_lease,
+                                ttl_seconds=300.0,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Failed to refresh session turn lease: %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                            continue
+                        if not refreshed:
+                            logger.error(
+                                "Lost session turn lease while turn is active: %s",
+                                session_id,
+                            )
+                            return
+
+                durable_turn_lease_task = asyncio.create_task(
+                    _refresh_durable_turn_lease(),
+                    name="session-turn-lease-refresh",
+                )
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
@@ -8130,6 +8214,24 @@ class AIAgent:
                     )
                 )
             finally:
+                if durable_turn_lease_stop is not None:
+                    durable_turn_lease_stop.set()
+
+                async def _cleanup_durable_turn_lease() -> None:
+                    if durable_turn_lease_task is not None:
+                        await durable_turn_lease_task
+                    if durable_turn_lease is not None and turn_db is not None:
+                        await turn_db.release_session_turn_lease(
+                            session_id,
+                            durable_turn_lease,
+                        )
+
+                if durable_turn_lease is not None and turn_db is not None:
+                    cleanup_task = asyncio.create_task(
+                        _cleanup_durable_turn_lease(),
+                        name="session-turn-lease-cleanup",
+                    )
+                    await _finish_owned_task(cleanup_task)
                 _reset_session_runtime_config(session_runtime_token)
                 turn_lock.release()
 
