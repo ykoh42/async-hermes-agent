@@ -76,6 +76,7 @@ dependencies = [
   # Native CDP transport for browser_cdp and the persistent supervisor.
   "websockets==15.0.1",
   "rich==14.3.3",
+  "fire==0.7.1",
   "pyyaml==6.0.3",
   # Bumped from 2.12.5 to 2.13.4 to pull in pydantic-core 2.46.4.
   # pydantic-core 2.41.5 (pulled by 2.12.5) segfaults when the OpenAI SDK's
