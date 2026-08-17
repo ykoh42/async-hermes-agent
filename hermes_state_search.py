@@ -1087,7 +1087,7 @@ class SessionSearchMixin:
         sql = f"""
             SELECT m.id, m.session_id, m.role,
                    snippet({table}, -1, '>>>', '<<<', '...', 40) AS snippet,
-                   m.content, m.timestamp, m.tool_name,
+                   m.timestamp, m.tool_name,
                    s.source, s.model, s.started_at AS session_started
             FROM {table}
             JOIN messages m ON m.id = {table}.rowid
@@ -1283,7 +1283,7 @@ class SessionSearchMixin:
         sql = f"""
             SELECT m.id, m.session_id, m.role,
                    substr(m.content, max(1, instr(m.content, ?) - 40), 120) AS snippet,
-                   m.content, m.timestamp, m.tool_name,
+                   m.timestamp, m.tool_name,
                    s.source, s.model, s.started_at AS session_started
             FROM messages m
             JOIN sessions s ON s.id = m.session_id
@@ -1383,7 +1383,7 @@ class SessionSearchMixin:
         sql = f"""
             SELECT m.id, m.session_id, m.role,
                    snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
-                   m.content, m.timestamp, m.tool_name,
+                   m.timestamp, m.tool_name,
                    s.source, s.model, s.started_at AS session_started
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
@@ -1487,11 +1487,11 @@ class SessionSearchMixin:
                     )
                     like_params.extend(role_filter)
                 like_sql = f"""
-                    SELECT m.id, m.session_id, m.role,
+                        SELECT m.id, m.session_id, m.role,
                            substr(m.content,
                                   max(1, instr(m.content, ?) - 40),
                                   120) AS snippet,
-                           m.content, m.timestamp, m.tool_name,
+                           m.timestamp, m.tool_name,
                            s.source, s.model,
                            s.started_at AS session_started
                     FROM messages m
@@ -1702,7 +1702,7 @@ class SessionSearchMixin:
                    substr(m.content,
                           max(1, instr(m.content, ?) - 40),
                           120) AS snippet,
-                   m.content, m.timestamp, m.tool_name,
+                   m.timestamp, m.tool_name,
                    s.source, s.model, s.started_at AS session_started
             FROM messages m
             JOIN sessions s ON s.id = m.session_id
