@@ -15,7 +15,9 @@ from agent.context_compressor import (
 )
 
 
-def _compressor(protect_first_n: int = 1) -> ContextCompressor:
+def _compressor(
+    protect_first_n: int = 1, tail_mode: str = "legacy"
+) -> ContextCompressor:
     with patch("agent.context_compressor._get_static_context_length", return_value=100000):
         return ContextCompressor(
             model="test/model",
@@ -23,6 +25,7 @@ def _compressor(protect_first_n: int = 1) -> ContextCompressor:
             protect_first_n=protect_first_n,
             protect_last_n=1,
             quiet_mode=True,
+            tail_mode=tail_mode,
         )
 
 
@@ -88,6 +91,65 @@ def _messages_with_summary_at_index(summary_index: int):
         {"role": "user", "content": "tail request"},
     ])
     return msgs
+
+
+def test_tail_mode_defaults_to_legacy_and_supports_upstream_lean_budget():
+    legacy = _compressor()
+    lean = _compressor(tail_mode="lean")
+    invalid = _compressor(tail_mode="unknown")
+
+    assert legacy.tail_mode == "legacy"
+    assert invalid.tail_mode == "legacy"
+    assert lean.tail_mode == "lean"
+    assert lean.tail_token_budget == 10_000
+    assert legacy.tail_token_budget == int(legacy.threshold_tokens * 0.20)
+
+
+@pytest.mark.asyncio
+async def test_degenerate_compress_end_keeps_same_session_previous_summary():
+    """A handoff past a degenerate cut must keep same-session state."""
+    compressor = _compressor(protect_first_n=0)
+    rich_summary = (
+        "RICH-SAME-SESSION-HANDOFF\n"
+        "1. completed action alpha\n"
+        "2. completed action beta\n"
+        "3. completed action gamma"
+    )
+    compressor.compression_count = 1
+    compressor._previous_summary = rich_summary
+
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "early turn before cut"},
+        {"role": "assistant", "content": "early answer"},
+        {"role": "user", "content": "mid turn before handoff"},
+        {"role": "assistant", "content": f"{SUMMARY_PREFIX}\n{rich_summary}"},
+        {"role": "user", "content": "post handoff turn"},
+        {"role": "assistant", "content": "post handoff answer"},
+        {"role": "user", "content": "tail request"},
+    ]
+    previous_at_generate: list[str | None] = []
+
+    def _capture(turns: list[dict[str, object]], **kwargs: object) -> str:
+        del turns, kwargs
+        previous_at_generate.append(compressor._previous_summary)
+        return ContextCompressor._with_summary_prefix("updated iterative summary")
+
+    with (
+        patch.object(compressor, "_find_tail_cut_by_tokens", return_value=2),
+        patch.object(compressor, "_generate_summary", side_effect=_capture),
+    ):
+        result = await compressor.compress(messages, current_tokens=90_000)
+
+    assert previous_at_generate
+    assert previous_at_generate[0] is not None
+    assert "RICH-SAME-SESSION-HANDOFF" in previous_at_generate[0]
+    assert compressor._previous_summary is not None
+    stored = compressor._previous_summary or ""
+    assert "RICH-SAME-SESSION-HANDOFF" in stored or "updated iterative summary" in stored
+    assert sum(
+        1 for msg in result if ContextCompressor._is_context_summary_message(msg)
+    ) >= 1
 
 
 
