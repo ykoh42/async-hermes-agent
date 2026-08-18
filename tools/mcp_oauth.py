@@ -1274,11 +1274,16 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": auth_method,
+        "application_type": cfg.get("application_type", "native"),
     }
     if scope:
         metadata_kwargs["scope"] = scope
 
-    return OAuthClientMetadata.model_validate(metadata_kwargs)
+    try:
+        return OAuthClientMetadata.model_validate(metadata_kwargs)
+    except Exception:
+        metadata_kwargs.pop("application_type", None)
+        return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
 async def _invalidate_tokens_on_client_change(

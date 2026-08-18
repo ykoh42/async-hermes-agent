@@ -435,6 +435,7 @@ _MCP_MESSAGE_HANDLER_SUPPORTED = False
 # Streamable HTTP was introduced by 2025-03-26, so this remains valid for the
 # HTTP transport path even on older-but-supported SDK versions.
 LATEST_PROTOCOL_VERSION = "2025-03-26"
+LATEST_HANDSHAKE_VERSION = LATEST_PROTOCOL_VERSION
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -458,6 +459,10 @@ try:
         from mcp.types import LATEST_PROTOCOL_VERSION
     except ImportError:
         logger.debug("mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version")
+    try:
+        from mcp.client.session import LATEST_HANDSHAKE_VERSION
+    except ImportError:
+        LATEST_HANDSHAKE_VERSION = LATEST_PROTOCOL_VERSION
     # SSE transport client (for MCP servers using SSE transport instead of Streamable HTTP)
     try:
         from mcp.client.sse import sse_client
@@ -783,6 +788,24 @@ try:
 except Exception:  # pragma: no cover — older/newer SDK without the constant
     _JSONRPC_METHOD_NOT_FOUND = -32601
 
+_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+
+def _handshake_rejected_as_modern(exc: BaseException) -> bool:
+    err = getattr(exc, "error", None)
+    code = getattr(err, "code", None) or getattr(exc, "code", None)
+    if code in (_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION, _JSONRPC_METHOD_NOT_FOUND):
+        return True
+    msg = str(exc).lower()
+    return bool(
+        msg
+        and (
+            "unsupported protocol version" in msg
+            or str(_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION) in msg
+            or _is_method_not_found_error(exc)
+        )
+    )
+
 
 def _is_method_not_found_error(exc: BaseException) -> bool:
     """Return True if *exc* is a JSON-RPC ``method not found`` (-32601).
@@ -888,7 +911,12 @@ def _prepend_path(env: dict, directory: str) -> dict:
 _MCP_LIST_MAX_PAGES = 50
 
 
-async def _paginate_full_list(list_method, items_attr: str, server_name: str):
+async def _paginate_full_list(
+    list_method,
+    items_attr: str,
+    server_name: str,
+    cache_meta_out: dict | None = None,
+):
     """Drain a paginated MCP ``list_*`` call by following ``nextCursor``.
 
     The MCP spec allows servers to paginate ``tools/list``,
@@ -913,7 +941,29 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str):
     items: list = []
     cursor = None
     for _ in range(_MCP_LIST_MAX_PAGES):
-        result = await (list_method(cursor=cursor) if cursor else list_method())
+        if not cursor:
+            result = await list_method()
+        else:
+            try:
+                from mcp.types import PaginatedRequestParams
+            except ImportError:
+                PaginatedRequestParams = None
+            try:
+                if PaginatedRequestParams is not None:
+                    result = await list_method(
+                        params=PaginatedRequestParams(cursor=cursor)
+                    )
+                else:
+                    result = await list_method(cursor=cursor)
+            except TypeError:
+                result = await list_method(cursor=cursor)
+        if cache_meta_out is not None and not items:
+            ttl = mcp_field(result, "ttl_ms", "ttlMs")
+            scope = mcp_field(result, "cache_scope", "cacheScope")
+            if ttl is not None:
+                cache_meta_out["ttl_ms"] = ttl
+            if scope is not None:
+                cache_meta_out["cache_scope"] = scope
         items.extend(getattr(result, items_attr, None) or [])
         cursor = mcp_field(result, "next_cursor", "nextCursor")
         # Per the MCP spec the cursor is an opaque string; anything else
@@ -2081,7 +2131,11 @@ class ElicitationHandler:
         message = getattr(params, "message", "") or (
             f"MCP server '{self.server_name}' is requesting your approval"
         )
-        schema = getattr(params, "requested_schema", {}) or {}
+        schema = (
+            getattr(params, "requestedSchema", None)
+            or getattr(params, "requested_schema", None)
+            or {}
+        )
         description = _format_elicitation_schema_summary(schema, self.server_name)
 
         try:
@@ -2208,7 +2262,7 @@ class MCPServerTask:
         "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
-        "initialize_result", "_ping_unsupported",
+        "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked",
     )
 
@@ -2276,6 +2330,7 @@ class MCPServerTask:
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
         self.initialize_result: Any | None = None
+        self._list_cache_meta: dict = {}
         # Set True the first time a keepalive ``ping`` returns JSON-RPC
         # -32601 (method not found): the server is tool-capable but doesn't
         # implement the optional ``ping`` utility. Subsequent keepalives fall
@@ -2306,6 +2361,45 @@ class MCPServerTask:
         if caps is None:
             return True
         return getattr(caps, "tools", None) is not None
+
+    async def _negotiate_session(self, session, connect_timeout: float):
+        """Negotiate legacy initialize or the 2026-07-28 stateless protocol."""
+        mode = str((self._config or {}).get("protocol", "auto")).lower().strip()
+        if mode in {"stateless", "modern", "2026-07-28"}:
+            try:
+                return await asyncio.wait_for(
+                    session.discover(), timeout=connect_timeout
+                )
+            except (TimeoutError, asyncio.CancelledError):
+                raise
+            except Exception:
+                return await asyncio.wait_for(
+                    session.initialize(), timeout=connect_timeout
+                )
+        if mode in {"legacy", "handshake"}:
+            return await asyncio.wait_for(
+                session.initialize(), timeout=connect_timeout
+            )
+        if mode != "auto":
+            logger.warning(
+                "MCP server '%s': unknown protocol=%r; treating as auto",
+                self.name,
+                mode,
+            )
+        try:
+            return await asyncio.wait_for(
+                session.initialize(), timeout=connect_timeout
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            if not _handshake_rejected_as_modern(exc) or not hasattr(
+                session, "discover"
+            ):
+                raise
+            return await asyncio.wait_for(
+                session.discover(), timeout=connect_timeout
+            )
 
     def _is_recycled_stdio(self) -> bool:
         """Return True when a stdio server was intentionally recycled."""
@@ -2479,8 +2573,12 @@ class MCPServerTask:
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
+                self._list_cache_meta = {}
                 new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                    self.session.list_tools,
+                    "tools",
+                    self.name,
+                    cache_meta_out=self._list_cache_meta,
                 )
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
@@ -2904,8 +3002,8 @@ class MCPServerTask:
                     connect_timeout = float(
                         config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
                     )
-                    self.initialize_result = await asyncio.wait_for(
-                        session.initialize(), timeout=connect_timeout
+                    self.initialize_result = await self._negotiate_session(
+                        session, connect_timeout
                     )
                     self.session = session
                     self._mark_lifecycle_started()
@@ -3169,7 +3267,7 @@ class MCPServerTask:
         # Seed it as a client-level default, but treat user overrides as
         # case-insensitive so conventional casing is preserved.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+            headers["mcp-protocol-version"] = LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = await _resolve_client_cert(self.name, config)
@@ -3280,8 +3378,8 @@ class MCPServerTask:
                         # stdio path (#59349): an endpoint that accepts the
                         # connection but never answers ``initialize`` parks this
                         # coroutine forever on the background loop.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
+                        self.initialize_result = await self._negotiate_session(
+                            session, float(connect_timeout)
                         )
                         self.session = session
                         await self._discover_tools()
@@ -3340,18 +3438,15 @@ class MCPServerTask:
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
             try:
-                from agent.ssl_verify import _create_httpx_client
-
-                async with (
-                    await _create_httpx_client(**client_kwargs)
-                ) as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream, _get_session_id,
-                    ):
+                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                    async with streamable_http_client(
+                        url, http_client=http_client
+                    ) as streams:
+                        read_stream, write_stream = streams[0], streams[1]
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
-                            self.initialize_result = await asyncio.wait_for(
-                                session.initialize(), timeout=float(connect_timeout)
+                            self.initialize_result = await self._negotiate_session(
+                                session, float(connect_timeout)
                             )
                             self.session = session
                             await self._discover_tools()
@@ -3383,13 +3478,12 @@ class MCPServerTask:
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
             try:
-                async with streamablehttp_client(url, **_http_kwargs) as (
-                    read_stream, write_stream, _get_session_id,
-                ):
+                async with streamablehttp_client(url, **_http_kwargs) as streams:
+                    read_stream, write_stream = streams[0], streams[1]
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         # Bound the handshake (#59349) — see stdio path.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
+                        self.initialize_result = await self._negotiate_session(
+                            session, float(connect_timeout)
                         )
                         self.session = session
                         await self._discover_tools()
@@ -3438,8 +3532,12 @@ class MCPServerTask:
             await self._register_discovered_tools_if_needed()
             return
         async with self._rpc_lock:
+            self._list_cache_meta = {}
             self._tools = await _paginate_full_list(
-                self.session.list_tools, "tools", self.name
+                self.session.list_tools,
+                "tools",
+                self.name,
+                cache_meta_out=self._list_cache_meta,
             )
         await self._register_discovered_tools_if_needed()
 
@@ -6518,6 +6616,8 @@ async def _write_server_schema_cache(
             config_fingerprint(config),
             tools=tools_payload,
             utility_tools=utility_payload,
+            ttl_ms=(getattr(server, "_list_cache_meta", None) or {}).get("ttl_ms"),
+            cache_scope=(getattr(server, "_list_cache_meta", None) or {}).get("cache_scope"),
         )
     except Exception as exc:
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)

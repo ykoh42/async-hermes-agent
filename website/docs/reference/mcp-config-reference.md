@@ -66,6 +66,7 @@ transport.
 | `headers` | Remote request headers |
 | `timeout` | Per-tool-call timeout in seconds; default `300` |
 | `connect_timeout` | Initial connection timeout; default `60` |
+| `protocol` | `auto` (default), `stateless`, or `legacy` protocol negotiation mode |
 | `lazy` | Register from a valid schema cache and connect on first call when possible |
 | `supports_parallel_tool_calls` | Opt this server's tools into parallel-safe scheduling; default `false` |
 | `keepalive_interval` | Liveness-ping interval; default `180`, minimum `5` seconds |

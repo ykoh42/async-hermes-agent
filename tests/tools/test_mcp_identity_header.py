@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -83,6 +84,9 @@ async def test_http_identity_header_is_attached():
     captured: dict = {}
 
     class DummyClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
         async def __aenter__(self):
             return self
 
@@ -109,9 +113,14 @@ async def test_http_identity_header_is_attached():
         async def initialize(self):
             return None
 
-    async def build_client(**kwargs):
-        captured.update(kwargs)
-        return DummyClient()
+    from tools import mcp_tool
+
+    real_httpx = mcp_tool.sdk_httpx()
+    dummy_httpx = SimpleNamespace(
+        URL=real_httpx.URL,
+        Timeout=real_httpx.Timeout,
+        AsyncClient=DummyClient,
+    )
 
     server = MCPServerTask("remote")
 
@@ -123,7 +132,7 @@ async def test_http_identity_header_is_attached():
         patch("tools.mcp_tool._MCP_NEW_HTTP", True),
         patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransport()),
         patch("tools.mcp_tool.ClientSession", DummySession),
-        patch("agent.ssl_verify._create_httpx_client", new=build_client),
+        patch("tools.mcp_tool.sdk_httpx", return_value=dummy_httpx),
         patch.object(MCPServerTask, "_discover_tools", stop_discovery),
     ):
         await server._run_http(

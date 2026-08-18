@@ -105,13 +105,18 @@ async def _save_all(data: dict[str, Any]) -> None:
 
 
 async def get_cached_entry(server_name: str, fingerprint: str) -> dict | None:
-    """Return cached entry when fingerprint matches, else None."""
+    """Return a matching, non-expired schema cache entry."""
     async with await _cache_lock():
         entry = (await _load_all()).get(server_name)
     if not isinstance(entry, dict):
         return None
     if entry.get("fingerprint") != fingerprint:
         return None
+    ttl_ms = entry.get("ttl_ms")
+    written_at = entry.get("written_at")
+    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
+        if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
+            return None
     return entry
 
 
@@ -125,6 +130,8 @@ async def write_cache_entry(
     *,
     tools: list[dict],
     utility_tools: list[dict] | None = None,
+    ttl_ms: float | None = None,
+    cache_scope: str | None = None,
 ) -> None:
     """Persist tool schemas after a successful live connect."""
     entry = {
@@ -132,12 +139,17 @@ async def write_cache_entry(
         "tools": tools,
         "utility_tools": utility_tools or [],
     }
+    if isinstance(ttl_ms, (int, float)):
+        entry["ttl_ms"] = ttl_ms
+        entry["written_at"] = time.time()
+    if cache_scope:
+        entry["cache_scope"] = cache_scope
     async with await _cache_lock():
         data = await _load_all()
         # Write-through fires on every registration (reconnects,
         # list_changed refreshes); skip the load-all+rewrite churn when the
         # entry is byte-identical to what is already on disk.
-        if data.get(server_name) == entry:
+        if "written_at" not in entry and data.get(server_name) == entry:
             return
         data[server_name] = entry
         await _save_all(data)

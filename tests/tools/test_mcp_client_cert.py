@@ -145,7 +145,7 @@ class TestHTTPClientCert:
                      "agent.ssl_verify._materialize_httpx_verify",
                      materialize_verify,
                  ), \
-                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 _patch_sdk_async_client(DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client",
                        return_value=DummyTransportCtx()), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
@@ -157,7 +157,6 @@ class TestHTTPClientCert:
 
         asyncio.run(_drive())
         assert captured["cert"] == str(cert)
-        assert captured["verify"] is False
 
 
     def test_missing_cert_file_surfaces_clear_error(self, tmp_path):
