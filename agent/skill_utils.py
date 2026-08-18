@@ -599,6 +599,110 @@ async def get_all_skills_dirs() -> list[Path]:
     return dirs
 
 
+# Project-local skills are a higher-precedence, explicitly trusted tier.  The
+# helpers below intentionally mirror the upstream names while keeping all
+# filesystem probes on the existing native-async boundary.
+PROJECT_SKILLS_SUBDIRS = (Path(".hermes") / "skills", Path(".agents") / "skills")
+_PROJECT_ROOT_MAX_DEPTH = 64
+
+
+async def find_project_root(start: Path | None = None) -> Path | None:
+    """Return the nearest enclosing git checkout, if one exists."""
+    try:
+        current = Path(await _realpath(start or Path(await aiofiles.os.getcwd())))
+    except (OSError, RuntimeError):
+        return None
+    try:
+        home = Path(await _realpath(Path.home()))
+    except (OSError, RuntimeError):
+        home = Path.home()
+    for _ in range(_PROJECT_ROOT_MAX_DEPTH):
+        try:
+            if await aiofiles.os.path.exists(current / ".git"):
+                return None if current == home else current
+        except OSError:
+            return None
+        if current.parent == current:
+            return None
+        current = current.parent
+    return None
+
+
+async def _project_trusted_dirs_from_config() -> set[Path]:
+    parsed = await _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    raw = skills_cfg.get("trusted_project_dirs") if isinstance(skills_cfg, dict) else None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    trusted: set[Path] = set()
+    for entry in raw:
+        value = str(entry).strip()
+        if not value:
+            continue
+        try:
+            trusted.add(Path(await _realpath(Path(os.path.expandvars(os.path.expanduser(value))))))
+        except (OSError, RuntimeError):
+            continue
+    return trusted
+
+
+async def is_project_root_trusted(root: Path) -> bool:
+    try:
+        return Path(await _realpath(root)) in await _project_trusted_dirs_from_config()
+    except (OSError, RuntimeError):
+        return False
+
+
+async def _candidate_project_skills_dirs(root: Path) -> list[Path]:
+    local_skills = Path(await _realpath(get_skills_dir()))
+    result: list[Path] = []
+    for subdir in PROJECT_SKILLS_SUBDIRS:
+        candidate = root / subdir
+        try:
+            if await aiofiles.os.path.isdir(candidate):
+                resolved = Path(await _realpath(candidate))
+                if resolved != local_skills:
+                    result.append(resolved)
+        except (OSError, RuntimeError):
+            continue
+    return result
+
+
+async def get_project_skills_dirs() -> list[Path]:
+    """Return trusted project-local skill roots in precedence order."""
+    parsed = await _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if isinstance(skills_cfg, dict) and skills_cfg.get("project_discovery") is False:
+        return []
+    root = await find_project_root()
+    if root is None or not await is_project_root_trusted(root):
+        return []
+    return await _candidate_project_skills_dirs(root)
+
+
+async def get_untrusted_project_skills_root() -> tuple[Path, int] | None:
+    """Return an untrusted project's root and skill count for a notice."""
+    parsed = await _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if isinstance(skills_cfg, dict) and skills_cfg.get("project_discovery") is False:
+        return None
+    root = await find_project_root()
+    if root is None or await is_project_root_trusted(root):
+        return None
+    count = 0
+    for skills_root in await _candidate_project_skills_dirs(root):
+        async for _ in iter_skill_index_files(skills_root, "SKILL.md"):
+            count += 1
+    return (root, count) if count else None
+
+
+async def get_scan_ordered_skills_dirs() -> list[Path]:
+    """Return project, local, and external skill roots in precedence order."""
+    return [*(await get_project_skills_dirs()), get_skills_dir(), *(await get_external_skills_dirs())]
+
+
 async def normalize_skill_lookup_name(identifier: str) -> str:
     """Normalize a skill identifier to a ``skill_view()``-safe relative path.
 

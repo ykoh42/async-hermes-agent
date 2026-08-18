@@ -906,6 +906,31 @@ def _prepend_path(env: dict, directory: str) -> dict:
     return updated
 
 
+def _is_reserved_mcp_meta_key(key: str) -> bool:
+    """Return whether an MCP metadata key uses a reserved protocol prefix."""
+    slash = key.find("/")
+    if slash <= 0:
+        return False
+    labels = key[:slash].split(".")
+    return any(
+        label in {"modelcontextprotocol", "mcp"}
+        and index < len(labels) - 1
+        for index, label in enumerate(labels)
+    )
+
+
+def _strip_reserved_meta_keys(meta: Any) -> dict[str, Any] | None:
+    """Keep model-facing MCP metadata while dropping protocol namespaces."""
+    if not isinstance(meta, dict):
+        return None
+    filtered = {
+        key: value
+        for key, value in meta.items()
+        if isinstance(key, str) and not _is_reserved_mcp_meta_key(key)
+    }
+    return filtered or None
+
+
 # Safety cap on nextCursor pagination loops so a misbehaving server that
 # returns a cursor forever cannot spin discovery indefinitely. 50 pages at
 # the common 50-100 items/page covers thousands of tools/resources/prompts.
@@ -5396,13 +5421,24 @@ async def _call_mcp_tool(
 
     text_result = "\n".join(parts) if parts else ""
     structured = getattr(result, "structuredContent", None)
-    if structured is not None:
+    meta = _strip_reserved_meta_keys(getattr(result, "meta", None))
+    if structured is not None or meta is not None:
+        payload: dict[str, Any] = {}
         if text_result:
-            return json.dumps(
-                {"result": text_result, "structuredContent": structured},
-                ensure_ascii=False,
-            )
-        return json.dumps({"result": structured}, ensure_ascii=False)
+            payload["result"] = text_result
+        if structured is not None:
+            if text_result:
+                payload["structuredContent"] = structured
+            else:
+                payload["result"] = structured
+        if meta is not None:
+            payload["_meta"] = meta
+        if "result" not in payload:
+            payload["result"] = text_result
+        try:
+            return json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return json.dumps({"result": text_result}, ensure_ascii=False)
     return json.dumps({"result": text_result}, ensure_ascii=False)
 
 

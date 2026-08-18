@@ -204,6 +204,8 @@ class ProcessSession:
 class ProcessRegistry:
     """Track local background processes without leaving the event loop."""
 
+    _MIN_PREFIX_CHARS = 4
+
     def __init__(self) -> None:
         self._loop_profile_states: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, dict[str, _ProcessRegistryState]
@@ -926,7 +928,28 @@ class ProcessRegistry:
     async def get(self, session_id: str) -> ProcessSession | None:
         await self._activate_profile_state()
         session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None:
+            session = self._resolve_prefix(session_id)
         return await self._refresh_detached_session(session)
+
+    def _resolve_prefix(self, session_id: str) -> ProcessSession | None:
+        """Resolve a unique full-ID or bare-suffix prefix, if unambiguous."""
+        if not isinstance(session_id, str):
+            return None
+        query = session_id.strip()
+        if not query:
+            return None
+        if not query.startswith("proc_"):
+            query = f"proc_{query}"
+        if len(query.removeprefix("proc_")) < self._MIN_PREFIX_CHARS:
+            return None
+        matches = [
+            session
+            for store in (self._running, self._finished)
+            for process_id, session in store.items()
+            if process_id.startswith(query)
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     async def poll(self, session_id: str) -> dict[str, Any]:
         """Return status plus the latest output without consuming completion."""
@@ -1937,7 +1960,9 @@ PROCESS_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Process session ID (from terminal background output). "
-                    "Required for all actions except 'list'."
+                    "Required for all actions except 'list'. A unique ID "
+                    "prefix is also accepted (for example 'proc_4dae' or "
+                    "'4dae')."
                 ),
             },
             "data": {

@@ -53,6 +53,44 @@ def _make_call_result(text="file contents here", is_error=False):
     return SimpleNamespace(content=[block], isError=is_error)
 
 
+@pytest.mark.asyncio
+async def test_mcp_tool_result_surfaces_non_reserved_meta():
+    from tools.mcp_tool import _call_mcp_tool
+
+    result = SimpleNamespace(
+        content=[SimpleNamespace(text="ok")],
+        isError=False,
+        structuredContent={"id": 3},
+        meta={
+            "com.example.contract/v1": {"ok": True},
+            "mcp.example/reserved": "drop",
+            "modelcontextprotocol.io/trace": "drop",
+            "mcp": "keep",
+        },
+    )
+    server = SimpleNamespace(
+        _rpc_lock=asyncio.Lock(),
+        session=SimpleNamespace(call_tool=AsyncMock(return_value=result)),
+        _pending_call_context=None,
+    )
+    payload = json.loads(await _call_mcp_tool("demo", "tool", server, {}))
+    assert payload["result"] == "ok"
+    assert payload["structuredContent"] == {"id": 3}
+    assert payload["_meta"] == {
+        "com.example.contract/v1": {"ok": True},
+        "mcp": "keep",
+    }
+
+
+def test_mcp_reserved_meta_prefix_rules():
+    from tools.mcp_tool import _is_reserved_mcp_meta_key
+
+    assert _is_reserved_mcp_meta_key("mcp.example/value")
+    assert _is_reserved_mcp_meta_key("modelcontextprotocol.io/value")
+    assert not _is_reserved_mcp_meta_key("com.example.mcp/value")
+    assert not _is_reserved_mcp_meta_key("plain")
+
+
 def _make_mock_server(name, session=None, tools=None):
     """Create an MCPServerTask with mock attributes for testing."""
     from tools.mcp_tool import MCPServerTask

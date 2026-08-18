@@ -453,11 +453,21 @@ async def get_skills_directory_mount(
         )
 
     try:
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
 
         external_dirs = await get_external_skills_dirs()
+        project_dirs = await get_project_skills_dirs()
     except ImportError:
         external_dirs = []
+        project_dirs = []
+    for index, project_dir in enumerate(project_dirs):
+        if await aiofiles.os.path.isdir(project_dir):
+            mounts.append(
+                {
+                    "host_path": await _safe_skills_path(project_dir),
+                    "container_path": f"{container_base.rstrip('/')}/project_skills/{index}",
+                }
+            )
     for index, external_dir in enumerate(external_dirs):
         if await aiofiles.os.path.isdir(external_dir):
             mounts.append(
@@ -490,11 +500,25 @@ async def iter_skills_files(
         )
 
     try:
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
 
         external_dirs = await get_external_skills_dirs()
+        project_dirs = await get_project_skills_dirs()
     except ImportError:
         external_dirs = []
+        project_dirs = []
+    for index, project_dir in enumerate(project_dirs):
+        if not await aiofiles.os.path.isdir(project_dir):
+            continue
+        _directories, files, _symlinks = await _walk_tree(project_dir)
+        container_root = f"{container_base.rstrip('/')}/project_skills/{index}"
+        result.extend(
+            {
+                "host_path": str(item),
+                "container_path": f"{container_root}/{item.relative_to(project_dir)}",
+            }
+            for item in files
+        )
     for index, external_dir in enumerate(external_dirs):
         if not await aiofiles.os.path.isdir(external_dir):
             continue

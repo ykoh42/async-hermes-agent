@@ -127,6 +127,35 @@ class SubagentWorktreeTests(unittest.TestCase):
         )
         self.assertTrue(payload["pruned"])
 
+    def test_finalize_unknown_base_is_not_pruned(self):
+        repo = _make_repo(self.tmp)
+        info = sw.create_subagent_worktree(str(repo), "unknown-base")
+        assert info is not None
+        info["base_commit"] = ""
+        payload = sw.finalize_subagent_worktree(info)
+        self.assertFalse(payload["pruned"])
+        self.assertTrue(payload["inspection_failed"])
+        self.assertIn("commits UNKNOWN", payload["note"])
+        self.assertTrue(os.path.isdir(info["path"]))
+
+    def test_finalize_probe_failure_is_not_pruned(self):
+        repo = _make_repo(self.tmp)
+        info = sw.create_subagent_worktree(str(repo), "probe-failure")
+        assert info is not None
+        with mock.patch.object(
+            sw,
+            "_run_git",
+            side_effect=[
+                mock.Mock(returncode=1, stdout="", stderr="bad index"),
+                mock.Mock(returncode=0, stdout="", stderr=""),
+            ],
+        ):
+            payload = sw.finalize_subagent_worktree(info)
+        self.assertFalse(payload["pruned"])
+        self.assertTrue(payload["inspection_failed"])
+        self.assertIn("commits UNKNOWN", payload["note"])
+        self.assertTrue(os.path.isdir(info["path"]))
+
     def test_local_backend_active_local(self):
         with mock.patch(
             "hermes_cli.config.load_config_readonly",

@@ -7606,6 +7606,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if cancellation is not None:
             raise cancellation
 
+    async def __aenter__(self) -> "SessionDB":
+        """Enter an async scope that closes this handle on exit."""
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb) -> bool:
+        """Close the handle without suppressing caller exceptions."""
+        await self.close()
+        return False
+
     async def _close_owned(self) -> None:
         await self._drain_token_queue_at_exit()
         writer_task = self._token_writer_task

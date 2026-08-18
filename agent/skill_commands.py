@@ -365,11 +365,12 @@ async def scan_skill_commands() -> dict[str, dict[str, Any]]:
         skill_matches_environment,
         skill_matches_platform,
     )
+    from agent.skill_utils import get_project_skills_dirs
 
     scan_platform = _resolve_skill_commands_platform()
     commands: dict[str, dict[str, Any]] = {}
     disabled = await _get_disabled_skill_names(scan_platform)
-    roots: list[Path] = []
+    roots: list[Path] = await get_project_skills_dirs()
     local_root = _skills_dir()
     if await aiofiles.os.path.isdir(local_root):
         roots.append(local_root)

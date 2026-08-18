@@ -7,7 +7,7 @@ description: "Native-async library architecture, retained subsystem boundaries, 
 # Architecture
 
 Async Hermes Agent is a library-focused derivative of Hermes Agent
-`v2026.8.16`. It keeps upstream file locations and public names where possible,
+`v2026.8.16.2`. It keeps upstream file locations and public names where possible,
 then converts I/O-bearing runtime boundaries to coroutines. This makes upstream
 changes easier to compare without maintaining a parallel async module tree.
 

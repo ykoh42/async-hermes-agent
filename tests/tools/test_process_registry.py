@@ -42,6 +42,22 @@ def test_process_session_upstream_public_defaults_and_uptime_format():
     assert format_uptime_short(3660) == "1h 1m"
 
 
+@pytest.mark.asyncio
+async def test_process_get_accepts_unique_prefix_and_rejects_ambiguous_prefix():
+    registry = ProcessRegistry()
+    first = ProcessSession("proc_4dae56ca81f6", "echo first")
+    second = ProcessSession("proc_abcd56ca81f6", "echo second")
+    registry._running[first.id] = first
+    registry._finished[second.id] = second
+    assert await registry.get("proc_4dae") is first
+    assert await registry.get("4dae") is first
+    assert await registry.get("proc") is None
+    registry._running["proc_4dae99999999"] = ProcessSession(
+        "proc_4dae99999999", "echo other"
+    )
+    assert await registry.get("proc_4dae") is None
+
+
 def test_process_notification_preserves_upstream_keyword_name():
     text = format_process_notification(
         evt={
