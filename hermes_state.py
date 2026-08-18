@@ -1263,8 +1263,17 @@ PERSISTENCE_ERROR_CAUSES = (
     "compression",
     "compression_closed",
     "turn_lease",
+    "corrupt",
     "disk",
     "unknown",
+)
+
+
+_DB_CORRUPTION_MARKERS = (
+    "malformed",
+    "file is not a database",
+    "not a database",
+    "database corruption",
 )
 
 
@@ -1285,6 +1294,8 @@ def classify_persistence_error(exc_or_str: BaseException | str | None) -> str:
         return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
+    if any(marker in text for marker in _DB_CORRUPTION_MARKERS):
+        return "corrupt"
     if "locked" in text or "busy" in text:
         return "locked"
     if (

@@ -2550,15 +2550,21 @@ async def _run_rg(arguments: list[str]) -> tuple[int, str, str]:
     )
 
 
-def _count_rg_matches(output: str) -> tuple[int, int]:
+def _count_rg_matches(output: str) -> tuple[int, list[str]]:
     total = 0
-    files = 0
+    paths: list[str] = []
     for line in output.splitlines():
-        _path, separator, count = line.rpartition(":")
+        path, separator, count = line.rpartition(":")
         if separator and count.isdigit():
             total += int(count)
-            files += 1
-    return total, files
+            paths.append(path)
+    return total, paths
+
+
+def _format_probe_paths(paths: list[str], cap: int = 5) -> str:
+    shown = ", ".join(paths[:cap])
+    extra = len(paths) - cap
+    return shown + (f" (+{extra} more)" if extra > 0 else "")
 
 
 async def _zero_match_hint(
@@ -2572,32 +2578,38 @@ async def _zero_match_hint(
     path_args = [str(path) for path in paths]
 
     _code, output, _error = await _run_rg(["-i", *common, pattern, *path_args])
-    total, files = _count_rg_matches(output)
+    total, matched_paths = _count_rg_matches(output)
     if total:
         return (
             f"0 exact matches, but {total} case-insensitive match(es) in "
-            f"{files} file(s) — the pattern's casing may be wrong."
+            f"{len(matched_paths)} file(s): "
+            f"{_format_probe_paths(matched_paths)} — the pattern's casing "
+            "may be wrong."
         )
 
     _code, output, _error = await _run_rg(
         ["--hidden", "--no-ignore", *common, pattern, *path_args]
     )
-    total, files = _count_rg_matches(output)
+    total, matched_paths = _count_rg_matches(output)
     if total:
         return (
-            f"0 matches in visible files, but {total} match(es) in {files} "
-            "hidden or gitignored file(s) — these are excluded by default."
+            f"0 matches in visible files, but {total} match(es) in "
+            f"{len(matched_paths)} hidden or gitignored file(s): "
+            f"{_format_probe_paths(matched_paths)} — these are excluded "
+            "by default."
         )
 
     if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
         _code, output, _error = await _run_rg(
             ["-F", *common, pattern, *path_args]
         )
-        total, _files = _count_rg_matches(output)
+        total, matched_paths = _count_rg_matches(output)
         if total:
             return (
-                f"0 regex matches, but {total} literal match(es) — the pattern "
-                "contains regex metacharacters that likely need escaping."
+                f"0 regex matches, but {total} literal match(es) in "
+                f"{len(matched_paths)} file(s): "
+                f"{_format_probe_paths(matched_paths)} — the pattern contains "
+                "regex metacharacters that likely need escaping."
             )
     return None
 
