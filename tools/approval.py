@@ -2483,12 +2483,57 @@ async def detect_dangerous_command(command: str) -> tuple:
 
 
 
-_ALLOWLIST_SHELL_OPERATOR_RE = re.compile(r"(?:\n|&&|\|\||[;&|<>`]|\$\()")
+_SHELL_CONTROL_CHARS = frozenset("\n\r;&|<>`$()")
+_REINTERPRETED_ARGUMENT_RE = re.compile(
+    r"(?:^|[ \t])(?:-[^\-\s]*[ce]|--(?:command|eval))(?:[= \t]|$)"
+)
 
 
 def _has_allowlist_shell_operator(command: str) -> bool:
     """Return True when a command is too compound for the allowlist shortcut."""
-    return bool(_ALLOWLIST_SHELL_OPERATOR_RE.search(command or ""))
+    command = command or ""
+    quote = None
+    has_reinterpretable = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            elif ch in _SHELL_CONTROL_CHARS:
+                has_reinterpretable = True
+            i += 1
+            continue
+        if ch == "\\":
+            nxt = command[i + 1] if i + 1 < len(command) else ""
+            if nxt in _SHELL_CONTROL_CHARS:
+                has_reinterpretable = True
+            i += 2
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch in ("`", "$"):
+                return True
+            elif ch in _SHELL_CONTROL_CHARS:
+                has_reinterpretable = True
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "$":
+            if i + 1 < len(command) and command[i + 1] == "(":
+                return True
+            i += 1
+            continue
+        if ch in _SHELL_CONTROL_CHARS and ch not in "()":
+            return True
+        i += 1
+    if quote is not None:
+        return True
+    return has_reinterpretable and bool(_REINTERPRETED_ARGUMENT_RE.search(command))
 
 
 def _command_matches_permanent_allowlist(command: str) -> bool:

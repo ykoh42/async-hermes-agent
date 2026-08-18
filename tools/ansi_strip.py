@@ -42,6 +42,12 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # tab/newline), CR, DEL, ESC, or C1 byte triggers the slow path.
 _HAS_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
+_UNICODE_TAG_SUB_RE = re.compile(
+    r"(\U0001F3F4[\U000E0020-\U000E007E]+\U000E007F)"
+    r"|[\U000E0000-\U000E007F]"
+)
+_HAS_UNICODE_TAG = re.compile(r"[\U000E0000-\U000E007F]")
+
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences from text.
@@ -77,3 +83,10 @@ def sanitize_display_text(text: str) -> str:
     if "\r" in text:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
     return _CONTROL_CHARS_RE.sub("", text)
+
+
+def strip_unicode_tags(text: str) -> str:
+    """Remove invisible Unicode TAG characters while preserving tag emojis."""
+    if not text or not _HAS_UNICODE_TAG.search(text):
+        return text
+    return _UNICODE_TAG_SUB_RE.sub(lambda match: match.group(1) or "", text)

@@ -147,6 +147,15 @@ async def _resolve_xai_bearer() -> tuple[str, str, str]:
     check exists so a credential that expires between registration and
     invocation produces a clean tool error instead of a 401.
     """
+    from hermes_cli.config import get_env_value
+
+    explicit_key = str(get_env_value("XAI_API_KEY") or "").strip()
+    if explicit_key:
+        base_url = str(
+            get_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL
+        ).strip().rstrip("/")
+        return explicit_key, base_url, "xai"
+
     creds = await resolve_xai_http_credentials()
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:

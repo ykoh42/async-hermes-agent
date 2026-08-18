@@ -125,6 +125,18 @@ class TestSubdirectoryHintTracker:
         # Should be capped
         assert len(result) < 20_000
 
+    async def test_agents_override_md_wins_in_subdirectory(self, tmp_path):
+        sub = tmp_path / "backend"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("Committed backend rules")
+        (sub / "AGENTS.override.md").write_text("Personal backend override")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = await tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
+        assert result is not None
+        assert "Personal backend override" in result
+        assert "Committed backend rules" not in result
+
     async def test_empty_args(self, project):
         """Empty args should not crash."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))

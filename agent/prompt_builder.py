@@ -1518,7 +1518,7 @@ async def _load_agents_md(
     sections: list[str] = []
     seen_content: set[str] = set()
     for directory in await _agents_md_directory_chain(cwd_resolved):
-        for name in ("AGENTS.md", "agents.md"):
+        for name in ("AGENTS.override.md", "AGENTS.md", "agents.md"):
             candidate = directory / name
             if not await aiofiles.os.path.isfile(candidate):
                 continue

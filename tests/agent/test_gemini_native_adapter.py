@@ -465,6 +465,76 @@ def test_build_gemini_request_does_not_raise_when_thinking_is_disabled():
     assert request["generationConfig"]["thinkingConfig"]["includeThoughts"] is False
 
 
+class TestGemini3ToolCallIds:
+    def _history(self):
+        return [
+            {"role": "user", "content": "Read a.txt and b.txt"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}},
+                    {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "b.txt"}'}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "AAA"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "BBB"},
+        ]
+
+    def test_requires_ids_gate(self):
+        from agent.gemini_native_adapter import gemini_requires_tool_call_ids
+
+        assert gemini_requires_tool_call_ids("gemini-3.6-flash")
+        assert gemini_requires_tool_call_ids("google/gemini-3.6-pro")
+        assert not gemini_requires_tool_call_ids("gemini-2.5-flash")
+        assert not gemini_requires_tool_call_ids("claude-opus-4.6")
+
+    def test_ids_preserved_for_gemini3(self):
+        from agent.gemini_native_adapter import _build_gemini_contents
+
+        contents, _ = _build_gemini_contents(self._history(), include_tool_call_ids=True)
+        call_ids = [
+            p["functionCall"]["id"]
+            for c in contents for p in c["parts"] if "functionCall" in p
+        ]
+        response_ids = [
+            p["functionResponse"]["id"]
+            for c in contents for p in c["parts"] if "functionResponse" in p
+        ]
+        assert call_ids == ["call_1", "call_2"]
+        assert response_ids == ["call_1", "call_2"]
+
+    def test_ids_omitted_for_older_gemini(self):
+        from agent.gemini_native_adapter import _build_gemini_contents
+
+        contents, _ = _build_gemini_contents(self._history())
+        for content in contents:
+            for part in content["parts"]:
+                if "functionCall" in part:
+                    assert "id" not in part["functionCall"]
+                if "functionResponse" in part:
+                    assert "id" not in part["functionResponse"]
+
+    def test_build_request_threads_model_gate(self):
+        from agent.gemini_native_adapter import build_gemini_request
+
+        request = build_gemini_request(messages=self._history(), model="gemini-3.6-flash")
+        parts = [p for c in request["contents"] for p in c["parts"]]
+        assert any(p.get("functionCall", {}).get("id") == "call_1" for p in parts)
+
+    def test_response_preserves_provider_tool_call_id(self):
+        from agent.gemini_native_adapter import translate_gemini_response
+
+        response = {
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"id": "call_native_7", "name": "read_file", "args": {"path": "a.txt"}}}]},
+                "finishReason": "STOP",
+            }],
+        }
+        result = translate_gemini_response(response, model="gemini-3.6-flash")
+        assert result.choices[0].message.tool_calls[0].id == "call_native_7"
+
+
 
 
 

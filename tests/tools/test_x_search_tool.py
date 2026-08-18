@@ -403,3 +403,61 @@ async def test_x_search_cancellation_closes_owned_http_client(monkeypatch):
         await task
 
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_x_search_prefers_explicit_api_key_over_oauth(monkeypatch):
+    from tools.x_search_tool import _resolve_xai_bearer
+
+    paid_key = "paid-key-x1"
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name, default=None: {
+            "XAI_API_KEY": paid_key,
+            "XAI_BASE_URL": None,
+        }.get(name, default),
+    )
+    oauth_token = "oauth-key-x1"
+    monkeypatch.setattr(
+        "tools.x_search_tool.resolve_xai_http_credentials",
+        AsyncMock(
+            return_value={
+                "provider": "xai-oauth",
+                "api_key": oauth_token,
+                "base_url": "https://api.x.ai/v1",
+            }
+        ),
+    )
+
+    assert await _resolve_xai_bearer() == (
+        paid_key,
+        "https://api.x.ai/v1",
+        "xai",
+    )
+
+
+@pytest.mark.asyncio
+async def test_x_search_bearer_falls_back_to_oauth_without_api_key(monkeypatch):
+    from tools.x_search_tool import _resolve_xai_bearer
+
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name, default=None: default,
+    )
+    oauth_token = "oauth-key-x1"
+    monkeypatch.setattr(
+        "tools.x_search_tool.resolve_xai_http_credentials",
+        AsyncMock(
+            return_value={
+                "provider": "xai-oauth",
+                "api_key": oauth_token,
+                "base_url": "https://api.x.ai/v1",
+            }
+        ),
+    )
+
+    assert await _resolve_xai_bearer() == (
+        oauth_token,
+        "https://api.x.ai/v1",
+        "xai-oauth",
+    )

@@ -114,6 +114,7 @@ import aiofiles.os
 from hermes_cli import config as _config_bootstrap  # noqa: F401
 
 from tools.registry import tool_error
+from tools.ansi_strip import strip_unicode_tags
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -1244,7 +1245,7 @@ async def _render_mcp_resource_block(block, server_name: str = "") -> str:
 
     text = getattr(resource, "text", None)
     if text is not None:
-        return str(text)
+        return strip_unicode_tags(str(text))
 
     blob = getattr(resource, "blob", None)
     if blob is None:
@@ -1731,7 +1732,9 @@ class SamplingHandler:
         if not hasattr(block, "content") or block.content is None:
             return ""
         items = block.content if isinstance(block.content, list) else [block.content]
-        return "\n".join(item.text for item in items if hasattr(item, "text"))
+        return "\n".join(
+            strip_unicode_tags(item.text) for item in items if hasattr(item, "text")
+        )
 
     def _convert_messages(self, params) -> list[dict]:
         """Convert MCP SamplingMessages to OpenAI format.
@@ -1774,14 +1777,23 @@ class SamplingHandler:
                     })
                 msg_dict: dict = {"role": msg.role, "tool_calls": tc_list}
                 # Include any accompanying text
-                text_parts = [b.text for b in content_blocks if hasattr(b, "text")]
+                text_parts = [
+                    strip_unicode_tags(b.text)
+                    for b in content_blocks
+                    if hasattr(b, "text")
+                ]
                 if text_parts:
                     msg_dict["content"] = "\n".join(text_parts)
                 messages.append(msg_dict)
             elif content_blocks:
                 # Pure text/image content
                 if len(content_blocks) == 1 and hasattr(content_blocks[0], "text"):
-                    messages.append({"role": msg.role, "content": content_blocks[0].text})
+                    messages.append(
+                        {
+                            "role": msg.role,
+                            "content": strip_unicode_tags(content_blocks[0].text),
+                        }
+                    )
                 else:
                     parts = []
                     for block in content_blocks:
@@ -1789,7 +1801,9 @@ class SamplingHandler:
                             block, "mime_type", "mimeType", _MISSING
                         )
                         if hasattr(block, "text"):
-                            parts.append({"type": "text", "text": block.text})
+                            parts.append(
+                                {"type": "text", "text": strip_unicode_tags(block.text)}
+                            )
                         elif hasattr(block, "data") and block_mime is not _MISSING:
                             parts.append({
                                 "type": "image_url",
@@ -5342,7 +5356,7 @@ async def _call_mcp_tool(
         error_text = ""
         for block in (result.content or []):
             if getattr(block, "text", None):
-                error_text += block.text
+                error_text += strip_unicode_tags(block.text)
                 continue
             res_text = getattr(getattr(block, "resource", None), "text", None)
             if res_text:
@@ -5352,7 +5366,7 @@ async def _call_mcp_tool(
     parts: list[str] = []
     for block in (result.content or []):
         if hasattr(block, "text") and block.text:
-            parts.append(block.text)
+            parts.append(strip_unicode_tags(block.text))
             continue
         image_tag = await _cache_mcp_image_block(block)
         if image_tag:
@@ -5597,7 +5611,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             contents = result.contents if hasattr(result, "contents") else []
             for block in contents:
                 if getattr(block, "text", None) is not None:
-                    parts.append(block.text)
+                    parts.append(strip_unicode_tags(block.text))
                 elif getattr(block, "blob", None) is not None:
                     # Materialize binary resource contents into the document
                     # cache instead of discarding them (same contract as
@@ -5744,11 +5758,11 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
                 if hasattr(msg, "content"):
                     content = msg.content
                     if hasattr(content, "text"):
-                        entry["content"] = content.text
+                        entry["content"] = strip_unicode_tags(content.text)
                     elif isinstance(content, str):
-                        entry["content"] = content
+                        entry["content"] = strip_unicode_tags(content)
                     else:
-                        entry["content"] = str(content)
+                        entry["content"] = strip_unicode_tags(str(content))
                 messages.append(entry)
             resp = {"messages": messages}
             if hasattr(result, "description") and result.description:
@@ -6004,7 +6018,9 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     prefixed_name = mcp_prefixed_tool_name(server_name, mcp_tool.name)
     return {
         "name": prefixed_name,
-        "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
+        "description": strip_unicode_tags(
+            mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"
+        ),
         "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
     }
 
