@@ -20,6 +20,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+def _patch_sdk_async_client(dummy):
+    """Patch ``AsyncClient`` on whichever httpx module the MCP SDK uses.
+
+    mcp 2.0 moved the SDK's HTTP stack to ``httpx2``, so patching
+    ``httpx.AsyncClient`` no longer intercepts the client Hermes builds for
+    the SDK. Resolve the module the same way production does, via
+    ``tools.mcp_tool.sdk_httpx``, so these tests follow the SDK rather than
+    hardcoding a distribution name.
+    """
+    from tools.mcp_tool import sdk_httpx
+
+    return patch.object(sdk_httpx(), "AsyncClient", dummy)
+
+
 # ---------------------------------------------------------------------------
 # _resolve_client_cert helper
 # ---------------------------------------------------------------------------
