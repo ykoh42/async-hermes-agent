@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import re
@@ -194,7 +195,26 @@ _spawn_paused: bool = False
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: dict[str, dict[str, Any]] = {}
+# Keep bounded attribution after child completion: child-started processes can
+# outlive the child summary and still need provenance in the parent turn.
+_RECENT_SUBAGENTS_CAP = 200
+_recent_subagents: dict[str, dict[str, Any]] = {}
 _active_subagents_lock = threading.RLock()
+
+
+def get_subagent_attribution(task_id: str | None) -> dict[str, Any] | None:
+    """Resolve a child task id for live and recently finished subagents."""
+    if not task_id or not isinstance(task_id, str):
+        return None
+    with _active_subagents_lock:
+        record = _active_subagents.get(task_id) or _recent_subagents.get(task_id)
+        if record is None:
+            return None
+        return {
+            "subagent_id": task_id,
+            "goal": record.get("goal"),
+            "delegation_id": record.get("delegation_id"),
+        }
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -226,6 +246,13 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
         record = _active_subagents.get(subagent_id)
         if record is not None and (agent is None or record.get("agent") is agent):
             _active_subagents.pop(subagent_id, None)
+            _recent_subagents[subagent_id] = {
+                "goal": record.get("goal"),
+                "delegation_id": record.get("delegation_id"),
+                "owner_agent_session_id": record.get("owner_agent_session_id"),
+            }
+            while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
+                _recent_subagents.pop(next(iter(_recent_subagents)), None)
 
 
 def _close_subagent_steering(subagent_id: str, agent: Any) -> str | None:
@@ -359,7 +386,43 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
-def _handle_control_action(
+async def _resolve_session_lineage(session_id: str | None, parent_agent: Any) -> str:
+    """Resolve a session id through async compression lineage when available."""
+    sid = str(session_id or "")
+    if not sid:
+        return ""
+    db = getattr(parent_agent, "_session_db", None)
+    resolver = getattr(db, "resolve_resume_session_id", None)
+    if not callable(resolver):
+        return sid
+    try:
+        resolved = resolver(sid)
+        if inspect.isawaitable(resolved):
+            resolved = await resolved
+        return str(resolved) if resolved else sid
+    except Exception:
+        return sid
+
+
+async def _owns_subagent_record(
+    record: dict[str, Any], parent_agent: Any
+) -> bool:
+    """Check object ownership, then the durable conversation session spine."""
+    child = record.get("agent")
+    if _is_descendant_of(child, parent_agent):
+        return True
+    owner_sid = str(record.get("owner_agent_session_id") or "")
+    parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+    if not owner_sid or not parent_sid:
+        return False
+    if owner_sid == parent_sid:
+        return True
+    owner_tip = await _resolve_session_lineage(owner_sid, parent_agent)
+    parent_tip = await _resolve_session_lineage(parent_sid, parent_agent)
+    return owner_tip in {parent_sid, parent_tip}
+
+
+async def _handle_control_action(
     action: str,
     subagent_id: str | None,
     message: str | None,
@@ -372,7 +435,7 @@ def _handle_control_action(
         entries = []
         for record in records:
             child = record.get("agent")
-            if not _is_descendant_of(child, parent_agent):
+            if not await _owns_subagent_record(record, parent_agent):
                 continue
             started = record.get("started_at")
             entries.append(
@@ -411,7 +474,7 @@ def _handle_control_action(
     with _active_subagents_lock:
         record = _active_subagents.get(sid)
         child = record.get("agent") if record else None
-    if record is None or not _is_descendant_of(child, parent_agent):
+    if record is None or not await _owns_subagent_record(record, parent_agent):
         return tool_error(
             f"No live subagent '{sid}' in this conversation's spawn tree."
         )
@@ -2237,6 +2300,9 @@ async def _run_single_child(
                 "status": "running",
                 "tool_count": 0,
                 "agent": child,
+                "owner_agent_session_id": (
+                    str(getattr(parent_agent, "session_id", "") or "") or None
+                ),
                 "owner_session_id": owner_session_id,
                 "owner_transport": owner_transport,
                 "owner_session_record": owner_session_record,
@@ -3051,7 +3117,7 @@ async def delegate_task(
 
     normalized_action = (action or "").strip().lower()
     if normalized_action in {"list", "steer", "stop"}:
-        return _handle_control_action(
+        return await _handle_control_action(
             normalized_action, subagent_id, message, parent_agent
         )
     if normalized_action and normalized_action != "spawn":
@@ -3406,6 +3472,11 @@ async def delegate_task(
             progress_fn=_batch_progress,
         )
         if dispatch.get("status") == "dispatched":
+            for child in child_agents:
+                try:
+                    child._delegation_id = dispatch["delegation_id"]
+                except Exception:
+                    logger.debug("Could not attach delegation id to child")
             # Keep the existing agent-owned task set as a cleanup index only.
             # Completion publication and restart recovery remain owned by the
             # durable registry; no result is injected directly from this task.

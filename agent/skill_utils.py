@@ -18,6 +18,7 @@ import aiofiles
 import aiofiles.os
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
+from agent.secret_scope import UnscopedSecretError, get_secret
 
 logger = logging.getLogger(__name__)
 _realpath = aiofiles.os.wrap(os.path.realpath)
@@ -609,7 +610,13 @@ _PROJECT_ROOT_MAX_DEPTH = 64
 async def find_project_root(start: Path | None = None) -> Path | None:
     """Return the nearest enclosing git checkout, if one exists."""
     try:
-        current = Path(await _realpath(start or Path(await aiofiles.os.getcwd())))
+        if start is None:
+            try:
+                env_cwd = get_secret("TERMINAL_CWD")
+            except UnscopedSecretError:
+                return None
+            start = Path(env_cwd) if env_cwd else Path(await aiofiles.os.getcwd())
+        current = Path(await _realpath(start))
     except (OSError, RuntimeError):
         return None
     try:
@@ -701,6 +708,69 @@ async def get_untrusted_project_skills_root() -> tuple[Path, int] | None:
 async def get_scan_ordered_skills_dirs() -> list[Path]:
     """Return project, local, and external skill roots in precedence order."""
     return [*(await get_project_skills_dirs()), get_skills_dir(), *(await get_external_skills_dirs())]
+
+
+# Project trust is a repository-level decision, while SKILL.md content can
+# change after every checkout update.  Keep the quarantine at the shared async
+# iteration boundary so prompt, slash-command, and tool projections agree.
+_PROJECT_SCAN_SOURCE = "project-local"
+_PROJECT_QUARANTINE_CACHE: dict[str, bool] = {}
+
+
+def _project_scan_cache_dir() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "project_skill_scans"
+
+
+async def is_quarantined_project_skill(skill_md: Path) -> bool:
+    """Return whether a project skill's scan is dangerous; fail closed."""
+    skill_dir = Path(skill_md).parent
+    try:
+        key = str(Path(await _realpath(skill_dir)))
+    except (OSError, RuntimeError):
+        key = str(skill_dir)
+    cached = _PROJECT_QUARANTINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from tools.skills_guard import scan_skill_cached
+
+        result, _provenance = await scan_skill_cached(
+            skill_dir,
+            source=_PROJECT_SCAN_SOURCE,
+            cache_dir=_project_scan_cache_dir(),
+        )
+        quarantined = result.verdict == "dangerous"
+        if quarantined:
+            logger.warning(
+                "Project skill quarantined (verdict=dangerous): %s — %s",
+                skill_dir,
+                result.summary,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Project skill scan failed — quarantining (fail closed): %s",
+            skill_dir,
+            exc_info=True,
+        )
+        quarantined = True
+    _PROJECT_QUARANTINE_CACHE[key] = quarantined
+    return quarantined
+
+
+def _project_quarantine_cache_clear() -> None:
+    """Clear the in-process quarantine projection (tests)."""
+    _PROJECT_QUARANTINE_CACHE.clear()
+
+
+async def iter_project_skill_files(project_dir: Path):
+    """Yield only non-quarantined project ``SKILL.md`` files."""
+    async for skill_md in iter_skill_index_files(project_dir, "SKILL.md"):
+        if not await is_quarantined_project_skill(skill_md):
+            yield skill_md
 
 
 async def normalize_skill_lookup_name(identifier: str) -> str:

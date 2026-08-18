@@ -98,6 +98,7 @@ from agent.skill_utils import (
     get_disabled_skill_names as _get_disabled_skill_names,
     get_external_skills_dirs as _external_skills_dirs,
     get_project_skills_dirs as _project_skills_dirs,
+    iter_project_skill_files as _iter_project_skill_files,
     iter_skill_index_files as _iter_skill_index_files,
 )
 
@@ -771,6 +772,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
     disabled = set() if skip_disabled else await _get_disabled_skill_names()
     roots: list[Path] = await _project_skills_dirs()
+    project_roots = set(roots)
     active = _skills_dir()
     if await aiofiles.os.path.isdir(active):
         roots.append(active)
@@ -784,7 +786,12 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any
     skills: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for root in roots:
-        async for skill_md in _iter_skill_index_files(root, "SKILL.md"):
+        iterator = (
+            _iter_project_skill_files(root)
+            if root in project_roots
+            else _iter_skill_index_files(root, "SKILL.md")
+        )
+        async for skill_md in iterator:
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             try:
@@ -1096,6 +1103,7 @@ async def skill_view(
         seen: set[Path] = set()
         from agent.skill_utils import is_skill_support_path
 
+        project_roots = set(project_dirs)
         for root in roots:
             lookup_names = [name]
             if local_category_name:
@@ -1120,7 +1128,12 @@ async def skill_view(
                     if resolved_legacy not in seen:
                         candidates.append((None, legacy_md, root))
                         seen.add(resolved_legacy)
-            async for candidate in _iter_skill_index_files(root, "SKILL.md"):
+            iterator = (
+                _iter_project_skill_files(root)
+                if root in project_roots
+                else _iter_skill_index_files(root, "SKILL.md")
+            )
+            async for candidate in iterator:
                 resolved_candidate = Path(await _realpath(candidate))
                 if resolved_candidate in seen:
                     continue

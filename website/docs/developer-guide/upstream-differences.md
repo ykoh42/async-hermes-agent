@@ -1,17 +1,17 @@
 ---
 sidebar_position: 2
 title: "Upstream Differences"
-description: "The deliberate differences between Hermes Agent v2026.8.16.2 and Async Hermes Agent"
+description: "The deliberate differences between Hermes Agent v2026.8.18 and Async Hermes Agent"
 ---
 
 # Upstream differences
 
-Async Hermes Agent is based on upstream Hermes Agent `v2026.8.16.2` (Python
-package version `0.20.3`). The table below records the deliberate differences
+Async Hermes Agent is based on upstream Hermes Agent `v2026.8.18` (Python
+package version `0.20.4`). The table below records the deliberate differences
 in the retained library surface. It is a migration guide, not a claim that the
 removed upstream applications are still shipped.
 
-| Area | Upstream `v2026.8.16.2` | Async Hermes Agent `0.20.3.1` | Integration impact |
+| Area | Upstream `v2026.8.18` | Async Hermes Agent `0.20.4.1` | Integration impact |
 | --- | --- | --- | --- |
 | Public entry points | Retained names and module paths | The same retained names, arguments, defaults, and return shapes; I/O-bearing calls are coroutines | Existing library callers normally add `await` at the call site |
 | Agent construction | Synchronous upstream lifecycle | `AIAgent.__init__()` is state-only; provider, session, MCP, and plugin setup starts at an awaited boundary | Use `async with AIAgent(...)` or `await agent.close()` |
@@ -29,7 +29,7 @@ removed upstream applications are still shipped.
 | FastAPI/service boundary | Upstream product applications may own service surfaces | No FastAPI server or interactive Hermes CLI/TUI, messaging bridge, scheduler, dashboard, or desktop application is bundled; the upstream BatchRunner script entrypoint is retained | The host application owns HTTP lifecycle, auth, routing, quotas, and shutdown; web code awaits BatchRunner directly |
 | MCP and skills | Upstream product-managed discovery | Retained stdio, Streamable HTTP, and SSE MCP clients plus filesystem/external skill discovery with async lifecycle cleanup | Configure them from the host's Hermes home and close the agent at shutdown |
 | Optional providers and tools | Upstream distribution layout | Provider-specific extras remain opt-in (`anthropic`, `vertex`, `azure-identity`, `bedrock`, memory, web, media, and execution backends) | Install only the extras used by the selected configuration |
-| Python and package version | Upstream baseline `0.20.3` | Python `>=3.11,<3.14`; package `0.20.3.1` (`async_revision=1`) | The first three version segments track upstream; the fourth tracks this async distribution |
+| Python and package version | Upstream baseline `0.20.4` | Python `>=3.11,<3.14`; package `0.20.4.1` (`async_revision=1`) | The first three version segments track upstream; the fourth tracks this async distribution |
 
 ## Intentional public-surface exception
 

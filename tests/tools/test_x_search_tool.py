@@ -411,11 +411,13 @@ async def test_x_search_prefers_explicit_api_key_over_oauth(monkeypatch):
 
     paid_key = "paid-key-x1"
     monkeypatch.setattr(
-        "hermes_cli.config.get_env_value",
-        lambda name, default=None: {
-            "XAI_API_KEY": paid_key,
-            "XAI_BASE_URL": None,
-        }.get(name, default),
+        "hermes_cli.config.get_env_value_prefer_dotenv",
+        AsyncMock(
+            side_effect=lambda name, default=None: {
+                "XAI_API_KEY": paid_key,
+                "XAI_BASE_URL": None,
+            }.get(name, default)
+        ),
     )
     oauth_token = "oauth-key-x1"
     monkeypatch.setattr(
@@ -441,8 +443,8 @@ async def test_x_search_bearer_falls_back_to_oauth_without_api_key(monkeypatch):
     from tools.x_search_tool import _resolve_xai_bearer
 
     monkeypatch.setattr(
-        "hermes_cli.config.get_env_value",
-        lambda name, default=None: default,
+        "hermes_cli.config.get_env_value_prefer_dotenv",
+        AsyncMock(return_value=None),
     )
     oauth_token = "oauth-key-x1"
     monkeypatch.setattr(

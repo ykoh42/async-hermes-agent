@@ -28,6 +28,7 @@ from agent.skill_utils import (
     get_disabled_skill_names as _get_disabled_skill_names,
     get_external_skills_dirs as _external_skills_dirs,
     get_project_skills_dirs as _project_skills_dirs,
+    iter_project_skill_files as _iter_project_skill_files,
     iter_skill_index_files as _iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
@@ -1134,7 +1135,7 @@ async def build_skills_system_prompt(
     for project_dir in project_dirs:
         if not await aiofiles.os.path.isdir(project_dir):
             continue
-        async for skill_file in _iter_skill_index_files(project_dir, "SKILL.md"):
+        async for skill_file in _iter_project_skill_files(project_dir):
             try:
                 compatible, frontmatter, desc = await _parse_skill_file(skill_file)
                 if not compatible:

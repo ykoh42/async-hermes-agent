@@ -54,6 +54,7 @@ API-key variable.
 | `openrouter` | `OPENROUTER_API_KEY` | OpenAI-compatible |
 | `deepseek` | `DEEPSEEK_API_KEY` | OpenAI-compatible |
 | `xai` | `XAI_API_KEY` or xAI OAuth state | OpenAI-compatible / Responses |
+| `meta-ai` | `MODEL_API_KEY`, `META_API_KEY`, or `META_MODEL_API_KEY` | Meta Responses (`api.meta.ai`) |
 | `zai` | `GLM_API_KEY`, `ZAI_API_KEY`, or `Z_AI_API_KEY` | OpenAI-compatible |
 | `kimi-coding` | `KIMI_API_KEY` or `KIMI_CODING_API_KEY` | OpenAI-compatible |
 | `minimax` | `MINIMAX_API_KEY`; OAuth uses `minimax-oauth` | Anthropic-compatible |
@@ -95,6 +96,11 @@ transports are native async except where the SDK boundary below says otherwise:
 | Microsoft Foundry/Azure | `azure-foundry` | Base transport; restricted `azure-identity` extra for Entra ID |
 | AWS Bedrock | `bedrock` | `bedrock` extra; see SDK boundary below |
 | Codex Responses and Copilot ACP | Corresponding bundled profiles | Profile-specific credentials/runtime |
+
+Meta Model API (`meta-ai`, aliases `meta` and `muse`) is routed to the
+Responses transport on the exact `api.meta.ai` host. The transport supplies a
+24-hour prompt-cache retention hint; custom OpenAI-compatible endpoints still
+use their explicitly selected or inferred mode.
 
 Bundled profile discovery includes additional OpenAI-compatible services. A
 profile in the source tree means Hermes knows how to resolve that service; it

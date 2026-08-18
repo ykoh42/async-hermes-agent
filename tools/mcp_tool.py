@@ -5377,7 +5377,7 @@ async def _call_mcp_tool(
     if _mark_proven is not None:
         _mark_proven()
 
-    if result.isError:
+    if getattr(result, "isError", getattr(result, "is_error", False)):
         error_text = ""
         for block in (result.content or []):
             if getattr(block, "text", None):
@@ -5420,7 +5420,11 @@ async def _call_mcp_tool(
             )
 
     text_result = "\n".join(parts) if parts else ""
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(
+        result,
+        "structuredContent",
+        getattr(result, "structured_content", None),
+    )
     meta = _strip_reserved_meta_keys(getattr(result, "meta", None))
     if structured is not None or meta is not None:
         payload: dict[str, Any] = {}

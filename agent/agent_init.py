@@ -70,6 +70,7 @@ from hermes_cli import env_loader as _env_loader_bootstrap  # noqa: F401
 from hermes_cli import managed_scope as _managed_scope_bootstrap  # noqa: F401
 from hermes_cli import model_normalize as _model_normalize_bootstrap  # noqa: F401
 from hermes_cli import models as _models_bootstrap  # noqa: F401
+from hermes_cli import providers as _providers_bootstrap  # noqa: F401
 from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_constants import get_hermes_home
@@ -1222,30 +1223,31 @@ def init_agent(
     elif (provider_name is None) and agent._base_url_hostname == "api.x.ai":
         agent.api_mode = "codex_responses"
         agent.provider = "xai"
-    elif agent.provider == "anthropic" or (provider_name is None and agent._base_url_hostname == "api.anthropic.com"):
+    elif agent.provider == "anthropic" or (
+        provider_name is None and agent._base_url_hostname == "api.anthropic.com"
+    ):
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
     elif agent._base_url_lower.rstrip("/").endswith("/anthropic"):
-        # Third-party Anthropic-compatible endpoints (e.g. MiniMax, DashScope)
-        # use a URL convention ending in /anthropic. Auto-detect these so the
-        # Anthropic Messages API adapter is used instead of chat completions.
         agent.api_mode = "anthropic_messages"
     elif agent.provider == "bedrock" or (
         agent._base_url_hostname.startswith("bedrock-runtime.")
         and base_url_host_matches(agent._base_url_lower, "amazonaws.com")
     ):
-        # AWS Bedrock — auto-detect from provider name or base URL
-        # (bedrock-runtime.<region>.amazonaws.com).
         agent.api_mode = "bedrock_converse"
     elif agent.provider in {"nous", "nous-portal", "nousresearch"}:
-        # Portal is dual-wire: anthropic/* → Messages, everything else →
-        # chat_completions. Callers that already pass api_mode win above;
-        # this covers direct AIAgent construction without a resolved runtime.
         from hermes_cli.providers import nous_api_mode
 
         agent.api_mode = nous_api_mode(agent.model)
     else:
-        agent.api_mode = "chat_completions"
+        # Hosts may mandate a wire protocol without owning a provider slug.
+        # Keep this fallback after URL-based provider rewrites so credentials
+        # for endpoints such as api.anthropic.com retain their provider id.
+        try:
+            mandated_mode = _providers_bootstrap.host_mandated_api_mode(base_url or "")
+        except Exception:
+            mandated_mode = None
+        agent.api_mode = mandated_mode or "chat_completions"
 
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent

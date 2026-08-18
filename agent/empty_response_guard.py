@@ -50,7 +50,7 @@ import logging
 import inspect
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ class EmptyAttempt:
         return (self.model, self.provider, self.finish_reason)
 
 
-def resolve_guard_settings(section: Any) -> Tuple[bool, Decimal]:
+def resolve_guard_settings(section: Any) -> tuple[bool, Decimal]:
     """Resolve ``agent.empty_response_guard`` config into (enabled, threshold).
 
     Tolerant of malformed input: anything that isn't a well-formed dict
@@ -137,7 +137,7 @@ def _cost_threshold_usd(agent: Any) -> Decimal:
     return DEFAULT_COST_THRESHOLD_USD
 
 
-def _attempts(agent: Any) -> List[EmptyAttempt]:
+def _attempts(agent: Any) -> list[EmptyAttempt]:
     attempts = getattr(agent, _ATTEMPTS_ATTR, None)
     if attempts is None:
         attempts = []
@@ -145,7 +145,7 @@ def _attempts(agent: Any) -> List[EmptyAttempt]:
     return attempts
 
 
-async def _estimate_attempt_cost(agent: Any, response: Any) -> Optional[Decimal]:
+async def _estimate_attempt_cost(agent: Any, response: Any) -> Decimal | None:
     """Best-effort USD estimate for one attempt. None when unknown."""
     raw_usage = getattr(response, "usage", None)
     if not raw_usage:
@@ -271,7 +271,7 @@ async def empty_retry_budget(agent: Any, response: Any) -> int:
     return DEFAULT_EMPTY_RETRY_BUDGET
 
 
-def streak_cost_usd(agent: Any) -> Optional[Decimal]:
+def streak_cost_usd(agent: Any) -> Decimal | None:
     """Accumulated estimated cost of the current empty streak, if known."""
     cost = getattr(agent, _STREAK_COST_ATTR, None)
     if cost is None or cost <= 0:

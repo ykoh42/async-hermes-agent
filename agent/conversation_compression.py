@@ -2862,6 +2862,26 @@ async def compress_context(
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
+        # The compression heartbeat is persisted against the parent before an
+        # out-of-place rotation publishes its child.  Clear those labels after
+        # the transaction commits so an archived parent does not advertise a
+        # fresh compression activity forever; the child keeps the live labels.
+        if _old_sid and _session_commit_succeeded:
+            try:
+                clear_labels = getattr(
+                    _lock_db, "clear_session_activity_labels", None
+                )
+                if callable(clear_labels):
+                    await clear_labels(_old_sid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "failed to clear archived compression parent's activity "
+                    "labels (ignored)",
+                    exc_info=True,
+                )
+
         # Notify the context engine that a compaction boundary occurred. Plugin
         # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
         # DAG lineage / checkpoint per-session state across the boundary instead of

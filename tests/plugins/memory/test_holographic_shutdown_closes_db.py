@@ -43,3 +43,34 @@ async def test_shutdown_closes_store_connection(tmp_path):
     # ...AND the underlying connection was actually closed (not left to GC).
     with pytest.raises(ValueError, match="no active connection"):
         await conn.execute("SELECT 1")
+
+
+@pytest.mark.asyncio
+async def test_stale_holder_close_does_not_evict_fresh_registry_entry(tmp_path):
+    from plugins.memory.holographic.store import MemoryStore
+
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    db_path = profile_dir / "memory_store.db"
+    stale = MemoryStore(db_path=db_path, hrr_dim=64)
+    await stale._initialize()
+    key = stale._registry_key
+    assert key is not None
+    # Simulate the profile-cleanup path force-removing the old registry entry
+    # while a stale holder still owns its reference.
+    MemoryStore._shared.pop(key, None)
+    fresh = MemoryStore(db_path=db_path, hrr_dim=64)
+    await fresh._initialize()
+    key = fresh._registry_key
+    fresh_entry = MemoryStore._shared[key]
+    try:
+        await stale.close()
+        assert MemoryStore._shared.get(key) is fresh_entry
+        third = MemoryStore(db_path=db_path, hrr_dim=64)
+        try:
+            await third._initialize()
+            assert third._conn is fresh._conn
+        finally:
+            await third.close()
+    finally:
+        await fresh.close()

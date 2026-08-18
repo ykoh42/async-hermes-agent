@@ -126,6 +126,8 @@ def _detect_api_mode_for_url(base_url: str) -> str | None:
     # providers.is_official_openai_host for the spoof-rejection contract.
     if is_official_openai_host(base_url):
         return "codex_responses"
+    if hostname == "api.meta.ai":
+        return "codex_responses"
     # Direct native Anthropic host: realign with providers.determine_api_mode,
     # which already maps this host to anthropic_messages. The exact-hostname
     # match rejects lookalike subdomains (api.anthropic.com.attacker.test) and
