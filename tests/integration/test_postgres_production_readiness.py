@@ -15,6 +15,7 @@ import aiofiles.os
 import pytest
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_state import SessionTurnLeaseLostError
 from hermes_state_postgres import SessionDB
 
 
@@ -68,6 +69,9 @@ async def _start_worker(
     count: int = 1,
     delay: float = 0.0,
     ready_path: Path | None = None,
+    acquired_path: Path | None = None,
+    ttl: float = 300.0,
+    wait: float = 1800.0,
 ) -> asyncio.subprocess.Process:
     await aiofiles.os.makedirs(root / "os-home", exist_ok=True)
     await aiofiles.os.makedirs(root / "hermes-home", exist_ok=True)
@@ -86,6 +90,9 @@ async def _start_worker(
     ]
     if ready_path is not None:
         command.extend(("--ready-path", str(ready_path)))
+    if acquired_path is not None:
+        command.extend(("--acquired-path", str(acquired_path)))
+    command.extend(("--ttl", str(ttl), "--wait", str(wait)))
     return await asyncio.create_subprocess_exec(
         *command,
         cwd=root,
@@ -266,6 +273,167 @@ async def test_postgres_worker_kill_then_cold_resume_has_no_duplicate_rows(tmp_p
         if interrupted is not None and interrupted.returncode is None:
             interrupted.kill()
             await interrupted.communicate()
+        await database.delete_session(session_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_same_session_turn_lease_serializes_workers(tmp_path):
+    """Two servers cannot advance one session at the same time."""
+    dsn = _dsn()
+    database = SessionDB(dsn)
+    session_id = f"readiness-turn-lease-{uuid.uuid4()}"
+    root = tmp_path / "turn-lease-workers"
+    first = second = None
+    try:
+        await database.create_session(session_id, "postgres-readiness")
+        first = await _start_worker(
+            "lease",
+            root / "worker-a",
+            dsn,
+            session_id,
+            worker="a",
+            delay=1.5,
+            ready_path=root / "worker-a" / "ready",
+            acquired_path=root / "worker-a" / "acquired",
+            ttl=5.0,
+            wait=5.0,
+        )
+        await _wait_for_path(root / "worker-a" / "acquired", first)
+
+        second = await _start_worker(
+            "lease",
+            root / "worker-b",
+            dsn,
+            session_id,
+            worker="b",
+            ready_path=root / "worker-b" / "ready",
+            acquired_path=root / "worker-b" / "acquired",
+            ttl=5.0,
+            wait=5.0,
+        )
+        await _wait_for_path(root / "worker-b" / "ready", second)
+        first_result, second_result = await asyncio.gather(
+            _finish_worker(first),
+            _finish_worker(second),
+        )
+        assert first_result is not None and first_result["lease_acquired"] is True
+        assert second_result is not None and second_result["lease_acquired"] is True
+        assert second_result["lease_wait_seconds"] > 0.5
+        assert [row["content"] for row in await database.get_messages(session_id)] == [
+            "lease=a:start",
+            "lease=a:end",
+            "lease=b:start",
+            "lease=b:end",
+        ]
+        assert _pool_metrics(database)["checked_out"] == 0
+    finally:
+        for process in (first, second):
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.communicate()
+        await database.delete_session(session_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_expired_turn_lease_is_reclaimed_after_worker_death(tmp_path):
+    """A new server takes over after the previous server disappears."""
+    dsn = _dsn()
+    database = SessionDB(dsn)
+    session_id = f"readiness-turn-takeover-{uuid.uuid4()}"
+    root = tmp_path / "turn-lease-takeover"
+    interrupted = resumed = None
+    try:
+        await database.create_session(session_id, "postgres-readiness")
+        interrupted = await _start_worker(
+            "lease",
+            root / "interrupted",
+            dsn,
+            session_id,
+            worker="interrupted",
+            delay=10.0,
+            ready_path=root / "interrupted" / "ready",
+            acquired_path=root / "interrupted" / "acquired",
+            ttl=0.35,
+            wait=5.0,
+        )
+        await _wait_for_path(root / "interrupted" / "acquired", interrupted)
+        interrupted.kill()
+        await _finish_worker(interrupted, expected_code=None)
+
+        resumed = await _start_worker(
+            "lease",
+            root / "resumed",
+            dsn,
+            session_id,
+            worker="resumed",
+            acquired_path=root / "resumed" / "acquired",
+            ttl=5.0,
+            wait=5.0,
+        )
+        resumed_result = await _finish_worker(resumed)
+        assert resumed_result is not None
+        assert resumed_result["lease_acquired"] is True
+        contents = [row["content"] for row in await database.get_messages(session_id)]
+        assert contents[-2:] == ["lease=resumed:start", "lease=resumed:end"]
+        assert contents.count("lease=resumed:start") == 1
+        assert contents.count("lease=resumed:end") == 1
+        assert "lease=interrupted:end" not in contents
+        assert contents in (
+            ["lease=resumed:start", "lease=resumed:end"],
+            [
+                "lease=interrupted:start",
+                "lease=resumed:start",
+                "lease=resumed:end",
+            ],
+        )
+        assert _pool_metrics(database)["checked_out"] == 0
+    finally:
+        for process in (interrupted, resumed):
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.communicate()
+        await database.delete_session(session_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_reclaimed_turn_lease_fences_stale_transcript_write():
+    """A lease holder that lost ownership cannot append after takeover."""
+    dsn = _dsn()
+    database = SessionDB(dsn)
+    session_id = f"readiness-turn-fence-{uuid.uuid4()}"
+    try:
+        await database.create_session(session_id, "postgres-readiness")
+        assert await database.try_acquire_session_turn_lease(
+            session_id,
+            "holder-a",
+            ttl_seconds=0.05,
+        )
+        await asyncio.sleep(0.1)
+        assert await database.try_acquire_session_turn_lease(
+            session_id,
+            "holder-b",
+            ttl_seconds=5.0,
+        )
+        with pytest.raises(SessionTurnLeaseLostError, match="lease lost"):
+            await database.append_message(
+                session_id,
+                "user",
+                "stale",
+                turn_lease_holder="holder-a",
+            )
+        await database.append_message(
+            session_id,
+            "user",
+            "current",
+            turn_lease_holder="holder-b",
+        )
+        assert [row["content"] for row in await database.get_messages(session_id)] == [
+            "current"
+        ]
+    finally:
         await database.delete_session(session_id)
         await database.close()
 
