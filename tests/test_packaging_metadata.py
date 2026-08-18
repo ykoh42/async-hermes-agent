@@ -73,7 +73,7 @@ def test_release_versions_match_upstream_revision_policy():
     expected_npm_version = f"{upstream_version}-async.{async_revision}"
 
     assert re.fullmatch(r"\d+\.\d+\.\d+", upstream_version)
-    assert re.fullmatch(r"v\d{4}\.\d{1,2}\.\d{1,2}", upstream_tag)
+    assert re.fullmatch(r"v\d{4}(?:\.\d{1,2}){2,3}", upstream_tag)
     assert upstream_tag == f'v{cli_metadata["__release_date__"]}'
     assert isinstance(async_revision, int) and async_revision > 0
     assert project_version == expected_python_version
@@ -245,10 +245,10 @@ def test_release_workflow_publishes_verified_artifacts_with_least_privilege():
     assert workflow.count(
         f"re.fullmatch(r'{release_tag_pattern}', tag)"
     ) == 2
-    assert re.fullmatch(release_tag_pattern, "v0.20.2.1")
+    assert re.fullmatch(release_tag_pattern, "v0.20.4.1")
     assert not any(
         re.fullmatch(release_tag_pattern, tag)
-        for tag in ("v0.20.2", "v0.20.2.1.1", "v0.20.2.1rc1", "0.20.2.1")
+        for tag in ("v0.20.4", "v0.20.4.1.1", "v0.20.4.1rc1", "0.20.4.1")
     )
     assert "release:\n    types: [published]" not in workflow
     assert (
@@ -278,8 +278,8 @@ def test_release_workflow_publishes_verified_artifacts_with_least_privilege():
     assert "--json isDraft" in stage_job
     assert 'test "$is_draft" = true' in stage_job
     assert "--draft \\" in stage_job
-    assert 'if [ "$RELEASE_TAG" = "v0.20.2.1" ]; then' in stage_job
-    assert "v2026.8.16" in stage_job
+    assert 'if [ "$RELEASE_TAG" = "v0.20.4.1" ]; then' in stage_job
+    assert "v2026.8.18" in stage_job
     assert '--notes "$release_notes" \\' in stage_job
     assert 'gh release upload "$RELEASE_TAG" dist/* \\' in stage_job
     assert "--clobber \\" in stage_job
@@ -573,15 +573,14 @@ def test_retained_no_op_compatibility_extras_are_published():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     extras = data["project"]["optional-dependencies"]
 
-    for extra in (
-        "computer-use",
-        "exa",
-        "firecrawl",
-        "homeassistant",
-        "mcp",
-        "vision",
-    ):
+    for extra in ("exa", "firecrawl", "homeassistant", "vision"):
         assert extras[extra] == []
+
+    # MCP 2.x is an intentional retained runtime dependency.  The
+    # computer-use extra shares the same SDK because the CUA backend speaks
+    # MCP over stdio; neither is a compatibility-only no-op alias.
+    assert extras["mcp"]
+    assert extras["computer-use"]
 
 
 

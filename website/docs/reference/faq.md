@@ -9,7 +9,7 @@ description: "Common integration, async lifecycle, provider, MCP, session, and t
 ## Is this the full Hermes Agent product?
 
 No. It is a native-async library distribution derived from upstream Hermes
-Agent `v2026.8.16`. It keeps the agent loop and retained provider/tool/MCP/
+Agent `v2026.8.18`. It keeps the agent loop and retained provider/tool/MCP/
 skill/memory/session/trajectory surfaces. CLI/TUI, desktop/dashboard,
 messaging, cron, and a bundled web service are intentionally outside scope.
 

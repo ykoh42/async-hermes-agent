@@ -31,6 +31,7 @@ import os
 import re
 import difflib
 import hashlib
+import json
 import tomllib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1202,6 +1203,91 @@ class ShellFileOperations(FileOperations):
     # READ Implementation
     # =========================================================================
 
+    _UTF16_MAX_BYTES = 10 * 1024 * 1024
+    _UTF16_SAMPLE_BYTES = 512
+
+    async def _try_read_utf16(
+        self, path: str, offset: int, limit: int, file_size: int
+    ) -> ReadResult | None:
+        """Transcode a bounded UTF-16 text file for display."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in BINARY_EXTENSIONS or file_size > self._UTF16_MAX_BYTES:
+            return None
+        snippet = (
+            "import sys, json, os\n"
+            f"p = {path!r}\n"
+            f"offset = {int(offset)}\n"
+            f"limit = {int(limit)}\n"
+            f"MAX = {self._UTF16_MAX_BYTES}\n"
+            f"SAMPLE = {self._UTF16_SAMPLE_BYTES}\n"
+            "try:\n"
+            "    size = os.path.getsize(p)\n"
+            "    if size > MAX:\n"
+            "        print('HERMES_UTF16:NO'); sys.exit(0)\n"
+            "    with open(p, 'rb') as f:\n"
+            "        data = f.read()\n"
+            "    sample = data[:SAMPLE]\n"
+            "    enc = None\n"
+            "    if sample[:2] == b'\\xfe\\xff':\n"
+            "        enc = 'utf-16-be'\n"
+            "    elif sample[:2] == b'\\xff\\xfe':\n"
+            "        enc = 'utf-16-le'\n"
+            "    else:\n"
+            "        odd = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)\n"
+            "        even = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)\n"
+            "        if even == 0 and odd >= 2:\n"
+            "            enc = 'utf-16-le'\n"
+            "        elif odd == 0 and even >= 2:\n"
+            "            enc = 'utf-16-be'\n"
+            "    if enc is None:\n"
+            "        print('HERMES_UTF16:NO'); sys.exit(0)\n"
+            "    text = data.decode(enc, 'replace')\n"
+            "    if text[:1] == '\\ufeff':\n"
+            "        text = text[1:]\n"
+            "    text = text.replace('\\r\\n', '\\n')\n"
+            "    lines = text.split('\\n')\n"
+            "    total = len(lines)\n"
+            "    sel = lines[offset - 1: offset - 1 + limit]\n"
+            "    out = {'total_lines': total, 'encoding': enc, 'content': '\\n'.join(sel)}\n"
+            "    print('HERMES_UTF16:OK')\n"
+            "    print(json.dumps(out, ensure_ascii=True))\n"
+            "except Exception:\n"
+            "    print('HERMES_UTF16:NO'); sys.exit(0)\n"
+        )
+        result = await self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+        if result.exit_code != 0 and "python3" in (result.stdout or ""):
+            result = await self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+        stdout = _strip_terminal_fence_leaks(result.stdout or "")
+        marker = stdout.find("HERMES_UTF16:OK")
+        if result.exit_code != 0 or marker < 0:
+            return None
+        payload = stdout[marker + len("HERMES_UTF16:OK"):].strip()
+        try:
+            data = json.loads(payload.split("\n", 1)[0] if "\n" in payload else payload)
+            content = data["content"]
+            total_lines = int(data["total_lines"])
+            encoding = str(data.get("encoding", "utf-16"))
+        except (ValueError, KeyError, TypeError):
+            return None
+        end_line = offset + limit - 1
+        truncated = total_lines > end_line
+        hint = (
+            f"Transcoded from {encoding.upper()} to UTF-8 for display. "
+            "Text edits via patch/write_file would re-encode as UTF-8."
+        )
+        if truncated:
+            hint += (
+                f" Use offset={end_line + 1} to continue reading "
+                f"(showing {offset}-{end_line} of {total_lines} lines)"
+            )
+        return ReadResult(
+            content=self._add_line_numbers(content, offset),
+            total_lines=total_lines,
+            file_size=file_size,
+            truncated=truncated,
+            hint=hint,
+        )
+
     async def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> ReadResult:
         """
         Read a file with pagination, binary detection, and line numbers.
@@ -1264,6 +1350,9 @@ class ShellFileOperations(FileOperations):
             is_binary = self._is_likely_binary(path, sample_output)
 
         if is_binary:
+            utf16_result = await self._try_read_utf16(path, offset, limit, file_size)
+            if utf16_result is not None:
+                return utf16_result
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -2406,6 +2495,23 @@ class ShellFileOperations(FileOperations):
         """
         if not await self._has_command('rg'):
             return None
+
+        def _tally(stdout: str):
+            """Parse ``path:count`` lines from rg --count-matches."""
+            total = 0
+            per_file = []
+            for line in (stdout or "").strip().splitlines():
+                p, _sep, n = line.rpartition(":")
+                if n.isdigit():
+                    total += int(n)
+                    per_file.append(p)
+            return total, per_file
+
+        def _paths_note(per_file, cap: int = 5) -> str:
+            shown = ", ".join(per_file[:cap])
+            extra = len(per_file) - cap
+            return shown + (f" (+{extra} more)" if extra > 0 else "")
+
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = await self._exec(
             f"rg -i --count-matches{glob_expr} "
@@ -2413,17 +2519,12 @@ class ShellFileOperations(FileOperations):
             f"2>/dev/null | head -50",
             timeout=30,
         )
-        ci_total = 0
-        ci_files = 0
-        for line in (probe.stdout or "").strip().splitlines():
-            _p, _sep, n = line.rpartition(":")
-            if n.isdigit():
-                ci_total += int(n)
-                ci_files += 1
+        ci_total, ci_paths = _tally(probe.stdout)
         if ci_total > 0:
             return (
                 f"0 exact matches, but {ci_total} case-insensitive match(es) "
-                f"in {ci_files} file(s) — the pattern's casing may be wrong."
+                f"in {len(ci_paths)} file(s): {_paths_note(ci_paths)} — "
+                "the pattern's casing may be wrong."
             )
         # Hidden/ignored probe: rg skips dotdirs and .gitignore'd files by
         # default. When the pattern exists only there, say so instead of
@@ -2435,18 +2536,12 @@ class ShellFileOperations(FileOperations):
             f"2>/dev/null | head -50",
             timeout=30,
         )
-        h_total = 0
-        h_files = 0
-        for line in (hidden.stdout or "").strip().splitlines():
-            _p, _sep, n = line.rpartition(":")
-            if n.isdigit():
-                h_total += int(n)
-                h_files += 1
+        h_total, h_paths = _tally(hidden.stdout)
         if h_total > 0:
             return (
                 f"0 matches in visible files, but {h_total} match(es) in "
-                f"{h_files} hidden or gitignored file(s) — these are excluded "
-                "by default. Search the hidden path explicitly to include them."
+                f"{len(h_paths)} hidden or gitignored file(s): "
+                f"{_paths_note(h_paths)} — these are excluded by default."
             )
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = await self._exec(
@@ -2455,14 +2550,11 @@ class ShellFileOperations(FileOperations):
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
-            f_total = sum(
-                int(line.rpartition(":")[2])
-                for line in (fixed.stdout or "").strip().splitlines()
-                if line.rpartition(":")[2].isdigit()
-            )
+            f_total, f_paths = _tally(fixed.stdout)
             if f_total > 0:
                 return (
-                    f"0 regex matches, but {f_total} literal match(es) — the "
+                    f"0 regex matches, but {f_total} literal match(es) in "
+                    f"{len(f_paths)} file(s): {_paths_note(f_paths)} — the "
                     "pattern contains regex metacharacters that likely need "
                     "escaping (or pass a simpler substring)."
                 )

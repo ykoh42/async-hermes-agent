@@ -245,8 +245,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           release_notes=""
-          if [ "$RELEASE_TAG" = "v0.20.2.1" ]; then
-            release_notes='Async revision 1: this release tracks Hermes Agent v2026.8.16 (Python 0.20.2). Reinstall explicitly when moving from the legacy v0.20.4 fork release; future fork-only releases increment the fourth numeric segment.'
+          if [ "$RELEASE_TAG" = "v0.20.4.1" ]; then
+            release_notes='Async revision 1: this release tracks Hermes Agent v2026.8.18 (Python 0.20.4). Reinstall explicitly when moving from the legacy v0.20.4 fork release; future fork-only releases increment the fourth numeric segment.'
           fi
           if is_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
             test "$is_draft" = true

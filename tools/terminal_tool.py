@@ -1748,15 +1748,19 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
             session_key=session_key or task_id,
             env_type=env_type,
         )
-        # A local command that rewrites the checkout backing this interpreter
-        # can mix module versions in the running process.  This guard is
-        # deliberately non-bypassable and does not apply to remote sandboxes.
+        # On Windows, rewriting the checkout backing this interpreter can
+        # corrupt loaded files. POSIX keeps old inodes alive, so the guard is
+        # platform-scoped and does not apply to remote sandboxes.
         if env_type == "local":
-            from tools.self_repo_guard import detect_self_repo_git_mutation
+            from tools.self_repo_guard import (
+                detect_self_repo_git_mutation,
+                guard_active,
+            )
 
-            self_repo_hit, self_repo_message = detect_self_repo_git_mutation(
-                command,
-                cwd,
+            self_repo_hit, self_repo_message = (
+                detect_self_repo_git_mutation(command, cwd)
+                if guard_active()
+                else (False, None)
             )
             if self_repo_hit:
                 return json.dumps(
@@ -2285,10 +2289,60 @@ async def _prepare_terminal_output(
     return redact_terminal_output(clean_output.strip(), command), metadata
 
 
+# Signal-death notes for the lethal signals seen in practice. Keyed by
+# signum; used for both the ``-signum`` (subprocess) and ``128+signum``
+# (shell) encodings. Curated rather than exhaustive so we never mislabel a
+# legitimate application exit code (e.g. 130/SIGINT is handled by the
+# executor's interrupt-marker path and excluded here).
+_SIGNAL_EXIT_NOTES: dict[int, str] = {
+    3: "SIGQUIT (quit from keyboard)",
+    4: "SIGILL (illegal instruction — corrupt binary or wrong architecture)",
+    6: "SIGABRT (abort — assertion failure, fatal runtime error, or glibc abort)",
+    7: "SIGBUS (bus error — misaligned or unmapped memory access)",
+    8: "SIGFPE (fatal arithmetic error, e.g. integer division by zero)",
+    9: "SIGKILL — often the kernel OOM killer on memory exhaustion, or an explicit kill -9",
+    11: "SIGSEGV (segmentation fault — the program crashed)",
+    13: "SIGPIPE (wrote to a closed pipe — e.g. output piped to a reader that exited)",
+    15: "SIGTERM (terminated — kill/timeout or shutdown requested it to stop)",
+    24: "SIGXCPU (CPU time limit exceeded)",
+    25: "SIGXFSZ (file size limit exceeded)",
+}
+
+
+def _interpret_signal_exit(exit_code: int) -> str | None:
+    """Map signal-termination exit codes to a human-readable note."""
+    if exit_code < 0:
+        signum = -exit_code
+        if signum == 2:  # SIGINT is owned by the interrupt-marker path.
+            return None
+        note = _SIGNAL_EXIT_NOTES.get(signum)
+        if note:
+            return f"Command terminated by signal {signum}: {note}"
+        try:
+            import signal as _signal
+
+            name = _signal.Signals(signum).name
+        except (ValueError, ImportError):
+            name = f"signal {signum}"
+        return f"Command terminated by {name} (signal {signum})"
+    if exit_code > 128:
+        signum = exit_code - 128
+        note = _SIGNAL_EXIT_NOTES.get(signum)
+        if note:
+            return (
+                f"Exit code {exit_code} usually means the command was terminated "
+                f"by signal {signum}: {note}"
+            )
+    return None
+
+
 def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     """Return a note when a non-zero exit code is conventional, not erroneous."""
     if exit_code == 0:
         return None
+    signal_note = _interpret_signal_exit(exit_code)
+    if signal_note is not None:
+        return signal_note
     segments = re.split(r"\s*(?:\|\||&&|[|;])\s*", command)
     words = (segments[-1] if segments else command).strip().split()
     base_cmd = ""

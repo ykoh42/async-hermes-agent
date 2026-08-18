@@ -114,6 +114,7 @@ import aiofiles.os
 from hermes_cli import config as _config_bootstrap  # noqa: F401
 
 from tools.registry import tool_error
+from tools.ansi_strip import strip_unicode_tags
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -425,6 +426,8 @@ async def _close_mcp_stderr_log() -> None:
 
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
+_MCP_NEW_HTTP = False
+_MCP_LEGACY_HTTP = False
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_ELICITATION_TYPES = False
@@ -433,14 +436,17 @@ _MCP_MESSAGE_HANDLER_SUPPORTED = False
 # Streamable HTTP was introduced by 2025-03-26, so this remains valid for the
 # HTTP transport path even on older-but-supported SDK versions.
 LATEST_PROTOCOL_VERSION = "2025-03-26"
+LATEST_HANDSHAKE_VERSION = LATEST_PROTOCOL_VERSION
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     _MCP_AVAILABLE = True
     try:
         from mcp.client.streamable_http import streamablehttp_client
+        _MCP_LEGACY_HTTP = True
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
+        _MCP_LEGACY_HTTP = False
         _MCP_HTTP_AVAILABLE = False
     # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
     # deprecated wrapper for older SDK versions.
@@ -449,10 +455,15 @@ try:
         _MCP_NEW_HTTP = True
     except ImportError:
         _MCP_NEW_HTTP = False
+    _MCP_HTTP_AVAILABLE = _MCP_NEW_HTTP or _MCP_LEGACY_HTTP
     try:
         from mcp.types import LATEST_PROTOCOL_VERSION
     except ImportError:
         logger.debug("mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version")
+    try:
+        from mcp.client.session import LATEST_HANDSHAKE_VERSION
+    except ImportError:
+        LATEST_HANDSHAKE_VERSION = LATEST_PROTOCOL_VERSION
     # SSE transport client (for MCP servers using SSE transport instead of Streamable HTTP)
     try:
         from mcp.client.sse import sse_client
@@ -496,6 +507,46 @@ try:
         logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
 except ImportError:
     logger.debug("mcp package not installed -- MCP tool support disabled")
+
+
+_SDK_HTTPX_MOD = None
+
+
+def sdk_httpx():
+    """Return the HTTP module used by the installed MCP SDK."""
+    global _SDK_HTTPX_MOD
+    if _SDK_HTTPX_MOD is not None:
+        return _SDK_HTTPX_MOD
+    try:
+        from mcp.client import streamable_http as transport
+    except ImportError:
+        transport = None
+    if transport is not None:
+        _SDK_HTTPX_MOD = getattr(transport, "httpx2", None) or getattr(
+            transport, "httpx", None
+        )
+    if _SDK_HTTPX_MOD is None:
+        try:
+            import httpx2 as fallback
+        except ImportError:
+            try:
+                import httpx as fallback
+            except ImportError:
+                return None
+        _SDK_HTTPX_MOD = fallback
+    return _SDK_HTTPX_MOD
+
+
+_MISSING = object()
+
+
+def mcp_field(obj, snake: str, camel: str, default=None):
+    """Read a model field across MCP SDK snake/camel attribute spellings."""
+    value = getattr(obj, snake, _MISSING)
+    if value is not _MISSING:
+        return value
+    value = getattr(obj, camel, _MISSING)
+    return default if value is _MISSING else value
 
 
 def _check_message_handler_support() -> bool:
@@ -738,13 +789,31 @@ try:
 except Exception:  # pragma: no cover — older/newer SDK without the constant
     _JSONRPC_METHOD_NOT_FOUND = -32601
 
+_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+
+def _handshake_rejected_as_modern(exc: BaseException) -> bool:
+    err = getattr(exc, "error", None)
+    code = getattr(err, "code", None) or getattr(exc, "code", None)
+    if code in (_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION, _JSONRPC_METHOD_NOT_FOUND):
+        return True
+    msg = str(exc).lower()
+    return bool(
+        msg
+        and (
+            "unsupported protocol version" in msg
+            or str(_JSONRPC_UNSUPPORTED_PROTOCOL_VERSION) in msg
+            or _is_method_not_found_error(exc)
+        )
+    )
+
 
 def _is_method_not_found_error(exc: BaseException) -> bool:
     """Return True if *exc* is a JSON-RPC ``method not found`` (-32601).
 
     ``ping`` is an *optional* MCP utility (spec: "optional ping mechanism").
     A server that doesn't implement it answers a ping with -32601 rather than
-    an empty result. Structurally inspect ``McpError.error.code`` first, then
+    an empty result. Structurally inspect ``MCPError.error.code`` first, then
     fall back to a substring match so detection survives SDK version drift and
     servers that surface the condition as a plain message.
 
@@ -755,7 +824,7 @@ def _is_method_not_found_error(exc: BaseException) -> bool:
     server is one such case (#50028). Without matching that phrasing the
     ping→list_tools fallback never latches and the keepalive reconnect-loops.
     """
-    # Structural: mcp.shared.exceptions.McpError carries ErrorData.code.
+    # Structural: mcp.shared.exceptions.MCPError carries ErrorData.code.
     err = getattr(exc, "error", None)
     code = getattr(err, "code", None)
     if code == _JSONRPC_METHOD_NOT_FOUND:
@@ -837,13 +906,43 @@ def _prepend_path(env: dict, directory: str) -> dict:
     return updated
 
 
+def _is_reserved_mcp_meta_key(key: str) -> bool:
+    """Return whether an MCP metadata key uses a reserved protocol prefix."""
+    slash = key.find("/")
+    if slash <= 0:
+        return False
+    labels = key[:slash].split(".")
+    return any(
+        label in {"modelcontextprotocol", "mcp"}
+        and index < len(labels) - 1
+        for index, label in enumerate(labels)
+    )
+
+
+def _strip_reserved_meta_keys(meta: Any) -> dict[str, Any] | None:
+    """Keep model-facing MCP metadata while dropping protocol namespaces."""
+    if not isinstance(meta, dict):
+        return None
+    filtered = {
+        key: value
+        for key, value in meta.items()
+        if isinstance(key, str) and not _is_reserved_mcp_meta_key(key)
+    }
+    return filtered or None
+
+
 # Safety cap on nextCursor pagination loops so a misbehaving server that
 # returns a cursor forever cannot spin discovery indefinitely. 50 pages at
 # the common 50-100 items/page covers thousands of tools/resources/prompts.
 _MCP_LIST_MAX_PAGES = 50
 
 
-async def _paginate_full_list(list_method, items_attr: str, server_name: str):
+async def _paginate_full_list(
+    list_method,
+    items_attr: str,
+    server_name: str,
+    cache_meta_out: dict | None = None,
+):
     """Drain a paginated MCP ``list_*`` call by following ``nextCursor``.
 
     The MCP spec allows servers to paginate ``tools/list``,
@@ -868,9 +967,31 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str):
     items: list = []
     cursor = None
     for _ in range(_MCP_LIST_MAX_PAGES):
-        result = await (list_method(cursor=cursor) if cursor else list_method())
+        if not cursor:
+            result = await list_method()
+        else:
+            try:
+                from mcp.types import PaginatedRequestParams
+            except ImportError:
+                PaginatedRequestParams = None
+            try:
+                if PaginatedRequestParams is not None:
+                    result = await list_method(
+                        params=PaginatedRequestParams(cursor=cursor)
+                    )
+                else:
+                    result = await list_method(cursor=cursor)
+            except TypeError:
+                result = await list_method(cursor=cursor)
+        if cache_meta_out is not None and not items:
+            ttl = mcp_field(result, "ttl_ms", "ttlMs")
+            scope = mcp_field(result, "cache_scope", "cacheScope")
+            if ttl is not None:
+                cache_meta_out["ttl_ms"] = ttl
+            if scope is not None:
+                cache_meta_out["cache_scope"] = scope
         items.extend(getattr(result, items_attr, None) or [])
-        cursor = getattr(result, "nextCursor", None)
+        cursor = mcp_field(result, "next_cursor", "nextCursor")
         # Per the MCP spec the cursor is an opaque string; anything else
         # (including mock objects in tests) means "no more pages".
         if not isinstance(cursor, str) or not cursor:
@@ -988,7 +1109,7 @@ async def _cache_mcp_image_block(block) -> str:
     import base64
 
     data = getattr(block, "data", None)
-    mime_type = getattr(block, "mimeType", None)
+    mime_type = mcp_field(block, "mime_type", "mimeType")
     normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
     if data is None or not normalized_mime.startswith("image/"):
         return ""
@@ -1076,7 +1197,7 @@ async def _cache_mcp_audio_block(block) -> str:
     import base64
 
     data = getattr(block, "data", None)
-    mime_type = str(getattr(block, "mimeType", None) or "").split(";", 1)[0].strip().lower()
+    mime_type = str(mcp_field(block, "mime_type", "mimeType") or "").split(";", 1)[0].strip().lower()
     if data is None or not mime_type.startswith("audio/"):
         return ""
     if len(data) > _MCP_RESOURCE_MAX_B64_CHARS:
@@ -1130,7 +1251,7 @@ async def _render_mcp_resource_block(block, server_name: str = "") -> str:
         if not uri:
             return ""
         name = getattr(block, "name", "") or ""
-        mime = getattr(block, "mimeType", "") or ""
+        mime = mcp_field(block, "mime_type", "mimeType", "") or ""
         details = f"uri={uri}"
         if name:
             details += f", name={name}"
@@ -1149,7 +1270,7 @@ async def _render_mcp_resource_block(block, server_name: str = "") -> str:
 
     text = getattr(resource, "text", None)
     if text is not None:
-        return str(text)
+        return strip_unicode_tags(str(text))
 
     blob = getattr(resource, "blob", None)
     if blob is None:
@@ -1158,7 +1279,7 @@ async def _render_mcp_resource_block(block, server_name: str = "") -> str:
     import base64
 
     uri = str(getattr(resource, "uri", "") or "")
-    mime = str(getattr(resource, "mimeType", "") or "")
+    mime = str(mcp_field(resource, "mime_type", "mimeType", "") or "")
     if len(blob) > _MCP_RESOURCE_MAX_B64_CHARS:
         return f"[MCP embedded resource too large to cache: ~{len(blob) * 3 // 4} bytes, uri={uri}]"
     try:
@@ -1636,7 +1757,9 @@ class SamplingHandler:
         if not hasattr(block, "content") or block.content is None:
             return ""
         items = block.content if isinstance(block.content, list) else [block.content]
-        return "\n".join(item.text for item in items if hasattr(item, "text"))
+        return "\n".join(
+            strip_unicode_tags(item.text) for item in items if hasattr(item, "text")
+        )
 
     def _convert_messages(self, params) -> list[dict]:
         """Convert MCP SamplingMessages to OpenAI format.
@@ -1679,23 +1802,37 @@ class SamplingHandler:
                     })
                 msg_dict: dict = {"role": msg.role, "tool_calls": tc_list}
                 # Include any accompanying text
-                text_parts = [b.text for b in content_blocks if hasattr(b, "text")]
+                text_parts = [
+                    strip_unicode_tags(b.text)
+                    for b in content_blocks
+                    if hasattr(b, "text")
+                ]
                 if text_parts:
                     msg_dict["content"] = "\n".join(text_parts)
                 messages.append(msg_dict)
             elif content_blocks:
                 # Pure text/image content
                 if len(content_blocks) == 1 and hasattr(content_blocks[0], "text"):
-                    messages.append({"role": msg.role, "content": content_blocks[0].text})
+                    messages.append(
+                        {
+                            "role": msg.role,
+                            "content": strip_unicode_tags(content_blocks[0].text),
+                        }
+                    )
                 else:
                     parts = []
                     for block in content_blocks:
+                        block_mime = mcp_field(
+                            block, "mime_type", "mimeType", _MISSING
+                        )
                         if hasattr(block, "text"):
-                            parts.append({"type": "text", "text": block.text})
-                        elif hasattr(block, "data") and hasattr(block, "mimeType"):
+                            parts.append(
+                                {"type": "text", "text": strip_unicode_tags(block.text)}
+                            )
+                        elif hasattr(block, "data") and block_mime is not _MISSING:
                             parts.append({
                                 "type": "image_url",
-                                "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                                "image_url": {"url": f"data:{block_mime};base64,{block.data}"},
                             })
                         else:
                             logger.warning(
@@ -1849,11 +1986,15 @@ class SamplingHandler:
 
         # Convert messages
         messages = self._convert_messages(params)
-        if hasattr(params, "systemPrompt") and params.systemPrompt:
-            messages.insert(0, {"role": "system", "content": params.systemPrompt})
+        system_prompt = mcp_field(params, "system_prompt", "systemPrompt")
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
 
         # Build LLM call kwargs
-        max_tokens = min(params.maxTokens, self.max_tokens_cap)
+        max_tokens = min(
+            mcp_field(params, "max_tokens", "maxTokens", self.max_tokens_cap),
+            self.max_tokens_cap,
+        )
         call_temperature = None
         if hasattr(params, "temperature") and params.temperature is not None:
             call_temperature = params.temperature
@@ -1869,7 +2010,7 @@ class SamplingHandler:
                         "name": getattr(t, "name", ""),
                         "description": getattr(t, "description", "") or "",
                         "parameters": _normalize_mcp_input_schema(
-                            getattr(t, "inputSchema", None)
+                            mcp_field(t, "input_schema", "inputSchema")
                         ),
                     },
                 }
@@ -2029,7 +2170,11 @@ class ElicitationHandler:
         message = getattr(params, "message", "") or (
             f"MCP server '{self.server_name}' is requesting your approval"
         )
-        schema = getattr(params, "requested_schema", {}) or {}
+        schema = (
+            getattr(params, "requestedSchema", None)
+            or getattr(params, "requested_schema", None)
+            or {}
+        )
         description = _format_elicitation_schema_summary(schema, self.server_name)
 
         try:
@@ -2156,7 +2301,7 @@ class MCPServerTask:
         "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
-        "initialize_result", "_ping_unsupported",
+        "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked",
     )
 
@@ -2224,6 +2369,7 @@ class MCPServerTask:
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
         self.initialize_result: Any | None = None
+        self._list_cache_meta: dict = {}
         # Set True the first time a keepalive ``ping`` returns JSON-RPC
         # -32601 (method not found): the server is tool-capable but doesn't
         # implement the optional ``ping`` utility. Subsequent keepalives fall
@@ -2241,7 +2387,7 @@ class MCPServerTask:
         Per the MCP spec, ``InitializeResult.capabilities.tools`` is non-None
         iff the server implements the ``tools/*`` request family. Prompt-only
         or resource-only servers omit it, and calling ``tools/list`` against
-        them raises ``McpError(-32601 Method not found)`` — which previously
+        them raises ``MCPError(-32601 Method not found)`` — which previously
         killed the connection during discovery and made every keepalive fail.
         (Ported from anomalyco/opencode#31271.)
 
@@ -2254,6 +2400,45 @@ class MCPServerTask:
         if caps is None:
             return True
         return getattr(caps, "tools", None) is not None
+
+    async def _negotiate_session(self, session, connect_timeout: float):
+        """Negotiate legacy initialize or the 2026-07-28 stateless protocol."""
+        mode = str((self._config or {}).get("protocol", "auto")).lower().strip()
+        if mode in {"stateless", "modern", "2026-07-28"}:
+            try:
+                return await asyncio.wait_for(
+                    session.discover(), timeout=connect_timeout
+                )
+            except (TimeoutError, asyncio.CancelledError):
+                raise
+            except Exception:
+                return await asyncio.wait_for(
+                    session.initialize(), timeout=connect_timeout
+                )
+        if mode in {"legacy", "handshake"}:
+            return await asyncio.wait_for(
+                session.initialize(), timeout=connect_timeout
+            )
+        if mode != "auto":
+            logger.warning(
+                "MCP server '%s': unknown protocol=%r; treating as auto",
+                self.name,
+                mode,
+            )
+        try:
+            return await asyncio.wait_for(
+                session.initialize(), timeout=connect_timeout
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            if not _handshake_rejected_as_modern(exc) or not hasattr(
+                session, "discover"
+            ):
+                raise
+            return await asyncio.wait_for(
+                session.discover(), timeout=connect_timeout
+            )
 
     def _is_recycled_stdio(self) -> bool:
         """Return True when a stdio server was intentionally recycled."""
@@ -2367,7 +2552,15 @@ class MCPServerTask:
                     logger.debug("MCP message handler (%s): exception: %s", self.name, message)
                     return
                 if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
-                    match message.root:
+                    # mcp 2.0 turned ServerNotification from a RootModel into
+                    # a plain union of the concrete notification types, so the
+                    # payload IS the message instead of living under ``.root``.
+                    # ``isinstance`` accepts a union, so the guard above still
+                    # holds on both generations; only the unwrap changes.
+                    # Without this, ``message.root`` raises AttributeError into
+                    # the catch-all below and tools/list_changed refreshes stop
+                    # firing silently.
+                    match getattr(message, "root", message):
                         case ToolListChangedNotification():
                             logger.info(
                                 "MCP server '%s': received tools/list_changed notification",
@@ -2410,7 +2603,7 @@ class MCPServerTask:
         if not self._advertises_tools():
             # A server that doesn't implement tools/* should never send
             # tools/list_changed, but guard anyway — calling tools/list
-            # would raise McpError(-32601).
+            # would raise MCPError(-32601).
             return
 
         async with self._refresh_lock:
@@ -2419,8 +2612,12 @@ class MCPServerTask:
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
+                self._list_cache_meta = {}
                 new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                    self.session.list_tools,
+                    "tools",
+                    self.name,
+                    cache_meta_out=self._list_cache_meta,
                 )
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
@@ -2844,8 +3041,8 @@ class MCPServerTask:
                     connect_timeout = float(
                         config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
                     )
-                    self.initialize_result = await asyncio.wait_for(
-                        session.initialize(), timeout=connect_timeout
+                    self.initialize_result = await self._negotiate_session(
+                        session, connect_timeout
                     )
                     self.session = session
                     self._mark_lifecycle_started()
@@ -3109,7 +3306,7 @@ class MCPServerTask:
         # Seed it as a client-level default, but treat user overrides as
         # case-insensitive so conventional casing is preserved.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+            headers["mcp-protocol-version"] = LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = await _resolve_client_cert(self.name, config)
@@ -3174,7 +3371,9 @@ class MCPServerTask:
                 # defaults (follow_redirects=True) and adds our TLS settings.
                 # The SDK calls the factory with (headers, auth, timeout); we
                 # forward all of those and layer verify/cert on top.
-                import httpx as _httpx_mod
+                # The client MUST come from the SDK's own httpx module
+                # (httpx2 on mcp >= 2.0) — see sdk_httpx().
+                _httpx_mod = sdk_httpx()
 
                 _cert_for_factory = client_cert
                 _verify_for_factory = ssl_verify
@@ -3218,8 +3417,8 @@ class MCPServerTask:
                         # stdio path (#59349): an endpoint that accepts the
                         # connection but never answers ``initialize`` parks this
                         # coroutine forever on the background loop.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
+                        self.initialize_result = await self._negotiate_session(
+                            session, float(connect_timeout)
                         )
                         self.session = session
                         await self._discover_tools()
@@ -3243,9 +3442,12 @@ class MCPServerTask:
             return reason
 
         if _MCP_NEW_HTTP:
-            # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
-            # matching the SDK's own create_mcp_http_client defaults.
-            import httpx
+            # New API (mcp >= 1.24.0): build an explicit AsyncClient matching
+            # the SDK's own create_mcp_http_client defaults. It has to come
+            # from the SDK's httpx module (httpx2 on mcp >= 2.0), because the
+            # SDK sends its own Request objects through this client — see
+            # sdk_httpx().
+            httpx = sdk_httpx()
 
             _original_url = httpx.URL(url)
 
@@ -3275,18 +3477,15 @@ class MCPServerTask:
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
             try:
-                from agent.ssl_verify import _create_httpx_client
-
-                async with (
-                    await _create_httpx_client(**client_kwargs)
-                ) as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream, _get_session_id,
-                    ):
+                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                    async with streamable_http_client(
+                        url, http_client=http_client
+                    ) as streams:
+                        read_stream, write_stream = streams[0], streams[1]
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
-                            self.initialize_result = await asyncio.wait_for(
-                                session.initialize(), timeout=float(connect_timeout)
+                            self.initialize_result = await self._negotiate_session(
+                                session, float(connect_timeout)
                             )
                             self.session = session
                             await self._discover_tools()
@@ -3318,13 +3517,12 @@ class MCPServerTask:
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
             try:
-                async with streamablehttp_client(url, **_http_kwargs) as (
-                    read_stream, write_stream, _get_session_id,
-                ):
+                async with streamablehttp_client(url, **_http_kwargs) as streams:
+                    read_stream, write_stream = streams[0], streams[1]
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         # Bound the handshake (#59349) — see stdio path.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
+                        self.initialize_result = await self._negotiate_session(
+                            session, float(connect_timeout)
                         )
                         self.session = session
                         await self._discover_tools()
@@ -3351,7 +3549,7 @@ class MCPServerTask:
         """Discover tools from the connected session.
 
         Capability-gated: prompt-only / resource-only MCP servers don't
-        implement ``tools/list``, and calling it raises ``McpError(-32601)``,
+        implement ``tools/list``, and calling it raises ``MCPError(-32601)``,
         which previously aborted the connection — those servers could never
         stay connected for their prompts/resources. Skip the call when the
         server doesn't advertise the ``tools`` capability.
@@ -3373,8 +3571,12 @@ class MCPServerTask:
             await self._register_discovered_tools_if_needed()
             return
         async with self._rpc_lock:
+            self._list_cache_meta = {}
             self._tools = await _paginate_full_list(
-                self.session.list_tools, "tools", self.name
+                self.session.list_tools,
+                "tools",
+                self.name,
+                cache_meta_out=self._list_cache_meta,
             )
         await self._register_discovered_tools_if_needed()
 
@@ -4200,6 +4402,32 @@ async def reconnect_mcp_server(server_name: str) -> bool:
 # Cached tuple of auth-related exception types. Lazy so this module
 # imports cleanly when the MCP SDK OAuth module is missing.
 _AUTH_ERROR_TYPES: tuple = ()
+_HTTP_STATUS_ERROR_TYPES: tuple | None = None
+
+
+def _http_status_error_types() -> tuple:
+    """``HTTPStatusError`` classes that can reach us, from both httpx flavours.
+
+    A 401 can be raised either by the MCP SDK's own HTTP stack (``httpx2`` on
+    mcp >= 2.0) or by Hermes' pinned ``httpx``, and the two define unrelated
+    exception classes. Both go in the tuple so ``isinstance`` covers whichever
+    layer raised.
+    """
+    global _HTTP_STATUS_ERROR_TYPES
+    if _HTTP_STATUS_ERROR_TYPES is not None:
+        return _HTTP_STATUS_ERROR_TYPES
+    found: list = []
+    sdk_mod = sdk_httpx()
+    if sdk_mod is not None:
+        found.append(sdk_mod.HTTPStatusError)
+    try:
+        import httpx
+        if httpx.HTTPStatusError not in found:
+            found.append(httpx.HTTPStatusError)
+    except ImportError:
+        pass
+    _HTTP_STATUS_ERROR_TYPES = tuple(found)
+    return _HTTP_STATUS_ERROR_TYPES
 
 
 def _get_auth_error_types() -> tuple:
@@ -4212,8 +4440,8 @@ def _get_auth_error_types() -> tuple:
         optional import for forward/backward compatibility.
       - ``tools.mcp_oauth.OAuthNonInteractiveError`` — raised by our callback
         handler when no user is present to complete a browser flow.
-      - ``httpx.HTTPStatusError`` — caller must additionally check
-        ``status_code == 401`` via :func:`_is_auth_error`.
+      - ``HTTPStatusError`` from both httpx flavours — caller must
+        additionally check ``status_code == 401`` via :func:`_is_auth_error`.
     """
     global _AUTH_ERROR_TYPES
     if _AUTH_ERROR_TYPES:
@@ -4235,11 +4463,7 @@ def _get_auth_error_types() -> tuple:
         types.append(OAuthNonInteractiveError)
     except ImportError:
         pass
-    try:
-        import httpx
-        types.append(httpx.HTTPStatusError)
-    except ImportError:
-        pass
+    types.extend(_http_status_error_types())
     _AUTH_ERROR_TYPES = tuple(types)
     return _AUTH_ERROR_TYPES
 
@@ -4247,19 +4471,16 @@ def _get_auth_error_types() -> tuple:
 def _is_auth_error(exc: BaseException) -> bool:
     """Return True if ``exc`` indicates an MCP OAuth failure.
 
-    ``httpx.HTTPStatusError`` is only treated as auth-related when the
-    response status code is 401. Other HTTP errors fall through to the
-    generic error path in the tool handlers.
+    ``HTTPStatusError`` is only treated as auth-related when the response
+    status code is 401. Other HTTP errors fall through to the generic error
+    path in the tool handlers.
     """
     types = _get_auth_error_types()
     if not types or not isinstance(exc, types):
         return False
-    try:
-        import httpx
-        if isinstance(exc, httpx.HTTPStatusError):
-            return getattr(exc.response, "status_code", None) == 401
-    except ImportError:
-        pass
+    status_error_types = _http_status_error_types()
+    if status_error_types and isinstance(exc, status_error_types):
+        return getattr(exc.response, "status_code", None) == 401
     return True
 
 
@@ -5156,11 +5377,11 @@ async def _call_mcp_tool(
     if _mark_proven is not None:
         _mark_proven()
 
-    if result.isError:
+    if getattr(result, "isError", getattr(result, "is_error", False)):
         error_text = ""
         for block in (result.content or []):
             if getattr(block, "text", None):
-                error_text += block.text
+                error_text += strip_unicode_tags(block.text)
                 continue
             res_text = getattr(getattr(block, "resource", None), "text", None)
             if res_text:
@@ -5170,7 +5391,7 @@ async def _call_mcp_tool(
     parts: list[str] = []
     for block in (result.content or []):
         if hasattr(block, "text") and block.text:
-            parts.append(block.text)
+            parts.append(strip_unicode_tags(block.text))
             continue
         image_tag = await _cache_mcp_image_block(block)
         if image_tag:
@@ -5199,14 +5420,29 @@ async def _call_mcp_tool(
             )
 
     text_result = "\n".join(parts) if parts else ""
-    structured = getattr(result, "structuredContent", None)
-    if structured is not None:
+    structured = getattr(
+        result,
+        "structuredContent",
+        getattr(result, "structured_content", None),
+    )
+    meta = _strip_reserved_meta_keys(getattr(result, "meta", None))
+    if structured is not None or meta is not None:
+        payload: dict[str, Any] = {}
         if text_result:
-            return json.dumps(
-                {"result": text_result, "structuredContent": structured},
-                ensure_ascii=False,
-            )
-        return json.dumps({"result": structured}, ensure_ascii=False)
+            payload["result"] = text_result
+        if structured is not None:
+            if text_result:
+                payload["structuredContent"] = structured
+            else:
+                payload["result"] = structured
+        if meta is not None:
+            payload["_meta"] = meta
+        if "result" not in payload:
+            payload["result"] = text_result
+        try:
+            return json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return json.dumps({"result": text_result}, ensure_ascii=False)
     return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
@@ -5349,8 +5585,11 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                     entry["name"] = r.name
                 if hasattr(r, "description") and r.description:
                     entry["description"] = r.description
-                if hasattr(r, "mimeType") and r.mimeType:
-                    entry["mimeType"] = r.mimeType
+                # Key stays camelCase — this dict is the tool's own JSON
+                # output shape, not an SDK model.
+                _mime = mcp_field(r, "mime_type", "mimeType")
+                if _mime:
+                    entry["mimeType"] = _mime
                 resources.append(entry)
             return json.dumps({"resources": resources}, ensure_ascii=False)
 
@@ -5412,7 +5651,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             contents = result.contents if hasattr(result, "contents") else []
             for block in contents:
                 if getattr(block, "text", None) is not None:
-                    parts.append(block.text)
+                    parts.append(strip_unicode_tags(block.text))
                 elif getattr(block, "blob", None) is not None:
                     # Materialize binary resource contents into the document
                     # cache instead of discarding them (same contract as
@@ -5559,11 +5798,11 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
                 if hasattr(msg, "content"):
                     content = msg.content
                     if hasattr(content, "text"):
-                        entry["content"] = content.text
+                        entry["content"] = strip_unicode_tags(content.text)
                     elif isinstance(content, str):
-                        entry["content"] = content
+                        entry["content"] = strip_unicode_tags(content)
                     else:
-                        entry["content"] = str(content)
+                        entry["content"] = strip_unicode_tags(str(content))
                 messages.append(entry)
             resp = {"messages": messages}
             if hasattr(result, "description") and result.description:
@@ -5811,7 +6050,7 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     Args:
         server_name: The logical server name for prefixing.
         mcp_tool:    An MCP ``Tool`` object with ``.name``, ``.description``,
-                     and ``.inputSchema``.
+                     and ``.input_schema`` (``.inputSchema`` before mcp 2.0).
 
     Returns:
         A dict suitable for ``registry.register(schema=...)``.
@@ -5819,7 +6058,9 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     prefixed_name = mcp_prefixed_tool_name(server_name, mcp_tool.name)
     return {
         "name": prefixed_name,
-        "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
+        "description": strip_unicode_tags(
+            mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"
+        ),
         "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
     }
 
@@ -6431,6 +6672,8 @@ async def _write_server_schema_cache(
             config_fingerprint(config),
             tools=tools_payload,
             utility_tools=utility_payload,
+            ttl_ms=(getattr(server, "_list_cache_meta", None) or {}).get("ttl_ms"),
+            cache_scope=(getattr(server, "_list_cache_meta", None) or {}).get("cache_scope"),
         )
     except Exception as exc:
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)

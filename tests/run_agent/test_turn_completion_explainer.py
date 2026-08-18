@@ -99,6 +99,31 @@ def test_explanation_distinguishes_locked_session_storage():
     assert "storage was busy" in out
 
 
+def test_explanation_persistence_corrupt_cause_never_says_free_space():
+    out = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "corrupt"
+    )
+    lower = out.lower()
+    assert "corrupt" in lower
+    assert "hermes doctor" in lower
+    assert "free some space" not in lower
+    assert "full disk" not in lower
+
+
+def test_classify_persistence_error_corruption_beats_disk_bucket():
+    import sqlite3
+
+    from hermes_state import classify_persistence_error
+
+    assert classify_persistence_error(
+        sqlite3.DatabaseError("database disk image is malformed")
+    ) == "corrupt"
+    assert classify_persistence_error("file is not a database") == "corrupt"
+    assert classify_persistence_error("malformed database schema") == "corrupt"
+    assert classify_persistence_error("database or disk is full") == "disk"
+    assert classify_persistence_error("disk I/O error") == "disk"
+
+
 
 
 

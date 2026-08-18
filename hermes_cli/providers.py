@@ -576,6 +576,7 @@ def host_mandated_api_mode(base_url: str = "") -> str | None:
     Some hosts only accept one API mode and reject the others outright:
       - api.openai.com only accepts the Responses API for its (reasoning)
         models when tools + reasoning are in play (chat/completions 400s).
+      - api.meta.ai uses Responses for prompt caching.
       - api.anthropic.com / ``…/anthropic`` suffixes speak native Messages.
       - Kimi's ``/coding`` endpoint speaks native Messages.
       - AWS Bedrock runtime hosts speak Converse.
@@ -602,6 +603,8 @@ def host_mandated_api_mode(base_url: str = "") -> str | None:
     # models with tools. Shared predicate keeps this lane in lockstep with
     # catalog filtering and listing authority.
     if is_official_openai_host(base_url):
+        return "codex_responses"
+    if hostname == "api.meta.ai":
         return "codex_responses"
     if hostname.startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com"):
         return "bedrock_converse"

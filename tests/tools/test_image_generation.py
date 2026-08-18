@@ -47,23 +47,9 @@ class TestFalCatalog:
 
 
     def test_upscale_defaults_track_native_resolution(self, image_tool):
-        """Low-resolution models use the upstream default upscale pass.
-
-        Native hi-res models skip it to avoid an unnecessary second paid
-        request; an explicit ``upscale`` argument is tested separately.
-        """
-        native_hi_res = {
-            "bytedance/seedream/v5/pro/text-to-image",
-            "bytedance/seedream/v5/lite/text-to-image",
-            "fal-ai/krea/v2/large/text-to-image",
-        }
+        """Every model is opt-in for the potentially fidelity-changing pass."""
         for mid, meta in image_tool.FAL_MODELS.items():
-            if mid in native_hi_res:
-                assert meta["upscale"] is False, \
-                    f"{mid} is native hi-res — should not double-upscale"
-            else:
-                assert meta["upscale"] is True, \
-                    f"{mid} should default to upscale=True"
+            assert meta["upscale"] is False, f"{mid} must default to opt-in"
 
 
     def test_nano_banana_2_in_catalog(self, image_tool):

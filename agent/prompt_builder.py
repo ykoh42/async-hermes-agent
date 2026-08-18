@@ -27,6 +27,8 @@ from agent.skill_utils import (
     extract_skill_description,
     get_disabled_skill_names as _get_disabled_skill_names,
     get_external_skills_dirs as _external_skills_dirs,
+    get_project_skills_dirs as _project_skills_dirs,
+    iter_project_skill_files as _iter_project_skill_files,
     iter_skill_index_files as _iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
@@ -1043,8 +1045,12 @@ async def build_skills_system_prompt(
         external_dirs = await _external_skills_dirs()
     except Exception:
         external_dirs = []
+    try:
+        project_dirs = await _project_skills_dirs()
+    except Exception:
+        project_dirs = []
 
-    if not await aiofiles.os.path.isdir(skills_dir) and not external_dirs:
+    if not await aiofiles.os.path.isdir(skills_dir) and not external_dirs and not project_dirs:
         return ""
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
@@ -1055,6 +1061,7 @@ async def build_skills_system_prompt(
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
+        tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1119,6 +1126,41 @@ async def build_skills_system_prompt(
                 continue
             visible_entries.append(entry)
 
+    # Trusted project-local skills have the highest precedence.  Scan them
+    # before the org labeling pass and remove same-named profile entries so
+    # the prompt and skill_view resolve the same first-wins tier.
+    project_names: set[str] = set()
+    profile_visible_entries = visible_entries
+    project_visible_entries: list[dict] = []
+    for project_dir in project_dirs:
+        if not await aiofiles.os.path.isdir(project_dir):
+            continue
+        async for skill_file in _iter_project_skill_files(project_dir):
+            try:
+                compatible, frontmatter, desc = await _parse_skill_file(skill_file)
+                if not compatible:
+                    continue
+                entry = await _build_snapshot_entry(skill_file, project_dir, frontmatter, desc)
+                skill_name = entry["skill_name"]
+                frontmatter_name = entry["frontmatter_name"]
+                if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if not _skill_should_show(
+                    extract_skill_conditions(frontmatter), available_tools, available_toolsets
+                ):
+                    continue
+                project_names.add(frontmatter_name)
+                project_visible_entries.append(
+                    {**entry, "description": f"[project] {entry['description']}".strip()}
+                )
+            except Exception as e:
+                logger.debug("Error reading project skill %s: %s", skill_file, e)
+    if project_names:
+        visible_entries = project_visible_entries + [
+            entry for entry in profile_visible_entries
+            if (entry.get("frontmatter_name") or entry.get("skill_name")) not in project_names
+        ]
+
     # ── M2 org labeling + FAIL-LOUD collisions ─────────────────────────
     # An org skill lists with an explicit provenance tag. When a personal and
     # an org skill share a name, NEITHER silently wins: both list qualified
@@ -1164,6 +1206,7 @@ async def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read skill description %s: %s", desc_file, e)
 
+    if snapshot is None:
         await _write_skills_snapshot(
             skills_dir,
             await _build_skills_manifest(skills_dir),
@@ -1518,7 +1561,7 @@ async def _load_agents_md(
     sections: list[str] = []
     seen_content: set[str] = set()
     for directory in await _agents_md_directory_chain(cwd_resolved):
-        for name in ("AGENTS.md", "agents.md"):
+        for name in ("AGENTS.override.md", "AGENTS.md", "agents.md"):
             candidate = directory / name
             if not await aiofiles.os.path.isfile(candidate):
                 continue

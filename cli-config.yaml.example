@@ -124,6 +124,15 @@ model:
   #       X-Client-Name: "hermes-agent"
 
 # Named provider overrides (optional)
+# Meta Model API (Muse Spark) uses the Responses wire automatically on
+# https://api.meta.ai/v1 for prompt caching. META_BASE_URL is resolved by the
+# selected profile at runtime; it is not read during provider discovery.
+# providers:
+#   meta:
+#     base_url: "https://api.meta.ai/v1"
+#     key_env: "MODEL_API_KEY"
+#     # api_mode is host-mandated for api.meta.ai; custom endpoints may differ.
+#
 # Use this for per-provider request timeouts, non-stream stale timeouts,
 # and per-model exceptions.
 # Applies to the primary turn client on every api_mode (OpenAI-wire, native

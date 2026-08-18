@@ -721,3 +721,149 @@ class TestTodoSnapshotScaffoldingTails:
         )
         await agent.close()
         await db.close()
+
+
+class TestArchivedParentActivityLabelsCleared:
+    @pytest.mark.asyncio
+    async def test_parent_labels_cleared_after_rotation_child_lineage_intact(
+        self, tmp_path: Path
+    ):
+        """Round-2 #4: the terminal heartbeat stamp must not stay on the parent.
+
+        The compression activity heartbeat force-persists "context compression
+        completed" against the PARENT id (agent.session_id at stamp time).
+        After the out-of-place rotation the parent is archived; its activity
+        labels must be cleared so it doesn't advertise a fresh
+        last_activity_at + terminal label forever, while the child keeps its
+        lineage.
+        """
+        from agent.session_activity import ActivityProvenance
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ACTIVITY_LABELS"
+        await db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = agent.session_id
+        assert child != parent  # rotation happened
+
+        # Child lineage intact.
+        child_row = await db.get_session(child)
+        assert child_row is not None
+        assert child_row.get("parent_session_id") == parent
+
+        # Parent archived with cleared activity labels.
+        parent_row = await db.get_session(parent)
+        assert parent_row is not None
+        assert parent_row.get("ended_at") is not None
+        assert not parent_row.get("last_activity_description"), (
+            "archived compression parent kept a stale activity description "
+            f"({parent_row.get('last_activity_description')!r})"
+        )
+        prov = parent_row.get("last_activity_provenance")
+        assert not prov or prov == ActivityProvenance.UNKNOWN.value, (
+            f"archived parent kept terminal provenance {prov!r}"
+        )
+        await agent.close()
+        await db.close()
+
+
+class TestAbortedRotationDoesNotGrowParent:
+    """#88197 — a rotation that cannot publish must not have already written.
+
+    The rotation flushes its un-persisted current-turn transcript to the parent
+    (#47202) and only then calls ``publish_compression_child``. The abort
+    handler rolls back memory but not that flush, so every failed rotation
+    leaves the parent transcript longer than it found it. When the failure is
+    STICKY -- a parent row stamped ``ended_at`` by something that ended the
+    process rather than the conversation, e.g. the TUI gateway's
+    ``_shutdown_sessions`` stamping ``end_reason='tui_shutdown'`` while the
+    agent keeps running -- every subsequent auto-compaction repeats it, and the
+    session grows instead of shrinking until the provider rejects the request.
+    """
+
+    @staticmethod
+    async def _durable_len(db: SessionDB, session_id: str) -> int:
+        return len(await db.get_messages_as_conversation(session_id))
+
+    @pytest.mark.asyncio
+    async def test_ended_parent_aborts_before_the_prepublish_flush(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ENDED_NO_GROWTH"
+        await db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        # The lie at the heart of #88197: the row says ended, the agent is live.
+        # ``tui_shutdown`` is not a lineage boundary -- nothing forked off this
+        # session -- so durable writes to it are still permitted, which is
+        # exactly why the flush lands and the publish still refuses.
+        await db.end_session(parent, "tui_shutdown")
+        assert (await db.get_session(parent))["ended_at"] is not None
+
+        before = await self._durable_len(db, parent)
+
+        # Three consecutive auto-compactions, as the reported incident saw.
+        for attempt in range(1, 4):
+            original = _msgs()
+            returned, _sp = await agent._compress_context(
+                original, "sys", approx_tokens=120_000
+            )
+            assert await self._durable_len(db, parent) == before, (
+                f"attempt {attempt} appended to the parent it could not "
+                "publish; repeated attempts grow the transcript compression "
+                "exists to shrink"
+            )
+            # Rotation refused: the agent stays on the parent with its
+            # transcript intact, same contract as any other publish failure.
+            assert agent.session_id == parent
+            assert returned is original
+            assert [(m["role"], m["content"]) for m in returned] == [
+                (m["role"], m["content"]) for m in _msgs()
+            ]
+
+        assert await db.find_live_compression_child(parent) is None
+        await agent.close()
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_live_parent_still_gets_the_prepublish_flush(self, tmp_path: Path):
+        """The guard must not cost a real rotation its #47202 tail."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_LIVE_FLUSH"
+        await db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        assert agent.session_id != parent  # rotation happened
+
+        # The current-turn messages survive in the preserved parent transcript.
+        assert await self._durable_len(db, parent) >= len(_msgs())
+        await agent.close()
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_parent_row_fails_open(self, tmp_path: Path):
+        """A guard that cannot read the row must not become a way to lose
+        compression -- an unreadable parent rotates exactly as before."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_UNREADABLE_ROW"
+        await db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        real_get_session = db.get_session
+        calls = {"n": 0}
+
+        async def _flaky_get_session(session_id: str):
+            if session_id == parent and calls["n"] == 0:
+                calls["n"] += 1
+                raise RuntimeError("simulated read failure")
+            return await real_get_session(session_id)
+
+        with patch.object(db, "get_session", side_effect=_flaky_get_session):
+            await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        assert calls["n"] == 1, "the pre-flush guard never read the parent row"
+        assert agent.session_id != parent  # rotation still happened
+        await agent.close()
+        await db.close()

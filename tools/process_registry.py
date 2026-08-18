@@ -204,6 +204,8 @@ class ProcessSession:
 class ProcessRegistry:
     """Track local background processes without leaving the event loop."""
 
+    _MIN_PREFIX_CHARS = 4
+
     def __init__(self) -> None:
         self._loop_profile_states: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, dict[str, _ProcessRegistryState]
@@ -782,6 +784,7 @@ class ProcessRegistry:
                         {
                             "session_id": session.id,
                             "session_key": session.session_key,
+                            "task_id": session.task_id,
                             "command": session.command,
                             "type": "watch_disabled",
                             "suppressed": session._watch_suppressed,
@@ -813,6 +816,7 @@ class ProcessRegistry:
             {
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "task_id": session.task_id,
                 "command": session.command,
                 "type": "watch_match",
                 "pattern": matched_pattern,
@@ -880,6 +884,7 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "task_id": session.task_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -926,7 +931,28 @@ class ProcessRegistry:
     async def get(self, session_id: str) -> ProcessSession | None:
         await self._activate_profile_state()
         session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None:
+            session = self._resolve_prefix(session_id)
         return await self._refresh_detached_session(session)
+
+    def _resolve_prefix(self, session_id: str) -> ProcessSession | None:
+        """Resolve a unique full-ID or bare-suffix prefix, if unambiguous."""
+        if not isinstance(session_id, str):
+            return None
+        query = session_id.strip()
+        if not query:
+            return None
+        if not query.startswith("proc_"):
+            query = f"proc_{query}"
+        if len(query.removeprefix("proc_")) < self._MIN_PREFIX_CHARS:
+            return None
+        matches = [
+            session
+            for store in (self._running, self._finished)
+            for process_id, session in store.items()
+            if process_id.startswith(query)
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     async def poll(self, session_id: str) -> dict[str, Any]:
         """Return status plus the latest output without consuming completion."""
@@ -1863,20 +1889,48 @@ def _format_async_delegation(evt: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _delegation_attribution_line(evt: dict) -> str | None:
+    """Return provenance for a process started by a live subagent."""
+    task_id = str(evt.get("task_id") or "")
+    if not task_id.startswith("sa-"):
+        return None
+    try:
+        from tools.delegate_tool import get_subagent_attribution
+
+        info = get_subagent_attribution(task_id)
+    except Exception:
+        info = None
+    if not info:
+        return f"Started by subagent {task_id} (delegate_task)."
+    goal = str(info.get("goal") or "").strip()
+    if len(goal) > 120:
+        goal = goal[:117] + "..."
+    delegation_id = info.get("delegation_id")
+    line = f"Started by subagent {task_id}"
+    if delegation_id:
+        line += f" of delegation {delegation_id}"
+    line += "."
+    if goal:
+        line += f' Task: "{goal}"'
+    return line
+
+
 def format_process_notification(evt: dict) -> str | None:
     """Format a queued process event using the upstream reinjection shape."""
     event_type = evt.get("type", "completion")
     session_id = evt.get("session_id", "unknown")
     command = evt.get("command", "unknown")
+    attribution = _delegation_attribution_line(evt)
     if event_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
     if event_type == "watch_match":
         text = (
             f"[IMPORTANT: Background process {session_id} matched watch pattern "
             f"\"{evt.get('pattern', '?')}\".\n"
-            f"Command: {command}\n"
-            f"Matched output:\n{evt.get('output', '')}"
         )
+        if attribution:
+            text += f"{attribution}\n"
+        text += f"Command: {command}\nMatched output:\n{evt.get('output', '')}"
         suppressed = evt.get("suppressed", 0)
         if suppressed:
             text += f"\n({suppressed} earlier matches were suppressed by rate limit)"
@@ -1898,12 +1952,19 @@ def format_process_notification(evt: dict) -> str | None:
         status = "completed normally"
     else:
         status = "exited"
-    return (
+    output = evt.get("output", "")
+    if attribution and isinstance(output, str) and len(output) > 600:
+        output = (
+            "...(output trimmed — subagent-owned process; see the delegation's "
+            "live transcript for full output)\n" + output[-600:]
+        )
+    text = (
         f"[IMPORTANT: Background process {session_id} {status} "
         f"(exit code {exit_code}{signal_note}).\n"
-        f"Command: {command}\n"
-        f"Output:\n{evt.get('output', '')}]"
     )
+    if attribution:
+        text += f"{attribution}\n"
+    return text + f"Command: {command}\nOutput:\n{output}]"
 
 
 PROCESS_SCHEMA = {
@@ -1937,7 +1998,9 @@ PROCESS_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Process session ID (from terminal background output). "
-                    "Required for all actions except 'list'."
+                    "Required for all actions except 'list'. A unique ID "
+                    "prefix is also accepted (for example 'proc_4dae' or "
+                    "'4dae')."
                 ),
             },
             "data": {

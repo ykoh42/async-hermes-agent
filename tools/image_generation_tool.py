@@ -134,7 +134,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "num_inference_steps", "seed",
             "output_format", "enable_safety_checker",
         },
-        "upscale": True,
+        "upscale": False,
         # Image-to-image / editing: FLUX.2 [klein] 9B edit endpoint takes
         # `image_urls` (list). Natural-language edits, multi-ref.
         "edit_endpoint": "fal-ai/flux-2/klein/9b/edit",
@@ -169,7 +169,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "num_images", "output_format", "enable_safety_checker",
             "safety_tolerance", "sync_mode", "seed",
         },
-        "upscale": True,   # Backward-compat: current default behavior.
+        "upscale": False,
         # Edit endpoint accepts up to 9 reference images.
         "edit_endpoint": "fal-ai/flux-2-pro/edit",
         "edit_supports": {
@@ -202,7 +202,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "seed", "output_format", "enable_safety_checker",
             "enable_prompt_expansion",
         },
-        "upscale": True,
+        "upscale": False,
     },
     "fal-ai/nano-banana-pro": {
         "display": "Nano Banana Pro (Gemini 3 Pro Image)",
@@ -228,7 +228,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "safety_tolerance", "seed", "sync_mode", "resolution",
             "enable_web_search", "limit_generations",
         },
-        "upscale": True,
+        "upscale": False,
         # Nano Banana Pro edit (Gemini 3 Pro Image): natural-language edits
         # with up to 2 reference images via `image_urls`.
         "edit_endpoint": "fal-ai/nano-banana-pro/edit",
@@ -263,7 +263,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "resolution", "enable_web_search", "limit_generations",
             "thinking_level",
         },
-        "upscale": True,
+        "upscale": False,
         "edit_endpoint": "fal-ai/nano-banana-2/edit",
         "edit_supports": {
             "prompt", "image_urls", "aspect_ratio", "num_images",
@@ -295,7 +295,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "quality", "num_images", "output_format",
             "background", "sync_mode",
         },
-        "upscale": True,
+        "upscale": False,
         # Edit endpoint: high-fidelity edits preserving composition/lighting.
         "edit_endpoint": "fal-ai/gpt-image-1.5/edit",
         "edit_supports": {
@@ -334,7 +334,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             # openai_api_key (BYOK) intentionally omitted — all users go
             # through the shared FAL billing path.
         },
-        "upscale": True,
+        "upscale": False,
         # GPT Image 2 edit endpoint lives under the OpenAI namespace on FAL
         # (NOT fal-ai/). Takes `image_urls` (list) + optional mask. We don't
         # send `image_size` on edit so the model auto-infers from input.
@@ -365,7 +365,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "rendering_speed", "expand_prompt",
             "style", "seed",
         },
-        "upscale": True,
+        "upscale": False,
         # Ideogram V3 edit endpoint takes `image_urls` (list).
         "edit_endpoint": "fal-ai/ideogram/v3/edit",
         "edit_supports": {
@@ -393,7 +393,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "enable_safety_checker",
             "colors", "background_color",
         },
-        "upscale": True,
+        "upscale": False,
     },
     "fal-ai/qwen-image": {
         "display": "Qwen Image",
@@ -417,7 +417,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "num_inference_steps", "guidance_scale",
             "num_images", "output_format", "acceleration", "seed", "sync_mode",
         },
-        "upscale": True,
+        "upscale": False,
         # Qwen edit uses the Qwen Image 2.0 Pro editing endpoint, which takes
         # `image_urls` (list) + natural-language edit instructions.
         "edit_endpoint": "fal-ai/qwen-image-2/pro/edit",
@@ -447,7 +447,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "aspect_ratio", "creativity", "seed",
             "image_style_references",
         },
-        "upscale": True,
+        "upscale": False,
     },
     "fal-ai/krea/v2/large/text-to-image": {
         "display": "Krea 2 Large",
@@ -538,7 +538,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "expansion_model", "num_images",
             "seed", "sync_mode", "enable_safety_checker", "output_format",
         },
-        "upscale": True,
+        "upscale": False,
     },
     "ideogram/v4/fast": {
         "display": "Ideogram V4 (Fast)",
@@ -559,7 +559,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "expansion_model", "rendering_speed",
             "num_images", "seed", "sync_mode",
         },
-        "upscale": True,
+        "upscale": False,
     },
     "alibaba/qwen-image-3/text-to-image": {
         "display": "Qwen Image 3",
@@ -583,7 +583,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "seed", "sync_mode", "output_format", "enable_prompt_expansion",
             "enable_safety_checker",
         },
-        "upscale": True,
+        "upscale": False,
         "edit_endpoint": "alibaba/qwen-image-3/edit",
         "edit_supports": {
             "prompt", "image_urls", "negative_prompt", "num_images",
@@ -611,7 +611,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "aspect_ratio", "num_images", "output_format",
             "sync_mode",
         },
-        "upscale": True,
+        "upscale": False,
     },
     "google/nano-banana-2-lite": {
         "display": "Nano Banana 2 Lite",
@@ -634,7 +634,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "safety_tolerance", "sync_mode", "system_prompt",
             "limit_generations", "thinking_level",
         },
-        "upscale": True,
+        "upscale": False,
         "edit_endpoint": "google/nano-banana-2-lite/edit",
         "edit_supports": {
             "prompt", "image_urls", "aspect_ratio", "num_images", "seed",
@@ -660,7 +660,7 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "prompt", "image_size", "enable_safety_checker",
             "colors", "background_color",
         },
-        "upscale": True,
+        "upscale": False,
     },
 }
 
@@ -1319,12 +1319,12 @@ IMAGE_GENERATE_SCHEMA = {
             "upscale": {
                 "type": "boolean",
                 "description": (
-                    "Optional override for the high-resolution pass. Models "
-                    "with sub-2MP native output upscale automatically (~2x, "
-                    "extra cost/latency); pass false for a faster/cheaper "
-                    "draft at native resolution, or true to force the pass "
-                    "on native hi-res models and image edits. Omit to keep "
-                    "the per-model default."
+                    "Optional post-generation high-resolution pass (~2x, "
+                    "extra cost/latency). Off by default for every model — "
+                    "pass true to opt in. The upscaler is a creative "
+                    "enhancer and can alter fine detail (rendered text, "
+                    "faces), so only use it when resolution matters more "
+                    "than fidelity."
                 ),
             },
         },

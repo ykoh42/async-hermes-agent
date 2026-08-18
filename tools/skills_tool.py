@@ -97,6 +97,8 @@ from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     get_disabled_skill_names as _get_disabled_skill_names,
     get_external_skills_dirs as _external_skills_dirs,
+    get_project_skills_dirs as _project_skills_dirs,
+    iter_project_skill_files as _iter_project_skill_files,
     iter_skill_index_files as _iter_skill_index_files,
 )
 
@@ -769,7 +771,8 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any
     """
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
     disabled = set() if skip_disabled else await _get_disabled_skill_names()
-    roots: list[Path] = []
+    roots: list[Path] = await _project_skills_dirs()
+    project_roots = set(roots)
     active = _skills_dir()
     if await aiofiles.os.path.isdir(active):
         roots.append(active)
@@ -783,7 +786,12 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any
     skills: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for root in roots:
-        async for skill_md in _iter_skill_index_files(root, "SKILL.md"):
+        iterator = (
+            _iter_project_skill_files(root)
+            if root in project_roots
+            else _iter_skill_index_files(root, "SKILL.md")
+        )
+        async for skill_md in iterator:
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             try:
@@ -1074,8 +1082,12 @@ async def skill_view(
                         ensure_ascii=False,
                     )
         active = _skills_dir()
-        roots = [active] if await aiofiles.os.path.isdir(active) else []
+        project_dirs = await _project_skills_dirs()
+        roots = list(project_dirs)
+        if await aiofiles.os.path.isdir(active):
+            roots.append(active)
         roots.extend(await _external_skills_dirs())
+        all_dirs = list(roots)
         if not roots:
             return json.dumps(
                 {
@@ -1091,6 +1103,7 @@ async def skill_view(
         seen: set[Path] = set()
         from agent.skill_utils import is_skill_support_path
 
+        project_roots = set(project_dirs)
         for root in roots:
             lookup_names = [name]
             if local_category_name:
@@ -1115,7 +1128,12 @@ async def skill_view(
                     if resolved_legacy not in seen:
                         candidates.append((None, legacy_md, root))
                         seen.add(resolved_legacy)
-            async for candidate in _iter_skill_index_files(root, "SKILL.md"):
+            iterator = (
+                _iter_project_skill_files(root)
+                if root in project_roots
+                else _iter_skill_index_files(root, "SKILL.md")
+            )
+            async for candidate in iterator:
                 resolved_candidate = Path(await _realpath(candidate))
                 if resolved_candidate in seen:
                     continue
@@ -1141,6 +1159,22 @@ async def skill_view(
                 ][:20],
                 "hint": "Use skills_list to see all available skills",
             }, ensure_ascii=False)
+        if len(candidates) > 1 and project_dirs:
+            project_candidates = []
+            for candidate in candidates:
+                candidate_path = Path(await _realpath(candidate[1]))
+                in_project = False
+                for project_dir in project_dirs:
+                    try:
+                        candidate_path.relative_to(project_dir)
+                    except ValueError:
+                        continue
+                    in_project = True
+                    break
+                if in_project:
+                    project_candidates.append(candidate)
+            if project_candidates:
+                candidates = project_candidates
         if len(candidates) > 1:
             return json.dumps({
                 "success": False,
@@ -1219,13 +1253,15 @@ async def skill_view(
                 "_source_path": str(target),
             }, ensure_ascii=False)
 
-        try:
-            resolved_skill = Path(await _realpath(skill_md))
-            resolved_active = Path(await _realpath(active))
-            resolved_skill.relative_to(resolved_active)
+        resolved_skill = Path(await _realpath(skill_md))
+        outside_skills_dir = True
+        for trusted_root in all_dirs:
+            try:
+                resolved_skill.relative_to(Path(await _realpath(trusted_root)))
+            except (OSError, ValueError):
+                continue
             outside_skills_dir = False
-        except (OSError, ValueError):
-            outside_skills_dir = True
+            break
         injection_detected = any(
             pattern in content.lower() for pattern in _INJECTION_PATTERNS
         )

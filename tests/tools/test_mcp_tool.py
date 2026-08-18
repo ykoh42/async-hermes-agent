@@ -20,6 +20,18 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _stop_reason(result):
+    """Read a sampling result's stop reason across the mcp 1.x -> 2.x rename.
+
+    ``CreateMessageResult.stopReason`` became ``.stop_reason`` in mcp 2.0
+    (camelCase survives only as the serialization alias, which pydantic does
+    not expose to attribute access).
+    """
+    from tools.mcp_tool import mcp_field
+
+    return mcp_field(result, "stop_reason", "stopReason")
+
+
 def _make_mcp_tool(name="read_file", description="Read a file", input_schema=None):
     """Create a fake MCP Tool object matching the SDK interface."""
     tool = SimpleNamespace()
@@ -39,6 +51,44 @@ def _make_call_result(text="file contents here", is_error=False):
     """Create a fake MCP CallToolResult."""
     block = SimpleNamespace(text=text)
     return SimpleNamespace(content=[block], isError=is_error)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_result_surfaces_non_reserved_meta():
+    from tools.mcp_tool import _call_mcp_tool
+
+    result = SimpleNamespace(
+        content=[SimpleNamespace(text="ok")],
+        isError=False,
+        structuredContent={"id": 3},
+        meta={
+            "com.example.contract/v1": {"ok": True},
+            "mcp.example/reserved": "drop",
+            "modelcontextprotocol.io/trace": "drop",
+            "mcp": "keep",
+        },
+    )
+    server = SimpleNamespace(
+        _rpc_lock=asyncio.Lock(),
+        session=SimpleNamespace(call_tool=AsyncMock(return_value=result)),
+        _pending_call_context=None,
+    )
+    payload = json.loads(await _call_mcp_tool("demo", "tool", server, {}))
+    assert payload["result"] == "ok"
+    assert payload["structuredContent"] == {"id": 3}
+    assert payload["_meta"] == {
+        "com.example.contract/v1": {"ok": True},
+        "mcp": "keep",
+    }
+
+
+def test_mcp_reserved_meta_prefix_rules():
+    from tools.mcp_tool import _is_reserved_mcp_meta_key
+
+    assert _is_reserved_mcp_meta_key("mcp.example/value")
+    assert _is_reserved_mcp_meta_key("modelcontextprotocol.io/value")
+    assert not _is_reserved_mcp_meta_key("com.example.mcp/value")
+    assert not _is_reserved_mcp_meta_key("plain")
 
 
 def _make_mock_server(name, session=None, tools=None):
@@ -1694,7 +1744,7 @@ class TestSamplingCallbackText:
         assert result.content.text == "Hello from LLM"
         assert result.model == "test-model"
         assert result.role == "assistant"
-        assert result.stopReason == "endTurn"
+        assert _stop_reason(result) == "endTurn"
 
     def test_server_tools_with_object_schema_are_normalized(self):
         """Server-provided tools should gain empty properties for object schemas."""
@@ -1744,7 +1794,7 @@ class TestSamplingCallbackToolUse:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResultWithTools)
-        assert result.stopReason == "toolUse"
+        assert _stop_reason(result) == "toolUse"
         assert result.model == "test-model"
         assert len(result.content) == 1
         tc = result.content[0]
@@ -2423,9 +2473,23 @@ class TestRegisterMcpServers:
         # Simulate that srv_a is already connecting from another call
         _server_connecting.add("srv_a")
 
+        real_wait_for = asyncio.wait_for
+
+        async def _timeout_discovery_only(awaitable, timeout):
+            # The outer registration timeout is the behavior under test.  Do
+            # not replace every wait_for in the MCP transport: doing so leaves
+            # SDK TLS/subprocess cleanup half-cancelled on Python 3.12+.
+            if timeout == 120:
+                cancel = getattr(awaitable, "cancel", None)
+                if cancel is not None:
+                    cancel()
+                elif hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise TimeoutError("timed out")
+            return await real_wait_for(awaitable, timeout)
+
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-             patch("tools.mcp_tool.asyncio.wait_for", new_callable=AsyncMock,
-                   side_effect=TimeoutError("timed out")), \
+             patch("tools.mcp_tool.asyncio.wait_for", new=_timeout_discovery_only), \
              patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
              patch("tools.mcp_tool._connect_cooldown_active", return_value=False):
             await register_mcp_servers(fake_config)

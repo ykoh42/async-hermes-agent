@@ -122,7 +122,12 @@ class SessionSchemaMixin:
     """Native-async retained schema migrations for ``SessionDB``."""
 
     async def _dedupe_legacy_system_prompts(self, cursor: Any) -> None:
-        """Move inline prompt snapshots into the shared addressed table."""
+        """Move inline prompt snapshots into the shared addressed table.
+
+        A contended v25 migration may safely stop after any row: unmigrated
+        sessions still have the legacy inline prompt as a read fallback, and
+        the next schema initialization resumes the remaining rows.
+        """
         try:
             async with cursor.execute(
                 "SELECT id, system_prompt FROM sessions "
@@ -137,17 +142,26 @@ class SessionSchemaMixin:
             prompt = (
                 row["system_prompt"] if isinstance(row, sqlite3.Row) else row[1]
             )
-            prompt_hash = await self._store_system_prompt(  # type: ignore[unresolved-attribute]
-                cursor,
-                prompt,
-            )
-            update_cursor = await cursor.execute(
-                "UPDATE sessions "
-                "SET system_prompt_hash = ?, system_prompt = NULL "
-                "WHERE id = ?",
-                (prompt_hash, session_id),
-            )
-            await update_cursor.close()
+            try:
+                prompt_hash = await self._store_system_prompt(  # type: ignore[unresolved-attribute]
+                    cursor,
+                    prompt,
+                )
+                update_cursor = await cursor.execute(
+                    "UPDATE sessions "
+                    "SET system_prompt_hash = ?, system_prompt = NULL "
+                    "WHERE id = ?",
+                    (prompt_hash, session_id),
+                )
+                await update_cursor.close()
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "v25 prompt dedupe paused after contention (%s); "
+                    "unmigrated rows keep the legacy inline prompt and the "
+                    "next schema init resumes the migration.",
+                    exc,
+                )
+                return
 
     async def _sqlite_supports_fts5(self, cursor: Any) -> bool:
         try:

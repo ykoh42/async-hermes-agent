@@ -568,6 +568,22 @@ class TestBuildContextFilesPrompt:
         assert "Project Context" in result
 
     @pytest.mark.asyncio
+    async def test_agents_override_md_wins_over_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "AGENTS.override.md").write_text("Use Black instead.")
+        result = await build_context_files_prompt(cwd=str(tmp_path))
+        assert "Use Black instead" in result
+        assert "Ruff for linting" not in result
+        assert "AGENTS.override.md" in result
+
+    @pytest.mark.asyncio
+    async def test_agents_override_md_loads_alone(self, tmp_path):
+        (tmp_path / "AGENTS.override.md").write_text("Override-only context.")
+        result = await build_context_files_prompt(cwd=str(tmp_path))
+        assert "Override-only context" in result
+        assert "Project Context" in result
+
+    @pytest.mark.asyncio
     async def test_agents_md_chain_merges_root_to_cwd(self, tmp_path):
         (tmp_path / ".git").mkdir()
         (tmp_path / "AGENTS.md").write_text("Root: use Ruff.")

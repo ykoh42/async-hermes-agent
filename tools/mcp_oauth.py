@@ -679,12 +679,22 @@ class HermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 
+def _authorization_code_result(code: str, state: str | None, iss: str | None = None):
+    """Return the callback result shape required by the installed SDK."""
+    try:
+        from mcp.shared.auth import AuthorizationCodeResult
+    except ImportError:
+        return code, state
+    return AuthorizationCodeResult(code=code, state=state, iss=iss)
+
+
 def _make_callback_handler():
     """Create a native-async HTTP callback and isolated result state."""
     result: dict[str, Any] = {
         "auth_code": None,
         "state": None,
         "error": None,
+        "iss": None,
         "ready": asyncio.Event(),
     }
 
@@ -700,11 +710,13 @@ def _make_callback_handler():
             code = params.get("code", [None])[0]
             state = params.get("state", [None])[0]
             error = params.get("error", [None])[0]
+            iss = params.get("iss", [None])[0]
 
             if result["auth_code"] is None and result["error"] is None:
                 result["auth_code"] = code
                 result["state"] = state
                 result["error"] = error
+                result["iss"] = iss
                 result["ready"].set()
 
             body = (
@@ -841,8 +853,13 @@ async def _wait_for_callback() -> tuple[str, str | None]:
     return await _make_callback_waiter(_oauth_port)()
 
 
-def _make_callback_waiter(port: int):
+def _make_callback_waiter(port: int, timeout: float = 300.0):
     """Return a callback waiter bound to a single OAuth flow's port.
+
+    ``timeout`` bounds how long the waiter polls for the redirect. It used to
+    be passed to ``OAuthClientProvider(timeout=...)`` as well, but mcp 2.0
+    dropped that constructor argument — the wait happens here, so this is now
+    the only place the configured ``oauth.timeout`` takes effect.
 
     Closing over the port (instead of reading the module-level
     ``_oauth_port``) keeps concurrent OAuth flows isolated: flow A's waiter
@@ -923,7 +940,7 @@ def _make_callback_waiter(port: int):
             paste_task = asyncio.create_task(_wait_for_pasted_callback(result))
 
         try:
-            await asyncio.wait_for(result["ready"].wait(), timeout=300.0)
+            await asyncio.wait_for(result["ready"].wait(), timeout=timeout)
         except TimeoutError:
             pass
         finally:
@@ -953,7 +970,9 @@ def _make_callback_waiter(port: int):
                 "Ensure you completed the browser authorization flow."
             )
 
-        return result["auth_code"], result["state"]
+        return _authorization_code_result(
+            result["auth_code"], result["state"], result.get("iss")
+        )
 
     return _wait
 
@@ -1051,6 +1070,7 @@ def _apply_pasted_callback(line: str, result: dict) -> None:
     code = params.get("code", [None])[0]
     state = params.get("state", [None])[0]
     error = params.get("error", [None])[0]
+    iss = params.get("iss", [None])[0]  # RFC 9207 — see _make_callback_handler
 
     if not code and not error:
         print(
@@ -1066,6 +1086,7 @@ def _apply_pasted_callback(line: str, result: dict) -> None:
     result["auth_code"] = code
     result["state"] = state
     result["error"] = error
+    result["iss"] = iss
     result["ready"].set()
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
@@ -1253,11 +1274,16 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": auth_method,
+        "application_type": cfg.get("application_type", "native"),
     }
     if scope:
         metadata_kwargs["scope"] = scope
 
-    return OAuthClientMetadata.model_validate(metadata_kwargs)
+    try:
+        return OAuthClientMetadata.model_validate(metadata_kwargs)
+    except Exception:
+        metadata_kwargs.pop("application_type", None)
+        return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
 async def _invalidate_tokens_on_client_change(
@@ -1447,13 +1473,17 @@ async def build_oauth_auth(
     redirect_handler = _make_redirect_handler(
         resolved_port, redirect_uri=cfg.get("redirect_uri") or None
     )
-    callback_handler = _make_callback_waiter(resolved_port)
+    callback_handler = _make_callback_waiter(
+        resolved_port, timeout=float(cfg.get("timeout", 300))
+    )
 
     return OAuthClientProvider(
         server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,
         redirect_handler=redirect_handler,
+        # mcp 2.0 removed the provider's own `timeout` argument; the configured
+        # `oauth.timeout` is applied inside the callback waiter above, which is
+        # where the browser round-trip is actually awaited.
         callback_handler=callback_handler,
-        timeout=float(cfg.get("timeout", 300)),
     )

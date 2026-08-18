@@ -885,7 +885,8 @@ class MemoryStore:
                         try:
                             await _close_owned_connection(entry["conn"])
                         finally:
-                            MemoryStore._shared.pop(registry_key, None)
+                            if MemoryStore._shared.get(registry_key) is entry:
+                                MemoryStore._shared.pop(registry_key, None)
                 finally:
                     self._entry = None
                     self._registry_key = None

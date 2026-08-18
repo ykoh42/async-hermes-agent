@@ -173,6 +173,39 @@ def create_subagent_worktree(
     }
 
 
+def mark_worktree_payload_unproven(
+    payload: dict[str, Any], reason: str, *, unmeasured: str = "commits/dirty"
+) -> dict[str, Any]:
+    """Mark git inspection fields unknown and keep the worktree for review."""
+    payload["inspection_failed"] = True
+    payload["note"] = (
+        f"git inspection failed ({reason}): {unmeasured} UNKNOWN — not "
+        "proven zero/clean. The worktree and branch were preserved — inspect "
+        f"{payload.get('path', '')} (branch {payload.get('branch', '')}) before assuming no work."
+    )
+    logger.warning(
+        "subagent worktree: git inspection failed (%s) — keeping %s (branch %s)",
+        reason,
+        payload.get("path", ""),
+        payload.get("branch", ""),
+    )
+    return payload
+
+
+def unproven_worktree_payload(info: dict[str, str], reason: str) -> dict[str, Any]:
+    """Build the common result shape when finalization itself raises."""
+    return mark_worktree_payload_unproven(
+        {
+            "path": info.get("path", ""),
+            "branch": info.get("branch", ""),
+            "commits": 0,
+            "dirty": False,
+            "pruned": False,
+        },
+        reason,
+    )
+
+
 def finalize_subagent_worktree(
     info: dict[str, str], *, prune: bool = True
 ) -> dict[str, Any]:
@@ -199,20 +232,38 @@ def finalize_subagent_worktree(
         payload["pruned"] = True  # nothing on disk to review
         return payload
 
+    def _unproven(reason: str, *, unmeasured: str = "commits/dirty"):
+        return mark_worktree_payload_unproven(payload, reason, unmeasured=unmeasured)
+
+    if not base_commit:
+        return _unproven("no base_commit recorded — commit count unmeasurable", unmeasured="commits")
+
+    failed: list[str] = []
+    unmeasured: list[str] = []
     try:
-        if base_commit:
-            counted = _run_git(
-                ["rev-list", "--count", f"{base_commit}..HEAD"], cwd=path
+        counted = _run_git(
+            ["rev-list", "--count", f"{base_commit}..HEAD"], cwd=path
+        )
+        if counted.returncode == 0:
+            payload["commits"] = int(counted.stdout.strip() or 0)
+        else:
+            failed.append(
+                f"rev-list exit {counted.returncode}: {counted.stderr.strip()[:200]}"
             )
-            if counted.returncode == 0:
-                payload["commits"] = int(counted.stdout.strip() or 0)
+            unmeasured.append("commits")
         status = _run_git(["status", "--porcelain"], cwd=path)
         if status.returncode == 0:
             payload["dirty"] = bool(status.stdout.strip())
+        else:
+            failed.append(
+                f"status exit {status.returncode}: {status.stderr.strip()[:200]}"
+            )
+            unmeasured.append("dirty")
     except Exception as exc:
-        logger.debug("subagent worktree: finalize inspection failed: %s", exc)
-        # Unknown state — keep the worktree rather than risk deleting work.
-        return payload
+        return _unproven(f"inspection raised: {exc}")
+
+    if failed:
+        return _unproven("; ".join(failed), unmeasured="/".join(unmeasured))
 
     if prune and payload["commits"] == 0 and not payload["dirty"]:
         try:

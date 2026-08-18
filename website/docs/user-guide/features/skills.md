@@ -63,6 +63,14 @@ conversation context, while full instructions are loaded through a tool call.
 Creating or editing a skill invalidates the skill snapshot for a later
 conversation; it does not rewrite past messages in the current conversation.
 
+Project-local skills are scanned before they are listed or loaded. A skill
+with a failed or disallowed advisory scan is quarantined and omitted from the
+project skill surface; scanner failures fail closed. The quarantine cache is
+kept under the active Hermes home rather than inside the checkout, so a
+profile-scoped scan cannot be reused by another profile. Non-interactive trust
+for project-local skills is inherited only when the project root is explicitly
+scoped to the current task.
+
 ## Packaging and trust
 
 Do not assume the Python distribution installs a large upstream skill catalog.

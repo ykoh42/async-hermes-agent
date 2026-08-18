@@ -365,18 +365,28 @@ async def scan_skill_commands() -> dict[str, dict[str, Any]]:
         skill_matches_environment,
         skill_matches_platform,
     )
+    from agent.skill_utils import (
+        get_project_skills_dirs,
+        iter_project_skill_files,
+    )
 
     scan_platform = _resolve_skill_commands_platform()
     commands: dict[str, dict[str, Any]] = {}
     disabled = await _get_disabled_skill_names(scan_platform)
-    roots: list[Path] = []
+    roots: list[Path] = await get_project_skills_dirs()
+    project_roots = set(roots)
     local_root = _skills_dir()
     if await aiofiles.os.path.isdir(local_root):
         roots.append(local_root)
     roots.extend(await _external_skills_dirs())
     seen_names: set[str] = set()
     for root in roots:
-        async for skill_md in _iter_skill_index_files(root, "SKILL.md"):
+        iterator = (
+            iter_project_skill_files(root)
+            if root in project_roots
+            else _iter_skill_index_files(root, "SKILL.md")
+        )
+        async for skill_md in iterator:
             try:
                 content = await _read_skill_text(skill_md)
                 frontmatter, body = _parse_frontmatter(content)
