@@ -297,7 +297,7 @@ def test_release_workflow_publishes_verified_artifacts_with_least_privilege():
     assert "url: https://pypi.org/p/async-hermes-agent" in workflow
     assert (
         "pypa/gh-action-pypi-publish@"
-        "cef221092ed1bacb1cc03d23a2d87d1d172e277b"
+        "dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
     ) in workflow
     assert "packages-dir: dist/" in workflow
     assert "skip-existing: true" in publish_job
