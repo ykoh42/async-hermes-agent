@@ -2473,9 +2473,23 @@ class TestRegisterMcpServers:
         # Simulate that srv_a is already connecting from another call
         _server_connecting.add("srv_a")
 
+        real_wait_for = asyncio.wait_for
+
+        async def _timeout_discovery_only(awaitable, timeout):
+            # The outer registration timeout is the behavior under test.  Do
+            # not replace every wait_for in the MCP transport: doing so leaves
+            # SDK TLS/subprocess cleanup half-cancelled on Python 3.12+.
+            if timeout == 120:
+                cancel = getattr(awaitable, "cancel", None)
+                if cancel is not None:
+                    cancel()
+                elif hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise TimeoutError("timed out")
+            return await real_wait_for(awaitable, timeout)
+
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-             patch("tools.mcp_tool.asyncio.wait_for", new_callable=AsyncMock,
-                   side_effect=TimeoutError("timed out")), \
+             patch("tools.mcp_tool.asyncio.wait_for", new=_timeout_discovery_only), \
              patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
              patch("tools.mcp_tool._connect_cooldown_active", return_value=False):
             await register_mcp_servers(fake_config)
